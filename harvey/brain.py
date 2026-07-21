@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from pathlib import Path
 
 from harvey.state import StateManager
@@ -51,7 +52,14 @@ class Brain:
             "--dangerously-skip-permissions",
         ]
         if session_id:
-            cmd.extend(["--session-id", session_id])
+            # The CLI only accepts UUIDs for --session-id; callers pass
+            # friendly names ("harvey-scout") purely as a debug label, and
+            # one-shot -p calls get no continuity from a session id anyway.
+            try:
+                uuid.UUID(session_id)
+                cmd.extend(["--session-id", session_id])
+            except ValueError:
+                pass
 
         logger.debug(f"Brain call (session={session_id}): {prompt[:100]}...")
 
@@ -69,6 +77,9 @@ class Brain:
             try:
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
+                    # DEVNULL: the CLI reads inherited stdin as prompt input,
+                    # stealing the terminal (and any piped answers) from Harvey.
+                    stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
