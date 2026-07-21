@@ -5,10 +5,8 @@ Falls back to manual scraping if no Cloudflare credentials are configured.
 """
 
 import asyncio
-import json
 import logging
 import os
-import re
 import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -22,6 +20,16 @@ from harvey.brain import Brain
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.trainer")
+
+PROJECT_ROOT = Path(__file__).parent.parent
+
+
+def _normalize_start_url(url: str) -> str:
+    """Accept 'acmecorp.com' as well as 'https://acmecorp.com'."""
+    url = url.strip()
+    if url and not urlparse(url).scheme:
+        url = f"https://{url}"
+    return url
 
 # Fallback: pages to try if Cloudflare crawl is unavailable
 FALLBACK_PATHS = [
@@ -323,8 +331,13 @@ class Trainer:
         load_dotenv()
         await self.state.init_db()
 
+        url = _normalize_start_url(url)
         parsed = urlparse(url)
         domain = parsed.netloc
+        if not domain:
+            print(f"\nERROR: '{url}' doesn't look like a valid URL.")
+            print("Try something like: https://yourcompany.com")
+            return None
         base_url = f"{parsed.scheme}://{domain}"
 
         logger.info(f"Training Harvey on {base_url}...")
@@ -382,8 +395,11 @@ class Trainer:
         print("[6/6] Building configuration and product knowledge...")
         config = self._build_config(product_info, icp_info, objections, domain)
 
-        # Write config
+        # Write config (relative paths resolve against the project root,
+        # so training works no matter what directory it's launched from)
         config_path = Path(output_path)
+        if not config_path.is_absolute():
+            config_path = PROJECT_ROOT / config_path
         with open(config_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
@@ -407,8 +423,9 @@ class Trainer:
         print(f"    - skills/product_knowledge.md")
         if competitive_intel.get("competitors"):
             print(f"    - skills/competitive_intel.md")
-        print(f"\n  Review {config_path} and adjust as needed.")
-        print(f"  Then run: python -m harvey\n")
+        print(f"\n  Review {config_path} and adjust as needed — especially the")
+        print(f"  persona name/email, which I guessed from your domain.")
+        print(f"  Then run: harvey run\n")
 
         return config
 
@@ -676,14 +693,16 @@ What prospects do instead of buying a solution like ours:
         company = product_info.get("company_name", "Your Company")
         product = product_info.get("product_name", "Your Product")
         tone = product_info.get("tone", "professional, consultative, confident")
+        # "www.acme.com" should yield harvey@acme.com, not harvey@www.acme.com
+        email_domain = domain.removeprefix("www.")
 
         return {
             "persona": {
                 "name": "Harvey",
                 "company": company,
                 "role": "Business Development",
-                "email": f"harvey@{domain}",
-                "linkedin": f"linkedin.com/in/harvey-{domain.replace('.', '-')}",
+                "email": f"harvey@{email_domain}",
+                "linkedin": f"linkedin.com/in/harvey-{email_domain.replace('.', '-')}",
                 "tone": tone,
             },
             "product": {
@@ -748,8 +767,15 @@ def main():
         print("scraping (no JavaScript rendering, limited page discovery).")
         sys.exit(1)
 
-    url = sys.argv[1]
-    max_pages = int(sys.argv[2]) if len(sys.argv) > 2 else 100
+    url = _normalize_start_url(sys.argv[1])
+
+    max_pages = 100
+    if len(sys.argv) > 2:
+        try:
+            max_pages = max(1, int(sys.argv[2]))
+        except ValueError:
+            print(f"Invalid max-pages value: {sys.argv[2]!r} (expected a number)")
+            sys.exit(1)
 
     asyncio.run(run_training(url, max_pages=max_pages))
 

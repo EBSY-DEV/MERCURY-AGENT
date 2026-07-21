@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import subprocess
 import sys
+from pathlib import Path
 
 
 def cmd_install(args):
@@ -12,21 +13,34 @@ def cmd_install(args):
 
     # Install Python packages
     print("  [1/2] Installing Python packages...")
+    requirements = Path(args._project_root) / "requirements.txt"
+    if requirements.exists():
+        pip_args = ["-r", "requirements.txt"]
+    else:
+        # Fall back to an editable install from pyproject.toml
+        pip_args = ["-e", "."]
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
+        [sys.executable, "-m", "pip", "install", *pip_args],
         cwd=args._project_root,
     )
     if result.returncode != 0:
         print("\n  Failed to install Python packages.")
+        print("  Tip: make sure you're inside a virtualenv "
+              "(python3 -m venv .venv && source .venv/bin/activate).")
         sys.exit(1)
     print("  ✓ Python packages installed.\n")
 
     # Install Playwright browsers
     print("  [2/2] Installing Playwright browsers...")
-    result = subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-    )
-    if result.returncode != 0:
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            timeout=600,
+        )
+        playwright_ok = result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        playwright_ok = False
+    if not playwright_ok:
         print("\n  Playwright browser install failed (optional — needed for LinkedIn).")
     else:
         print("  ✓ Playwright browsers installed.\n")
@@ -52,13 +66,26 @@ def cmd_train(args):
     """Train Harvey on a website."""
     from harvey.trainer import Trainer
 
+    url = args.url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+        print(f"  No scheme given — using {url}")
+
+    if args.max_pages < 1:
+        print("  max_pages must be at least 1.")
+        sys.exit(2)
+
     trainer = Trainer()
-    asyncio.run(trainer.train(args.url, max_pages=args.max_pages))
+    asyncio.run(trainer.train(url, max_pages=args.max_pages))
 
 
 def cmd_dashboard(args):
     """Launch the local web dashboard."""
     from harvey.dashboard import start_dashboard
+
+    if not 1 <= args.port <= 65535:
+        print(f"  Invalid port: {args.port}. Must be 1-65535.")
+        sys.exit(2)
 
     start_dashboard(host=args.host, port=args.port)
 
@@ -85,8 +112,6 @@ def cmd_status(args):
 
 
 def main():
-    from pathlib import Path
-
     project_root = str(Path(__file__).parent.parent)
 
     parser = argparse.ArgumentParser(
@@ -142,7 +167,21 @@ def main():
         print()
         sys.exit(0)
 
-    args.func(args)
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print("\n  Interrupted. Goodbye.")
+        sys.exit(130)
+    except Exception as e:
+        # ConfigError and friends carry actionable messages — show them
+        # cleanly instead of a raw traceback.
+        from harvey.config import ConfigError
+
+        if isinstance(e, ConfigError):
+            print(f"\n  Configuration problem:\n  {e}\n")
+        else:
+            print(f"\n  Error running 'harvey {args.command}': {e}\n")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

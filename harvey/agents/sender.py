@@ -1,7 +1,7 @@
 """Sender — deploys campaigns via Instantly."""
 
-import json
 import logging
+import re
 from datetime import date
 
 from harvey.brain import Brain
@@ -10,6 +10,12 @@ from harvey.integrations.instantly import InstantlyClient
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.sender")
+
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+# Only prospects in these statuses may be added as leads. This guarantees
+# we never re-send to someone already contacted, replied, opted out, or lost.
+SENDABLE_STATUSES = {"new", "queued"}
 
 
 class Sender:
@@ -52,26 +58,63 @@ class Sender:
             except Exception as e:
                 logger.error(f"Sender: Failed to deploy campaign {campaign.name}: {e}")
 
+    def _validate_sequence(self, campaign) -> bool:
+        """Never deploy a broken or empty sequence."""
+        if not campaign.sequence:
+            logger.error(f"Sender: Campaign '{campaign.name}' has no email sequence. Marking failed.")
+            return False
+        for step in campaign.sequence:
+            if not (step.subject or "").strip() or not (step.body or "").strip():
+                logger.error(
+                    f"Sender: Campaign '{campaign.name}' step {step.step} has an empty "
+                    "subject or body. Marking failed."
+                )
+                return False
+            if step.delay_days < 0:
+                logger.error(
+                    f"Sender: Campaign '{campaign.name}' step {step.step} has a negative delay."
+                )
+                return False
+        return True
+
     async def _deploy_campaign(self, campaign):
-        """Deploy a single campaign to Instantly."""
+        """Deploy a single campaign to Instantly. Idempotent: safe to retry."""
         logger.info(f"Sender: Deploying campaign '{campaign.name}'...")
 
-        # 1. Create campaign in Instantly
-        instantly_campaign = await self.instantly.create_campaign(campaign.name)
-        if not instantly_campaign:
-            logger.error(f"Sender: Failed to create Instantly campaign: {campaign.name}")
+        # 0. Validate before touching the network
+        if not self._validate_sequence(campaign):
+            await self.state.update_campaign(campaign.id, status="failed")
             return
 
-        campaign_id = instantly_campaign.get("id")
-        if not campaign_id:
-            logger.error("Sender: No campaign ID returned from Instantly.")
-            return
+        # 1. Create campaign in Instantly — or resume one from a previous
+        # partially-failed deploy. Never create a duplicate.
+        campaign_id = campaign.instantly_campaign_id
+        if campaign_id:
+            logger.info(
+                f"Sender: Campaign '{campaign.name}' already has Instantly ID "
+                f"{campaign_id}. Resuming deploy instead of recreating."
+            )
+        else:
+            instantly_campaign = await self.instantly.create_campaign(campaign.name)
+            if not instantly_campaign or not isinstance(instantly_campaign, dict):
+                logger.error(f"Sender: Failed to create Instantly campaign: {campaign.name}")
+                return
+
+            campaign_id = instantly_campaign.get("id")
+            if not campaign_id:
+                logger.error("Sender: No campaign ID returned from Instantly.")
+                return
+
+            # Persist the ID immediately so a crash mid-deploy resumes this
+            # campaign instead of creating a second one (double-send guard).
+            await self.state.update_campaign(campaign.id, instantly_campaign_id=campaign_id)
+            campaign.instantly_campaign_id = campaign_id
 
         # 2. Set email sequence
         sequences = [
             {
-                "subject": step.subject,
-                "body": step.body,
+                "subject": step.subject.strip(),
+                "body": step.body.strip(),
                 "wait": step.delay_days,
             }
             for step in campaign.sequence
@@ -82,14 +125,45 @@ class Sender:
             logger.error(f"Sender: Failed to set emails for campaign {campaign_id}")
             return
 
-        # 3. Add leads (capped to remaining daily budget)
+        # 3. Add leads — validated, deduped, and only never-contacted prospects
         prospects = []
+        seen_emails: set[str] = set()
         for prospect_id in campaign.prospect_ids:
             prospect = await self.state.get_prospect(prospect_id)
-            if prospect and prospect.email:
-                prospects.append(prospect)
+            if not prospect or not prospect.email:
+                continue
+            email = prospect.email.strip().lower()
+            if not EMAIL_RE.match(email):
+                logger.warning(f"Sender: Skipping invalid email '{prospect.email}'")
+                continue
+            if email in seen_emails:
+                continue
+            if prospect.status not in SENDABLE_STATUSES:
+                # Already contacted / replied / opted out — never double-send.
+                logger.debug(
+                    f"Sender: Skipping {email} (status '{prospect.status}' is not sendable)."
+                )
+                continue
+            seen_emails.add(email)
+            prospects.append(prospect)
 
         if not prospects:
+            # Retry path: leads were already staged and marked 'contacted'
+            # on a previous cycle but activation failed. Just activate.
+            already_staged = False
+            for pid in campaign.prospect_ids:
+                p = await self.state.get_prospect(pid)
+                if p and p.status == "contacted":
+                    already_staged = True
+                    break
+            if already_staged:
+                logger.info(
+                    f"Sender: Leads for '{campaign.name}' already staged. Retrying activation."
+                )
+                if await self.instantly.activate_campaign(campaign_id) is not None:
+                    await self.state.update_campaign(campaign.id, status="active")
+                    logger.info(f"Sender: Campaign '{campaign.name}' activated on retry.")
+                return
             logger.warning(f"Sender: No valid prospects for campaign {campaign.name}")
             return
 
@@ -106,7 +180,7 @@ class Sender:
 
         leads = [
             {
-                "email": p.email,
+                "email": p.email.strip().lower(),
                 "first_name": p.first_name,
                 "last_name": p.last_name,
                 "company_name": p.company,
@@ -123,10 +197,19 @@ class Sender:
             logger.error(f"Sender: Failed to add leads to campaign {campaign_id}")
             return
 
+        # Mark prospects as contacted BEFORE activation: if activation
+        # succeeds but this write failed, a retry would re-add the same
+        # leads. Better to under-count than double-send.
+        for prospect in prospects:
+            await self.state.update_prospect_status(prospect.id, "contacted")
+
         # 4. Activate campaign
         result = await self.instantly.activate_campaign(campaign_id)
         if result is None:
-            logger.error(f"Sender: Failed to activate campaign {campaign_id}")
+            logger.error(
+                f"Sender: Failed to activate campaign {campaign_id}. "
+                "Leads are staged; will retry activation next cycle."
+            )
             return
 
         # 5. Update our records
@@ -135,10 +218,6 @@ class Sender:
             instantly_campaign_id=campaign_id,
             status="active",
         )
-
-        # Update prospect statuses
-        for prospect in prospects:
-            await self.state.update_prospect_status(prospect.id, "contacted")
 
         await self.state.log_action(
             action_type="send_campaign",

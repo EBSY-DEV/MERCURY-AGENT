@@ -1,11 +1,24 @@
 """Configuration loader for Harvey. Reads harvey.yaml + .env."""
 
+import logging
 import os
+from datetime import time as _time
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError, field_validator
+
+logger = logging.getLogger("harvey.config")
+
+
+class ConfigError(Exception):
+    """Raised when Harvey's configuration is missing or invalid."""
+
+
+class ConfigFileNotFoundError(ConfigError, FileNotFoundError):
+    """Config file is missing. Subclasses FileNotFoundError for
+    backward compatibility with existing callers/tests."""
 
 
 class PersonaConfig(BaseModel):
@@ -48,6 +61,13 @@ class EmailChannelConfig(BaseModel):
     provider: str = "instantly"
     max_daily_sends: int = 50
 
+    @field_validator("max_daily_sends")
+    @classmethod
+    def _sends_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("max_daily_sends must be >= 0")
+        return v
+
 
 class LinkedInChannelConfig(BaseModel):
     enabled: bool = True
@@ -65,11 +85,47 @@ class QuietHoursConfig(BaseModel):
     end: str = "07:00"
     timezone: str = "America/New_York"
 
+    @field_validator("start", "end")
+    @classmethod
+    def _valid_time(cls, v: str) -> str:
+        try:
+            _time.fromisoformat(v)
+        except ValueError:
+            raise ValueError(
+                f"'{v}' is not a valid time. Use 24h HH:MM format, e.g. '22:00'."
+            )
+        return v
+
+    @field_validator("timezone")
+    @classmethod
+    def _valid_timezone(cls, v: str) -> str:
+        import pytz
+
+        if v not in pytz.all_timezones_set:
+            raise ValueError(
+                f"'{v}' is not a valid timezone. Use an IANA name like 'America/New_York'."
+            )
+        return v
+
 
 class UsageConfig(BaseModel):
     max_daily_claude_percent: float = 80.0
     heartbeat_interval_minutes: int = 15
     quiet_hours: QuietHoursConfig = QuietHoursConfig()
+
+    @field_validator("max_daily_claude_percent")
+    @classmethod
+    def _valid_percent(cls, v: float) -> float:
+        if not 0 < v <= 100:
+            raise ValueError("max_daily_claude_percent must be between 0 and 100")
+        return v
+
+    @field_validator("heartbeat_interval_minutes")
+    @classmethod
+    def _valid_interval(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("heartbeat_interval_minutes must be at least 1")
+        return v
 
 
 class HarveyConfig(BaseModel):
@@ -88,25 +144,72 @@ class EnvConfig(BaseModel):
     serper_api_key: str = ""
 
 
+def _format_validation_error(e: ValidationError) -> str:
+    """Turn a pydantic ValidationError into a readable, actionable message."""
+    lines = []
+    for err in e.errors():
+        loc = ".".join(str(p) for p in err["loc"]) or "(root)"
+        lines.append(f"  - {loc}: {err['msg']}")
+    return "\n".join(lines)
+
+
 def load_config(config_path: str | None = None) -> HarveyConfig:
-    """Load Harvey configuration from YAML file."""
+    """Load Harvey configuration from YAML file.
+
+    Raises ConfigError with a clear, actionable message on any problem.
+    """
     if config_path is None:
         config_path = _find_config_file()
-    with open(config_path) as f:
-        data = yaml.safe_load(f)
-    return HarveyConfig(**data)
+
+    try:
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+    except FileNotFoundError:
+        raise ConfigFileNotFoundError(
+            f"Config file not found: {config_path}. "
+            "Create one from harvey.yaml.example or run 'harvey setup'."
+        )
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Invalid YAML in {config_path}:\n  {e}")
+    except OSError as e:
+        raise ConfigError(f"Could not read {config_path}: {e}")
+
+    if data is None:
+        raise ConfigError(f"{config_path} is empty. Run 'harvey setup' to configure Harvey.")
+    if not isinstance(data, dict):
+        raise ConfigError(
+            f"{config_path} must contain a YAML mapping (key: value pairs), "
+            f"got {type(data).__name__}."
+        )
+
+    try:
+        return HarveyConfig(**data)
+    except ValidationError as e:
+        # Log a friendly, actionable summary, then re-raise the original
+        # ValidationError so callers (and tests) keep the pydantic type.
+        logger.error(
+            f"Invalid configuration in {config_path}:\n{_format_validation_error(e)}\n"
+            "Fix the fields above or re-run 'harvey setup'."
+        )
+        raise
 
 
 def load_env() -> EnvConfig:
     """Load environment variables from .env file."""
     load_dotenv()
-    return EnvConfig(
-        instantly_api_key=os.getenv("INSTANTLY_API_KEY", ""),
-        linkedin_email=os.getenv("LINKEDIN_EMAIL", ""),
-        linkedin_password=os.getenv("LINKEDIN_PASSWORD", ""),
-        hunter_api_key=os.getenv("HUNTER_API_KEY", ""),
-        serper_api_key=os.getenv("SERPER_API_KEY", ""),
+    env = EnvConfig(
+        instantly_api_key=os.getenv("INSTANTLY_API_KEY", "").strip(),
+        linkedin_email=os.getenv("LINKEDIN_EMAIL", "").strip(),
+        linkedin_password=os.getenv("LINKEDIN_PASSWORD", "").strip(),
+        hunter_api_key=os.getenv("HUNTER_API_KEY", "").strip(),
+        serper_api_key=os.getenv("SERPER_API_KEY", "").strip(),
     )
+    if not env.instantly_api_key:
+        logger.warning(
+            "INSTANTLY_API_KEY is not set — email sending will be disabled "
+            "until it's added to .env."
+        )
+    return env
 
 
 def _find_config_file() -> str:
@@ -119,6 +222,8 @@ def _find_config_file() -> str:
     for path in candidates:
         if path.exists():
             return str(path)
-    raise FileNotFoundError(
-        "harvey.yaml not found. Create one from harvey.yaml.example"
+    raise ConfigFileNotFoundError(
+        "harvey.yaml not found in "
+        + ", ".join(str(p.parent) for p in candidates)
+        + ". Create one from harvey.yaml.example or run 'harvey setup'."
     )

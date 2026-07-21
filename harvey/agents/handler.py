@@ -18,7 +18,51 @@ INTENT_LABELS = {
     "ooo",
     "wrong_person",
     "question",
+    "unsubscribe",
+    "escalate",
 }
+
+# Intents that get an automated reply. Everything else is closed,
+# deferred, or escalated to a human.
+AUTO_REPLY_INTENTS = {"interested", "objection", "question", "wrong_person"}
+
+# Hard opt-out phrases. If any of these appear, we ALWAYS honor the
+# opt-out regardless of what the LLM classifier says.
+OPT_OUT_PATTERNS = (
+    "unsubscribe",
+    "opt out",
+    "opt-out",
+    "remove me",
+    "take me off",
+    "stop emailing",
+    "stop contacting",
+    "stop sending",
+    "do not contact",
+    "do not email",
+    "don't contact",
+    "don't email",
+    "never contact",
+    "delete my info",
+    "delete my data",
+)
+
+# Phrases that mean a human must take over. Never auto-reply to these.
+ESCALATION_PATTERNS = (
+    "lawyer",
+    "attorney",
+    "legal action",
+    "lawsuit",
+    "cease and desist",
+    "harassment",
+    "harassing",
+    "report you",
+    "reporting you",
+    "spam complaint",
+    "ftc",
+    "gdpr",
+    "can-spam",
+    "blacklist",
+)
 
 
 class Handler:
@@ -33,6 +77,7 @@ class Handler:
         self.state = state
         self.config = config
         self.instantly = InstantlyClient(env.instantly_api_key)
+        self.skills = ""
 
     async def run(self):
         """Check for new replies and handle them."""
@@ -57,48 +102,59 @@ class Handler:
                 continue
 
             # 2. Get replies from Instantly
-            replies = await self.instantly.get_replies(campaign.instantly_campaign_id)
+            try:
+                replies = await self.instantly.get_replies(campaign.instantly_campaign_id)
+            except Exception as e:
+                logger.error(f"Handler: Failed to fetch replies for {campaign.name}: {e}")
+                continue
             if not replies:
                 continue
 
             for reply in replies:
+                if not isinstance(reply, dict):
+                    continue
                 try:
-                    await self._handle_reply(reply, campaign)
-                    total_handled += 1
+                    handled = await self._handle_reply(reply, campaign)
+                    if handled:
+                        total_handled += 1
                 except Exception as e:
                     logger.error(f"Handler: Error processing reply: {e}")
-
-        # Also check open conversations that need follow-up
-        open_convos = await self.state.get_conversations_by_status("open")
-        for convo in open_convos:
-            if convo.intent == "interested":
-                # Check if we need to follow up
-                pass  # TODO: follow-up logic
 
         if total_handled:
             logger.info(f"Handler: Processed {total_handled} replies.")
         else:
             logger.info("Handler: No new replies.")
 
-    async def _handle_reply(self, reply: dict, campaign):
-        """Process a single reply."""
-        lead_email = reply.get("lead_email", reply.get("from_email", ""))
-        reply_text = reply.get("body", reply.get("text", ""))
-        reply_uuid = reply.get("uuid", reply.get("id", ""))
+    async def _handle_reply(self, reply: dict, campaign) -> bool:
+        """Process a single reply. Returns True if a new reply was handled."""
+        lead_email = (reply.get("lead_email") or reply.get("from_email") or "").strip().lower()
+        reply_text = (reply.get("body") or reply.get("text") or "").strip()
+        reply_uuid = str(reply.get("uuid") or reply.get("id") or "")
 
         if not lead_email or not reply_text:
-            return
+            return False
 
         # Dedup: skip if we already processed this reply
         if reply_uuid and await self.state.is_reply_processed(reply_uuid):
             logger.debug(f"Handler: Reply {reply_uuid} already processed. Skipping.")
-            return
+            return False
 
         logger.info(f"Handler: Reply from {lead_email}")
 
+        try:
+            await self._process_reply(lead_email, reply_text, reply_uuid, campaign)
+        finally:
+            # ALWAYS mark processed — even on early exits (opt-out, OOO,
+            # unknown prospect) — so the same reply is never re-handled
+            # or double-replied on the next cycle.
+            if reply_uuid:
+                await self.state.mark_reply_processed(reply_uuid)
+        return True
+
+    async def _process_reply(self, lead_email: str, reply_text: str, reply_uuid: str, campaign):
+        """Classify, record, and respond to a single reply."""
         # Find the prospect by email (indexed lookup)
         prospect = await self.state.get_prospect_by_email(lead_email)
-
         if not prospect:
             logger.warning(f"Handler: No prospect found for {lead_email}")
             return
@@ -106,8 +162,15 @@ class Handler:
         # Update prospect status
         await self.state.update_prospect_status(prospect.id, "replied")
 
-        # 1. Classify intent
-        intent = await self._classify_intent(reply_text, prospect)
+        # 1. Classify intent. Hard keyword checks run FIRST and override
+        # the LLM — opt-outs and legal threats must never be missed.
+        text_lower = reply_text.lower()
+        if any(p in text_lower for p in OPT_OUT_PATTERNS):
+            intent = "unsubscribe"
+        elif any(p in text_lower for p in ESCALATION_PATTERNS):
+            intent = "escalate"
+        else:
+            intent = await self._classify_intent(reply_text, prospect)
         logger.info(f"Handler: Intent for {lead_email}: {intent}")
 
         # 2. Get or create conversation
@@ -128,7 +191,7 @@ class Handler:
                 intent=intent,
                 status="open",
             )
-            await self.state.add_conversation(convo)
+            convo.id = await self.state.add_conversation(convo)
         else:
             convo.thread.append(Message(sender="prospect", content=reply_text))
             convo.intent = intent
@@ -141,19 +204,51 @@ class Handler:
         # 2b. Advance conversation stage based on intent
         new_stage = self._determine_stage(intent, convo.stage, reply_text)
         if new_stage != convo.stage:
+            logger.info(f"Handler: Stage for {lead_email}: {convo.stage} -> {new_stage}")
             await self.state.update_conversation(convo.id, stage=new_stage)
             convo.stage = new_stage
-            logger.info(f"Handler: Stage for {lead_email}: {convo.stage} → {new_stage}")
 
-        # 3. Generate and send response based on intent
+        # 3. Route based on intent
+        if intent == "unsubscribe":
+            # Honor opt-outs ALWAYS. No reply, no future contact.
+            await self.state.update_conversation(convo.id, status="closed", stage="closed_lost")
+            await self.state.update_prospect_status(prospect.id, "opted_out")
+            await self.state.log_action(
+                action_type="opt_out",
+                agent="handler",
+                details={"prospect_email": lead_email},
+            )
+            logger.info(f"Handler: {lead_email} opted out. Suppressed permanently. No reply sent.")
+            return
+
+        if intent == "escalate":
+            # Angry / legal / compliance replies go to a human. Never auto-reply.
+            await self.state.update_conversation(convo.id, status="needs_human")
+            await self.state.log_action(
+                action_type="escalation",
+                agent="handler",
+                details={
+                    "prospect_email": lead_email,
+                    "reply_preview": reply_text[:200],
+                },
+            )
+            logger.warning(
+                f"Handler: ESCALATED reply from {lead_email} — needs human review. No auto-reply sent."
+            )
+            return
+
         if intent == "not_interested":
             await self.state.update_conversation(convo.id, status="closed", stage="closed_lost")
             await self.state.update_prospect_status(prospect.id, "lost")
-            logger.info(f"Handler: {lead_email} not interested. Closing.")
+            logger.info(f"Handler: {lead_email} not interested. Closing. One no is enough.")
             return
 
         if intent == "ooo":
             logger.info(f"Handler: {lead_email} is OOO. Will follow up later.")
+            return
+
+        if intent not in AUTO_REPLY_INTENTS:
+            logger.warning(f"Handler: No auto-reply policy for intent '{intent}'. Skipping reply.")
             return
 
         # For interested, objection, question, wrong_person — generate a reply
@@ -184,19 +279,20 @@ class Handler:
                     },
                 )
 
-        # Mark reply as processed to avoid double-handling
-        if reply_uuid:
-            await self.state.mark_reply_processed(reply_uuid)
-
     async def _classify_intent(self, reply_text: str, prospect) -> str:
         """Ask the brain to classify the reply's intent."""
         prompt = f"""Classify this email reply into exactly ONE category:
 - "interested" — wants to learn more, open to a meeting, positive response
 - "objection" — has concerns but hasn't said no (price, timing, competition)
-- "not_interested" — clearly says no, unsubscribe, do not contact
+- "not_interested" — a clear no, not now, or "we're all set"
+- "unsubscribe" — asks to stop being contacted, remove from list, opt out
+- "escalate" — angry, hostile, threatens legal action, or mentions spam/compliance
 - "ooo" — out of office / auto-reply
 - "wrong_person" — not the right contact, suggests someone else
 - "question" — asking for more information before deciding
+
+When in doubt between "not_interested" and "unsubscribe", choose "unsubscribe".
+When in doubt between anything and "escalate", choose "escalate".
 
 Reply from {prospect.full_name()} ({prospect.title} at {prospect.company}):
 \"\"\"{reply_text}\"\"\"
@@ -204,28 +300,43 @@ Reply from {prospect.full_name()} ({prospect.title} at {prospect.company}):
 Respond with ONLY the category label, nothing else."""
 
         result = await self.brain.think(prompt, session_id="harvey-handler")
-        intent = result.strip().strip('"').lower()
+        if not result:
+            # Classifier failed. Do NOT auto-reply blind — flag for a human.
+            logger.warning("Handler: Intent classifier returned nothing. Escalating.")
+            return "escalate"
 
-        if intent not in INTENT_LABELS:
-            logger.warning(f"Unknown intent: {intent}. Defaulting to 'question'.")
-            return "question"
+        # Robust extraction: take the first recognized label anywhere in
+        # the response (models sometimes add explanation despite instructions).
+        cleaned = result.strip().strip('"').strip("'").lower()
+        if cleaned in INTENT_LABELS:
+            return cleaned
+        for label in sorted(INTENT_LABELS, key=len, reverse=True):
+            if label in cleaned:
+                return label
 
-        return intent
+        logger.warning(f"Handler: Unknown intent '{cleaned[:80]}'. Defaulting to 'question'.")
+        return "question"
 
     def _determine_stage(self, intent: str, current_stage: str, reply_text: str) -> str:
         """Advance the conversation stage based on intent and context."""
         text_lower = reply_text.lower()
 
         # Terminal states
-        if intent == "not_interested":
+        if intent in ("not_interested", "unsubscribe"):
             return "closed_lost"
+
+        if intent == "escalate":
+            return current_stage  # Human decides what happens next
 
         # Stage advancement rules
         if intent == "interested":
+            # Meeting/call signals from an interested prospect → closing
+            if any(w in text_lower for w in ["let's meet", "schedule", "calendar", "book a call", "free on", "available"]):
+                return "closing"
             if current_stage == "initial_outreach":
                 return "engaged"
             if current_stage == "engaged":
-                # Check if they're asking about specifics → qualifying
+                # Check if they're asking about specifics → presenting
                 if any(w in text_lower for w in ["price", "cost", "how much", "pricing", "demo", "trial"]):
                     return "presenting"
                 return "qualifying"
@@ -245,13 +356,6 @@ Respond with ONLY the category label, nothing else."""
                 return "engaged"
             if current_stage == "engaged":
                 return "qualifying"
-
-        if intent == "wrong_person":
-            return current_stage  # Don't advance
-
-        # Check for meeting/call signals
-        if any(w in text_lower for w in ["let's meet", "schedule", "calendar", "book a call", "free on", "available"]):
-            return "closing"
 
         return current_stage
 
@@ -273,7 +377,7 @@ Respond with ONLY the category label, nothing else."""
                     objection_context = f"\nSuggested approach for this objection: {response}"
                     break
 
-        prompt = self.brain.load_prompt("handler")
+        prompt = self.brain.load_prompt("handler", stage=convo.stage)
         if not prompt:
             prompt = f"""You are {self.config.persona.name}, {self.config.persona.role} at {self.config.persona.company}.
 Your tone is: {self.config.persona.tone}
@@ -318,7 +422,14 @@ Write a reply that:"""
 - Makes it easy for them to refer (one-line ask)
 - Under 50 words"""
 
-        prompt += "\n\nWrite ONLY the email body. No subject line, no greeting label."
+        prompt += "\n\nWrite ONLY the email body. No subject line, no greeting label, no signature block, no markdown."
 
         response = await self.brain.think(prompt, session_id="harvey-handler")
-        return response.strip() if response else ""
+        if not response:
+            return ""
+        response = response.strip()
+        # Guard against the model returning meta-text instead of an email
+        if response.lower().startswith(("i can't", "i cannot", "as an ai", "sorry,")):
+            logger.warning("Handler: Model returned meta-text instead of an email. Discarding.")
+            return ""
+        return response

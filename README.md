@@ -4,7 +4,7 @@
 
 Harvey is an open-source, fully autonomous sales agent that finds prospects, writes personalized cold email campaigns, sends them, monitors replies, handles objections, and books meetings — all without human intervention. Named after Harvey Specter from *Suits*, because the best closer in New York never sleeps.
 
-Harvey runs on your existing Claude Max subscription (zero extra LLM cost), deploys to any VPS with Docker, and replaces expensive prospecting tools by finding leads on its own.
+Harvey runs on your existing Claude Max subscription (zero extra LLM cost), deploys to any VPS with Docker, and replaces expensive prospecting tools by finding leads on its own. It ships with compliant defaults — hard opt-out handling, send limits, honest-identity rules — because outreach that gets your domain blacklisted isn't outreach. Read [Legal & Deliverability](#legal--deliverability-read-this-before-sending-anything) before your first campaign.
 
 ```
 $ python -m harvey
@@ -125,16 +125,16 @@ Quiet hours are also configurable. Harvey won't run between 10pm and 7am (or wha
 
 ---
 
-## Quick Start
+## Quick Start (5 Minutes)
 
 ### Prerequisites
 
-- [Claude Code CLI](https://claude.ai/download) installed and authenticated (with a Max subscription)
+- [Claude Code CLI](https://claude.ai/download) installed and authenticated (`claude login`) with a Max subscription
 - Python 3.11+
-- An [Instantly](https://instantly.ai) account with API access (for cold email)
-- A LinkedIn account (for prospecting — optional)
+- An [Instantly](https://instantly.ai) account with API access — Growth plan or higher (for cold email)
+- A LinkedIn account (for prospecting — optional, and see the [ToS warning](#legal--deliverability-read-this-before-sending-anything) below)
 
-### 1. Clone and Open in Claude
+### Option A — Let Claude set you up (easiest)
 
 ```bash
 git clone https://github.com/ethanplusai/harvey.git
@@ -142,15 +142,29 @@ cd harvey
 claude
 ```
 
-That's it. Claude reads the project, sees it's unconfigured, and walks you through everything — installs dependencies, connects your email platform, trains on your product, and gets Harvey running. Just follow along.
+Claude reads the project, sees it's unconfigured, and walks you through everything — installs dependencies, connects your email platform, trains on your product, and gets Harvey running. Just follow along.
 
-### 2. Run Harvey (after setup)
-
-Once configured, start Harvey anytime:
+### Option B — Manual (still 5 minutes)
 
 ```bash
+# 1. Clone and install (~1 min)
+git clone https://github.com/ethanplusai/harvey.git
 cd harvey
-source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
+python -m playwright install chromium   # only needed for LinkedIn prospecting
+
+# 2. Add your API keys (~1 min)
+cp .env.example .env
+# Edit .env — only INSTANTLY_API_KEY is required; every variable is
+# documented inline with where to get it.
+
+# 3. Run the interactive setup wizard (~3 min)
+# Checks prerequisites, tests your keys, and trains Harvey on your
+# product (point it at your website and it teaches itself).
+harvey setup
+
+# 4. Start closing
 harvey run
 ```
 
@@ -232,7 +246,7 @@ After setup, Harvey writes all config files for you. Just run `harvey run` to st
 
 To re-run setup anytime: `harvey setup`
 
-### 4. Deploy (VPS)
+### Deploy to a VPS (always-on)
 
 For always-on operation, deploy with Docker:
 
@@ -389,6 +403,63 @@ Harvey stores everything in SQLite (`data/harvey.db`):
 | `usage_log` | Daily Claude usage tracking for budget control |
 | `feedback` | User comments and training feedback on Harvey's work |
 | `processed_replies` | Reply deduplication — prevents double-handling |
+
+---
+
+## Legal & Deliverability (Read This Before Sending Anything)
+
+Harvey automates outreach, but **you are the sender**. Cold email is legal in most places when done right and expensive when done wrong (CAN-SPAM fines run to $53,088 *per email*). Harvey ships with compliant defaults — keep them.
+
+### The law, in practice
+
+**CAN-SPAM (US)** — every commercial email must have:
+- A truthful subject line and accurate from-name/address (Harvey's copywriting rules enforce this — no fake "re:" threads, no impersonation)
+- A working unsubscribe mechanism, honored within 10 business days (Harvey treats any opt-out wording — "stop", "remove me", "unsubscribe" — as immediate and permanent)
+- Your valid physical mailing address in the footer — **enable this in your Instantly campaign settings before launching**
+
+**GDPR / PECR (EU & UK)** — B2B cold email requires a defensible *legitimate interest*: the pitch must be genuinely relevant to the recipient's professional role. You must be able to say where you got their data, and objecting must be effortless. If you can't articulate why a specific person would care, Harvey shouldn't email them — and its qualification rules say so.
+
+**Bot disclosure** — some jurisdictions (e.g. California's B.O.T. Act) require disclosing automation in commercial communications. Harvey is instructed to *always* answer truthfully if a prospect asks whether they're talking to an AI. Never configure it otherwise.
+
+**LinkedIn** — browser automation violates LinkedIn's Terms of Service and can get the account restricted or banned. This feature is off by default in the wizard; if you enable it, use conservative limits and an account you can afford to lose.
+
+### Deliverability: warm up or burn out
+
+Sending cold email from your main company domain, or at volume from day one, will land you in spam permanently. Before your first campaign:
+
+1. **Buy a dedicated sending domain** (e.g. `getacme.com` instead of `acme.com`) so your primary domain's reputation is never at risk. Point it at your real site.
+2. **Set up SPF, DKIM, and DMARC** on the sending domain. Instantly's docs walk you through it; without all three, Gmail and Outlook will junk you.
+3. **Warm up for 2–4 weeks** before real volume. Instantly has built-in warmup — turn it on and leave it on.
+4. **Ramp slowly**: start at 10–20 emails/day per inbox, add ~5/day. Harvey's default `max_daily_sends: 50` is a ceiling, not a starting point.
+5. **Watch bounce and spam rates.** Bounce rate above ~3% or any spam complaints: pause, fix your list quality, ramp again. Harvey verifies emails before sending to keep bounces low, but the platform metrics are your ground truth.
+
+None of this is legal advice — if you're sending at scale or into regulated industries, talk to a lawyer.
+
+---
+
+## Troubleshooting & FAQ
+
+**`command not found: harvey`** — Activate the venv first: `source .venv/bin/activate`. If you installed with `pip install -e .` inside the venv, the `harvey` command lives there.
+
+**`externally-managed-environment` on pip install** — You're using system Python. Create a venv: `python3 -m venv .venv && source .venv/bin/activate`.
+
+**Claude headless mode fails / setup step 1 fails** — Run `claude login` and confirm your Max subscription is active. Test manually: `claude -p "say hi"`. In Docker, make sure `~/.claude` is mounted into the container (see `docker-compose.yml`).
+
+**Instantly API returns 401** — Wrong key, or your plan doesn't include API access (requires Growth or higher). Regenerate the key under Settings → Integrations → API Keys.
+
+**Emails land in spam** — Almost always a domain problem, not a copy problem. Check SPF/DKIM/DMARC, confirm warmup ran for 2+ weeks, and cut your daily volume in half. See [Legal & Deliverability](#legal--deliverability-read-this-before-sending-anything).
+
+**Harvey isn't finding prospects / search is rate-limited** — Free search backends (DuckDuckGo, Bing) throttle aggressively. Add a `SERPER_API_KEY` (~$5 for 2,500 Google searches) to `.env` for reliable search.
+
+**Training crawl finds almost nothing** — Your site is probably JavaScript-rendered. Add Cloudflare Browser Rendering credentials to `.env` (documented in `.env.example`) or fill in `harvey.yaml` manually via `harvey setup`.
+
+**Harvey does nothing during the day** — Check `quiet_hours` and `timezone` in `harvey.yaml`, and whether it hit `max_daily_claude_percent`. `harvey status` shows current state; the `actions` table in `data/harvey.db` shows every decision it made.
+
+**How do I stop Harvey immediately?** — `Ctrl+C` locally, or `docker compose down` on a VPS. Nothing sends while it's stopped; state is in SQLite so it resumes cleanly.
+
+**Can I run it without LinkedIn?** — Yes. Leave the LinkedIn credentials blank and Harvey prospects via web search and company websites only. This is the recommended (and default) mode.
+
+**Where does my data live?** — Everything is local: `data/harvey.db` (SQLite) plus your `.env` and `harvey.yaml`. Nothing is sent anywhere except to the APIs you configured.
 
 ---
 

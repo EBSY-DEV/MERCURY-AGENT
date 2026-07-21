@@ -1,14 +1,12 @@
 """Interactive setup wizard — Claude walks you through everything Harvey needs."""
 
 import asyncio
+import getpass
 import logging
-import os
-import re
 import shutil
 from pathlib import Path
 
 import yaml
-from dotenv import load_dotenv
 
 from harvey.brain import Brain
 from harvey.state import StateManager
@@ -34,11 +32,12 @@ def _print_step(step: int, total: int, title: str):
 
 
 def _ask(prompt: str, default: str = "", required: bool = True, secret: bool = False) -> str:
-    """Ask the user a question."""
+    """Ask the user a question. secret=True hides input (passwords, API keys)."""
     suffix = f" [{default}]" if default else ""
+    reader = getpass.getpass if secret else input
     while True:
         try:
-            answer = input(f"\n  → {prompt}{suffix}: ").strip()
+            answer = reader(f"\n  → {prompt}{suffix}: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n\n  Setup cancelled.")
             raise SystemExit(1)
@@ -200,7 +199,7 @@ class SetupWizard:
         has_instantly = _ask_yes_no("Do you have an Instantly account?")
 
         if has_instantly:
-            api_key = _ask("Instantly API key (from Settings → Integrations)")
+            api_key = _ask("Instantly API key (from Settings → Integrations; input hidden)", secret=True)
             self.env_vars["INSTANTLY_API_KEY"] = api_key
 
             # Test the key
@@ -222,19 +221,23 @@ class SetupWizard:
     def _setup_linkedin(self):
         """Configure LinkedIn credentials."""
         _print_harvey("I can search LinkedIn to find prospects matching your ICP.")
-        _print_harvey("I'll log into your LinkedIn account using a browser and")
-        _print_harvey("search like a human would — with random delays and everything.")
+        _print_harvey("I'll log into your LinkedIn account using a browser, with")
+        _print_harvey("conservative rate limits and human-like pacing.")
+        print("\n  ⚠  Heads up: automating LinkedIn violates their Terms of Service.")
+        print("     Accounts doing this can be restricted or banned. Only use an")
+        print("     account you're comfortable putting at risk, and keep the")
+        print("     default rate limits. This is entirely optional.")
 
-        use_linkedin = _ask_yes_no("Set up LinkedIn prospecting?")
+        use_linkedin = _ask_yes_no("Set up LinkedIn prospecting anyway?", default=False)
 
         if use_linkedin:
             email = _ask("LinkedIn email/username")
-            password = _ask("LinkedIn password")
+            password = _ask("LinkedIn password (input hidden)", secret=True)
             self.env_vars["LINKEDIN_EMAIL"] = email
             self.env_vars["LINKEDIN_PASSWORD"] = password
 
-            _print_harvey("Got it. I'll be careful with your account — human-like")
-            _print_harvey("behavior, rate limits, the works. No one will know.")
+            _print_harvey("Got it. I'll stay well under the rate limits and behave")
+            _print_harvey("like a careful human, but the ToS risk is yours to own.")
         else:
             _print_harvey("That's fine. I can still find prospects via Google")
             _print_harvey("and company websites. You can add LinkedIn later.")
@@ -252,7 +255,7 @@ class SetupWizard:
 
         if use_cloudflare:
             account_id = _ask("Cloudflare Account ID")
-            api_token = _ask("Cloudflare API Token (needs Browser Rendering - Edit permission)")
+            api_token = _ask("Cloudflare API Token (needs Browser Rendering - Edit permission; input hidden)", secret=True)
             self.env_vars["CLOUDFLARE_ACCOUNT_ID"] = account_id
             self.env_vars["CLOUDFLARE_API_TOKEN"] = api_token
             _print_harvey("Nice. I'll use Cloudflare for deep crawling during training.")
@@ -432,8 +435,9 @@ class SetupWizard:
             default="80",
         )
         try:
-            usage_pct = float(usage_pct)
+            usage_pct = min(100.0, max(1.0, float(usage_pct)))
         except ValueError:
+            print("    (didn't catch that — using 80)")
             usage_pct = 80.0
 
         # Heartbeat interval
@@ -443,8 +447,9 @@ class SetupWizard:
             default="15",
         )
         try:
-            interval = int(interval)
+            interval = max(1, int(interval))
         except ValueError:
+            print("    (didn't catch that — using 15)")
             interval = 15
 
         # Quiet hours
@@ -459,9 +464,13 @@ class SetupWizard:
             default="50",
         )
         try:
-            daily_sends = int(daily_sends)
+            daily_sends = max(1, int(daily_sends))
         except ValueError:
+            print("    (didn't catch that — using 50)")
             daily_sends = 50
+        if daily_sends > 200:
+            print("\n  ⚠  200+ sends/day from a fresh domain will torch your")
+            print("     deliverability. Warm up gradually (see README).")
 
         # Update config
         if self.config:
@@ -480,12 +489,28 @@ class SetupWizard:
         _print_harvey("Perfect. All configured.")
 
     def _write_env(self):
-        """Write the .env file."""
-        lines = []
-        for key, value in self.env_vars.items():
-            lines.append(f"{key}={value}")
+        """Write the .env file, preserving any existing variables we didn't touch."""
+        existing: dict[str, str] = {}
+        if ENV_FILE.exists():
+            for line in ENV_FILE.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    existing[key.strip()] = value.strip()
 
+        # Wizard answers win, but never blank out a previously-set value
+        # (e.g. re-running setup and skipping the LinkedIn step).
+        merged = dict(existing)
+        for key, value in self.env_vars.items():
+            if value or key not in merged:
+                merged[key] = value
+
+        lines = [f"{key}={value}" for key, value in merged.items()]
         ENV_FILE.write_text("\n".join(lines) + "\n")
+        try:
+            ENV_FILE.chmod(0o600)  # credentials — owner read/write only
+        except OSError:
+            pass
         logger.info(f"Wrote {ENV_FILE}")
 
     def _write_config(self):
@@ -541,15 +566,23 @@ class SetupWizard:
     - harvey.yaml (your configuration)
 
   To start Harvey:
-    python -m harvey
+    harvey run          (or: python -m harvey)
 
   To re-train on a different product:
-    python -m harvey.trainer https://newproduct.com
+    harvey train https://newproduct.com
 
   To re-run this setup:
-    python -m harvey.setup
+    harvey setup
+
+  Before you send a single email:
+    1. Use a dedicated sending domain (not your main domain) with
+       SPF, DKIM, and DMARC configured.
+    2. Warm it up 2-4 weeks before real volume (Instantly has warmup).
+    3. Make sure your Instantly campaigns include an unsubscribe
+       option and your physical mailing address (CAN-SPAM).
+    See the "Legal & Deliverability" section of the README.
 """)
-        _print_harvey("I'm ready. Run 'python -m harvey' and I'll start closing.")
+        _print_harvey("I'm ready. Run 'harvey run' and I'll start closing.")
         _print_harvey("Always be closing.\n")
 
 

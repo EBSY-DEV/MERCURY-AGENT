@@ -38,14 +38,22 @@ _env_lock = asyncio.Lock()
 
 
 async def query_db(sql: str, params: tuple = ()) -> list[dict]:
-    """Run a query and return results as list of dicts."""
+    """Run a query and return results as list of dicts.
+
+    Never raises: a missing DB file, missing table, or malformed schema
+    returns [] so no dashboard route can 500 on an empty install.
+    """
     if not DB_PATH.exists():
         return []
-    async with aiosqlite.connect(str(DB_PATH)) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(sql, params) as cursor:
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+    try:
+        async with aiosqlite.connect(str(DB_PATH)) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("query_db failed (%s): %s", sql.split(None, 4)[:4], e)
+        return []
 
 
 def _mask_key(key: str) -> str:
@@ -231,23 +239,36 @@ async def get_settings():
 @app.post("/api/settings/env")
 async def save_env_settings(request: Request):
     """Save environment variables to .env file."""
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
+    if not isinstance(data, dict):
+        return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
     async with _env_lock:
         updates = {}
         for key in ["INSTANTLY_API_KEY", "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
                      "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"]:
             if key in data and data[key] is not None:
-                updates[key] = data[key]
+                # Strip newlines so a crafted value can't inject extra .env entries
+                updates[key] = str(data[key]).replace("\n", " ").replace("\r", " ").strip()
         if updates:
-            _write_env_file(updates)
+            try:
+                _write_env_file(updates)
+            except Exception as e:
+                logger.warning("Failed to write .env: %s", e)
+                return {"success": False, "message": "Could not write .env file."}
     return {"success": True}
 
 
 @app.post("/api/settings/test-instantly")
 async def test_instantly(request: Request):
     """Test an Instantly API key."""
-    data = await request.json()
-    api_key = data.get("api_key", "")
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    api_key = str(data.get("api_key", "") or "")
     if not api_key:
         return {"success": False, "message": "No API key provided."}
     try:
@@ -295,21 +316,39 @@ async def get_company_contacts(company_id: str):
 @app.post("/api/feedback")
 async def add_feedback(request: Request):
     """Add a comment/feedback on any entity."""
-    data = await request.json()
-    entity_type = data.get("entity_type", "")
-    entity_id = data.get("entity_id", "")
-    comment = data.get("comment", "")
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    entity_type = str(data.get("entity_type", "") or "")[:50]
+    entity_id = str(data.get("entity_id", "") or "")[:100]
+    comment = str(data.get("comment", "") or "").strip()[:4000]
     if not comment:
         return {"success": False, "message": "Comment is required."}
     feedback_id = uuid.uuid4().hex[:12]
-    db_path = str(DB_PATH)
-    if DB_PATH.exists():
-        async with aiosqlite.connect(db_path) as db:
+    try:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        async with aiosqlite.connect(str(DB_PATH)) as db:
+            # Ensure the table exists so feedback works even on a fresh install
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS feedback (
+                    id TEXT PRIMARY KEY,
+                    entity_type TEXT,
+                    entity_id TEXT,
+                    comment TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )"""
+            )
             await db.execute(
                 "INSERT INTO feedback (id, entity_type, entity_id, comment) VALUES (?, ?, ?, ?)",
                 (feedback_id, entity_type, entity_id, comment),
             )
             await db.commit()
+    except Exception as e:
+        logger.warning("Failed to save feedback: %s", e)
+        return {"success": False, "message": "Could not save feedback."}
     return {"success": True, "id": feedback_id}
 
 
@@ -345,18 +384,29 @@ async def start_harvey():
     # Ensure data dir exists
     (PROJECT_ROOT / "data").mkdir(parents=True, exist_ok=True)
 
-    log_handle = open(LOG_FILE, "a")
-    _harvey_process = subprocess.Popen(
-        [sys.executable, "-m", "harvey"],
-        cwd=str(PROJECT_ROOT),
-        stdout=log_handle,
-        stderr=log_handle,
-        start_new_session=True,
-    )
+    try:
+        log_handle = open(LOG_FILE, "a")
+        try:
+            _harvey_process = subprocess.Popen(
+                [sys.executable, "-m", "harvey"],
+                cwd=str(PROJECT_ROOT),
+                stdout=log_handle,
+                stderr=log_handle,
+                start_new_session=True,
+            )
+        finally:
+            # Child holds its own copies of the fds; don't leak ours.
+            log_handle.close()
+    except Exception as e:
+        logger.warning("Failed to start Harvey: %s", e)
+        return {"success": False, "message": f"Failed to start Harvey: {e}"}
     _harvey_started_at = datetime.now()
 
     # Write PID file
-    PID_FILE.write_text(str(_harvey_process.pid))
+    try:
+        PID_FILE.write_text(str(_harvey_process.pid))
+    except OSError as e:
+        logger.warning("Could not write PID file: %s", e)
 
     return {"success": True, "pid": _harvey_process.pid}
 
@@ -383,9 +433,9 @@ async def stop_harvey():
             # Force kill if still running
             try:
                 os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
 
     _harvey_process = None
@@ -401,8 +451,13 @@ async def get_harvey_logs():
     if not LOG_FILE.exists():
         return {"lines": []}
     try:
-        text = LOG_FILE.read_text()
-        lines = text.strip().splitlines()[-50:]
+        # Tail only the last 64KB so a huge log file never blocks the UI
+        with open(LOG_FILE, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            text = f.read().decode("utf-8", errors="replace")
+        lines = text.strip().splitlines()[-100:]
         return {"lines": lines}
     except Exception:
         return {"lines": []}
@@ -506,267 +561,441 @@ async def dashboard():
     return DASHBOARD_HTML
 
 
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Harvey Dashboard</title>
+<title>Harvey — Command Deck</title>
 <style>
+  :root {
+    --bg: #08090c;
+    --panel: #0f1216;
+    --panel-raised: #141922;
+    --border: #1d2430;
+    --border-strong: #2b3444;
+    --text: #e9ecf2;
+    --text-2: #9aa4b4;
+    --text-3: #5c6774;
+    --accent: #3ecf8e;
+    --accent-deep: #22996a;
+    --accent-soft: rgba(62, 207, 142, 0.12);
+    --blue: #74a8ff;
+    --amber: #e5b567;
+    --red: #e06c75;
+    --purple: #b48ce8;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  }
+
   * { margin: 0; padding: 0; box-sizing: border-box; }
+  ::selection { background: rgba(62,207,142,0.25); }
+
+  html { color-scheme: dark; }
 
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #0a0a0a;
-    color: #e0e0e0;
+    font-family: var(--sans);
+    background: var(--bg);
+    background-image:
+      radial-gradient(1100px 480px at 75% -12%, rgba(62,207,142,0.06), transparent 60%),
+      radial-gradient(900px 420px at 8% -10%, rgba(116,168,255,0.05), transparent 55%);
+    background-repeat: no-repeat;
+    color: var(--text);
     min-height: 100vh;
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
   }
 
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* ── Header ── */
   header {
-    background: #111;
-    border-bottom: 1px solid #222;
-    padding: 16px 32px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
+    position: sticky; top: 0; z-index: 100;
+    background: rgba(8,9,12,0.82);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 32px;
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
   }
 
-  header h1 { font-size: 20px; font-weight: 600; color: #fff; }
-  header h1 span { color: #666; font-weight: 400; font-size: 14px; margin-left: 8px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand .mark {
+    width: 34px; height: 34px; border-radius: 9px;
+    background: linear-gradient(145deg, #2fbf82, #17795a);
+    box-shadow: 0 0 0 1px rgba(62,207,142,0.35), 0 4px 14px rgba(62,207,142,0.18);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 17px; color: #04140d; letter-spacing: -0.5px;
+  }
+  .brand h1 { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; line-height: 1.1; }
+  .brand .tagline {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1.4px;
+    color: var(--text-3); margin-top: 2px; font-weight: 600;
+  }
 
-  .header-controls { display: flex; align-items: center; gap: 12px; }
+  .header-controls { display: flex; align-items: center; gap: 10px; }
 
   .harvey-status {
     display: flex; align-items: center; gap: 8px;
-    font-size: 13px; color: #888;
-    padding: 6px 14px;
-    background: #1a1a1a;
-    border: 1px solid #333;
-    border-radius: 6px;
+    font-size: 12px; font-weight: 600; color: var(--text-2);
+    padding: 7px 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 99px;
   }
-
-  .status-dot {
-    width: 8px; height: 8px; border-radius: 50%;
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .status-dot.running {
+    background: var(--accent);
+    box-shadow: 0 0 0 0 rgba(62,207,142,0.5);
+    animation: pulse 2s infinite;
   }
-  .status-dot.running { background: #40c060; box-shadow: 0 0 6px #40c060; }
-  .status-dot.stopped { background: #666; }
+  .status-dot.stopped { background: #4a5361; }
+  .status-dot.offline { background: var(--red); }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(62,207,142,0.45); }
+    70% { box-shadow: 0 0 0 7px rgba(62,207,142,0); }
+    100% { box-shadow: 0 0 0 0 rgba(62,207,142,0); }
+  }
 
   .refresh-btn {
-    background: #1a1a1a; border: 1px solid #333; color: #888;
-    padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+    background: var(--panel); border: 1px solid var(--border); color: var(--text-2);
+    padding: 7px 14px; border-radius: 99px; cursor: pointer;
+    font-size: 12px; font-weight: 600; font-family: inherit;
+    transition: border-color .15s, color .15s;
   }
-  .refresh-btn:hover { border-color: #555; color: #ccc; }
+  .refresh-btn:hover { border-color: var(--border-strong); color: var(--text); }
 
+  /* ── Nav ── */
   nav {
-    background: #111; border-bottom: 1px solid #222;
-    padding: 0 32px; display: flex; gap: 0; overflow-x: auto;
+    position: sticky; top: 63px; z-index: 99;
+    background: rgba(8,9,12,0.82);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px; display: flex; overflow-x: auto;
+    scrollbar-width: none;
   }
+  nav::-webkit-scrollbar { display: none; }
 
   nav button {
-    background: none; border: none; border-bottom: 2px solid transparent;
-    color: #777; padding: 12px 16px; cursor: pointer; font-size: 13px;
-    transition: all 0.15s; white-space: nowrap;
+    position: relative;
+    background: none; border: none;
+    color: var(--text-3); padding: 13px 14px; cursor: pointer;
+    font-size: 13px; font-weight: 500; font-family: inherit;
+    transition: color .15s; white-space: nowrap;
   }
-  nav button:hover { color: #bbb; }
-  nav button.active { color: #fff; border-bottom-color: #fff; }
+  nav button:hover { color: var(--text-2); }
+  nav button.active { color: var(--text); font-weight: 600; }
+  nav button.active::after {
+    content: ""; position: absolute; left: 14px; right: 14px; bottom: -1px;
+    height: 2px; border-radius: 2px 2px 0 0; background: var(--accent);
+  }
 
-  main { padding: 24px 32px; max-width: 1400px; }
+  main { padding: 28px 32px 64px; max-width: 1400px; margin: 0 auto; }
 
   .section { display: none; }
-  .section.active { display: block; }
+  .section.active { display: block; animation: rise .25s ease; }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  .section-head { margin-bottom: 20px; }
+  .section-head h2 { font-size: 20px; font-weight: 700; letter-spacing: -0.4px; }
+  .section-head p { font-size: 13px; color: var(--text-3); margin-top: 4px; }
 
   /* ── Cards ── */
   .card {
-    background: #141414; border: 1px solid #222; border-radius: 10px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
     padding: 24px; margin-bottom: 16px;
   }
-  .card h2 { font-size: 16px; color: #fff; margin-bottom: 16px; }
-  .card h3 { font-size: 14px; color: #ccc; margin-bottom: 12px; }
+  .card h2 { font-size: 15px; font-weight: 650; letter-spacing: -0.2px; margin-bottom: 16px; }
 
-  /* ── Stats ── */
+  /* ── Stat cards ── */
   .stats-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 16px; margin-bottom: 32px;
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px; margin-bottom: 28px;
   }
-  .stat-card { background: #141414; border: 1px solid #222; border-radius: 10px; padding: 20px; }
-  .stat-card .label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #666; margin-bottom: 8px; }
-  .stat-card .value { font-size: 32px; font-weight: 700; color: #fff; }
-  .stat-card .breakdown { margin-top: 10px; font-size: 12px; color: #555; line-height: 1.6; }
+  .stat-card {
+    position: relative; overflow: hidden;
+    background: linear-gradient(180deg, var(--panel-raised), var(--panel));
+    border: 1px solid var(--border); border-radius: 12px; padding: 20px;
+    transition: border-color .2s;
+  }
+  .stat-card:hover { border-color: var(--border-strong); }
+  .stat-card::before {
+    content: ""; position: absolute; top: 0; left: 20px; right: 20px; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(62,207,142,0.35), transparent);
+  }
+  .stat-card .label {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 1.2px;
+    color: var(--text-3); font-weight: 700; margin-bottom: 10px;
+  }
+  .stat-card .value {
+    font-size: 34px; font-weight: 750; letter-spacing: -1px; line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat-card .breakdown { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 5px; }
+  .chip {
+    font-size: 11px; font-weight: 550; color: var(--text-2);
+    background: rgba(255,255,255,0.04); border: 1px solid var(--border);
+    padding: 2px 9px; border-radius: 99px; font-variant-numeric: tabular-nums;
+  }
+  .chip b { color: var(--text); font-weight: 650; }
 
-  /* ── Progress bar ── */
+  /* ── Progress ── */
   .progress-wrap { margin-bottom: 24px; }
   .progress-label { display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 13px; }
-  .progress-label .pct { color: #fff; font-weight: 600; }
-  .progress-label .text { color: #666; }
-  .progress-bar { background: #1a1a1a; border-radius: 8px; height: 12px; overflow: hidden; }
-  .progress-fill { height: 100%; border-radius: 8px; transition: width 0.5s ease; }
-  .progress-fill.green { background: linear-gradient(90deg, #2d8a4e, #40c060); }
-  .progress-fill.yellow { background: linear-gradient(90deg, #a08020, #d0b040); }
+  .progress-label .pct { color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
+  .progress-label .text { color: var(--text-3); }
+  .progress-bar { background: rgba(255,255,255,0.05); border-radius: 99px; height: 8px; overflow: hidden; }
+  .progress-fill { height: 100%; border-radius: 99px; transition: width .5s ease; }
+  .progress-fill.green { background: linear-gradient(90deg, var(--accent-deep), var(--accent)); }
+  .progress-fill.yellow { background: linear-gradient(90deg, #a3801f, var(--amber)); }
 
   /* ── Setup checklist ── */
   .check-item {
-    display: flex; align-items: flex-start; gap: 12px;
-    padding: 14px 0; border-bottom: 1px solid #1a1a1a;
+    display: flex; align-items: flex-start; gap: 14px;
+    padding: 14px 0; border-bottom: 1px solid var(--border);
   }
   .check-item:last-child { border-bottom: none; }
-  .check-icon { font-size: 16px; min-width: 24px; text-align: center; padding-top: 1px; }
-  .check-icon.done { color: #40c060; }
-  .check-icon.pending { color: #555; }
+  .check-icon {
+    width: 22px; height: 22px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; margin-top: 1px;
+  }
+  .check-icon.done { background: var(--accent-soft); color: var(--accent); border: 1px solid rgba(62,207,142,0.3); }
+  .check-icon.pending { background: transparent; color: var(--text-3); border: 1px dashed var(--border-strong); }
   .check-info { flex: 1; }
-  .check-label { font-size: 14px; color: #ddd; margin-bottom: 2px; }
-  .check-label.done { color: #888; }
-  .check-help { font-size: 12px; color: #555; margin-top: 4px; }
-  .optional-tag { font-size: 10px; background: #1a1a2a; color: #8080ff; padding: 2px 8px; border-radius: 4px; margin-left: 8px; }
+  .check-label { font-size: 14px; font-weight: 550; color: var(--text); }
+  .check-label.done { color: var(--text-3); text-decoration: line-through; text-decoration-color: rgba(255,255,255,0.15); }
+  .check-help { font-size: 12.5px; color: var(--text-3); margin-top: 4px; line-height: 1.5; }
+  .optional-tag {
+    font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px;
+    background: rgba(116,168,255,0.1); color: var(--blue);
+    padding: 2px 8px; border-radius: 99px; margin-left: 8px; vertical-align: 1px;
+  }
+  .subhead {
+    margin: 20px 0 4px; font-size: 10.5px; color: var(--text-3);
+    text-transform: uppercase; letter-spacing: 1.2px; font-weight: 700;
+  }
 
   /* ── Forms ── */
   .form-group { margin-bottom: 16px; }
-  .form-label { display: block; font-size: 12px; color: #888; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.3px; }
-  .form-input {
-    width: 100%; padding: 10px 14px; background: #1a1a1a; border: 1px solid #333;
-    border-radius: 6px; color: #e0e0e0; font-size: 14px; font-family: inherit;
+  .form-label {
+    display: block; font-size: 11px; color: var(--text-2); margin-bottom: 7px;
+    text-transform: uppercase; letter-spacing: 0.8px; font-weight: 650;
   }
-  .form-input:focus { outline: none; border-color: #555; }
-  .form-input::placeholder { color: #444; }
-  .form-row { display: flex; gap: 12px; align-items: flex-end; }
+  .form-input {
+    width: 100%; padding: 10px 14px;
+    background: rgba(255,255,255,0.03); border: 1px solid var(--border-strong);
+    border-radius: 8px; color: var(--text); font-size: 14px; font-family: inherit;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .form-input:focus { outline: none; border-color: var(--accent-deep); box-shadow: 0 0 0 3px rgba(62,207,142,0.12); }
+  .form-input::placeholder { color: var(--text-3); }
+  .form-row { display: flex; gap: 10px; align-items: flex-end; }
   .form-row .form-group { flex: 1; }
-  .form-hint { font-size: 11px; color: #555; margin-top: 4px; }
+  .card .lede { font-size: 13px; color: var(--text-2); margin: -6px 0 18px; line-height: 1.6; }
 
   .btn {
-    padding: 8px 20px; border: none; border-radius: 6px;
-    font-size: 13px; cursor: pointer; font-family: inherit;
-    transition: all 0.15s;
+    padding: 9px 20px; border: 1px solid transparent; border-radius: 8px;
+    font-size: 13px; font-weight: 600; cursor: pointer; font-family: inherit;
+    transition: background .15s, border-color .15s, transform .05s;
   }
+  .btn:active { transform: translateY(1px); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn-primary { background: #2d8a4e; color: #fff; }
-  .btn-primary:hover:not(:disabled) { background: #38a05c; }
-  .btn-danger { background: #8a2d2d; color: #fff; }
-  .btn-danger:hover:not(:disabled) { background: #a03838; }
-  .btn-secondary { background: #1a1a1a; border: 1px solid #333; color: #aaa; }
-  .btn-secondary:hover:not(:disabled) { border-color: #555; color: #ddd; }
-  .btn-sm { padding: 6px 14px; font-size: 12px; }
-
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .btn-primary { background: var(--accent-deep); color: #eafff5; box-shadow: inset 0 1px 0 rgba(255,255,255,0.12); }
+  .btn-primary:hover:not(:disabled) { background: #2ab27c; }
+  .btn-danger { background: #8a2f36; color: #ffe9ea; }
+  .btn-danger:hover:not(:disabled) { background: #a13940; }
+  .btn-secondary { background: rgba(255,255,255,0.03); border-color: var(--border-strong); color: var(--text-2); }
+  .btn-secondary:hover:not(:disabled) { color: var(--text); border-color: #3a4557; }
+  .btn-sm { padding: 6px 13px; font-size: 12px; }
   .btn-group { display: flex; gap: 10px; margin-top: 16px; }
 
-  .test-result { font-size: 13px; margin-top: 8px; padding: 8px 12px; border-radius: 6px; }
-  .test-result.success { background: #152a1a; color: #40c060; }
-  .test-result.error { background: #2a1515; color: #e05050; }
+  .test-result { font-size: 13px; margin-top: 10px; padding: 9px 13px; border-radius: 8px; }
+  .test-result.success { background: var(--accent-soft); color: var(--accent); border: 1px solid rgba(62,207,142,0.25); }
+  .test-result.error { background: rgba(224,108,117,0.1); color: var(--red); border: 1px solid rgba(224,108,117,0.25); }
+  .test-result.pending { background: rgba(255,255,255,0.04); color: var(--text-2); border: 1px solid var(--border); }
 
   /* ── Controls ── */
-  .control-panel { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 800px) { .control-panel { grid-template-columns: 1fr; } }
+  .control-panel { display: grid; grid-template-columns: 1fr 1.4fr; gap: 16px; }
+  @media (max-width: 900px) { .control-panel { grid-template-columns: 1fr; } }
 
-  .status-big { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
-  .status-big .dot { width: 14px; height: 14px; border-radius: 50%; }
-  .status-big .dot.running { background: #40c060; box-shadow: 0 0 8px #40c060; }
-  .status-big .dot.stopped { background: #666; }
-  .status-big .label { font-size: 18px; font-weight: 600; }
-  .status-big .label.running { color: #40c060; }
-  .status-big .label.stopped { color: #888; }
-  .status-meta { font-size: 12px; color: #555; margin-bottom: 20px; }
+  .status-big { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .status-big .dot { width: 13px; height: 13px; border-radius: 50%; }
+  .status-big .dot.running { background: var(--accent); animation: pulse 2s infinite; }
+  .status-big .dot.stopped { background: #4a5361; }
+  .status-big .label { font-size: 19px; font-weight: 700; letter-spacing: -0.3px; }
+  .status-big .label.running { color: var(--accent); }
+  .status-big .label.stopped { color: var(--text-2); }
+  .status-meta { font-size: 12px; color: var(--text-3); margin-bottom: 18px; font-variant-numeric: tabular-nums; min-height: 15px; }
 
   .log-viewer {
-    background: #0a0a0a; border: 1px solid #222; border-radius: 8px;
-    padding: 16px; font-family: 'SF Mono', Monaco, 'Consolas', monospace;
-    font-size: 11px; color: #888; line-height: 1.6;
-    max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+    background: #07080a; border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; font-family: var(--mono);
+    font-size: 11.5px; color: #8fa39a; line-height: 1.65;
+    max-height: 420px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
   }
 
   /* ── Help ── */
-  .help-section { margin-bottom: 24px; }
-  .help-section h2 { font-size: 18px; color: #fff; margin-bottom: 12px; }
-  .help-section p { font-size: 14px; color: #aaa; line-height: 1.7; margin-bottom: 12px; }
-  .help-section code { background: #1a1a1a; padding: 2px 8px; border-radius: 4px; font-size: 13px; color: #ccc; }
+  .help-section { margin-bottom: 28px; }
+  .help-section h2 { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; margin-bottom: 10px; }
+  .help-section p { font-size: 14px; color: var(--text-2); line-height: 1.7; margin-bottom: 10px; }
+  .help-section code { background: rgba(255,255,255,0.05); padding: 2px 7px; border-radius: 5px; font-size: 12.5px; font-family: var(--mono); color: var(--text); }
   .help-section pre {
-    background: #141414; border: 1px solid #222; border-radius: 8px;
-    padding: 16px; font-size: 13px; color: #aaa; line-height: 1.6;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; font-size: 12.5px; font-family: var(--mono); color: var(--text-2); line-height: 1.7;
     overflow-x: auto; margin: 12px 0;
   }
 
   .file-table { width: 100%; font-size: 13px; border-collapse: collapse; }
-  .file-table td { padding: 8px 12px; border-bottom: 1px solid #1a1a1a; }
-  .file-table td:first-child { color: #ccc; font-family: monospace; white-space: nowrap; width: 200px; }
-  .file-table td:last-child { color: #888; }
+  .file-table td { padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  .file-table tr:last-child td { border-bottom: none; }
+  .file-table td:first-child { color: var(--text); font-family: var(--mono); font-size: 12px; white-space: nowrap; width: 220px; }
+  .file-table td:last-child { color: var(--text-2); }
 
   details { margin-bottom: 8px; }
   details summary {
-    cursor: pointer; padding: 12px 16px; background: #141414; border: 1px solid #222;
-    border-radius: 8px; font-size: 14px; color: #ccc; list-style: none;
+    cursor: pointer; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; font-size: 13.5px; font-weight: 550; color: var(--text-2); list-style: none;
+    transition: color .15s;
   }
+  details summary:hover { color: var(--text); }
   details summary::-webkit-details-marker { display: none; }
-  details summary::before { content: "+ "; color: #555; }
-  details[open] summary::before { content: "- "; }
-  details[open] summary { border-radius: 8px 8px 0 0; border-bottom: none; }
+  details summary::before { content: "+"; display: inline-block; width: 18px; color: var(--accent); font-weight: 700; }
+  details[open] summary::before { content: "–"; }
+  details[open] summary { border-radius: 10px 10px 0 0; border-bottom: none; color: var(--text); }
   details .faq-body {
-    padding: 16px; background: #141414; border: 1px solid #222; border-top: none;
-    border-radius: 0 0 8px 8px; font-size: 13px; color: #999; line-height: 1.6;
+    padding: 4px 16px 16px 34px; background: var(--panel); border: 1px solid var(--border); border-top: none;
+    border-radius: 0 0 10px 10px; font-size: 13px; color: var(--text-2); line-height: 1.7;
   }
 
   /* ── Toast ── */
   .toast {
     position: fixed; bottom: 24px; right: 24px; padding: 12px 20px;
-    border-radius: 8px; font-size: 13px; z-index: 1000;
-    animation: fadeIn 0.2s, fadeOut 0.3s 2s forwards;
+    border-radius: 10px; font-size: 13px; font-weight: 550; z-index: 1000;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+    animation: toastIn .2s ease, toastOut .3s 2.2s forwards;
   }
-  .toast.success { background: #152a1a; color: #40c060; border: 1px solid #2d8a4e; }
-  .toast.error { background: #2a1515; color: #e05050; border: 1px solid #8a2d2d; }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; } }
-  @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
+  .toast.success { background: #0d2a1d; color: var(--accent); border: 1px solid rgba(62,207,142,0.4); }
+  .toast.error { background: #2c1416; color: var(--red); border: 1px solid rgba(224,108,117,0.4); }
+  @keyframes toastIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; } }
+  @keyframes toastOut { from { opacity: 1; } to { opacity: 0; transform: translateY(6px); } }
 
   /* ── Tables ── */
+  .table-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    overflow-x: auto;
+  }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; padding: 10px 14px; border-bottom: 1px solid #222; color: #666; font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-  td { padding: 12px 14px; border-bottom: 1px solid #1a1a1a; vertical-align: top; max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
-  tr:hover td { background: #151515; }
+  th {
+    text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--border);
+    color: var(--text-3); font-weight: 700; font-size: 10.5px;
+    text-transform: uppercase; letter-spacing: 1px; white-space: nowrap;
+    background: rgba(255,255,255,0.015);
+  }
+  td {
+    padding: 12px 16px; border-bottom: 1px solid var(--border); vertical-align: top;
+    max-width: 300px; overflow: hidden; text-overflow: ellipsis; color: var(--text-2);
+  }
+  td:first-child { color: var(--text); font-weight: 550; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr { transition: background .1s; }
+  tbody tr:hover td { background: rgba(255,255,255,0.02); }
+  .verified { color: var(--accent); }
+  .muted { color: var(--text-3); }
 
-  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 500; }
-  .badge-new { background: #1a2332; color: #4a9eff; }
-  .badge-contacted { background: #2a2215; color: #f0a030; }
-  .badge-replied { background: #152a1a; color: #40c060; }
-  .badge-meeting { background: #2a1530; color: #c050e0; }
-  .badge-draft { background: #1a1a2a; color: #8080ff; }
-  .badge-active { background: #152a1a; color: #40c060; }
-  .badge-open { background: #2a2215; color: #f0a030; }
-  .badge-closed { background: #1a1a1a; color: #666; }
-  .badge-lost { background: #2a1515; color: #e05050; }
-  .badge-interested { background: #152a1a; color: #40c060; }
-  .badge-objection { background: #2a2215; color: #f0a030; }
-  .badge-not_interested { background: #2a1515; color: #e05050; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: 99px; font-size: 11px; font-weight: 650;
+    border: 1px solid transparent; white-space: nowrap;
+  }
+  .badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .badge-new { background: rgba(116,168,255,0.1); color: var(--blue); border-color: rgba(116,168,255,0.22); }
+  .badge-contacted, .badge-open, .badge-objection { background: rgba(229,181,103,0.1); color: var(--amber); border-color: rgba(229,181,103,0.22); }
+  .badge-replied, .badge-active, .badge-interested { background: var(--accent-soft); color: var(--accent); border-color: rgba(62,207,142,0.25); }
+  .badge-meeting { background: rgba(180,140,232,0.12); color: var(--purple); border-color: rgba(180,140,232,0.25); }
+  .badge-draft { background: rgba(255,255,255,0.05); color: var(--text-2); border-color: var(--border-strong); }
+  .badge-closed { background: rgba(255,255,255,0.04); color: var(--text-3); border-color: var(--border); }
+  .badge-lost, .badge-not_interested { background: rgba(224,108,117,0.1); color: var(--red); border-color: rgba(224,108,117,0.22); }
+  .badge-unknown { background: rgba(255,255,255,0.04); color: var(--text-3); border-color: var(--border); }
 
-  .campaign-card { background: #141414; border: 1px solid #222; border-radius: 10px; padding: 24px; margin-bottom: 20px; }
-  .campaign-card h3 { font-size: 16px; color: #fff; margin-bottom: 4px; }
-  .campaign-card .meta { font-size: 12px; color: #555; margin-bottom: 16px; display: flex; gap: 16px; align-items: center; }
+  .campaign-card, .convo-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 24px; margin-bottom: 16px;
+  }
+  .campaign-card h3, .convo-card h3 { font-size: 16px; font-weight: 700; letter-spacing: -0.2px; margin-bottom: 6px; }
+  .campaign-card .meta, .convo-card .meta {
+    font-size: 12px; color: var(--text-3); margin-bottom: 18px;
+    display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  }
 
-  .email-step { border-left: 3px solid #222; padding: 16px 20px; margin-bottom: 12px; margin-left: 8px; }
-  .email-step .step-num { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
-  .email-step .subject { font-size: 14px; font-weight: 600; color: #ddd; margin-bottom: 8px; }
-  .email-step .body { font-size: 13px; color: #888; line-height: 1.7; white-space: pre-wrap; }
+  .email-step {
+    border-left: 2px solid var(--border-strong); padding: 14px 20px; margin: 0 0 12px 6px;
+    border-radius: 0 10px 10px 0; background: rgba(255,255,255,0.015);
+  }
+  .email-step .step-num {
+    font-size: 10px; color: var(--accent); text-transform: uppercase;
+    letter-spacing: 1px; font-weight: 700; margin-bottom: 7px;
+  }
+  .email-step .subject { font-size: 14px; font-weight: 650; margin-bottom: 8px; }
+  .email-step .body { font-size: 13px; color: var(--text-2); line-height: 1.7; white-space: pre-wrap; }
 
-  .convo-card { background: #141414; border: 1px solid #222; border-radius: 10px; padding: 24px; margin-bottom: 16px; }
-  .convo-card h3 { font-size: 15px; color: #fff; margin-bottom: 4px; }
-  .convo-card .meta { font-size: 12px; color: #555; margin-bottom: 16px; display: flex; gap: 16px; align-items: center; }
+  .thread-msg {
+    padding: 12px 16px; margin-bottom: 8px; border-radius: 12px; max-width: 78%;
+    font-size: 13px; line-height: 1.6; white-space: pre-wrap;
+  }
+  .thread-msg.sent { background: rgba(62,207,142,0.08); border: 1px solid rgba(62,207,142,0.16); color: #cfeee0; margin-left: auto; border-bottom-right-radius: 4px; }
+  .thread-msg.received { background: rgba(255,255,255,0.04); border: 1px solid var(--border); color: var(--text-2); border-bottom-left-radius: 4px; }
+  .thread-msg .sender { font-size: 10.5px; color: var(--text-3); margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.6px; font-weight: 700; }
 
-  .thread-msg { padding: 12px 16px; margin-bottom: 8px; border-radius: 8px; max-width: 80%; font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
-  .thread-msg.sent { background: #1a2332; color: #b0d0ff; margin-left: auto; }
-  .thread-msg.received { background: #1a1a1a; color: #ccc; }
-  .thread-msg .sender { font-size: 11px; color: #666; margin-bottom: 4px; }
+  .activity-feed { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 8px 20px; }
+  .activity-item { display: flex; gap: 18px; padding: 12px 0; border-bottom: 1px solid var(--border); font-size: 13px; align-items: baseline; }
+  .activity-item:last-child { border-bottom: none; }
+  .activity-item .time { color: var(--text-3); font-size: 12px; min-width: 130px; font-variant-numeric: tabular-nums; }
+  .activity-item .agent {
+    color: var(--accent); min-width: 84px; font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.8px;
+  }
+  .activity-item .action { color: var(--text-2); }
 
-  .activity-item { display: flex; gap: 16px; padding: 12px 0; border-bottom: 1px solid #1a1a1a; font-size: 13px; align-items: center; }
-  .activity-item .time { color: #444; font-size: 12px; min-width: 140px; font-variant-numeric: tabular-nums; }
-  .activity-item .agent { color: #666; min-width: 80px; }
-  .activity-item .action { color: #aaa; }
+  /* ── Empty states ── */
+  .empty {
+    text-align: center; padding: 72px 24px;
+    background: var(--panel); border: 1px dashed var(--border-strong); border-radius: 12px;
+  }
+  .empty .glyph {
+    width: 46px; height: 46px; margin: 0 auto 18px; border-radius: 12px;
+    background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px; color: var(--text-3);
+  }
+  .empty .title { font-size: 15px; font-weight: 650; color: var(--text); margin-bottom: 6px; }
+  .empty .copy { font-size: 13px; color: var(--text-3); line-height: 1.6; max-width: 420px; margin: 0 auto; }
+  .empty .copy b { color: var(--text-2); font-weight: 600; }
 
-  .empty { text-align: center; padding: 60px 20px; color: #444; font-size: 14px; }
-  .empty .big { font-size: 40px; margin-bottom: 16px; }
+  @media (max-width: 700px) {
+    header, main { padding-left: 18px; padding-right: 18px; }
+    nav { padding: 0 10px; }
+    .brand .tagline { display: none; }
+  }
 </style>
 </head>
 <body>
 
 <header>
-  <h1>Harvey <span>Always Be Closing</span></h1>
+  <div class="brand">
+    <div class="mark">H</div>
+    <div>
+      <h1>Harvey</h1>
+      <div class="tagline">Always Be Closing</div>
+    </div>
+  </div>
   <div class="header-controls">
     <div class="harvey-status" id="header-status">
-      <div class="status-dot stopped" id="header-dot"></div>
-      <span id="header-status-text">Checking...</span>
+      <span class="status-dot stopped" id="header-dot"></span>
+      <span id="header-status-text">Checking…</span>
     </div>
     <button class="refresh-btn" onclick="loadCurrentTab()">Refresh</button>
   </div>
@@ -787,55 +1016,62 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <main>
 
-<!-- ── Setup ── -->
+<!-- Setup -->
 <div id="setup" class="section active">
+  <div class="section-head"><h2>Setup</h2><p>Everything Harvey needs before it can start closing.</p></div>
   <div class="card">
-    <h2>Setup Progress</h2>
     <div class="progress-wrap" id="setup-progress"></div>
     <div id="setup-checklist"></div>
   </div>
 </div>
 
-<!-- ── Overview ── -->
+<!-- Overview -->
 <div id="overview" class="section">
+  <div class="section-head"><h2>Pipeline Overview</h2><p>Live counts from Harvey's local database. Refreshes automatically.</p></div>
   <div class="stats-grid" id="stats-grid"></div>
 </div>
 
-<!-- ── Companies ── -->
+<!-- Companies -->
 <div id="companies" class="section">
+  <div class="section-head"><h2>Companies</h2><p>Organizations Harvey has researched. Click a row to see its contacts.</p></div>
   <div id="companies-list"></div>
 </div>
 
-<!-- ── Contacts ── -->
+<!-- Contacts -->
 <div id="prospects" class="section">
+  <div class="section-head"><h2>Contacts</h2><p>People Harvey has found and verified.</p></div>
   <div id="prospects-table"></div>
 </div>
 
-<!-- ── Campaigns ── -->
+<!-- Campaigns -->
 <div id="campaigns" class="section">
+  <div class="section-head"><h2>Campaigns</h2><p>Email sequences Harvey has written and deployed.</p></div>
   <div id="campaigns-list"></div>
 </div>
 
-<!-- ── Conversations ── -->
+<!-- Conversations -->
 <div id="conversations" class="section">
+  <div class="section-head"><h2>Conversations</h2><p>Every reply, and how Harvey handled it.</p></div>
   <div id="conversations-list"></div>
 </div>
 
-<!-- ── Activity ── -->
+<!-- Activity -->
 <div id="activity" class="section">
+  <div class="section-head"><h2>Activity</h2><p>A running log of every action Harvey's agents have taken.</p></div>
   <div id="activity-list"></div>
 </div>
 
-<!-- ── Settings ── -->
+<!-- Settings -->
 <div id="settings" class="section">
+  <div class="section-head"><h2>Settings</h2><p>Credentials are stored locally in <span style="font-family:var(--mono);font-size:12px">.env</span> — never sent anywhere except the services themselves.</p></div>
   <div class="card">
     <h2>Instantly (Email Platform)</h2>
-    <p style="font-size:13px;color:#888;margin-bottom:16px">Required. Get your API key from <a href="https://app.instantly.ai/app/settings/integrations" target="_blank" style="color:#4a9eff">Instantly Settings &gt; Integrations</a>.</p>
+    <p class="lede">Required. Get your API key from <a href="https://app.instantly.ai/app/settings/integrations" target="_blank" rel="noopener">Instantly Settings &gt; Integrations</a>.</p>
     <div class="form-group">
-      <label class="form-label">API Key</label>
+      <label class="form-label" for="instantly-key">API Key</label>
       <div class="form-row">
         <div class="form-group" style="margin-bottom:0">
-          <input type="password" class="form-input" id="instantly-key" placeholder="Enter your Instantly API key">
+          <input type="password" class="form-input" id="instantly-key" placeholder="Enter your Instantly API key" autocomplete="off">
         </div>
         <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('instantly-key')">Show</button>
         <button class="btn btn-secondary btn-sm" onclick="testInstantly()">Test</button>
@@ -847,38 +1083,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <div class="card">
     <h2>LinkedIn <span class="optional-tag">optional</span></h2>
-    <p style="font-size:13px;color:#888;margin-bottom:16px">For automated LinkedIn prospecting. Harvey logs in and searches like a human.</p>
+    <p class="lede">For automated LinkedIn prospecting. Harvey logs in and searches like a human.</p>
     <div class="form-group">
-      <label class="form-label">Email / Username</label>
-      <input type="text" class="form-input" id="linkedin-email" placeholder="your@email.com">
+      <label class="form-label" for="linkedin-email">Email / Username</label>
+      <input type="text" class="form-input" id="linkedin-email" placeholder="your@email.com" autocomplete="off">
     </div>
     <div class="form-group">
-      <label class="form-label">Password</label>
-      <input type="password" class="form-input" id="linkedin-password" placeholder="Enter password">
+      <label class="form-label" for="linkedin-password">Password</label>
+      <input type="password" class="form-input" id="linkedin-password" placeholder="Enter password" autocomplete="new-password">
     </div>
     <button class="btn btn-primary" onclick="saveLinkedIn()">Save</button>
   </div>
 
   <div class="card">
     <h2>Cloudflare <span class="optional-tag">optional</span></h2>
-    <p style="font-size:13px;color:#888;margin-bottom:16px">For deep website crawling with JavaScript rendering during product training. ~$5/month.</p>
+    <p class="lede">For deep website crawling with JavaScript rendering during product training. ~$5/month.</p>
     <div class="form-group">
-      <label class="form-label">Account ID</label>
-      <input type="text" class="form-input" id="cf-account-id" placeholder="Your Cloudflare Account ID">
+      <label class="form-label" for="cf-account-id">Account ID</label>
+      <input type="text" class="form-input" id="cf-account-id" placeholder="Your Cloudflare Account ID" autocomplete="off">
     </div>
     <div class="form-group">
-      <label class="form-label">API Token</label>
-      <input type="password" class="form-input" id="cf-api-token" placeholder="Your Cloudflare API Token">
+      <label class="form-label" for="cf-api-token">API Token</label>
+      <input type="password" class="form-input" id="cf-api-token" placeholder="Your Cloudflare API Token" autocomplete="off">
     </div>
     <button class="btn btn-primary" onclick="saveCloudflare()">Save</button>
   </div>
 </div>
 
-<!-- ── Controls ── -->
+<!-- Controls -->
 <div id="controls" class="section">
+  <div class="section-head"><h2>Controls</h2><p>Start and stop Harvey's heartbeat loop, and watch what it's doing.</p></div>
   <div class="control-panel">
     <div class="card">
-      <h2>Harvey Controls</h2>
+      <h2>Agent</h2>
       <div class="status-big" id="control-status">
         <div class="dot stopped" id="control-dot"></div>
         <span class="label stopped" id="control-label">Stopped</span>
@@ -899,8 +1136,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- ── Help ── -->
+<!-- Help -->
 <div id="help" class="section">
+  <div class="section-head"><h2>Help</h2><p>What Harvey is, how it works, and how to fix the usual problems.</p></div>
 
   <div class="help-section">
     <h2>What is Harvey?</h2>
@@ -920,6 +1158,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="help-section">
     <h2>Where Everything Lives</h2>
     <p>Everything Harvey needs is inside this one project folder. Nothing is stored elsewhere.</p>
+    <div class="table-card" style="padding:6px 4px">
     <table class="file-table">
       <tr><td>.env</td><td>Your API keys and credentials (never shared or committed)</td></tr>
       <tr><td>harvey.yaml</td><td>Your product info, target customers, and behavior settings</td></tr>
@@ -929,6 +1168,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <tr><td>data/harvey.db</td><td>Database with all prospects, campaigns, and conversations</td></tr>
       <tr><td>data/harvey.log</td><td>Log file showing what Harvey is doing</td></tr>
     </table>
+    </div>
   </div>
 
   <div class="help-section">
@@ -938,8 +1178,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <summary>Instantly API Key (required)</summary>
       <div class="faq-body">
         <p>Instantly is the email platform Harvey uses to send campaigns.</p>
-        <p>1. Sign up at <a href="https://instantly.ai" target="_blank" style="color:#4a9eff">instantly.ai</a> (you need the Growth plan for API access)</p>
-        <p>2. Go to Settings > Integrations</p>
+        <p>1. Sign up at <a href="https://instantly.ai" target="_blank" rel="noopener">instantly.ai</a> (you need the Growth plan for API access)</p>
+        <p>2. Go to Settings &gt; Integrations</p>
         <p>3. Copy your API key</p>
         <p>4. Paste it in the Settings tab here</p>
       </div>
@@ -957,8 +1197,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <summary>Cloudflare Browser Rendering (optional)</summary>
       <div class="faq-body">
         <p>This is only used during product training (when Harvey crawls your website to learn about your product). It handles JavaScript-heavy websites that a basic crawler can't read.</p>
-        <p>1. Sign up at <a href="https://dash.cloudflare.com" target="_blank" style="color:#4a9eff">Cloudflare</a> (paid Workers plan, ~$5/month)</p>
-        <p>2. Go to Workers & Pages > Browser Rendering</p>
+        <p>1. Sign up at <a href="https://dash.cloudflare.com" target="_blank" rel="noopener">Cloudflare</a> (paid Workers plan, ~$5/month)</p>
+        <p>2. Go to Workers &amp; Pages &gt; Browser Rendering</p>
         <p>3. Create an API token with Browser Rendering Edit permissions</p>
         <p>4. Enter your Account ID and API Token in the Settings tab</p>
         <p>Without this, Harvey uses a built-in crawler that works fine for most websites but can't render JavaScript.</p>
@@ -976,7 +1216,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     <details>
       <summary>Instantly API returns 401</summary>
-      <div class="faq-body">Your API key is wrong, or you need the Growth plan (the free plan doesn't include API access). Double-check the key in Settings > Integrations in your Instantly dashboard.</div>
+      <div class="faq-body">Your API key is wrong, or you need the Growth plan (the free plan doesn't include API access). Double-check the key in Settings &gt; Integrations in your Instantly dashboard.</div>
     </details>
 
     <details>
@@ -995,9 +1235,72 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
 let currentTab = 'setup';
+let companyDrill = false;      // true while viewing a single company's contacts
+let _companies = [], _prospects = [], _campaigns = [];
+
+// ── Utilities ──
+
+function escHtml(s) {
+  if (s === null || s === undefined || s === '') return '';
+  return String(s).replace(/[&<>"']/g, ch => (
+    {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]
+  ));
+}
+
+function badge(status) {
+  const safe = String(status || 'unknown');
+  const cls = 'badge-' + safe.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  return '<span class="badge ' + escHtml(cls) + '">' + escHtml(safe) + '</span>';
+}
+
+function formatDate(d) {
+  if (!d) return '';
+  try {
+    const dt = new Date(d);
+    if (isNaN(dt)) return escHtml(d);
+    return dt.toLocaleString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+  } catch { return escHtml(d); }
+}
+
+function emptyState(glyph, title, copy) {
+  return '<div class="empty"><div class="glyph">' + glyph + '</div>' +
+    '<div class="title">' + title + '</div>' +
+    '<div class="copy">' + copy + '</div></div>';
+}
+
+function offlineState() {
+  return emptyState('&#9888;', 'Dashboard can\'t reach the server',
+    'The dashboard process may have stopped. Restart it with <b>harvey dashboard</b> and refresh this page.');
+}
+
+async function api(path, opts) {
+  try {
+    const r = await fetch(path, opts);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+function showToast(msg, type) {
+  const t = document.createElement('div');
+  t.className = 'toast ' + type;
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 2600);
+}
+
+function toggleVisibility(inputId) {
+  const el = document.getElementById(inputId);
+  el.type = el.type === 'password' ? 'text' : 'password';
+}
+
+// ── Tabs ──
 
 function showTab(id, btn) {
   currentTab = id;
+  if (id === 'companies') companyDrill = false;
   document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
   document.getElementById(id).classList.add('active');
@@ -1009,7 +1312,7 @@ function loadCurrentTab() {
   switch (currentTab) {
     case 'setup': loadSetupStatus(); break;
     case 'overview': loadStats(); break;
-    case 'companies': loadCompanies(); break;
+    case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
     case 'conversations': loadConversations(); break;
@@ -1019,91 +1322,51 @@ function loadCurrentTab() {
   }
 }
 
-function badge(status) {
-  const cls = 'badge-' + (status || '').replace(/\\s+/g, '_');
-  return `<span class="badge ${cls}">${status || 'unknown'}</span>`;
-}
-
-function formatDate(d) {
-  if (!d) return '';
-  try {
-    const dt = new Date(d);
-    return dt.toLocaleString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
-  } catch { return d; }
-}
-
-function escHtml(s) {
-  if (!s) return '';
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-function showToast(msg, type) {
-  const t = document.createElement('div');
-  t.className = 'toast ' + type;
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => t.remove(), 2500);
-}
-
-function toggleVisibility(inputId) {
-  const el = document.getElementById(inputId);
-  el.type = el.type === 'password' ? 'text' : 'password';
-}
-
 // ── Setup ──
 
 async function loadSetupStatus() {
-  const r = await fetch('/api/setup-status');
-  const data = await r.json();
+  const data = await api('/api/setup-status');
+  if (!data || !data.checks) {
+    document.getElementById('setup-progress').innerHTML = '';
+    document.getElementById('setup-checklist').innerHTML = offlineState();
+    return;
+  }
   const pct = data.percent || 0;
   const color = pct === 100 ? 'green' : 'yellow';
 
-  document.getElementById('setup-progress').innerHTML = `
-    <div class="progress-label">
-      <span class="pct">${pct}% complete</span>
-      <span class="text">${data.completed}/${data.total_required} required steps done</span>
-    </div>
-    <div class="progress-bar"><div class="progress-fill ${color}" style="width:${pct}%"></div></div>`;
+  document.getElementById('setup-progress').innerHTML =
+    '<div class="progress-label">' +
+      '<span class="pct">' + pct + '% complete</span>' +
+      '<span class="text">' + data.completed + ' of ' + data.total_required + ' required steps done</span>' +
+    '</div>' +
+    '<div class="progress-bar"><div class="progress-fill ' + color + '" style="width:' + pct + '%"></div></div>';
 
-  const required = data.checks.filter(c => c.required);
+  const renderCheck = (c, optional) => {
+    const icon = c.done
+      ? '<span class="check-icon done">&#10003;</span>'
+      : '<span class="check-icon pending">&#9679;</span>';
+    return '<div class="check-item">' + icon +
+      '<div class="check-info">' +
+        '<div class="check-label ' + (c.done ? 'done' : '') + '">' + escHtml(c.label) +
+          (optional ? ' <span class="optional-tag">optional</span>' : '') + '</div>' +
+        (!c.done ? '<div class="check-help">' + escHtml(c.help) + '</div>' : '') +
+      '</div></div>';
+  };
+
+  let html = data.checks.filter(c => c.required).map(c => renderCheck(c, false)).join('');
   const optional = data.checks.filter(c => !c.required);
-
-  let html = '';
-  for (const c of required) {
-    const icon = c.done ? '<span class="check-icon done">&#10003;</span>' : '<span class="check-icon pending">&#9675;</span>';
-    html += `<div class="check-item">
-      ${icon}
-      <div class="check-info">
-        <div class="check-label ${c.done ? 'done' : ''}">${escHtml(c.label)}</div>
-        ${!c.done ? `<div class="check-help">${escHtml(c.help)}</div>` : ''}
-      </div>
-    </div>`;
-  }
-
   if (optional.length) {
-    html += '<div style="margin-top:16px;margin-bottom:8px;font-size:12px;color:#555;text-transform:uppercase;letter-spacing:0.5px">Optional</div>';
-    for (const c of optional) {
-      const icon = c.done ? '<span class="check-icon done">&#10003;</span>' : '<span class="check-icon pending">&#9675;</span>';
-      html += `<div class="check-item">
-        ${icon}
-        <div class="check-info">
-          <div class="check-label ${c.done ? 'done' : ''}">${escHtml(c.label)} <span class="optional-tag">optional</span></div>
-          ${!c.done ? `<div class="check-help">${escHtml(c.help)}</div>` : ''}
-        </div>
-      </div>`;
-    }
+    html += '<div class="subhead">Optional</div>';
+    html += optional.map(c => renderCheck(c, true)).join('');
   }
-
   document.getElementById('setup-checklist').innerHTML = html;
 }
 
 // ── Settings ──
 
 async function loadSettings() {
-  const r = await fetch('/api/settings');
-  const data = await r.json();
+  const data = await api('/api/settings');
+  if (!data) return;
   document.getElementById('instantly-key').value = data.instantly_api_key || '';
   document.getElementById('linkedin-email').value = data.linkedin_email || '';
   document.getElementById('linkedin-password').value = '';
@@ -1114,69 +1377,76 @@ async function loadSettings() {
   }
 }
 
-async function saveInstantly() {
-  const key = document.getElementById('instantly-key').value.trim();
-  await fetch('/api/settings/env', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({INSTANTLY_API_KEY: key})
+async function saveEnv(payload, okMsg) {
+  const data = await api('/api/settings/env', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
   });
-  showToast('Instantly API key saved.', 'success');
+  if (data && data.success) showToast(okMsg, 'success');
+  else showToast((data && data.message) || 'Save failed — is the dashboard still running?', 'error');
 }
 
-async function saveLinkedIn() {
-  const email = document.getElementById('linkedin-email').value.trim();
+function saveInstantly() {
+  saveEnv({INSTANTLY_API_KEY: document.getElementById('instantly-key').value.trim()}, 'Instantly API key saved.');
+}
+
+function saveLinkedIn() {
+  const payload = {LINKEDIN_EMAIL: document.getElementById('linkedin-email').value.trim()};
   const pass = document.getElementById('linkedin-password').value;
-  const data = {LINKEDIN_EMAIL: email};
-  if (pass) data.LINKEDIN_PASSWORD = pass;
-  await fetch('/api/settings/env', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(data)
-  });
-  showToast('LinkedIn credentials saved.', 'success');
+  if (pass) payload.LINKEDIN_PASSWORD = pass;
+  saveEnv(payload, 'LinkedIn credentials saved.');
 }
 
-async function saveCloudflare() {
-  const id = document.getElementById('cf-account-id').value.trim();
-  const token = document.getElementById('cf-api-token').value.trim();
-  await fetch('/api/settings/env', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({CLOUDFLARE_ACCOUNT_ID: id, CLOUDFLARE_API_TOKEN: token})
-  });
-  showToast('Cloudflare credentials saved.', 'success');
+function saveCloudflare() {
+  saveEnv({
+    CLOUDFLARE_ACCOUNT_ID: document.getElementById('cf-account-id').value.trim(),
+    CLOUDFLARE_API_TOKEN: document.getElementById('cf-api-token').value.trim()
+  }, 'Cloudflare credentials saved.');
 }
 
 async function testInstantly() {
   const key = document.getElementById('instantly-key').value.trim();
   const el = document.getElementById('instantly-test-result');
-  el.innerHTML = '<div class="test-result" style="background:#1a1a1a;color:#888">Testing...</div>';
-  const r = await fetch('/api/settings/test-instantly', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
+  el.innerHTML = '<div class="test-result pending">Testing&hellip;</div>';
+  const data = await api('/api/settings/test-instantly', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({api_key: key})
   });
-  const data = await r.json();
-  el.innerHTML = `<div class="test-result ${data.success ? 'success' : 'error'}">${escHtml(data.message)}</div>`;
+  if (!data) {
+    el.innerHTML = '<div class="test-result error">Could not reach the dashboard server.</div>';
+    return;
+  }
+  el.innerHTML = '<div class="test-result ' + (data.success ? 'success' : 'error') + '">' + escHtml(data.message) + '</div>';
 }
 
 // ── Controls ──
 
 async function loadHarveyStatus() {
-  const r = await fetch('/api/harvey/status');
-  const data = await r.json();
-  const running = data.running;
+  const data = await api('/api/harvey/status');
+  const headerDot = document.getElementById('header-dot');
+  const headerText = document.getElementById('header-status-text');
 
-  document.getElementById('header-dot').className = 'status-dot ' + (running ? 'running' : 'stopped');
-  document.getElementById('header-status-text').textContent = running ? 'Running' : 'Stopped';
+  if (!data) {
+    headerDot.className = 'status-dot offline';
+    headerText.textContent = 'Offline';
+    return;
+  }
+  const running = !!data.running;
+
+  headerDot.className = 'status-dot ' + (running ? 'running' : 'stopped');
+  headerText.textContent = running ? 'Harvey is running' : 'Harvey is stopped';
   document.getElementById('control-dot').className = 'dot ' + (running ? 'running' : 'stopped');
-  document.getElementById('control-label').className = 'label ' + (running ? 'running' : 'stopped');
-  document.getElementById('control-label').textContent = running ? 'Running' : 'Stopped';
+  const label = document.getElementById('control-label');
+  label.className = 'label ' + (running ? 'running' : 'stopped');
+  label.textContent = running ? 'Running' : 'Stopped';
 
   const meta = document.getElementById('control-meta');
   if (running && data.pid) {
-    let info = `PID: ${data.pid}`;
-    if (data.started_at) info += ` &middot; Started: ${formatDate(data.started_at)}`;
+    let info = 'PID ' + escHtml(String(data.pid));
+    if (data.started_at) info += ' &middot; started ' + formatDate(data.started_at);
     meta.innerHTML = info;
   } else {
-    meta.innerHTML = '';
+    meta.innerHTML = 'Harvey wakes every few minutes, does what needs doing, and sleeps.';
   }
 
   document.getElementById('btn-start').style.display = running ? 'none' : '';
@@ -1184,146 +1454,201 @@ async function loadHarveyStatus() {
 }
 
 async function startHarvey() {
-  document.getElementById('btn-start').disabled = true;
-  const r = await fetch('/api/harvey/start', {method: 'POST'});
-  const data = await r.json();
-  if (data.success) {
-    showToast('Harvey started.', 'success');
-  } else {
-    showToast(data.message || 'Failed to start.', 'error');
-  }
-  document.getElementById('btn-start').disabled = false;
+  const btn = document.getElementById('btn-start');
+  btn.disabled = true;
+  const data = await api('/api/harvey/start', {method: 'POST'});
+  if (data && data.success) showToast('Harvey started.', 'success');
+  else showToast((data && data.message) || 'Failed to start.', 'error');
+  btn.disabled = false;
   loadHarveyStatus();
 }
 
 async function stopHarvey() {
-  document.getElementById('btn-stop').disabled = true;
-  const r = await fetch('/api/harvey/stop', {method: 'POST'});
-  const data = await r.json();
-  if (data.success) {
-    showToast('Harvey stopped.', 'success');
-  } else {
-    showToast(data.message || 'Failed to stop.', 'error');
-  }
-  document.getElementById('btn-stop').disabled = false;
+  const btn = document.getElementById('btn-stop');
+  btn.disabled = true;
+  const data = await api('/api/harvey/stop', {method: 'POST'});
+  if (data && data.success) showToast('Harvey stopped.', 'success');
+  else showToast((data && data.message) || 'Failed to stop.', 'error');
+  btn.disabled = false;
   loadHarveyStatus();
 }
 
 async function loadLogs() {
-  const r = await fetch('/api/harvey/logs');
-  const data = await r.json();
+  const data = await api('/api/harvey/logs');
   const el = document.getElementById('log-viewer');
-  if (data.lines && data.lines.length) {
-    el.textContent = data.lines.join('\\n');
-    el.scrollTop = el.scrollHeight;
+  if (data && data.lines && data.lines.length) {
+    const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+    el.textContent = data.lines.join('\n');
+    if (stick) el.scrollTop = el.scrollHeight;
   } else {
     el.textContent = 'No logs yet. Start Harvey to see activity.';
   }
 }
 
-// ── Pipeline Data ──
+// ── Pipeline data ──
 
 async function loadStats() {
-  const r = await fetch('/api/stats');
-  const data = await r.json();
+  const grid = document.getElementById('stats-grid');
+  const data = await api('/api/stats');
+  if (!data) { grid.innerHTML = offlineState(); return; }
   if (data.error) {
-    document.getElementById('stats-grid').innerHTML = `<div class="empty"><div class="big">No data yet</div>Start Harvey to begin building your pipeline.</div>`;
+    grid.innerHTML = emptyState('&#9670;', 'No pipeline data yet',
+      'Start Harvey from the <b>Controls</b> tab and it will begin prospecting, writing, and sending on its own.');
     return;
   }
   const p = data.prospects || {}, c = data.campaigns || {}, v = data.conversations || {};
-  const bd = (map) => Object.entries(map).map(([k,v]) => `${k}: ${v}`).join(' &middot; ') || 'none';
-  document.getElementById('stats-grid').innerHTML = `
-    <div class="stat-card"><div class="label">Prospects</div><div class="value">${p.total||0}</div><div class="breakdown">${bd(p.by_status||{})}</div></div>
-    <div class="stat-card"><div class="label">Campaigns</div><div class="value">${c.total||0}</div><div class="breakdown">${bd(c.by_status||{})}</div></div>
-    <div class="stat-card"><div class="label">Conversations</div><div class="value">${v.total||0}</div><div class="breakdown">${bd(v.by_status||{})}</div></div>
-    <div class="stat-card"><div class="label">Actions Today</div><div class="value">${data.actions_total||0}</div><div class="breakdown">Claude calls today: ${data.claude_calls_today||0}</div></div>`;
+  const chips = (map) => {
+    const entries = Object.entries(map || {});
+    if (!entries.length) return '<span class="chip muted">none yet</span>';
+    return entries.map(([k, n]) =>
+      '<span class="chip">' + escHtml(k) + ' <b>' + escHtml(String(n)) + '</b></span>'
+    ).join('');
+  };
+  const card = (label, value, breakdown) =>
+    '<div class="stat-card"><div class="label">' + label + '</div>' +
+    '<div class="value">' + value + '</div>' +
+    '<div class="breakdown">' + breakdown + '</div></div>';
+
+  grid.innerHTML =
+    card('Prospects', p.total || 0, chips(p.by_status)) +
+    card('Campaigns', c.total || 0, chips(c.by_status)) +
+    card('Conversations', v.total || 0, chips(v.by_status)) +
+    card('Actions Logged', data.actions_total || 0,
+      '<span class="chip">Claude calls today <b>' + escHtml(String(data.claude_calls_today || 0)) + '</b></span>');
 }
 
 async function loadCompanies() {
-  const r = await fetch('/api/companies');
-  const data = await r.json();
+  companyDrill = false;
+  const el = document.getElementById('companies-list');
+  const data = await api('/api/companies');
+  if (!data) { el.innerHTML = offlineState(); return; }
+  _companies = data;
   if (!data.length) {
-    document.getElementById('companies-list').innerHTML = `<div class="empty"><div class="big">No companies yet</div>Harvey hasn't researched any companies yet.</div>`;
+    el.innerHTML = emptyState('&#9906;', 'No companies yet',
+      'Harvey\'s Scout agent hasn\'t researched any companies. Finish <b>Setup</b>, then start Harvey from the <b>Controls</b> tab.');
     return;
   }
-  let html = `<table><thead><tr><th>Company</th><th>Domain</th><th>Industry</th><th>Size</th><th>Location</th><th>Contacts</th><th>Source</th><th>Added</th></tr></thead><tbody>`;
-  for (const c of data) {
-    const website = c.website || (c.domain ? 'https://'+c.domain : '');
-    const nameLink = website ? `<a href="${escHtml(website)}" target="_blank" style="color:#4a9eff">${escHtml(c.name)}</a>` : escHtml(c.name);
-    html += `<tr style="cursor:pointer" onclick="showCompanyContacts('${c.id}', '${escHtml(c.name)}')">
-      <td>${nameLink}</td><td>${escHtml(c.domain)}</td><td>${escHtml(c.industry)}</td><td>${escHtml(c.company_size)}</td><td>${escHtml(c.location)}</td><td>${c.contact_count||0}</td><td>${escHtml(c.source)}</td><td>${formatDate(c.created_at)}</td></tr>`;
-  }
-  document.getElementById('companies-list').innerHTML = html + '</tbody></table>';
+  let html = '<div class="table-card"><table><thead><tr><th>Company</th><th>Domain</th><th>Industry</th><th>Size</th><th>Location</th><th>Contacts</th><th>Source</th><th>Added</th></tr></thead><tbody>';
+  data.forEach((c, i) => {
+    const website = c.website || (c.domain ? 'https://' + c.domain : '');
+    const nameLink = website
+      ? '<a href="' + escHtml(website) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">' + escHtml(c.name) + '</a>'
+      : escHtml(c.name);
+    html += '<tr style="cursor:pointer" onclick="showCompanyContacts(' + i + ')">' +
+      '<td>' + nameLink + '</td><td class="muted">' + escHtml(c.domain) + '</td><td>' + escHtml(c.industry) + '</td>' +
+      '<td>' + escHtml(c.company_size) + '</td><td>' + escHtml(c.location) + '</td>' +
+      '<td>' + (c.contact_count || 0) + '</td><td class="muted">' + escHtml(c.source) + '</td>' +
+      '<td class="muted">' + formatDate(c.created_at) + '</td></tr>';
+  });
+  el.innerHTML = html + '</tbody></table></div>';
 }
 
-async function showCompanyContacts(companyId, companyName) {
-  const r = await fetch('/api/companies/' + companyId + '/contacts');
-  const data = await r.json();
-  let html = `<div class="card" style="margin-bottom:16px"><h2>${escHtml(companyName)} - Contacts</h2><button class="btn btn-secondary btn-sm" onclick="loadCompanies()" style="margin-bottom:16px">Back to Companies</button>`;
-  if (!data.length) {
-    html += '<p style="color:#888">No contacts found at this company.</p></div>';
+async function showCompanyContacts(index) {
+  const company = _companies[index];
+  if (!company) return;
+  companyDrill = true;
+  const el = document.getElementById('companies-list');
+  const data = await api('/api/companies/' + encodeURIComponent(company.id) + '/contacts');
+  let html = '<div class="card"><h2>' + escHtml(company.name) + ' — Contacts</h2>' +
+    '<button class="btn btn-secondary btn-sm" onclick="loadCompanies()" style="margin-bottom:16px">&larr; Back to Companies</button>';
+  if (!data || !data.length) {
+    html += '<p style="color:var(--text-3);font-size:13px">No contacts found at this company yet.</p></div>';
   } else {
-    html += '<table><thead><tr><th>Name</th><th>Title</th><th>Email</th><th>Phone</th><th>LinkedIn</th><th>Status</th><th>Source</th></tr></thead><tbody>';
+    html += '<div class="table-card"><table><thead><tr><th>Name</th><th>Title</th><th>Email</th><th>Phone</th><th>LinkedIn</th><th>Status</th><th>Source</th></tr></thead><tbody>';
     for (const p of data) {
-      const emailIcon = p.email_verified ? ' &#10003;' : '';
-      const phoneIcon = p.phone_verified ? ' &#10003;' : '';
-      html += `<tr><td>${escHtml(p.first_name)} ${escHtml(p.last_name)}</td><td>${escHtml(p.title)}</td><td>${escHtml(p.email)}${emailIcon}</td><td>${escHtml(p.phone)}${phoneIcon}</td><td>${p.linkedin_url ? '<a href="'+escHtml(p.linkedin_url)+'" target="_blank" style="color:#4a9eff">Profile</a>' : ''}</td><td>${badge(p.status)}</td><td>${escHtml(p.source)}</td></tr>`;
+      const emailIcon = p.email_verified ? ' <span class="verified">&#10003;</span>' : '';
+      const phoneIcon = p.phone_verified ? ' <span class="verified">&#10003;</span>' : '';
+      html += '<tr><td>' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</td>' +
+        '<td>' + escHtml(p.title) + '</td><td>' + escHtml(p.email) + emailIcon + '</td>' +
+        '<td>' + escHtml(p.phone) + phoneIcon + '</td>' +
+        '<td>' + (p.linkedin_url ? '<a href="' + escHtml(p.linkedin_url) + '" target="_blank" rel="noopener">Profile</a>' : '') + '</td>' +
+        '<td>' + badge(p.status) + '</td><td class="muted">' + escHtml(p.source) + '</td></tr>';
     }
-    html += '</tbody></table></div>';
+    html += '</tbody></table></div></div>';
   }
-  document.getElementById('companies-list').innerHTML = html;
+  el.innerHTML = html;
 }
 
-async function addFeedback(entityType, entityId, promptText) {
+async function submitFeedback(entityType, entityId, promptText) {
   const comment = prompt(promptText || 'Add your feedback:');
   if (!comment) return;
-  await fetch('/api/feedback', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
+  const data = await api('/api/feedback', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({entity_type: entityType, entity_id: entityId, comment: comment})
   });
-  showToast('Feedback saved.', 'success');
+  if (data && data.success) showToast('Feedback saved. Harvey will take it into account.', 'success');
+  else showToast((data && data.message) || 'Could not save feedback.', 'error');
+}
+
+function fbProspect(i) {
+  const p = _prospects[i];
+  if (p) submitFeedback('contact', p.id, 'Feedback on this contact:');
+}
+
+function fbCampaign(i) {
+  const c = _campaigns[i];
+  if (c) submitFeedback('campaign', c.id, 'Leave feedback on this campaign:');
 }
 
 async function loadProspects() {
-  const r = await fetch('/api/prospects');
-  const data = await r.json();
+  const el = document.getElementById('prospects-table');
+  const data = await api('/api/prospects');
+  if (!data) { el.innerHTML = offlineState(); return; }
+  _prospects = data;
   if (!data.length) {
-    document.getElementById('prospects-table').innerHTML = `<div class="empty"><div class="big">No prospects yet</div>Harvey hasn't found any prospects yet.</div>`;
+    el.innerHTML = emptyState('&#9673;', 'No contacts yet',
+      'Harvey hasn\'t found any prospects. Once it\'s running, the Scout agent searches the web for people matching your ideal customer profile in <b>harvey.yaml</b>.');
     return;
   }
-  let html = `<table><thead><tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th><th>Status</th><th>Source</th><th>Added</th><th></th></tr></thead><tbody>`;
-  for (const p of data) {
-    const emailV = p.email ? (escHtml(p.email) + (p.email_verified ? ' <span style="color:#40c060">&#10003;</span>' : '')) : '';
-    const phoneV = p.phone ? (escHtml(p.phone) + (p.phone_verified ? ' <span style="color:#40c060">&#10003;</span>' : '')) : '';
-    html += `<tr><td>${escHtml(p.first_name)} ${escHtml(p.last_name)}</td><td>${escHtml(p.title)}</td><td>${escHtml(p.company)}</td><td>${emailV}</td><td>${phoneV}</td><td>${badge(p.status)}</td><td>${escHtml(p.source)}</td><td>${formatDate(p.created_at)}</td><td><button class="btn btn-secondary btn-sm" onclick="addFeedback('contact','${p.id}','Feedback on this contact:')">Feedback</button></td></tr>`;
-  }
-  document.getElementById('prospects-table').innerHTML = html + '</tbody></table>';
+  let html = '<div class="table-card"><table><thead><tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th><th>Status</th><th>Source</th><th>Added</th><th></th></tr></thead><tbody>';
+  data.forEach((p, i) => {
+    const emailV = p.email ? (escHtml(p.email) + (p.email_verified ? ' <span class="verified">&#10003;</span>' : '')) : '';
+    const phoneV = p.phone ? (escHtml(p.phone) + (p.phone_verified ? ' <span class="verified">&#10003;</span>' : '')) : '';
+    html += '<tr><td>' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</td>' +
+      '<td>' + escHtml(p.title) + '</td><td>' + escHtml(p.company) + '</td>' +
+      '<td>' + emailV + '</td><td>' + phoneV + '</td><td>' + badge(p.status) + '</td>' +
+      '<td class="muted">' + escHtml(p.source) + '</td><td class="muted">' + formatDate(p.created_at) + '</td>' +
+      '<td><button class="btn btn-secondary btn-sm" onclick="fbProspect(' + i + ')">Feedback</button></td></tr>';
+  });
+  el.innerHTML = html + '</tbody></table></div>';
 }
 
 async function loadCampaigns() {
-  const r = await fetch('/api/campaigns');
-  const data = await r.json();
+  const el = document.getElementById('campaigns-list');
+  const data = await api('/api/campaigns');
+  if (!data) { el.innerHTML = offlineState(); return; }
+  _campaigns = data;
   if (!data.length) {
-    document.getElementById('campaigns-list').innerHTML = `<div class="empty"><div class="big">No campaigns yet</div>Harvey hasn't written any email sequences yet.</div>`;
+    el.innerHTML = emptyState('&#9993;', 'No campaigns yet',
+      'The Writer agent hasn\'t drafted any sequences. It kicks in automatically once Harvey has scored prospects to write for.');
     return;
   }
   let html = '';
-  for (const c of data) {
+  data.forEach((c, i) => {
     let stepsHtml = '';
     for (const step of (c.sequence || [])) {
-      stepsHtml += `<div class="email-step"><div class="step-num">Email ${step.step||'?'}${step.delay_days ? ` &middot; Send after ${step.delay_days} days`:''}</div><div class="subject">${escHtml(step.subject)}</div><div class="body">${escHtml(step.body)}</div></div>`;
+      stepsHtml += '<div class="email-step"><div class="step-num">Email ' + escHtml(String(step.step || '?')) +
+        (step.delay_days ? ' &middot; send after ' + escHtml(String(step.delay_days)) + ' days' : '') + '</div>' +
+        '<div class="subject">' + escHtml(step.subject) + '</div>' +
+        '<div class="body">' + escHtml(step.body) + '</div></div>';
     }
-    const pc = (c.prospect_ids||[]).length;
-    html += `<div class="campaign-card"><h3>${escHtml(c.name||'Untitled Campaign')}</h3><div class="meta">${badge(c.status)}<span>${c.channel||'email'}</span><span>${pc} prospect${pc!==1?'s':''}</span><span>${formatDate(c.created_at)}</span><button class="btn btn-secondary btn-sm" onclick="event.stopPropagation();addFeedback('campaign','${c.id}','Leave feedback on this campaign:')">Feedback</button></div>${stepsHtml||'<div class="empty">No email steps</div>'}</div>`;
-  }
-  document.getElementById('campaigns-list').innerHTML = html;
+    const pc = (c.prospect_ids || []).length;
+    html += '<div class="campaign-card"><h3>' + escHtml(c.name || 'Untitled Campaign') + '</h3>' +
+      '<div class="meta">' + badge(c.status) + '<span>' + escHtml(c.channel || 'email') + '</span>' +
+      '<span>' + pc + ' prospect' + (pc !== 1 ? 's' : '') + '</span><span>' + formatDate(c.created_at) + '</span>' +
+      '<button class="btn btn-secondary btn-sm" onclick="fbCampaign(' + i + ')">Feedback</button></div>' +
+      (stepsHtml || '<p style="color:var(--text-3);font-size:13px">No email steps in this campaign.</p>') + '</div>';
+  });
+  el.innerHTML = html;
 }
 
 async function loadConversations() {
-  const r = await fetch('/api/conversations');
-  const data = await r.json();
+  const el = document.getElementById('conversations-list');
+  const data = await api('/api/conversations');
+  if (!data) { el.innerHTML = offlineState(); return; }
   if (!data.length) {
-    document.getElementById('conversations-list').innerHTML = `<div class="empty"><div class="big">No conversations yet</div>Harvey hasn't received any replies yet.</div>`;
+    el.innerHTML = emptyState('&#9737;', 'No conversations yet',
+      'No prospects have replied so far. When they do, the Handler agent classifies each reply and responds — every thread shows up here.');
     return;
   }
   let html = '';
@@ -1331,41 +1656,70 @@ async function loadConversations() {
     let threadHtml = '';
     for (const msg of (c.thread || [])) {
       const cls = msg.sender === 'harvey' ? 'sent' : 'received';
-      threadHtml += `<div class="thread-msg ${cls}"><div class="sender">${escHtml(msg.sender)} &middot; ${formatDate(msg.timestamp)}</div>${escHtml(msg.content)}</div>`;
+      threadHtml += '<div class="thread-msg ' + cls + '"><div class="sender">' + escHtml(msg.sender) +
+        ' &middot; ' + formatDate(msg.timestamp) + '</div>' + escHtml(msg.content) + '</div>';
     }
     const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || 'Unknown';
-    html += `<div class="convo-card"><h3>${escHtml(name)} &mdash; ${escHtml(c.company||'')}</h3><div class="meta">${badge(c.status)}${c.intent?badge(c.intent):''}<span>${escHtml(c.prospect_email||'')}</span><span>${formatDate(c.updated_at)}</span></div>${threadHtml||'<div class="empty">No messages</div>'}</div>`;
+    html += '<div class="convo-card"><h3>' + escHtml(name) +
+      (c.company ? ' <span style="color:var(--text-3);font-weight:500">&mdash; ' + escHtml(c.company) + '</span>' : '') + '</h3>' +
+      '<div class="meta">' + badge(c.status) + (c.intent ? badge(c.intent) : '') +
+      '<span>' + escHtml(c.prospect_email || '') + '</span><span>' + formatDate(c.updated_at) + '</span></div>' +
+      (threadHtml || '<p style="color:var(--text-3);font-size:13px">No messages in this thread yet.</p>') + '</div>';
   }
-  document.getElementById('conversations-list').innerHTML = html;
+  el.innerHTML = html;
 }
 
 async function loadActivity() {
-  const r = await fetch('/api/activity');
-  const data = await r.json();
+  const el = document.getElementById('activity-list');
+  const data = await api('/api/activity');
+  if (!data) { el.innerHTML = offlineState(); return; }
   if (!data.length) {
-    document.getElementById('activity-list').innerHTML = `<div class="empty"><div class="big">No activity yet</div>Harvey hasn't taken any actions yet.</div>`;
+    el.innerHTML = emptyState('&#9202;', 'No activity yet',
+      'Harvey hasn\'t taken any actions. Every prospect found, email written, and reply handled will appear here the moment it happens.');
     return;
   }
-  let html = '';
+  let html = '<div class="activity-feed">';
   for (const a of data) {
-    html += `<div class="activity-item"><span class="time">${formatDate(a.created_at)}</span><span class="agent">${escHtml(a.agent)}</span><span class="action">${escHtml(a.action_type)}</span></div>`;
+    html += '<div class="activity-item"><span class="time">' + formatDate(a.created_at) + '</span>' +
+      '<span class="agent">' + escHtml(a.agent) + '</span>' +
+      '<span class="action">' + escHtml(a.action_type) + '</span></div>';
   }
-  document.getElementById('activity-list').innerHTML = html;
+  el.innerHTML = html + '</div>';
 }
 
-// ── Init ──
+// ── Init & live refresh ──
+
 loadSetupStatus();
 loadHarveyStatus();
-setInterval(loadHarveyStatus, 10000);
+
+// Agent status: quick poll
+setInterval(loadHarveyStatus, 8000);
+
+// Data tabs: auto-refresh live stats without clobbering form input
+setInterval(() => {
+  if (document.hidden) return;
+  switch (currentTab) {
+    case 'setup': loadSetupStatus(); break;
+    case 'overview': loadStats(); break;
+    case 'companies': if (!companyDrill) loadCompanies(); break;
+    case 'prospects': loadProspects(); break;
+    case 'campaigns': loadCampaigns(); break;
+    case 'conversations': loadConversations(); break;
+    case 'activity': loadActivity(); break;
+    case 'controls': loadLogs(); break;
+    // settings & help: never auto-refreshed (user may be typing)
+  }
+}, 15000);
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
     """Start the dashboard server."""
     import uvicorn
 
-    print(f"\\n  Harvey Dashboard running at http://{host}:{port}")
-    print(f"  Press Ctrl+C to stop.\\n")
+    print(f"\n  Harvey Dashboard running at http://{host}:{port}")
+    print("  Press Ctrl+C to stop.\n")
     uvicorn.run(app, host=host, port=port, log_level="warning")

@@ -124,14 +124,17 @@ Write a 3-email cold outreach sequence for prospects like these:
 {prospect_summary}
 
 Requirements:
-- Email 1: Personalized cold intro. Short (under 100 words). One clear CTA.
-- Email 2: Follow-up 3 days later. Different angle, add social proof or insight.
-- Email 3: Break-up email 4 days after that. Create gentle urgency, last chance.
-- Use {{{{first_name}}}}, {{{{company}}}}, {{{{title}}}} as merge variables.
+- Email 1: Personalized cold observation + one question. Under 75 words. No pitch.
+- Email 2: Follow-up 3 days later. Different angle, one concrete proof point. Under 75 words.
+- Email 3: Break-up email 4 days after that. Under 40 words. Gracious, not guilt-tripping.
+- Use {{{{first_name}}}}, {{{{company}}}}, {{{{title}}}} as merge variables — every email
+  must use at least one, and email 1 must reference something specific to
+  these prospects' industry or role (use the notes above).
 - Never be pushy or salesy. Be consultative and value-driven.
-- Subject lines should be short, curiosity-driven, lowercase.
+- Subject lines: lowercase, 2-5 words.
+- Follow every rule in the STRICT EMAIL RULES above. No exceptions.
 
-Return as JSON array:
+Return ONLY a JSON array (no markdown fences, no commentary):
 [
   {{"step": 1, "subject": "...", "body": "...", "delay_days": 0}},
   {{"step": 2, "subject": "...", "body": "...", "delay_days": 3}},
@@ -139,14 +142,57 @@ Return as JSON array:
 ]"""
 
         result = await self.brain.think_json(prompt, session_id="harvey-writer")
-        if not result or not isinstance(result, list):
+        return self._parse_sequence(result)
+
+    def _parse_sequence(self, result) -> list[EmailStep]:
+        """Robustly coerce LLM output into a validated EmailStep list.
+
+        Never raises. Tolerates a wrapper dict ({"emails": [...]}), missing
+        or wrong-typed fields, and extra keys. Drops invalid steps rather
+        than failing the whole sequence.
+        """
+        if isinstance(result, dict):
+            # Model wrapped the array in an object — unwrap common keys.
+            for key in ("emails", "sequence", "steps", "campaign"):
+                if isinstance(result.get(key), list):
+                    result = result[key]
+                    break
+        if not isinstance(result, list) or not result:
+            logger.error(f"Writer: Brain did not return an email array (got {type(result).__name__}).")
             return []
 
-        try:
-            return [EmailStep(**step) for step in result]
-        except Exception as e:
-            logger.error(f"Writer: Failed to parse sequence: {e}")
-            return []
+        steps: list[EmailStep] = []
+        for i, raw in enumerate(result[:5]):  # never accept absurdly long sequences
+            if not isinstance(raw, dict):
+                logger.warning(f"Writer: Skipping non-dict step at index {i}.")
+                continue
+            subject = str(raw.get("subject") or "").strip()
+            body = str(raw.get("body") or "").strip()
+            if not subject or not body:
+                logger.warning(f"Writer: Skipping step {i + 1} with empty subject/body.")
+                continue
+            try:
+                delay = max(0, int(raw.get("delay_days", 3 if steps else 0)))
+            except (TypeError, ValueError):
+                delay = 3 if steps else 0
+            try:
+                steps.append(
+                    EmailStep(
+                        step=len(steps) + 1,
+                        subject=subject,
+                        body=body,
+                        delay_days=delay,
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"Writer: Skipping invalid step {i + 1}: {e}")
+
+        if steps and steps[0].delay_days != 0:
+            steps[0].delay_days = 0  # first email always sends immediately
+
+        if len(steps) < 3:
+            logger.warning(f"Writer: Expected 3 emails, got {len(steps)}.")
+        return steps
 
     def _group_prospects(self, prospects: list) -> dict[str, list]:
         """Group prospects into campaign batches by industry/title combo."""

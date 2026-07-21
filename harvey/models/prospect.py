@@ -1,8 +1,13 @@
 """Contact data model — a person at a company."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _utcnow() -> datetime:
+    """Naive UTC now (consistent with DB storage; avoids deprecated utcnow)."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class Prospect(BaseModel):
@@ -27,8 +32,19 @@ class Prospect(BaseModel):
     company: str = ""
     industry: str = ""
     company_size: str = ""
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    @field_validator("email")
+    @classmethod
+    def _normalize_email(cls, v: str) -> str:
+        """Emails are dedup keys — normalize so 'Jane@X.com' == 'jane@x.com'."""
+        return (v or "").strip().lower()
+
+    @field_validator("linkedin_url")
+    @classmethod
+    def _strip_linkedin(cls, v: str) -> str:
+        return (v or "").strip()
 
     def full_name(self) -> str:
         return f"{self.first_name} {self.last_name}".strip()

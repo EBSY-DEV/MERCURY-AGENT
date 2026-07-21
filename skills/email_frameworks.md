@@ -6,6 +6,19 @@ Write like a real person sending a real email. Not a marketer. Not AI. A human w
 
 ---
 
+## Compliance & Deliverability (Overrides Everything Below)
+
+Style rules are negotiable. These are not:
+
+- **Subject lines must be truthful.** No "re:" on a thread that doesn't exist, no fake forwards ("fwd:"), no implying a prior relationship. Deceptive subject lines violate CAN-SPAM.
+- **Identity must be real.** The from-name, company, and signature must match the configured persona. Never pose as an individual consumer, a customer, or a mutual contact.
+- **Every campaign needs a working opt-out.** The sending platform (Instantly) must have unsubscribe handling enabled, and the sender's valid physical mailing address must appear in the campaign footer. Harvey never writes copy that discourages opting out.
+- **Any opt-out wording counts.** "Stop", "remove me", "not interested, don't email again" — treat all of them as unsubscribes, immediately and permanently, even mid-conversation.
+- **Deliverability hygiene:** plain text only, at most one link per email (zero in email 1 is better), no attachments, no image pixels beyond what the platform adds, no ALL-CAPS or spam-trigger phrasing ("free money", "act now", "guarantee"). One recipient's spam report costs more than a hundred sends earn.
+- **EU/UK prospects:** B2B cold email requires a defensible legitimate-interest basis — the pitch must be genuinely relevant to the person's professional role, and the first email should make it easy to object. When relevance is a stretch, don't send.
+
+---
+
 ## What Makes Bad Cold Email (NEVER DO THESE)
 
 ### Banned Patterns
@@ -158,6 +171,19 @@ The bad one is still pitching in the breakup. "Probably losing 5-10+ leads" is a
 
 ---
 
+## Why Replies Actually Happen (Use This When Choosing an Angle)
+
+A cold email gets a reply when it hits one of four triggers. Every email should be built around exactly one:
+
+1. **Recognition** — you named a problem they're living with, in their own words. This is the strongest trigger. It requires real specificity: "your pricing page has four tiers but no annual option" beats "companies struggle with pricing" every time.
+2. **Curiosity gap** — you know something they'd want to know ("noticed something odd in how {{company}} shows up in search"). Only works if you actually deliver the payoff when they reply. Never manufacture a fake gap.
+3. **Easy yes** — the ask is so small that replying is cheaper than deleting ("is this on your radar at all?" beats "do you have 30 minutes Thursday?").
+4. **Status/peer proof** — a named, real peer or competitor did something relevant. Must be true and public. "Two roofing companies in Austin started doing X" only if they exist.
+
+If the draft doesn't clearly hit one of these, it will be ignored no matter how clean the copy is. Rewrite around a trigger, not around your product.
+
+---
+
 ## Subject Lines
 
 ### Rules
@@ -166,7 +192,8 @@ The bad one is still pitching in the breakup. "Probably losing 5-10+ leads" is a
 - Never include the prospect's name in the subject
 - Never use "quick question" (overused beyond recognition)
 - Should look like an internal email, not a marketing email
-- Email 2 and 3 can use "re:" prefix or a completely new subject
+- "re:" is only allowed when the email genuinely continues an earlier thread in the same sequence — never as a fake-reply trick on a fresh thread
+- Emails 2 and 3 in a sequence should usually take a completely new subject (new angle, new thread)
 
 ### Good subjects
 - `{{company}} website`
@@ -239,5 +266,7 @@ Before finalizing any email, ask:
 4. Would I reply to this if I received it?
 5. Does it contain any em dashes?
 6. Does it contain any of the banned patterns listed above?
+7. Is every factual claim in it true and sourced from product_knowledge.md or the prospect's own site?
+8. Is the subject line honest, and the identity the real configured persona?
 
-If the answer to #5 or #6 is yes, rewrite it. No exceptions.
+If the answer to #5 or #6 is yes, or #7 or #8 is no, rewrite it. No exceptions.

@@ -9,7 +9,7 @@ from datetime import datetime, time, timedelta
 import pytz
 
 from harvey.brain import Brain
-from harvey.config import load_config, load_env, HarveyConfig
+from harvey.config import ConfigError, load_config, load_env, HarveyConfig
 from harvey.state import StateManager
 
 logging.basicConfig(
@@ -18,6 +18,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("harvey")
+
+# Backoff for consecutive failed cycles: 60s, 120s, 240s, ... capped at 15 min
+ERROR_BACKOFF_BASE = 60
+ERROR_BACKOFF_CAP = 900
 
 
 def in_quiet_hours(config: HarveyConfig) -> bool:
@@ -41,7 +45,7 @@ def seconds_until_quiet_hours_end(config: HarveyConfig) -> int:
     tz = pytz.timezone(qh.timezone)
     now = datetime.now(tz)
     end = time.fromisoformat(qh.end)
-    end_today = now.replace(hour=end.hour, minute=end.minute, second=0)
+    end_today = now.replace(hour=end.hour, minute=end.minute, second=0, microsecond=0)
 
     if end_today <= now:
         # End time is tomorrow
@@ -51,52 +55,70 @@ def seconds_until_quiet_hours_end(config: HarveyConfig) -> int:
     return max(int(delta.total_seconds()), 60)
 
 
-async def decide_next_action(brain: Brain, state: StateManager, config: HarveyConfig) -> str:
-    """Ask Claude what Harvey should do next based on current state."""
-    summary = await state.get_state_summary()
+async def decide_next_action(
+    brain: Brain,
+    state: StateManager,
+    config: HarveyConfig,
+    summary: dict | None = None,
+) -> str:
+    """Decide what Harvey should do next based on current state.
 
-    prompt = brain.load_prompt(
-        "system",
-        company_name=config.persona.company,
-        product_description=config.product.description,
-    )
+    Uses deterministic priority rules (handle_replies > send_campaign >
+    write_campaign > prospect > idle) instead of burning a Claude call on a
+    decision that is fully derivable from pipeline counts. This saves budget
+    every cycle and removes a fragile LLM string-parsing step.
+    """
+    if summary is None:
+        summary = await state.get_state_summary()
 
-    prompt += f"""
+    prospects = summary.get("prospects") or {}
+    new_prospects = prospects.get("new", 0) if isinstance(prospects, dict) else 0
+    draft_campaigns = summary.get("draft_campaigns", 0) or 0
+    open_conversations = summary.get("open_conversations", 0) or 0
 
-Current state:
-- Prospects by status: {summary['prospects']}
-- Draft campaigns waiting to send: {summary['draft_campaigns']}
-- Active campaigns running: {summary['active_campaigns']}
-- Open conversations needing replies: {summary['open_conversations']}
-- Claude calls used today: {summary['usage_today']}
+    if open_conversations > 0:
+        action, reason = "handle_replies", f"{open_conversations} open conversation(s) waiting"
+    elif draft_campaigns > 0:
+        action, reason = "send_campaign", f"{draft_campaigns} draft campaign(s) ready to deploy"
+    elif new_prospects > 0:
+        action, reason = "write_campaign", f"{new_prospects} new prospect(s) with no drafts ready"
+    elif new_prospects < 20:
+        action, reason = "prospect", f"only {new_prospects} new prospect(s); pipeline needs leads"
+    else:
+        action, reason = "idle", "pipeline is healthy; running analysis"
 
-Based on this state, what should I do next? Pick exactly ONE action:
-- "prospect" — if we need more leads (fewer than 20 prospects with status 'new')
-- "write_campaign" — if we have new prospects but no draft campaigns ready
-- "send_campaign" — if we have draft campaigns ready to deploy
-- "handle_replies" — if there are open conversations needing responses
-- "idle" — if everything is running and nothing needs attention
-
-Respond with ONLY the action name, nothing else."""
-
-    response = await brain.think(prompt, session_id="harvey-decision")
-    action = response.strip().strip('"').lower()
-
-    valid_actions = {"prospect", "write_campaign", "send_campaign", "handle_replies", "idle"}
-    if action not in valid_actions:
-        logger.warning(f"Unknown action from brain: {action}. Defaulting to idle.")
-        action = "idle"
-
+    logger.info(f"Decision: {action} ({reason})")
     return action
 
 
-async def heartbeat():
+async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event) -> bool:
+    """Sleep up to `seconds`, waking immediately on shutdown.
+
+    Returns True if a shutdown was requested during the sleep.
+    """
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=seconds)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def heartbeat(stop_event: asyncio.Event | None = None):
     """Harvey's main loop. Wakes up, decides, acts, sleeps. Repeat."""
+    if stop_event is None:
+        stop_event = asyncio.Event()
+
     logger.info("=" * 60)
     logger.info("Harvey is online. Always Be Closing.")
     logger.info("=" * 60)
 
-    config = load_config()
+    try:
+        config = load_config()
+    except (ConfigError, Exception) as e:
+        if isinstance(e, (KeyboardInterrupt, asyncio.CancelledError)):
+            raise
+        logger.error(f"Cannot start — configuration error:\n{e}")
+        return
     env = load_env()
     state = StateManager()
     brain = Brain(state)
@@ -118,29 +140,33 @@ async def heartbeat():
     analyst = Analyst(state)
 
     interval = config.usage.heartbeat_interval_minutes * 60
-    max_calls = int(200 * (config.usage.max_daily_claude_percent / 100))
+    max_calls = max(int(200 * (config.usage.max_daily_claude_percent / 100)), 1)
+    consecutive_errors = 0
 
-    while True:
+    while not stop_event.is_set():
         try:
             # 1. Check quiet hours
             if in_quiet_hours(config):
                 sleep_for = seconds_until_quiet_hours_end(config)
                 logger.info(f"Quiet hours. Sleeping for {sleep_for // 60} minutes.")
-                await asyncio.sleep(sleep_for)
+                if await _interruptible_sleep(sleep_for, stop_event):
+                    break
                 continue
 
             # 2. Check usage budget
             if not await brain.is_within_budget(max_calls):
-                logger.info("Daily usage limit reached. Sleeping until tomorrow.")
-                # Sleep for 1 hour and re-check (date will eventually roll over)
-                await asyncio.sleep(3600)
+                logger.info(
+                    f"Daily usage limit reached ({max_calls} calls). "
+                    "Sleeping 1h, then re-checking (resets at midnight)."
+                )
+                if await _interruptible_sleep(3600, stop_event):
+                    break
                 continue
 
             # 3. Decide what to do
-            logger.info("Thinking about what to do next...")
+            logger.info("Checking pipeline state...")
             summary = await state.get_state_summary()
-            action = await decide_next_action(brain, state, config)
-            logger.info(f"Primary action: {action}")
+            action = await decide_next_action(brain, state, config, summary=summary)
 
             # 4. Execute — run independent agents in parallel where possible
             # Handler is always safe to run alongside other agents
@@ -154,6 +180,8 @@ async def heartbeat():
                 # Also handle replies in parallel if needed
                 if has_open_convos:
                     tasks.append(("handle_replies", handler.run()))
+                # Analyst is cheap (no Claude calls) — keep analytics fresh
+                tasks.append(("analyze", analyst.run()))
             elif action == "write_campaign":
                 tasks.append(("write_campaign", writer.run()))
                 if has_open_convos:
@@ -166,30 +194,49 @@ async def heartbeat():
             if len(tasks) > 1:
                 logger.info(f"Running {len(tasks)} agents in parallel: {[t[0] for t in tasks]}")
 
-            # Run all tasks, catch errors per-task
+            # Run all tasks, catch errors per-task so one bad agent
+            # never takes down the cycle
             results = await asyncio.gather(
                 *[t[1] for t in tasks], return_exceptions=True
             )
             for (name, _), result in zip(tasks, results):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
                 if isinstance(result, Exception):
-                    logger.error(f"Agent {name} failed: {result}")
+                    logger.error(f"Agent {name} failed: {result}", exc_info=result)
 
-            # 5. Log the action
-            await state.log_action(action_type=action, agent="main")
+            # 5. Log the action (best-effort; never kills the loop)
+            try:
+                await state.log_action(action_type=action, agent="main")
+            except Exception as e:
+                logger.warning(f"Failed to log action '{action}': {e}")
+
+            consecutive_errors = 0
 
             # 6. Sleep until next heartbeat
             logger.info(
                 f"Cycle complete. Sleeping for {config.usage.heartbeat_interval_minutes} minutes."
             )
-            await asyncio.sleep(interval)
+            if await _interruptible_sleep(interval, stop_event):
+                break
 
-        except KeyboardInterrupt:
-            logger.info("Harvey shutting down. Deals don't close themselves, but I need a break.")
+        except (KeyboardInterrupt, asyncio.CancelledError):
             break
         except Exception as e:
-            logger.error(f"Error in heartbeat: {e}", exc_info=True)
-            logger.info("Recovering... sleeping 60s before retry.")
-            await asyncio.sleep(60)
+            consecutive_errors += 1
+            backoff = min(
+                ERROR_BACKOFF_BASE * (2 ** (consecutive_errors - 1)),
+                ERROR_BACKOFF_CAP,
+            )
+            logger.error(
+                f"Error in heartbeat (failure #{consecutive_errors}): {e}",
+                exc_info=True,
+            )
+            logger.info(f"Recovering... sleeping {backoff}s before retry.")
+            if await _interruptible_sleep(backoff, stop_event):
+                break
+
+    logger.info("Harvey shutting down. Deals don't close themselves, but I need a break.")
 
 
 def _needs_setup() -> bool:
@@ -209,7 +256,9 @@ def _needs_setup() -> bool:
             with open(config_file) as f:
                 import yaml
                 config = yaml.safe_load(f)
-            company = config.get("persona", {}).get("company", "")
+            if not isinstance(config, dict):
+                return True
+            company = (config.get("persona") or {}).get("company", "")
             if company in ("Your Company", ""):
                 return True
         except Exception:
@@ -218,6 +267,28 @@ def _needs_setup() -> bool:
         return True
 
     return False
+
+
+async def _run_with_signals():
+    """Run the heartbeat with SIGINT/SIGTERM wired to a graceful shutdown."""
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown(sig_name: str):
+        if stop_event.is_set():
+            logger.info("Second shutdown signal — exiting immediately.")
+            sys.exit(1)
+        logger.info(f"Received {sig_name}. Finishing current work, then shutting down...")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown, sig.name)
+        except (NotImplementedError, RuntimeError):
+            # Windows / non-main-thread fallback
+            signal.signal(sig, lambda s, f: _request_shutdown(signal.Signals(s).name))
+
+    await heartbeat(stop_event)
 
 
 def main():
@@ -229,23 +300,10 @@ def main():
         asyncio.run(run_setup())
         return
 
-    # Graceful shutdown on SIGTERM (for Docker)
-    loop = asyncio.new_event_loop()
-
-    def shutdown(sig, frame):
-        logger.info("Received shutdown signal.")
-        for task in asyncio.all_tasks(loop):
-            task.cancel()
-        loop.stop()
-
-    signal.signal(signal.SIGTERM, shutdown)
-
     try:
-        loop.run_until_complete(heartbeat())
+        asyncio.run(_run_with_signals())
     except KeyboardInterrupt:
         logger.info("Goodbye.")
-    finally:
-        loop.close()
 
 
 if __name__ == "__main__":
