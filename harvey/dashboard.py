@@ -125,34 +125,39 @@ async def get_setup_status():
         "help": "Go to the Settings tab to enter your API keys.",
     })
 
-    # 3. Instantly API key
-    instantly_key = env_vars.get("INSTANTLY_API_KEY", "") or os.getenv("INSTANTLY_API_KEY", "")
-    instantly_set = bool(instantly_key) and instantly_key != "your_instantly_api_key_here"
+    # 3. Email provider configured (matches channels.email.provider)
+    provider = _current_provider()
+
+    def _has(*keys):
+        return all((env_vars.get(k, "") or os.getenv(k, "")).strip() for k in keys)
+
+    if provider == "gmail":
+        provider_done = _has("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET") and \
+            (PROJECT_ROOT / "data" / "gmail_token.json").is_file()
+        provider_help = ("Set GMAIL_CLIENT_ID/SECRET in Settings, then run "
+                         "'harvey gmail auth' in your terminal.")
+    elif provider == "smtp":
+        provider_done = _has("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD")
+        provider_help = "Enter your SMTP host, username, and password in Settings."
+    else:
+        instantly_key = env_vars.get("INSTANTLY_API_KEY", "") or os.getenv("INSTANTLY_API_KEY", "")
+        provider_done = bool(instantly_key) and instantly_key != "your_instantly_api_key_here"
+        provider_help = "Enter your Instantly API key in Settings."
     checks.append({
-        "id": "instantly_key", "label": "Instantly API key",
-        "done": instantly_set,
+        "id": "email_provider", "label": f"Email provider configured ({provider})",
+        "done": provider_done,
         "required": True,
-        "help": "Get your API key from Instantly Settings > Integrations. Enter it in the Settings tab.",
+        "help": provider_help,
     })
 
-    # 4. Instantly API working
-    instantly_works = False
-    if instantly_set:
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(
-                    "https://api.instantly.ai/api/v2/accounts",
-                    headers={"Authorization": f"Bearer {instantly_key}"},
-                )
-                instantly_works = resp.status_code == 200
-        except Exception:
-            pass
+    # 4. Email verification (needed for addresses to be sendable, not 'guess')
+    verifier_set = _has("REOON_API_KEY") or _has("ZEROBOUNCE_API_KEY") or _has("HUNTER_API_KEY")
     checks.append({
-        "id": "instantly_works", "label": "Instantly API connected",
-        "done": instantly_works,
+        "id": "verifier", "label": "Email verification key",
+        "done": verifier_set,
         "required": True,
-        "help": "Your Instantly API key isn't working. Check that it's correct and you have the Growth plan.",
+        "help": "Add a Reoon (free 600/mo), ZeroBounce, or Hunter key in Settings — "
+                "without one, found emails stay 'guess' and are never sent.",
     })
 
     # 5. Config valid
@@ -216,23 +221,59 @@ async def get_setup_status():
 # ── Settings ──
 
 
+def _current_provider() -> str:
+    """Read channels.email.provider from harvey.yaml (best-effort)."""
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = yaml.safe_load(f) or {}
+        return ((cfg.get("channels") or {}).get("email") or {}).get("provider", "instantly")
+    except Exception:
+        return "instantly"
+
+
 @app.get("/api/settings")
 async def get_settings():
-    """Get current settings (API keys masked)."""
+    """Get current settings — presence flags only for secrets, never raw values."""
     env_vars = _read_env_file()
-    # Also check os.environ as fallback
-    for key in ["INSTANTLY_API_KEY", "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
-                "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"]:
+    all_keys = [
+        "INSTANTLY_API_KEY", "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
+        "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
+        "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
+        "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
+        "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
+        "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY",
+    ]
+    for key in all_keys:
         if key not in env_vars:
             env_vars[key] = os.getenv(key, "")
 
+    def is_set(k):
+        return bool((env_vars.get(k) or "").strip())
+
+    # Gmail is authorized once harvey gmail auth has stored a token file.
+    gmail_token = (PROJECT_ROOT / "data" / "gmail_token.json").is_file()
+
     return {
-        "instantly_api_key": env_vars.get("INSTANTLY_API_KEY", ""),
-        "instantly_api_key_masked": _mask_key(env_vars.get("INSTANTLY_API_KEY", "")),
+        "provider": _current_provider(),
+        # Non-secret values echo back so fields repopulate; secrets are
+        # presence-only so keys never leave the box.
+        "instantly_api_key_set": is_set("INSTANTLY_API_KEY"),
         "linkedin_email": env_vars.get("LINKEDIN_EMAIL", ""),
-        "linkedin_password_set": bool(env_vars.get("LINKEDIN_PASSWORD", "")),
+        "linkedin_password_set": is_set("LINKEDIN_PASSWORD"),
         "cloudflare_account_id": env_vars.get("CLOUDFLARE_ACCOUNT_ID", ""),
-        "cloudflare_api_token_masked": _mask_key(env_vars.get("CLOUDFLARE_API_TOKEN", "")),
+        "cloudflare_api_token_set": is_set("CLOUDFLARE_API_TOKEN"),
+        "gmail_client_id": env_vars.get("GMAIL_CLIENT_ID", ""),
+        "gmail_client_secret_set": is_set("GMAIL_CLIENT_SECRET"),
+        "gmail_authorized": gmail_token,
+        "smtp_host": env_vars.get("SMTP_HOST", ""),
+        "smtp_port": env_vars.get("SMTP_PORT", ""),
+        "smtp_username": env_vars.get("SMTP_USERNAME", ""),
+        "smtp_password_set": is_set("SMTP_PASSWORD"),
+        "imap_host": env_vars.get("IMAP_HOST", ""),
+        "imap_port": env_vars.get("IMAP_PORT", ""),
+        "reoon_api_key_set": is_set("REOON_API_KEY"),
+        "zerobounce_api_key_set": is_set("ZEROBOUNCE_API_KEY"),
+        "hunter_api_key_set": is_set("HUNTER_API_KEY"),
     }
 
 
@@ -248,7 +289,11 @@ async def save_env_settings(request: Request):
     async with _env_lock:
         updates = {}
         for key in ["INSTANTLY_API_KEY", "LINKEDIN_EMAIL", "LINKEDIN_PASSWORD",
-                     "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"]:
+                     "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
+                     "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
+                     "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
+                     "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
+                     "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY"]:
             if key in data and data[key] is not None:
                 # Strip newlines so a crafted value can't inject extra .env entries
                 updates[key] = str(data[key]).replace("\n", " ").replace("\r", " ").strip()
@@ -1260,20 +1305,63 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div id="settings" class="section">
   <div class="section-head"><h2>Settings</h2><p>Credentials are stored locally in <span style="font-family:var(--mono);font-size:12px">.env</span> — never sent anywhere except the services themselves.</p></div>
   <div class="card">
-    <h2>Instantly (Email Platform)</h2>
-    <p class="lede">Required. Get your API key from <a href="https://app.instantly.ai/app/settings/integrations" target="_blank" rel="noopener">Instantly Settings &gt; Integrations</a>.</p>
-    <div class="form-group">
-      <label class="form-label" for="instantly-key">API Key</label>
-      <div class="form-row">
-        <div class="form-group" style="margin-bottom:0">
-          <input type="password" class="form-input" id="instantly-key" placeholder="Enter your Instantly API key" autocomplete="off">
-        </div>
-        <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('instantly-key')">Show</button>
-        <button class="btn btn-secondary btn-sm" onclick="testInstantly()">Test</button>
-      </div>
-      <div id="instantly-test-result"></div>
+    <h2>Email Provider</h2>
+    <p class="lede">How Harvey sends and reads replies. Active provider: <b id="active-provider">…</b> — change it by setting <span style="font-family:var(--mono);font-size:12px">channels.email.provider</span> in <span style="font-family:var(--mono);font-size:12px">harvey.yaml</span> to <span style="font-family:var(--mono);font-size:12px">gmail</span>, <span style="font-family:var(--mono);font-size:12px">smtp</span>, or <span style="font-family:var(--mono);font-size:12px">instantly</span>.</p>
+
+    <div style="border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px">
+      <div style="font-weight:650;margin-bottom:4px">Gmail / Google Workspace <span class="optional-tag">recommended</span> <span id="gmail-status" class="email-tag"></span></div>
+      <p class="lede" style="margin-top:4px">Use a mailbox on a dedicated secondary domain. Create an OAuth client (type "Desktop app") in Google Cloud Console → Gmail API, paste the id/secret, save, then run <span style="font-family:var(--mono);font-size:12px">harvey gmail auth</span> in your terminal.</p>
+      <div class="form-group"><label class="form-label" for="gmail-id">Client ID</label>
+        <input type="text" class="form-input" id="gmail-id" placeholder="xxxx.apps.googleusercontent.com" autocomplete="off"></div>
+      <div class="form-group"><label class="form-label" for="gmail-secret">Client Secret</label>
+        <div class="form-row"><div class="form-group" style="margin-bottom:0">
+          <input type="password" class="form-input" id="gmail-secret" placeholder="Enter client secret" autocomplete="off"></div>
+          <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('gmail-secret')">Show</button></div></div>
+      <button class="btn btn-primary btn-sm" onclick="saveGmail()">Save Gmail</button>
     </div>
-    <button class="btn btn-primary" onclick="saveInstantly()">Save</button>
+
+    <div style="border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px">
+      <div style="font-weight:650;margin-bottom:4px">SMTP + IMAP mailbox</div>
+      <p class="lede" style="margin-top:4px">Any real mailbox (AgentMail, Fastmail, a Workspace app password). IMAP defaults to the SMTP host/login if left blank.</p>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label" for="smtp-host">SMTP host</label>
+          <input type="text" class="form-input" id="smtp-host" placeholder="smtp.example.com" autocomplete="off"></div>
+        <div class="form-group" style="max-width:120px"><label class="form-label" for="smtp-port">Port</label>
+          <input type="text" class="form-input" id="smtp-port" placeholder="587" autocomplete="off"></div>
+      </div>
+      <div class="form-group"><label class="form-label" for="smtp-user">Username</label>
+        <input type="text" class="form-input" id="smtp-user" placeholder="you@example.com" autocomplete="off"></div>
+      <div class="form-group"><label class="form-label" for="smtp-pass">Password</label>
+        <div class="form-row"><div class="form-group" style="margin-bottom:0">
+          <input type="password" class="form-input" id="smtp-pass" placeholder="Enter password / app password" autocomplete="off"></div>
+          <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('smtp-pass')">Show</button></div></div>
+      <button class="btn btn-primary btn-sm" onclick="saveSmtp()">Save SMTP</button>
+    </div>
+
+    <div style="border:1px solid var(--border);border-radius:10px;padding:16px">
+      <div style="font-weight:650;margin-bottom:4px">Instantly <span class="optional-tag">legacy</span></div>
+      <p class="lede" style="margin-top:4px">Get your API key from <a href="https://app.instantly.ai/app/settings/integrations" target="_blank" rel="noopener">Instantly Settings → Integrations</a> (Growth plan+ for API).</p>
+      <div class="form-group"><div class="form-row"><div class="form-group" style="margin-bottom:0">
+        <input type="password" class="form-input" id="instantly-key" placeholder="Enter your Instantly API key" autocomplete="off"></div>
+        <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('instantly-key')">Show</button>
+        <button class="btn btn-secondary btn-sm" onclick="testInstantly()">Test</button></div>
+        <div id="instantly-test-result"></div></div>
+      <button class="btn btn-primary btn-sm" onclick="saveInstantly()">Save Instantly</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Email Verification <span class="optional-tag">strongly recommended</span></h2>
+    <p class="lede">Add at least one so found emails get verified. Without any, addresses stay <span class="email-tag guess">guess</span> and are never sent. Reoon has the best free tier (600/mo).</p>
+    <div class="form-group"><label class="form-label" for="reoon-key">Reoon API key <span id="reoon-status" class="email-tag"></span></label>
+      <div class="form-row"><div class="form-group" style="margin-bottom:0">
+        <input type="password" class="form-input" id="reoon-key" placeholder="600 free/mo — reoon.com/email-verifier" autocomplete="off"></div>
+        <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('reoon-key')">Show</button></div></div>
+    <div class="form-group"><label class="form-label" for="zerobounce-key">ZeroBounce API key <span id="zerobounce-status" class="email-tag"></span></label>
+      <input type="password" class="form-input" id="zerobounce-key" placeholder="100 free/mo — best for M365/Workspace catch-alls" autocomplete="off"></div>
+    <div class="form-group"><label class="form-label" for="hunter-key">Hunter API key <span id="hunter-status" class="email-tag"></span></label>
+      <input type="password" class="form-input" id="hunter-key" placeholder="50 free/mo + email-pattern lookup" autocomplete="off"></div>
+    <button class="btn btn-primary btn-sm" onclick="saveVerifiers()">Save verification keys</button>
   </div>
 
   <div class="card">
@@ -1564,14 +1652,83 @@ async function loadSetupStatus() {
 async function loadSettings() {
   const data = await api('/api/settings');
   if (!data) return;
-  document.getElementById('instantly-key').value = data.instantly_api_key || '';
+
+  // Active provider indicator
+  const prov = data.provider || 'instantly';
+  const provEl = document.getElementById('active-provider');
+  if (provEl) provEl.textContent = prov;
+
+  // Secret fields never echo a value — show a "saved" placeholder instead.
+  const savedPh = (id, isSet, base) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.value = '';
+    el.placeholder = isSet ? 'Saved — enter new value to change' : base;
+  };
+  const tag = (id, ok, okLabel) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.className = 'email-tag ' + (ok ? 'verified' : 'guess');
+    el.textContent = ok ? okLabel : 'not set';
+  };
+
+  // Non-secret values repopulate
+  document.getElementById('gmail-id').value = data.gmail_client_id || '';
+  document.getElementById('smtp-host').value = data.smtp_host || '';
+  document.getElementById('smtp-port').value = data.smtp_port || '';
+  document.getElementById('smtp-user').value = data.smtp_username || '';
   document.getElementById('linkedin-email').value = data.linkedin_email || '';
-  document.getElementById('linkedin-password').value = '';
   document.getElementById('cf-account-id').value = data.cloudflare_account_id || '';
-  document.getElementById('cf-api-token').value = '';
-  if (data.linkedin_password_set) {
-    document.getElementById('linkedin-password').placeholder = 'Password saved (enter new to change)';
+
+  savedPh('gmail-secret', data.gmail_client_secret_set, 'Enter client secret');
+  savedPh('smtp-pass', data.smtp_password_set, 'Enter password / app password');
+  savedPh('instantly-key', data.instantly_api_key_set, 'Enter your Instantly API key');
+  savedPh('reoon-key', data.reoon_api_key_set, '600 free/mo — reoon.com/email-verifier');
+  savedPh('zerobounce-key', data.zerobounce_api_key_set, '100 free/mo — best for M365/Workspace catch-alls');
+  savedPh('hunter-key', data.hunter_api_key_set, '50 free/mo + email-pattern lookup');
+  savedPh('linkedin-password', data.linkedin_password_set, 'Enter password');
+  savedPh('cf-api-token', data.cloudflare_api_token_set, 'Your Cloudflare API Token');
+
+  // Gmail auth status chip
+  const g = document.getElementById('gmail-status');
+  if (g) {
+    if (data.gmail_authorized) { g.className = 'email-tag verified'; g.textContent = 'authorized'; }
+    else if (data.gmail_client_secret_set) { g.className = 'email-tag risky'; g.textContent = 'run: harvey gmail auth'; }
+    else { g.className = 'email-tag guess'; g.textContent = 'not set up'; }
   }
+  tag('reoon-status', data.reoon_api_key_set, 'set');
+  tag('zerobounce-status', data.zerobounce_api_key_set, 'set');
+  tag('hunter-status', data.hunter_api_key_set, 'set');
+}
+
+function saveGmail() {
+  const payload = {GMAIL_CLIENT_ID: document.getElementById('gmail-id').value.trim()};
+  const sec = document.getElementById('gmail-secret').value;
+  if (sec) payload.GMAIL_CLIENT_SECRET = sec;
+  saveEnv(payload, 'Gmail OAuth saved. Now run "harvey gmail auth" in your terminal.').then(loadSettings);
+}
+
+function saveSmtp() {
+  const payload = {
+    SMTP_HOST: document.getElementById('smtp-host').value.trim(),
+    SMTP_PORT: document.getElementById('smtp-port').value.trim(),
+    SMTP_USERNAME: document.getElementById('smtp-user').value.trim(),
+  };
+  const pass = document.getElementById('smtp-pass').value;
+  if (pass) payload.SMTP_PASSWORD = pass;
+  saveEnv(payload, 'SMTP settings saved.').then(loadSettings);
+}
+
+function saveVerifiers() {
+  const payload = {};
+  const r = document.getElementById('reoon-key').value;
+  const z = document.getElementById('zerobounce-key').value;
+  const h = document.getElementById('hunter-key').value;
+  if (r) payload.REOON_API_KEY = r;
+  if (z) payload.ZEROBOUNCE_API_KEY = z;
+  if (h) payload.HUNTER_API_KEY = h;
+  if (!Object.keys(payload).length) { showToast('Enter at least one key first.', 'error'); return; }
+  saveEnv(payload, 'Verification keys saved.').then(loadSettings);
 }
 
 async function saveEnv(payload, okMsg) {
