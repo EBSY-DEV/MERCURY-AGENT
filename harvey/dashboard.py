@@ -580,7 +580,7 @@ async def get_usage():
         return (
             f"SELECT {expr} AS {alias}, {_USAGE_SUM} FROM usage_events "
             f"WHERE created_at >= datetime('now', '-30 days') "
-            f"GROUP BY {alias} ORDER BY cost_usd DESC LIMIT 25"
+            f"GROUP BY {alias} ORDER BY output_tokens DESC LIMIT 25"
         )
 
     by_agent = await query_db(grouped("CASE WHEN agent = '' THEN 'other' ELSE agent END", "agent"))
@@ -1294,7 +1294,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <!-- Usage -->
 <div id="usage" class="section">
-  <div class="section-head"><h2>Usage</h2><p>What Harvey is spending — real subscription quota, tokens, and equivalent API cost per agent and task.</p></div>
+  <div class="section-head"><h2>Usage</h2><p>Actual Claude usage — your subscription quota, calls, and tokens per agent and task. Subscription plans aren't billed per token, so no dollar costs here.</p></div>
   <div id="usage-quota" class="card" style="display:none"></div>
   <div class="stats-grid" id="usage-stats"></div>
   <div class="card" id="usage-daily" style="display:none"></div>
@@ -1879,7 +1879,6 @@ function fmtTokens(n) {
   return String(n);
 }
 
-function fmtCost(v) { return '$' + (v || 0).toFixed(2); }
 
 function emailTag(p) {
   if (!p.email) return '';
@@ -1918,14 +1917,15 @@ async function loadUsage() {
     quotaEl.style.display = 'none';
   }
 
-  // Totals cards
+  // Totals cards — usage-first (calls is the headline; tokens as chips).
+  // No dollars: on a subscription plan usage isn't billed per token.
   const t = data.totals || {};
   const card = (label, p) => {
     p = p || {};
     return '<div class="stat-card"><div class="label">' + label + '</div>' +
-      '<div class="value">' + fmtCost(p.cost_usd) + '</div>' +
+      '<div class="value">' + (p.calls || 0) + '</div>' +
       '<div class="breakdown">' +
-        '<span class="chip">calls <b>' + (p.calls || 0) + '</b></span>' +
+        '<span class="chip">calls</span>' +
         '<span class="chip">out <b>' + fmtTokens(p.output_tokens) + '</b></span>' +
         '<span class="chip">in <b>' + fmtTokens(p.input_tokens) + '</b></span>' +
         '<span class="chip">cached <b>' + fmtTokens(p.cache_read_tokens) + '</b></span>' +
@@ -1933,20 +1933,20 @@ async function loadUsage() {
   };
   statsEl.innerHTML = card('Today', t.today) + card('Last 7 Days', t.week) + card('Last 30 Days', t.month);
 
-  // Daily bars
+  // Daily bars — output tokens per day (the work done)
   const dailyEl = document.getElementById('usage-daily');
   const days = data.by_day || [];
   if (days.length) {
-    const maxCost = Math.max(...days.map(d => d.cost_usd || 0), 0.0001);
-    let dHtml = '<h2>Daily Cost (equivalent API price, 30 days)</h2>';
+    const maxOut = Math.max(...days.map(d => d.output_tokens || 0), 1);
+    let dHtml = '<h2>Daily Output Tokens (30 days)</h2>';
     for (const d of days.slice(-30)) {
-      const pct = Math.max(2, (d.cost_usd || 0) / maxCost * 100);
+      const pct = Math.max(2, (d.output_tokens || 0) / maxOut * 100);
       dHtml += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;font-size:12px">' +
         '<span class="muted" style="width:78px;flex-shrink:0;font-family:var(--mono)">' + escHtml(d.day || '') + '</span>' +
         '<div style="flex:1;background:rgba(255,255,255,0.05);border-radius:99px;height:10px;overflow:hidden">' +
           '<div style="width:' + pct + '%;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent-deep),var(--accent))"></div>' +
         '</div>' +
-        '<span style="width:120px;text-align:right;font-variant-numeric:tabular-nums">' + fmtCost(d.cost_usd) +
+        '<span style="width:130px;text-align:right;font-variant-numeric:tabular-nums">' + fmtTokens(d.output_tokens) + ' out' +
           ' <span class="muted">&middot; ' + (d.calls || 0) + ' calls</span></span>' +
       '</div>';
     }
@@ -1956,20 +1956,19 @@ async function loadUsage() {
     dailyEl.style.display = 'none';
   }
 
-  // Breakdown tables
+  // Breakdown tables — calls + tokens, no cost column
   const tablesEl = document.getElementById('usage-tables');
   const table = (title, rows, keyName) => {
     if (!rows || !rows.length) return '';
     let h = '<div class="card"><h2>' + title + '</h2><div class="table-card"><table><thead><tr>' +
-      '<th>' + keyName + '</th><th>Calls</th><th>Input</th><th>Output</th><th>Cache read</th><th>Est. cost</th>' +
+      '<th>' + keyName + '</th><th>Calls</th><th>Input</th><th>Output</th><th>Cache read</th>' +
       '</tr></thead><tbody>';
     for (const r of rows) {
       h += '<tr><td>' + escHtml(String(r[keyName.toLowerCase()] || '')) + '</td>' +
         '<td>' + (r.calls || 0) + '</td>' +
         '<td class="muted">' + fmtTokens(r.input_tokens) + '</td>' +
         '<td>' + fmtTokens(r.output_tokens) + '</td>' +
-        '<td class="muted">' + fmtTokens(r.cache_read_tokens) + '</td>' +
-        '<td>' + fmtCost(r.cost_usd) + '</td></tr>';
+        '<td class="muted">' + fmtTokens(r.cache_read_tokens) + '</td></tr>';
     }
     return h + '</tbody></table></div></div>';
   };
@@ -1977,7 +1976,7 @@ async function loadUsage() {
   const anyRows = (data.by_agent || []).length || (data.by_task || []).length;
   if (!anyRows) {
     tablesEl.innerHTML = emptyState('&#9680;', 'No usage recorded yet',
-      'Once Harvey starts making Claude calls, every one is logged here with exact tokens and equivalent API cost. Run <b>harvey usage --reconcile</b> to backfill from Claude Code transcripts.');
+      'Once Harvey starts making Claude calls, every one is logged here with exact calls and tokens by agent and task. Run <b>harvey usage --reconcile</b> to backfill from Claude Code transcripts.');
   } else {
     tablesEl.innerHTML =
       table('By Agent (30 days)', data.by_agent, 'Agent') +

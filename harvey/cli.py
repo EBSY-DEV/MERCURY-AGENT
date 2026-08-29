@@ -184,13 +184,13 @@ def cmd_usage(args):
 
         totals = await state.usage_totals()
         print()
-        print(f"  {'Period':<10} {'Calls':>7} {'Input':>12} {'Output':>10} {'Cache read':>12} {'Est. cost':>10}")
+        print(f"  {'Period':<10} {'Calls':>7} {'Input':>12} {'Output':>10} {'Cache read':>12}")
         for label, key in (("Today", "today"), ("7 days", "week"), ("30 days", "month")):
             t = totals.get(key) or {}
             print(
                 f"  {label:<10} {t.get('calls', 0):>7} "
                 f"{t.get('input_tokens', 0):>12,} {t.get('output_tokens', 0):>10,} "
-                f"{t.get('cache_read_tokens', 0):>12,} ${t.get('cost_usd', 0.0):>9.2f}"
+                f"{t.get('cache_read_tokens', 0):>12,}"
             )
 
         by_agent = await state.usage_by_agent(days=args.days)
@@ -199,7 +199,7 @@ def cmd_usage(args):
             for row in by_agent:
                 print(
                     f"    {row['agent']:<14} {row['calls']:>5} calls  "
-                    f"{row['output_tokens']:>10,} out tokens  ${row['cost_usd']:.2f}"
+                    f"{row['output_tokens']:>10,} out tokens"
                 )
 
         by_task = await state.usage_by_task(days=args.days)
@@ -207,11 +207,12 @@ def cmd_usage(args):
             print(f"\n  By task (last {args.days} days):")
             for row in by_task[:10]:
                 print(
-                    f"    {row['task']:<22} {row['calls']:>5} calls  ${row['cost_usd']:.2f}"
+                    f"    {row['task']:<22} {row['calls']:>5} calls  "
+                    f"{row['output_tokens']:>10,} out tokens"
                 )
         print(
-            "\n  Costs are equivalent API list prices — what this usage would"
-            "\n  have cost without your subscription.\n"
+            "\n  Subscription plans aren't billed per token — these are usage"
+            "\n  counts, not costs.\n"
         )
 
     asyncio.run(_usage())
