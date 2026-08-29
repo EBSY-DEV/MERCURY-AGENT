@@ -141,7 +141,10 @@ Return ONLY a JSON array (no markdown fences, no commentary):
   {{"step": 3, "subject": "...", "body": "...", "delay_days": 4}}
 ]"""
 
-        result = await self.brain.think_json(prompt, session_id="harvey-writer")
+        result = await self.brain.think_json(
+            prompt, session_id="harvey-writer",
+            agent="writer", task="write_sequence",
+        )
         return self._parse_sequence(result)
 
     def _parse_sequence(self, result) -> list[EmailStep]:

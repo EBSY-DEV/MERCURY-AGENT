@@ -9,6 +9,8 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError, field_validator
 
+from harvey.paths import PROJECT_ROOT
+
 logger = logging.getLogger("harvey.config")
 
 
@@ -217,7 +219,7 @@ def _find_config_file() -> str:
     candidates = [
         Path.cwd() / "harvey.yaml",
         Path.cwd().parent / "harvey.yaml",
-        Path(__file__).parent.parent / "harvey.yaml",
+        PROJECT_ROOT / "harvey.yaml",
     ]
     for path in candidates:
         if path.exists():

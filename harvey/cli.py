@@ -45,7 +45,47 @@ def cmd_install(args):
     else:
         print("  ✓ Playwright browsers installed.\n")
 
+    _ensure_importable(args._project_root)
     print("  Harvey is installed. Run 'harvey setup' next.\n")
+
+
+def _ensure_importable(project_root: str):
+    """Make sure `import harvey` works outside the repo directory.
+
+    Python 3.13 silently skips .pth files carrying the macOS 'hidden'
+    file flag, and some Macs propagate that flag to everything inside
+    dot-directories like .venv — which breaks editable installs. When
+    that happens, fall back to symlinking the package into site-packages
+    (imports don't check the hidden flag; only .pth parsing does).
+    """
+    check = subprocess.run(
+        [sys.executable, "-c", "import harvey"],
+        cwd="/", capture_output=True,
+    )
+    if check.returncode == 0:
+        return
+
+    try:
+        import site
+        site_packages = Path(site.getsitepackages()[0])
+        link = site_packages / "harvey"
+        target = Path(project_root) / "harvey"
+        if not link.exists() and target.is_dir():
+            link.symlink_to(target)
+            recheck = subprocess.run(
+                [sys.executable, "-c", "import harvey"],
+                cwd="/", capture_output=True,
+            )
+            if recheck.returncode == 0:
+                print("  ✓ Fixed package visibility (editable .pth was being "
+                      "ignored; linked the package directly).\n")
+                return
+    except OSError as e:
+        print(f"  Could not apply import fix: {e}")
+
+    print("\n  Warning: 'import harvey' fails outside the project directory.")
+    print("  Run harvey commands from the project root, or reinstall with:")
+    print("    pip install -e . --config-settings editable_mode=compat\n")
 
 
 def cmd_setup(args):
@@ -111,8 +151,75 @@ def cmd_status(args):
     asyncio.run(_status())
 
 
+def cmd_usage(args):
+    """Show Claude usage: quota gauges, totals, per-agent breakdown."""
+    from harvey.state import StateManager
+
+    async def _usage():
+        state = StateManager()
+        await state.init_db()
+
+        if args.reconcile:
+            from harvey.usage import reconcile_transcripts
+            inserted = await reconcile_transcripts(state, since_days=args.days)
+            print(f"\n  Reconciled transcripts: {inserted} event(s) backfilled.")
+
+        # Live quota (best-effort; undocumented endpoint)
+        from harvey.integrations.quota import QuotaClient
+        windows = None
+        try:
+            windows = await QuotaClient().get_utilization()
+        except Exception:
+            pass
+
+        print("\n  Claude Usage")
+        print("  " + "=" * 52)
+        if windows:
+            labels = {"five_hour": "5-hour window", "seven_day": "Weekly"}
+            for key, w in windows.items():
+                resets = f"  (resets {w['resets_at']})" if w.get("resets_at") else ""
+                print(f"  {labels.get(key, key):<16} {w['utilization']:5.1f}% used{resets}")
+        else:
+            print("  Quota gauge unavailable (run 'claude login' or check network).")
+
+        totals = await state.usage_totals()
+        print()
+        print(f"  {'Period':<10} {'Calls':>7} {'Input':>12} {'Output':>10} {'Cache read':>12} {'Est. cost':>10}")
+        for label, key in (("Today", "today"), ("7 days", "week"), ("30 days", "month")):
+            t = totals.get(key) or {}
+            print(
+                f"  {label:<10} {t.get('calls', 0):>7} "
+                f"{t.get('input_tokens', 0):>12,} {t.get('output_tokens', 0):>10,} "
+                f"{t.get('cache_read_tokens', 0):>12,} ${t.get('cost_usd', 0.0):>9.2f}"
+            )
+
+        by_agent = await state.usage_by_agent(days=args.days)
+        if by_agent:
+            print(f"\n  By agent (last {args.days} days):")
+            for row in by_agent:
+                print(
+                    f"    {row['agent']:<14} {row['calls']:>5} calls  "
+                    f"{row['output_tokens']:>10,} out tokens  ${row['cost_usd']:.2f}"
+                )
+
+        by_task = await state.usage_by_task(days=args.days)
+        if by_task:
+            print(f"\n  By task (last {args.days} days):")
+            for row in by_task[:10]:
+                print(
+                    f"    {row['task']:<22} {row['calls']:>5} calls  ${row['cost_usd']:.2f}"
+                )
+        print(
+            "\n  Costs are equivalent API list prices — what this usage would"
+            "\n  have cost without your subscription.\n"
+        )
+
+    asyncio.run(_usage())
+
+
 def main():
-    project_root = str(Path(__file__).parent.parent)
+    from harvey.paths import PROJECT_ROOT
+    project_root = str(PROJECT_ROOT)
 
     parser = argparse.ArgumentParser(
         prog="harvey",
@@ -153,6 +260,15 @@ def main():
     # harvey status
     sub = subparsers.add_parser("status", help="Show pipeline status")
     sub.set_defaults(func=cmd_status)
+
+    # harvey usage
+    sub = subparsers.add_parser("usage", help="Show Claude usage and quota")
+    sub.add_argument("--days", type=int, default=30, help="Breakdown window (default: 30)")
+    sub.add_argument(
+        "--reconcile", action="store_true",
+        help="Backfill usage from Claude Code transcripts first",
+    )
+    sub.set_defaults(func=cmd_usage)
 
     args = parser.parse_args()
     args._project_root = project_root

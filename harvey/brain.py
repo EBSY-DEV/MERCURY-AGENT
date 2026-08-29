@@ -11,8 +11,10 @@ from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.brain")
 
-PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
-SKILLS_DIR = Path(__file__).parent.parent / "skills"
+from harvey.paths import PROJECT_ROOT
+
+PROMPTS_DIR = PROJECT_ROOT / "prompts"
+SKILLS_DIR = PROJECT_ROOT / "skills"
 
 # Subprocess safety limits
 DEFAULT_TIMEOUT_SECONDS = 300  # a single Claude call should never hang forever
@@ -31,6 +33,9 @@ _NON_RETRYABLE_PATTERNS = (
 class Brain:
     def __init__(self, state: StateManager):
         self.state = state
+        # Lazy import avoids a cycle (quota -> usage -> state).
+        from harvey.integrations.quota import QuotaClient
+        self.quota = QuotaClient()
 
     async def think(
         self,
@@ -39,16 +44,22 @@ class Brain:
         expect_json: bool = False,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        agent: str = "",
+        task: str = "",
     ) -> str:
         """Send a prompt to Claude Code headless mode and return the response.
 
         Retries transient failures with exponential backoff and enforces a
         hard timeout so a hung CLI call can never stall the heartbeat.
         Returns "" on unrecoverable failure (callers already handle empty).
+
+        ``agent``/``task`` label the call in the usage_events ledger so the
+        dashboard can attribute tokens and cost to specific work.
         """
         cmd = [
             "claude", "-p", prompt,
-            "--output-format", "text",
+            # JSON output carries exact token/cost accounting per call.
+            "--output-format", "json",
             "--dangerously-skip-permissions",
         ]
         if session_id:
@@ -111,12 +122,20 @@ class Brain:
                         return ""
                     continue  # retry transient failures
 
-                response = stdout.decode(errors="replace").strip()
+                raw = stdout.decode(errors="replace").strip()
+                response, payload = self._parse_result_payload(raw)
+
+                # Usage accounting must never break the response path.
                 try:
                     await self.state.increment_usage()
                 except Exception as e:
-                    # Usage accounting must never break the response path
-                    logger.warning(f"Failed to record usage: {e}")
+                    logger.warning(f"Failed to record usage counter: {e}")
+                try:
+                    await self._record_usage(payload, agent=agent, task=task,
+                                             label=session_id or "")
+                except Exception as e:
+                    logger.warning(f"Failed to record usage event: {e}")
+
                 logger.debug(f"Brain response: {response[:200]}...")
                 return response
 
@@ -144,15 +163,93 @@ class Brain:
         )
         return ""
 
+    @staticmethod
+    def _parse_result_payload(raw: str) -> tuple[str, dict | None]:
+        """Split CLI JSON output into (response_text, result_payload).
+
+        With ``--output-format json`` stdout is one JSON object whose
+        ``result`` field is the model's text. If parsing fails (older CLI,
+        truncated output), fall back to treating stdout as plain text so a
+        formatting change can never break Harvey's pipeline.
+        """
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw, None
+        if not isinstance(payload, dict) or payload.get("type") != "result":
+            return raw, None
+        return str(payload.get("result") or ""), payload
+
+    async def _record_usage(
+        self, payload: dict | None, agent: str, task: str, label: str
+    ):
+        """Write per-model usage rows from a CLI result payload."""
+        if not payload:
+            return
+
+        if not agent and label.startswith("harvey-"):
+            # Callers historically pass labels like "harvey-scout-score".
+            agent = label[len("harvey-"):].split("-")[0]
+
+        session = str(payload.get("session_id") or "")
+        duration_ms = int(payload.get("duration_ms") or 0)
+        num_turns = int(payload.get("num_turns") or 0)
+        is_error = bool(payload.get("is_error"))
+
+        # modelUsage includes subagent spend; the flat `usage` field does not.
+        model_usage = payload.get("modelUsage")
+        rows = []
+        if isinstance(model_usage, dict) and model_usage:
+            for model, mu in model_usage.items():
+                if not isinstance(mu, dict):
+                    continue
+                rows.append({
+                    "model": str(model),
+                    "input_tokens": int(mu.get("inputTokens") or 0),
+                    "output_tokens": int(mu.get("outputTokens") or 0),
+                    "cache_read_tokens": int(mu.get("cacheReadInputTokens") or 0),
+                    "cache_creation_tokens": int(mu.get("cacheCreationInputTokens") or 0),
+                    "cost_usd": float(mu.get("costUSD") or 0.0),
+                })
+        else:
+            usage = payload.get("usage")
+            if isinstance(usage, dict):
+                rows.append({
+                    "model": "",
+                    "input_tokens": int(usage.get("input_tokens") or 0),
+                    "output_tokens": int(usage.get("output_tokens") or 0),
+                    "cache_read_tokens": int(usage.get("cache_read_input_tokens") or 0),
+                    "cache_creation_tokens": int(usage.get("cache_creation_input_tokens") or 0),
+                    "cost_usd": float(payload.get("total_cost_usd") or 0.0),
+                })
+
+        for row in rows:
+            await self.state.record_usage_event(
+                agent=agent,
+                task=task or label,
+                session_id=session,
+                duration_ms=duration_ms,
+                num_turns=num_turns,
+                is_error=is_error,
+                source="result_json",
+                **row,
+            )
+
     async def think_json(
-        self, prompt: str, session_id: str | None = None
+        self,
+        prompt: str,
+        session_id: str | None = None,
+        agent: str = "",
+        task: str = "",
     ) -> dict | list | None:
         """Send a prompt and parse the response as JSON."""
         full_prompt = (
             prompt
             + "\n\nRespond ONLY with valid JSON. No markdown, no explanation."
         )
-        response = await self.think(full_prompt, session_id=session_id)
+        response = await self.think(
+            full_prompt, session_id=session_id, agent=agent, task=task
+        )
         if not response:
             return None
         parsed = self._extract_json(response)
@@ -194,12 +291,40 @@ class Brain:
             logger.warning(f"Could not read usage from state: {e}")
             return 0.0
 
-    async def is_within_budget(self, max_daily_calls: int = 200) -> bool:
-        """Check if we're under the daily usage limit.
+    async def is_within_budget(
+        self, max_daily_calls: int = 200, max_percent: float | None = None
+    ) -> bool:
+        """Check whether Harvey may spend more Claude quota right now.
 
-        The max_daily_claude_percent from config is mapped to a call count.
-        Default budget: 200 calls/day at 100%. So 80% = 160 calls.
+        Preferred signal: the account's REAL utilization windows (the same
+        numbers `/usage` shows), compared against max_percent so Harvey
+        always leaves the remainder for the user's own interactive work.
+        Fallback when that endpoint is unavailable: Harvey's own call
+        counter against max_daily_calls.
         """
+        if max_percent is not None:
+            try:
+                windows = await self.quota.get_utilization()
+            except Exception as e:
+                logger.debug(f"Quota check errored: {e}")
+                windows = None
+            if windows:
+                worst = max(
+                    (w["utilization"] for w in windows.values()), default=0.0
+                )
+                within = worst < max_percent
+                if not within:
+                    resets = ", ".join(
+                        f"{name} resets {w['resets_at']}"
+                        for name, w in windows.items()
+                        if w.get("resets_at")
+                    )
+                    logger.info(
+                        f"Quota gate: utilization {worst:.0f}% >= "
+                        f"{max_percent:.0f}% limit. {resets}"
+                    )
+                return within
+
         calls = await self.check_usage()
         return calls < max_daily_calls
 

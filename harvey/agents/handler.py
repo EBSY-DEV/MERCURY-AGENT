@@ -299,7 +299,10 @@ Reply from {prospect.full_name()} ({prospect.title} at {prospect.company}):
 
 Respond with ONLY the category label, nothing else."""
 
-        result = await self.brain.think(prompt, session_id="harvey-handler")
+        result = await self.brain.think(
+            prompt, session_id="harvey-handler",
+            agent="handler", task="classify_intent",
+        )
         if not result:
             # Classifier failed. Do NOT auto-reply blind — flag for a human.
             logger.warning("Handler: Intent classifier returned nothing. Escalating.")
@@ -424,7 +427,10 @@ Write a reply that:"""
 
         prompt += "\n\nWrite ONLY the email body. No subject line, no greeting label, no signature block, no markdown."
 
-        response = await self.brain.think(prompt, session_id="harvey-handler")
+        response = await self.brain.think(
+            prompt, session_id="harvey-handler",
+            agent="handler", task="generate_response",
+        )
         if not response:
             return ""
         response = response.strip()

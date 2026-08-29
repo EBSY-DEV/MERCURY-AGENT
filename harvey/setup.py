@@ -13,7 +13,7 @@ from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.setup")
 
-PROJECT_ROOT = Path(__file__).parent.parent
+from harvey.paths import PROJECT_ROOT
 ENV_FILE = PROJECT_ROOT / ".env"
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 CONFIG_FILE = PROJECT_ROOT / "harvey.yaml"

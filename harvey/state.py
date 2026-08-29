@@ -22,7 +22,9 @@ from harvey.models.prospect import Prospect
 from harvey.models.campaign import Campaign, EmailStep  # noqa: F401 (EmailStep re-exported)
 from harvey.models.conversation import Conversation, Message  # noqa: F401
 
-DB_PATH = Path(__file__).parent.parent / "data" / "harvey.db"
+from harvey.paths import PROJECT_ROOT
+
+DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 
 # How long (seconds) a connection waits on a locked database before failing.
 BUSY_TIMEOUT_SECONDS = 30.0
@@ -186,6 +188,35 @@ MIGRATIONS: list[str] = [
         ON prospects(LOWER(first_name), LOWER(last_name), LOWER(company));
     CREATE INDEX IF NOT EXISTS idx_prospects_status_updated ON prospects(status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_actions_created_at ON actions(created_at);
+    """,
+    # ── v3: per-call usage accounting (tokens, cost, attribution) ──
+    """
+    CREATE TABLE IF NOT EXISTS usage_events (
+        id TEXT PRIMARY KEY,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        agent TEXT DEFAULT '',
+        task TEXT DEFAULT '',
+        session_id TEXT DEFAULT '',
+        request_key TEXT DEFAULT '',
+        model TEXT DEFAULT '',
+        input_tokens INTEGER DEFAULT 0,
+        output_tokens INTEGER DEFAULT 0,
+        cache_read_tokens INTEGER DEFAULT 0,
+        cache_creation_tokens INTEGER DEFAULT 0,
+        cost_usd REAL DEFAULT 0.0,
+        duration_ms INTEGER DEFAULT 0,
+        num_turns INTEGER DEFAULT 0,
+        is_error INTEGER DEFAULT 0,
+        source TEXT DEFAULT 'result_json'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_usage_events_created ON usage_events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_agent ON usage_events(agent);
+    CREATE INDEX IF NOT EXISTS idx_usage_events_session ON usage_events(session_id);
+    -- Transcript-backfilled rows carry a request_key; uniqueness makes
+    -- reconciliation idempotent (INSERT OR IGNORE).
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_events_request
+        ON usage_events(request_key) WHERE request_key != '';
     """,
 ]
 
@@ -685,6 +716,136 @@ class StateManager:
                 (_new_id(), today),
             )
             await db.commit()
+
+    # ── Per-call usage accounting (usage_events) ──
+
+    async def record_usage_event(
+        self,
+        *,
+        agent: str = "",
+        task: str = "",
+        session_id: str = "",
+        request_key: str = "",
+        model: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        cost_usd: float = 0.0,
+        duration_ms: int = 0,
+        num_turns: int = 0,
+        is_error: bool = False,
+        source: str = "result_json",
+        created_at: str | None = None,
+    ) -> bool:
+        """Insert one usage row (one model within one Claude call).
+
+        Returns False when the row was skipped as a duplicate (request_key
+        uniqueness makes transcript reconciliation idempotent).
+        """
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """INSERT OR IGNORE INTO usage_events
+                   (id, created_at, agent, task, session_id, request_key, model,
+                    input_tokens, output_tokens, cache_read_tokens,
+                    cache_creation_tokens, cost_usd, duration_ms, num_turns,
+                    is_error, source)
+                   VALUES (?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    _new_id(), created_at, agent, task, session_id, request_key,
+                    model, int(input_tokens or 0), int(output_tokens or 0),
+                    int(cache_read_tokens or 0), int(cache_creation_tokens or 0),
+                    float(cost_usd or 0.0), int(duration_ms or 0),
+                    int(num_turns or 0), 1 if is_error else 0, source,
+                ),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_recorded_session_ids(self) -> set[str]:
+        """Session IDs already captured live (skip during reconciliation)."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT DISTINCT session_id FROM usage_events "
+                "WHERE source = 'result_json' AND session_id != ''"
+            ) as cursor:
+                return {row[0] for row in await cursor.fetchall()}
+
+    _USAGE_SUM = (
+        "COUNT(DISTINCT CASE WHEN session_id != '' THEN session_id ELSE id END) AS calls, "
+        "SUM(input_tokens) AS input_tokens, "
+        "SUM(output_tokens) AS output_tokens, "
+        "SUM(cache_read_tokens) AS cache_read_tokens, "
+        "SUM(cache_creation_tokens) AS cache_creation_tokens, "
+        "SUM(cost_usd) AS cost_usd"
+    )
+
+    @staticmethod
+    def _usage_row_to_dict(row: aiosqlite.Row) -> dict:
+        d = dict(row)
+        for key, value in d.items():
+            if value is None and key != "period":
+                d[key] = 0
+        if "cost_usd" in d:
+            d["cost_usd"] = round(float(d["cost_usd"] or 0.0), 6)
+        return d
+
+    async def _usage_grouped(self, group_expr: str, alias: str, days: int) -> list[dict]:
+        sql = (
+            f"SELECT {group_expr} AS {alias}, {self._USAGE_SUM} "
+            f"FROM usage_events "
+            f"WHERE created_at >= datetime('now', ?) "
+            f"GROUP BY {alias} ORDER BY cost_usd DESC"
+        )
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, (f"-{int(days)} days",)) as cursor:
+                return [self._usage_row_to_dict(r) for r in await cursor.fetchall()]
+
+    async def usage_by_agent(self, days: int = 30) -> list[dict]:
+        return await self._usage_grouped(
+            "CASE WHEN agent = '' THEN 'other' ELSE agent END", "agent", days
+        )
+
+    async def usage_by_task(self, days: int = 30) -> list[dict]:
+        return await self._usage_grouped(
+            "CASE WHEN task = '' THEN 'other' ELSE task END", "task", days
+        )
+
+    async def usage_by_model(self, days: int = 30) -> list[dict]:
+        return await self._usage_grouped(
+            "CASE WHEN model = '' THEN 'unknown' ELSE model END", "model", days
+        )
+
+    async def usage_by_day(self, days: int = 30) -> list[dict]:
+        sql = (
+            f"SELECT date(created_at) AS day, {self._USAGE_SUM} "
+            f"FROM usage_events "
+            f"WHERE created_at >= datetime('now', ?) "
+            f"GROUP BY day ORDER BY day ASC"
+        )
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, (f"-{int(days)} days",)) as cursor:
+                return [self._usage_row_to_dict(r) for r in await cursor.fetchall()]
+
+    async def usage_totals(self) -> dict:
+        """Rollups for today / last 7 days / last 30 days (UTC)."""
+        totals = {}
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            for label, where in (
+                ("today", "date(created_at) = date('now')"),
+                ("week", "created_at >= datetime('now', '-7 days')"),
+                ("month", "created_at >= datetime('now', '-30 days')"),
+            ):
+                async with db.execute(
+                    f"SELECT {self._USAGE_SUM} FROM usage_events WHERE {where}"
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    totals[label] = self._usage_row_to_dict(row) if row else {}
+        return totals
 
     # ── Summary for Decision Making ──
 

@@ -21,7 +21,7 @@ from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.trainer")
 
-PROJECT_ROOT = Path(__file__).parent.parent
+from harvey.paths import PROJECT_ROOT
 
 
 def _normalize_start_url(url: str) -> str:
@@ -630,7 +630,7 @@ Do NOT pursue prospects who:
 {product_info.get('tone', 'professional, consultative, confident')}
 """
 
-        skills_path = Path(__file__).parent.parent / "skills" / "product_knowledge.md"
+        skills_path = PROJECT_ROOT / "skills" / "product_knowledge.md"
         skills_path.write_text(knowledge)
         print(f"      Generated: skills/product_knowledge.md")
 
@@ -678,7 +678,7 @@ What prospects do instead of buying a solution like ours:
 ---
 """
 
-        skills_path = Path(__file__).parent.parent / "skills" / "competitive_intel.md"
+        skills_path = PROJECT_ROOT / "skills" / "competitive_intel.md"
         skills_path.write_text(cards)
         print(f"      Generated: skills/competitive_intel.md")
 
