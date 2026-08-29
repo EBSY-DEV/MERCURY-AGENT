@@ -247,6 +247,49 @@ MIGRATIONS: list[str] = [
     ALTER TABLE companies ADD COLUMN tech_stack_json TEXT DEFAULT '[]';
     ALTER TABLE companies ADD COLUMN signals_json TEXT DEFAULT '[]';
     """,
+    # ── v6: outbox (approval ladder + native sending) and settings KV ──
+    """
+    -- Every outgoing email becomes an outbox row first. Status ladder:
+    --   pending_review -> approved -> sent
+    --   (or rejected / cancelled / failed)
+    -- The unique index on (campaign_id, prospect_id, step) is the
+    -- double-send guard: retries and re-stages physically cannot
+    -- duplicate a send.
+    CREATE TABLE IF NOT EXISTS outbox (
+        id TEXT PRIMARY KEY,
+        campaign_id TEXT DEFAULT '',
+        prospect_id TEXT DEFAULT '',
+        conversation_id TEXT DEFAULT '',
+        step INTEGER DEFAULT 1,
+        kind TEXT DEFAULT 'sequence',
+        to_email TEXT DEFAULT '',
+        subject TEXT DEFAULT '',
+        body TEXT DEFAULT '',
+        status TEXT DEFAULT 'pending_review',
+        send_at TIMESTAMP,
+        sent_at TIMESTAMP,
+        provider TEXT DEFAULT '',
+        message_id TEXT DEFAULT '',
+        thread_ref TEXT DEFAULT '',
+        in_reply_to TEXT DEFAULT '',
+        error TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_outbox_campaign_step
+        ON outbox(campaign_id, prospect_id, step)
+        WHERE campaign_id != '' AND kind = 'sequence';
+    CREATE INDEX IF NOT EXISTS idx_outbox_status_send_at ON outbox(status, send_at);
+    CREATE INDEX IF NOT EXISTS idx_outbox_prospect ON outbox(prospect_id);
+
+    -- Simple key/value store for operational flags (kill switch, counters).
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT DEFAULT '',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -600,6 +643,180 @@ class StateManager:
             )
             await db.commit()
 
+    # ── Outbox (approval ladder + native sending) ──
+
+    async def add_outbox_item(
+        self,
+        *,
+        prospect_id: str,
+        to_email: str,
+        subject: str,
+        body: str,
+        send_at: str,
+        status: str = "pending_review",
+        campaign_id: str = "",
+        conversation_id: str = "",
+        step: int = 1,
+        kind: str = "sequence",
+        provider: str = "",
+        thread_ref: str = "",
+        in_reply_to: str = "",
+    ) -> str | None:
+        """Queue one outgoing email. Returns its id, or None when the
+        (campaign, prospect, step) slot already exists — the double-send guard."""
+        item_id = _new_id()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """INSERT OR IGNORE INTO outbox
+                   (id, campaign_id, prospect_id, conversation_id, step, kind,
+                    to_email, subject, body, status, send_at, provider,
+                    thread_ref, in_reply_to)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    item_id, campaign_id, prospect_id, conversation_id,
+                    int(step), kind, _norm(to_email), subject, body,
+                    status, send_at, provider, thread_ref, in_reply_to,
+                ),
+            )
+            await db.commit()
+            return item_id if cursor.rowcount > 0 else None
+
+    async def get_outbox(
+        self,
+        status: str | None = None,
+        due_before: str | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        where, params = [], []
+        if status:
+            where.append("status = ?")
+            params.append(status)
+        if due_before:
+            where.append("(send_at IS NULL OR send_at <= ?)")
+            params.append(due_before)
+        sql = "SELECT * FROM outbox"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY send_at ASC, created_at ASC LIMIT ?"
+        params.append(int(limit))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def get_outbox_item(self, item_id: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE id = ?", (item_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    _OUTBOX_COLUMNS = frozenset({
+        "status", "error", "message_id", "thread_ref", "sent_at",
+        "subject", "body", "send_at", "provider",
+    })
+
+    async def update_outbox_item(self, item_id: str, **kwargs):
+        fields = {k: v for k, v in kwargs.items() if k in self._OUTBOX_COLUMNS}
+        if not fields:
+            return
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        async with self._connect() as db:
+            await db.execute(
+                f"UPDATE outbox SET {sets}, updated_at = ? WHERE id = ?",
+                (*fields.values(), _utcnow().isoformat(), item_id),
+            )
+            await db.commit()
+
+    async def approve_outbox(self, item_id: str | None = None) -> int:
+        """Approve one pending item, or ALL pending when item_id is None."""
+        async with self._connect() as db:
+            if item_id:
+                cursor = await db.execute(
+                    "UPDATE outbox SET status = 'approved', updated_at = ? "
+                    "WHERE id = ? AND status = 'pending_review'",
+                    (_utcnow().isoformat(), item_id),
+                )
+            else:
+                cursor = await db.execute(
+                    "UPDATE outbox SET status = 'approved', updated_at = ? "
+                    "WHERE status = 'pending_review'",
+                    (_utcnow().isoformat(),),
+                )
+            await db.commit()
+            return cursor.rowcount
+
+    async def cancel_pending_outbox_for_prospect(
+        self, prospect_id: str, reason: str = "stop_on_reply"
+    ) -> int:
+        """Stop-on-reply: cancel everything queued for a prospect who replied."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
+                "WHERE prospect_id = ? AND status IN ('pending_review', 'approved')",
+                (reason, _utcnow().isoformat(), prospect_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def count_outbox_sent(self) -> int:
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM outbox WHERE status = 'sent'"
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
+    async def count_outbox_sent_today(self) -> int:
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM outbox WHERE status = 'sent' "
+                "AND date(sent_at) = date('now')"
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
+    async def find_outbox_by_message_id(self, message_id: str) -> dict | None:
+        if not message_id:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE message_id = ?", (message_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    # ── Settings (operational flags: kill switch, counters) ──
+
+    async def get_setting(self, key: str, default: str = "") -> str:
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else default
+
+    async def set_setting(self, key: str, value: str):
+        async with self._connect() as db:
+            await db.execute(
+                """INSERT INTO settings (key, value, updated_at)
+                   VALUES (?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value = excluded.value, updated_at = CURRENT_TIMESTAMP""",
+                (key, str(value)),
+            )
+            await db.commit()
+
+    async def increment_setting(self, key: str, by: int = 1) -> int:
+        current = await self.get_setting(key, "0")
+        try:
+            value = int(current) + by
+        except ValueError:
+            value = by
+        await self.set_setting(key, str(value))
+        return value
+
     async def prospect_exists(
         self, email: str = "", linkedin_url: str = "",
         first_name: str = "", last_name: str = "", company: str = "",
@@ -770,6 +987,19 @@ class StateManager:
             )
             await db.commit()
         return convo.id
+
+    async def get_conversation(self, convo_id: str) -> Conversation | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM conversations WHERE id = ?", (convo_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    return None
+                d = dict(row)
+                d["thread"] = Conversation.thread_from_json(d.pop("thread_json"))
+                return Conversation(**d)
 
     async def get_conversations_by_status(self, status: str) -> list[Conversation]:
         async with self._connect() as db:

@@ -1,15 +1,40 @@
-"""Sender — deploys campaigns via Instantly."""
+"""Sender — deploys campaigns via Instantly, or sends natively via the
+configured mail provider (Gmail / SMTP) through the outbox approval ladder.
 
+Native flow:
+  1. Draft campaigns are STAGED: merge variables rendered per prospect,
+     one outbox row per (prospect, step) with a scheduled send_at.
+     Rows start as pending_review (copilot) or approved (autopilot).
+  2. Each heartbeat DRAINS due approved rows: kill-switch check, stop-on-
+     reply check, deterministic pre-send gate, then provider.send_email
+     with jittered pacing and the daily cap.
+"""
+
+import asyncio
 import logging
+import random
 import re
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from harvey.brain import Brain
 from harvey.config import HarveyConfig, EnvConfig
+from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
+from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.sender")
+
+# Max sends drained per heartbeat cycle — spreads volume through the day
+# instead of bursting the daily cap in one minute.
+MAX_SENDS_PER_CYCLE = 8
+SEND_JITTER_SECONDS = (4, 15)
+
+# Prospect pipeline statuses that mean "stop emailing this person".
+STOP_STATUSES = {"replied", "opted_out", "lost", "meeting", "closed"}
+
+KILL_SWITCH_KEY = "sending_paused"
+BOUNCE_COUNT_KEY = "bounce_count"
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
@@ -36,15 +61,28 @@ class Sender:
         self.state = state
         self.config = config
         self.instantly = InstantlyClient(env.instantly_api_key)
+        self.provider = get_mail_provider(config, env)
+        # Disabled in tests to skip inter-send sleeps.
+        self.send_pacing = True
+
+    @property
+    def is_native(self) -> bool:
+        return (
+            self.config.channels.email.provider in NATIVE_PROVIDERS
+            and self.provider is not None
+        )
 
     async def run(self):
-        """Deploy draft campaigns to Instantly."""
-        logger.info("Sender: Checking for campaigns to deploy...")
-
+        """Deploy campaigns — natively through the outbox, or via Instantly."""
         if not self.config.channels.email.enabled:
             logger.info("Sender: Email channel disabled. Skipping.")
             return
 
+        if self.is_native:
+            await self._run_native()
+            return
+
+        logger.info("Sender: Checking for campaigns to deploy...")
         draft_campaigns = await self.state.get_campaigns_by_status("draft")
         if not draft_campaigns:
             logger.info("Sender: No draft campaigns to deploy.")
@@ -272,3 +310,223 @@ class Sender:
             ) as cursor:
                 row = await cursor.fetchone()
                 return row[0] if row else 0
+
+    # ── Native provider flow (Gmail / SMTP via the outbox) ──
+
+    async def _run_native(self):
+        """Stage new campaigns into the outbox, then drain what's due."""
+        paused = await self.state.get_setting(KILL_SWITCH_KEY)
+        if paused:
+            logger.warning(
+                f"Sender: SENDING PAUSED ({paused}). Resume from the dashboard "
+                "or `harvey sending resume` once the cause is fixed."
+            )
+            return
+
+        for campaign in await self.state.get_campaigns_by_status("draft"):
+            try:
+                await self._stage_campaign_native(campaign)
+            except Exception as e:
+                logger.error(f"Sender: staging '{campaign.name}' failed: {e}")
+
+        await self._drain_due()
+
+    def _render(self, text: str, prospect) -> str:
+        """Fill merge variables. The pre-send gate rejects any leftovers."""
+        replacements = {
+            "first_name": prospect.first_name,
+            "last_name": prospect.last_name,
+            "company": prospect.company,
+            "title": prospect.title,
+            "personalization": prospect.personalization_notes,
+        }
+        for key, value in replacements.items():
+            text = text.replace("{{" + key + "}}", value or "")
+            text = text.replace("{{ " + key + " }}", value or "")
+        return text.strip()
+
+    async def _stage_campaign_native(self, campaign):
+        """Render + schedule a draft campaign's emails into the outbox."""
+        if not self._validate_sequence(campaign):
+            await self.state.update_campaign(campaign.id, status="failed")
+            return
+
+        require_approval = getattr(
+            self.config.channels.email, "require_approval", True
+        )
+        initial_status = "pending_review" if require_approval else "approved"
+        allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
+        sendable_email = (
+            SENDABLE_EMAIL_STATUSES_WITH_RISKY if allow_risky
+            else SENDABLE_EMAIL_STATUSES
+        )
+
+        staged = 0
+        skipped = 0
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        seen_emails: set[str] = set()
+
+        for prospect_id in campaign.prospect_ids:
+            prospect = await self.state.get_prospect(prospect_id)
+            if not prospect or not prospect.email:
+                continue
+            email = prospect.email.strip().lower()
+            if not EMAIL_RE.match(email) or email in seen_emails:
+                continue
+            if prospect.status not in SENDABLE_STATUSES:
+                continue
+            if (prospect.email_status or "guess") not in sendable_email:
+                skipped += 1
+                continue
+            seen_emails.add(email)
+
+            cumulative_days = 0
+            for step in campaign.sequence:
+                cumulative_days += max(0, step.delay_days)
+                send_at = now + timedelta(days=cumulative_days)
+                item_id = await self.state.add_outbox_item(
+                    prospect_id=prospect.id,
+                    campaign_id=campaign.id,
+                    step=step.step,
+                    to_email=email,
+                    subject=self._render(step.subject, prospect),
+                    body=self._render(step.body, prospect),
+                    send_at=send_at.isoformat(),
+                    status=initial_status,
+                    provider=self.provider.name,
+                )
+                if item_id:
+                    staged += 1
+            await self.state.update_prospect_status(prospect.id, "queued")
+
+        await self.state.update_campaign(campaign.id, status="active")
+        if skipped:
+            logger.info(
+                f"Sender: held back {skipped} prospect(s) with unverified "
+                f"emails from '{campaign.name}'."
+            )
+        if staged:
+            mode = "awaiting your approval" if require_approval else "approved"
+            logger.info(
+                f"Sender: staged {staged} email(s) for '{campaign.name}' "
+                f"({mode}). Review in the dashboard Outbox tab."
+            )
+            await self.state.log_action(
+                action_type="stage_campaign",
+                agent="sender",
+                details={"campaign": campaign.name, "staged": staged, "mode": mode},
+            )
+
+    async def _drain_due(self):
+        """Send due, approved outbox items through the provider."""
+        if not self.provider.is_configured():
+            logger.warning(
+                f"Sender: mail provider '{self.provider.name}' is not configured "
+                "yet — outbox is holding. See CLAUDE.md → provider setup."
+            )
+            return
+
+        max_daily = self.config.channels.email.max_daily_sends
+        sent_today = await self.state.count_outbox_sent_today()
+        budget = min(MAX_SENDS_PER_CYCLE, max_daily - sent_today)
+        if budget <= 0:
+            logger.info(f"Sender: daily send cap reached ({sent_today}/{max_daily}).")
+            return
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        due = await self.state.get_outbox(
+            status="approved", due_before=now, limit=budget * 3
+        )
+        if not due:
+            return
+
+        allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
+        sent = 0
+        for item in due:
+            if sent >= budget:
+                break
+
+            prospect = await self.state.get_prospect(item["prospect_id"])
+            if prospect is None:
+                await self.state.update_outbox_item(
+                    item["id"], status="failed", error="prospect missing"
+                )
+                continue
+
+            # Stop-on-reply / opt-out: never continue a sequence after contact.
+            if item["kind"] == "sequence" and prospect.status in STOP_STATUSES:
+                await self.state.update_outbox_item(
+                    item["id"], status="cancelled",
+                    error=f"prospect status '{prospect.status}'",
+                )
+                continue
+
+            gate = pre_send_check(
+                item["to_email"], item["subject"], item["body"],
+                prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
+            )
+            if not gate:
+                await self.state.update_outbox_item(
+                    item["id"], status="failed",
+                    error="gate: " + "; ".join(gate.reasons)[:300],
+                )
+                logger.warning(
+                    f"Sender: gate blocked email to {item['to_email']}: "
+                    f"{gate.reasons}"
+                )
+                continue
+
+            result = await self.provider.send_email(
+                item["to_email"], item["subject"], item["body"],
+                thread_ref=item.get("thread_ref", ""),
+                in_reply_to=item.get("in_reply_to", ""),
+            )
+            if not result.ok:
+                await self.state.update_outbox_item(
+                    item["id"], status="failed", error=result.error[:300]
+                )
+                continue
+
+            sent += 1
+            now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+            await self.state.update_outbox_item(
+                item["id"], status="sent", sent_at=now_iso,
+                message_id=result.message_id, thread_ref=result.thread_ref,
+            )
+            if prospect.status in ("new", "queued"):
+                await self.state.update_prospect_status(prospect.id, "contacted")
+
+            # A sent reply belongs in its conversation thread.
+            if item["kind"] == "reply" and item.get("conversation_id"):
+                try:
+                    convo = await self.state.get_conversation(item["conversation_id"])
+                    if convo:
+                        from harvey.models.conversation import Message
+                        convo.thread.append(
+                            Message(sender="harvey", content=item["body"])
+                        )
+                        await self.state.update_conversation(
+                            convo.id, thread_json=convo.thread_json()
+                        )
+                except Exception as e:
+                    logger.debug(f"Sender: convo append failed: {e}")
+            await self.state.log_action(
+                action_type="email_sent",
+                agent="sender",
+                details={
+                    "to": item["to_email"], "step": item["step"],
+                    "kind": item["kind"], "provider": self.provider.name,
+                },
+            )
+            logger.info(
+                f"Sender: sent step {item['step']} to {item['to_email']} "
+                f"via {self.provider.name}."
+            )
+            # Human-ish pacing BETWEEN sends (not after the last, and never
+            # in tests where pacing is disabled).
+            if self.send_pacing and sent < budget:
+                await asyncio.sleep(random.uniform(*SEND_JITTER_SECONDS))
+
+        if sent:
+            logger.info(f"Sender: {sent} email(s) sent this cycle "
+                        f"({sent_today + sent}/{max_daily} today).")

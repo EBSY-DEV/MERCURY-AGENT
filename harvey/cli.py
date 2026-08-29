@@ -255,6 +255,96 @@ def cmd_export(args):
     asyncio.run(_export())
 
 
+def cmd_gmail(args):
+    """Gmail provider utilities (auth / test)."""
+    from harvey.config import load_env
+
+    env = load_env()
+    if args.gmail_action == "auth":
+        from harvey.integrations.gmail import run_auth_flow
+        ok = run_auth_flow(env.gmail_client_id, env.gmail_client_secret)
+        sys.exit(0 if ok else 1)
+
+    if args.gmail_action == "test":
+        from harvey.config import load_config
+        from harvey.integrations.gmail import GmailProvider
+
+        async def _test():
+            provider = GmailProvider(load_config(), env)
+            ok, detail = await provider.test_connection()
+            print(f"\n  {'✓' if ok else '✗'} {detail}\n")
+            sys.exit(0 if ok else 1)
+        asyncio.run(_test())
+
+
+def cmd_outbox(args):
+    """Review and approve queued outgoing emails."""
+    from harvey.state import StateManager
+
+    async def _outbox():
+        state = StateManager()
+        await state.init_db()
+
+        if args.approve_all:
+            n = await state.approve_outbox()
+            print(f"\n  Approved {n} email(s). They'll send on schedule.\n")
+            return
+        if args.approve:
+            n = await state.approve_outbox(args.approve)
+            print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
+            return
+        if args.reject:
+            await state.update_outbox_item(args.reject, status="rejected")
+            print("\n  Rejected.\n")
+            return
+
+        paused = await state.get_setting("sending_paused")
+        if paused:
+            print(f"\n  ⚠ SENDING PAUSED: {paused}")
+            print("  Resume with: harvey sending resume")
+
+        pending = await state.get_outbox(status="pending_review", limit=50)
+        approved = await state.get_outbox(status="approved", limit=10)
+        print(f"\n  Outbox — {len(pending)} awaiting approval, "
+              f"{len(approved)}+ approved/scheduled")
+        print("  " + "=" * 60)
+        for item in pending:
+            print(f"\n  [{item['id']}] step {item['step']} ({item['kind']}) "
+                  f"→ {item['to_email']}  (send {item['send_at'][:16]})")
+            print(f"  Subject: {item['subject']}")
+            body_preview = (item["body"][:200] + "...") if len(item["body"]) > 200 else item["body"]
+            for line in body_preview.splitlines():
+                print(f"    {line}")
+        if pending:
+            print("\n  Approve: harvey outbox --approve <id>   |   all: harvey outbox --approve-all")
+            print("  Reject:  harvey outbox --reject <id>\n")
+        else:
+            print("  Nothing awaiting review.\n")
+
+    asyncio.run(_outbox())
+
+
+def cmd_sending(args):
+    """Pause/resume the sending kill switch."""
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        if args.sending_action == "pause":
+            await state.set_setting("sending_paused", "paused manually")
+            print("\n  Sending paused. Nothing will leave the outbox.\n")
+        elif args.sending_action == "resume":
+            await state.set_setting("sending_paused", "")
+            await state.set_setting("bounce_count", "0")
+            print("\n  Sending resumed (bounce counter reset).\n")
+        else:
+            paused = await state.get_setting("sending_paused")
+            print(f"\n  Sending: {'PAUSED — ' + paused if paused else 'active'}\n")
+
+    asyncio.run(_run())
+
+
 def main():
     from harvey.paths import PROJECT_ROOT
     project_root = str(PROJECT_ROOT)
@@ -312,6 +402,25 @@ def main():
     sub.add_argument("--status", default="", help="Comma-separated pipeline statuses (e.g. new,queued)")
     sub.add_argument("--all", action="store_true", help="Export everything, no filters")
     sub.set_defaults(func=cmd_export)
+
+    # harvey gmail auth|test
+    sub = subparsers.add_parser("gmail", help="Gmail provider setup")
+    sub.add_argument("gmail_action", choices=["auth", "test"],
+                     help="auth: one-time OAuth; test: verify connection")
+    sub.set_defaults(func=cmd_gmail)
+
+    # harvey outbox
+    sub = subparsers.add_parser("outbox", help="Review/approve queued emails")
+    sub.add_argument("--approve", metavar="ID", default="", help="Approve one item")
+    sub.add_argument("--approve-all", action="store_true", help="Approve all pending")
+    sub.add_argument("--reject", metavar="ID", default="", help="Reject one item")
+    sub.set_defaults(func=cmd_outbox)
+
+    # harvey sending pause|resume|status
+    sub = subparsers.add_parser("sending", help="Kill switch: pause/resume sending")
+    sub.add_argument("sending_action", nargs="?", default="status",
+                     choices=["pause", "resume", "status"])
+    sub.set_defaults(func=cmd_sending)
 
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show Claude usage and quota")

@@ -572,6 +572,82 @@ async def get_prospects():
     return rows
 
 
+def _state():
+    from harvey.state import StateManager
+    return StateManager(db_path=str(DB_PATH))
+
+
+@app.get("/api/outbox")
+async def get_outbox_api():
+    """Outbox queue + kill-switch state for the Outbox tab."""
+    try:
+        state = _state()
+        await state.init_db()
+        return {
+            "paused": await state.get_setting("sending_paused"),
+            "pending": await state.get_outbox(status="pending_review", limit=100),
+            "approved": await state.get_outbox(status="approved", limit=50),
+            "sent": (await query_db(
+                "SELECT * FROM outbox WHERE status = 'sent' "
+                "ORDER BY sent_at DESC LIMIT 25")),
+            "failed": (await query_db(
+                "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
+                "ORDER BY updated_at DESC LIMIT 25")),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/outbox/approve-all")
+async def outbox_approve_all():
+    try:
+        state = _state()
+        await state.init_db()
+        n = await state.approve_outbox()
+        return {"success": True, "approved": n}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/outbox/{item_id}/approve")
+async def outbox_approve(item_id: str):
+    try:
+        state = _state()
+        await state.init_db()
+        n = await state.approve_outbox(item_id)
+        return {"success": bool(n)}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/outbox/{item_id}/reject")
+async def outbox_reject(item_id: str):
+    try:
+        state = _state()
+        await state.init_db()
+        await state.update_outbox_item(item_id, status="rejected")
+        return {"success": True}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/sending/{action}")
+async def sending_toggle(action: str):
+    if action not in ("pause", "resume"):
+        return JSONResponse({"success": False, "message": "unknown action"}, status_code=400)
+    try:
+        state = _state()
+        await state.init_db()
+        if action == "pause":
+            await state.set_setting("sending_paused", "paused from dashboard")
+        else:
+            await state.set_setting("sending_paused", "")
+            await state.set_setting("bounce_count", "0")
+        return {"success": True}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
 @app.get("/api/export/prospects.csv")
 async def export_prospects(all: bool = False, min_score: int = 0, email_status: str = ""):
     """Sequencer-ready CSV download of the prospect list."""
@@ -1097,6 +1173,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <button onclick="showTab('companies', this)">Companies</button>
   <button onclick="showTab('prospects', this)">Contacts</button>
   <button onclick="showTab('campaigns', this)">Campaigns</button>
+  <button onclick="showTab('outbox', this)">Outbox</button>
   <button onclick="showTab('conversations', this)">Conversations</button>
   <button onclick="showTab('activity', this)">Activity</button>
   <button onclick="showTab('usage', this)">Usage</button>
@@ -1144,6 +1221,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div id="campaigns" class="section">
   <div class="section-head"><h2>Campaigns</h2><p>Email sequences Harvey has written and deployed.</p></div>
   <div id="campaigns-list"></div>
+</div>
+
+<!-- Outbox -->
+<div id="outbox" class="section">
+  <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
+    <div><h2>Outbox</h2><p>Every outgoing email waits here for approval before it sends. Approve once you're happy — Harvey handles the schedule.</p></div>
+    <div style="display:flex;gap:8px;flex-shrink:0">
+      <button class="btn btn-primary btn-sm" onclick="outboxApproveAll()">Approve all pending</button>
+    </div>
+  </div>
+  <div id="outbox-banner"></div>
+  <div id="outbox-list"></div>
 </div>
 
 <!-- Conversations -->
@@ -1421,6 +1510,7 @@ function loadCurrentTab() {
     case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
+    case 'outbox': loadOutbox(); break;
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
@@ -1739,6 +1829,94 @@ async function loadUsage() {
   }
 }
 
+async function loadOutbox() {
+  const data = await api('/api/outbox');
+  const banner = document.getElementById('outbox-banner');
+  const list = document.getElementById('outbox-list');
+  if (!data) { list.innerHTML = offlineState(); return; }
+
+  if (data.paused) {
+    banner.innerHTML = '<div class="card" style="border-color:var(--red)">' +
+      '<h2 style="color:var(--red)">&#9888; Sending paused</h2>' +
+      '<p style="color:var(--text-2);font-size:13px;margin-bottom:12px">' + escHtml(data.paused) + '</p>' +
+      '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'resume\')">Resume sending</button></div>';
+  } else {
+    banner.innerHTML = '<div style="display:flex;justify-content:flex-end;margin-bottom:12px">' +
+      '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'pause\')">Pause all sending</button></div>';
+  }
+
+  let html = '';
+  const pending = data.pending || [];
+  if (pending.length) {
+    html += '<div class="card"><h2>Awaiting approval (' + pending.length + ')</h2>';
+    for (const item of pending) {
+      html += '<div style="border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px">' +
+        '<div style="display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:8px">' +
+          '<div style="font-size:13px"><b>' + escHtml(item.to_email) + '</b>' +
+            ' <span class="muted">&middot; step ' + item.step + ' (' + escHtml(item.kind) + ')' +
+            ' &middot; sends ' + formatDate(item.send_at) + '</span></div>' +
+          '<div style="display:flex;gap:6px;flex-shrink:0">' +
+            '<button class="btn btn-primary btn-sm" onclick="outboxAct(\'' + item.id + '\',\'approve\')">Approve</button>' +
+            '<button class="btn btn-secondary btn-sm" onclick="outboxAct(\'' + item.id + '\',\'reject\')">Reject</button>' +
+          '</div></div>' +
+        '<div style="font-size:13px;font-weight:600;margin-bottom:6px">' + escHtml(item.subject) + '</div>' +
+        '<div style="font-size:13px;color:var(--text-2);white-space:pre-wrap">' + escHtml(item.body) + '</div>' +
+      '</div>';
+    }
+    html += '</div>';
+  } else {
+    html += '<div class="card"><h2>Awaiting approval</h2>' +
+      '<p style="color:var(--text-3);font-size:13px">Nothing to review. New drafts land here before they can send.</p></div>';
+  }
+
+  const table = (title, rows, cols) => {
+    if (!rows || !rows.length) return '';
+    let h = '<div class="card"><h2>' + title + '</h2><div class="table-card"><table><thead><tr>' +
+      cols.map(c => '<th>' + c[0] + '</th>').join('') + '</tr></thead><tbody>';
+    for (const r of rows) {
+      h += '<tr>' + cols.map(c => '<td' + (c[2] ? ' class="muted"' : '') + '>' +
+        escHtml(String(c[1](r) ?? '')) + '</td>').join('') + '</tr>';
+    }
+    return h + '</tbody></table></div></div>';
+  };
+
+  html += table('Approved &amp; scheduled', data.approved, [
+    ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
+    ['Sends', r => formatDate(r.send_at), true],
+  ]);
+  html += table('Recently sent', data.sent, [
+    ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
+    ['Sent', r => formatDate(r.sent_at), true],
+  ]);
+  html += table('Failed / rejected / cancelled', data.failed, [
+    ['To', r => r.to_email], ['Status', r => r.status],
+    ['Reason', r => r.error, true], ['Updated', r => formatDate(r.updated_at), true],
+  ]);
+
+  list.innerHTML = html;
+}
+
+async function outboxAct(id, action) {
+  const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
+  if (data && data.success) showToast(action === 'approve' ? 'Approved — will send on schedule.' : 'Rejected.', 'success');
+  else showToast('Action failed.', 'error');
+  loadOutbox();
+}
+
+async function outboxApproveAll() {
+  const data = await api('/api/outbox/approve-all', {method: 'POST'});
+  if (data && data.success) showToast('Approved ' + data.approved + ' email(s).', 'success');
+  else showToast('Approve-all failed.', 'error');
+  loadOutbox();
+}
+
+async function sendingToggle(action) {
+  const data = await api('/api/sending/' + action, {method: 'POST'});
+  if (data && data.success) showToast(action === 'pause' ? 'Sending paused.' : 'Sending resumed.', 'success');
+  else showToast('Failed.', 'error');
+  loadOutbox();
+}
+
 async function loadCompanies() {
   companyDrill = false;
   const el = document.getElementById('companies-list');
@@ -1929,6 +2107,7 @@ setInterval(() => {
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
+    case 'outbox': loadOutbox(); break;
     case 'controls': loadLogs(); break;
     // settings & help: never auto-refreshed (user may be typing)
   }

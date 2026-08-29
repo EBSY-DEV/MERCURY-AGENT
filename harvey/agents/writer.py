@@ -1,21 +1,48 @@
-"""Writer — crafts personalized email sequences."""
+"""Writer — crafts personalized email sequences.
+
+With a native mail provider (Gmail/SMTP), email 1 is written PER PROSPECT
+from grounded facts — the company's own description, detected tech stack,
+and buying signals — instead of one merge-tag template shared by a whole
+batch. Mass-templated "token-swap" mail is exactly what inbox filters now
+cluster and junk; a specific, verifiable first line is what earns replies.
+Steps 2-3 stay campaign-level (proof point + breakup are less personal by
+design). Every draft still passes the deterministic pre-send gate.
+"""
 
 import json
 import logging
+from datetime import datetime, timezone
 
 from harvey.brain import Brain
 from harvey.config import HarveyConfig
+from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.writer")
 
+# Native mode: one Claude call per prospect for email 1, so batches stay
+# small — the rest of the 'new' pool is picked up on later cycles.
+NATIVE_BATCH_CAP = 8
+LEGACY_BATCH_CAP = 50
+
 
 class Writer:
-    def __init__(self, brain: Brain, state: StateManager, config: HarveyConfig):
+    def __init__(
+        self,
+        brain: Brain,
+        state: StateManager,
+        config: HarveyConfig,
+        env=None,
+    ):
         self.brain = brain
         self.state = state
         self.config = config
+        self.env = env
+
+    @property
+    def is_native(self) -> bool:
+        return self.config.channels.email.provider in NATIVE_PROVIDERS
 
     async def run(self):
         """Create email campaigns for prospects that need outreach."""
@@ -77,6 +104,11 @@ class Writer:
             for p in prospects:
                 await self.state.update_prospect_status(p.id, "queued")
 
+            # Native providers: replace the shared template for email 1 with
+            # a per-prospect draft grounded in that company's actual facts.
+            if self.is_native:
+                await self._personalize_first_emails(campaign_id, prospects)
+
             await self.state.log_action(
                 action_type="write_campaign",
                 agent="writer",
@@ -91,6 +123,123 @@ class Writer:
                 f"Writer: Campaign '{batch_name}' created with "
                 f"{len(sequence)} emails for {len(prospects)} prospects."
             )
+
+    async def _personalize_first_emails(self, campaign_id: str, prospects: list):
+        """Draft a grounded, per-prospect email 1 and stage it in the outbox.
+
+        The outbox unique index means the sender's later template staging
+        can't overwrite these rows — a personalized draft always wins the
+        (campaign, prospect, step 1) slot. If a draft fails, the slot stays
+        empty and the sender falls back to the campaign template.
+        """
+        require_approval = getattr(
+            self.config.channels.email, "require_approval", True
+        )
+        status = "pending_review" if require_approval else "approved"
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        provider = self.config.channels.email.provider
+
+        drafted = 0
+        for prospect in prospects:
+            try:
+                draft = await self._write_personal_email(prospect)
+            except Exception as e:
+                logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
+                continue
+            if not draft:
+                continue
+            item_id = await self.state.add_outbox_item(
+                prospect_id=prospect.id,
+                campaign_id=campaign_id,
+                step=1,
+                to_email=prospect.email,
+                subject=draft["subject"],
+                body=draft["body"],
+                send_at=now,
+                status=status,
+                provider=provider,
+            )
+            if item_id:
+                drafted += 1
+
+        if drafted:
+            logger.info(
+                f"Writer: drafted {drafted} personalized first email(s) "
+                f"({'awaiting approval' if require_approval else 'approved'})."
+            )
+
+    async def _write_personal_email(self, prospect) -> dict | None:
+        """One grounded draft for one person. Facts in, one email out."""
+        facts = [
+            f"- Name: {prospect.full_name()}",
+            f"- Title: {prospect.title}",
+            f"- Company: {prospect.company}",
+        ]
+        if prospect.industry:
+            facts.append(f"- Industry: {prospect.industry}")
+
+        company = None
+        if prospect.company_id:
+            try:
+                company = await self.state.get_company(prospect.company_id)
+            except Exception:
+                company = None
+        if company:
+            if company.description:
+                facts.append(f"- What the company says about itself: {company.description}")
+            if company.tech_stack:
+                facts.append(f"- Tools detected on their website: {', '.join(company.tech_stack[:6])}")
+            for signal in company.signals[:3]:
+                facts.append(
+                    f"- Signal ({signal.get('type', 'signal')}): {signal.get('detail', '')}"
+                )
+        if prospect.personalization_notes:
+            facts.append(f"- Research notes: {prospect.personalization_notes}")
+
+        prompt = self.brain.load_prompt(
+            "writer",
+            product_name=self.config.product.name,
+            product_description=self.config.product.description,
+            product_benefits="\n".join(f"- {b}" for b in self.config.product.key_benefits),
+            product_pricing=self.config.product.pricing,
+            persona_name=self.config.persona.name,
+            persona_company=self.config.persona.company,
+            persona_role=self.config.persona.role,
+            persona_tone=self.config.persona.tone,
+        ) or ""
+        if self.skills:
+            prompt += "\n\n" + self.skills
+
+        prompt += f"""
+
+Write ONE cold email (the very first touch) to this specific person.
+
+FACTS — everything you know about them. Every claim about the prospect in
+your email must come from these facts. If a fact isn't listed here, you
+don't know it — do not invent funding rounds, mutual contacts, metrics,
+or anything else:
+{chr(10).join(facts)}
+
+Requirements:
+- Under 75 words. One specific observation from the FACTS above, one
+  question. No pitch, no product name.
+- Write the actual text (no merge variables — you know their name/company).
+- Subject: lowercase, 2-5 words.
+- Follow every STRICT EMAIL RULE above.
+
+Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
+
+        result = await self.brain.think_json(
+            prompt, session_id="harvey-writer",
+            agent="writer", task="personal_email",
+        )
+        if not isinstance(result, dict):
+            return None
+        subject = str(result.get("subject") or "").strip()
+        body = str(result.get("body") or "").strip()
+        if not subject or not body:
+            return None
+        return {"subject": subject[:120], "body": body[:2000]}
 
     async def _write_sequence(self, prospects: list) -> list[EmailStep]:
         """Ask the brain to write a 3-email sequence."""
@@ -218,12 +367,8 @@ Return ONLY a JSON array (no markdown fences, no commentary):
                 batches[key] = []
             batches[key].append(prospect)
 
-        # Cap each batch at 50 prospects (Instantly best practice)
-        capped = {}
-        for key, group in batches.items():
-            if len(group) > 50:
-                capped[key] = group[:50]
-            else:
-                capped[key] = group
-
-        return capped
+        # Cap batch size. Native mode stays small because email 1 is drafted
+        # per prospect (one Claude call each); leftovers ride the next cycle.
+        # Small segments also outperform blasts on deliverability.
+        cap = NATIVE_BATCH_CAP if self.is_native else LEGACY_BATCH_CAP
+        return {key: group[:cap] for key, group in batches.items()}
