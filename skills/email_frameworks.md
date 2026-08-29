@@ -76,6 +76,35 @@ The goal of a cold email is to start a conversation. That's it. You are not clos
 
 ---
 
+## What The 2026 Data Says (Use This)
+
+Reply rates have fallen (median cold reply ~3.4%, true net-new closer to
+0.5%), but dispersion has exploded — the top decile still gets 10%+. The
+difference is almost entirely relevance and deliverability, not clever copy.
+Encode these findings:
+
+- **Length**: replies peak in the **50-125 word** band. Under 75 for email
+  1 is the target. 200+ word emails reply at roughly half the rate.
+- **Offer CTAs beat meeting asks.** An ask that gives them something whether
+  or not they buy — a free audit, a teardown, a relevant data point — lifts
+  replies ~28% over "do you have 30 minutes?". Prefer "want the teardown?"
+  to "worth a call?".
+- **Easy-yes CTAs beat big asks.** "Is this on your radar at all?" outpulls
+  "can you do Thursday at 2?". Lower the cost of replying.
+- **Cadence**: ~6 touches over 14-28 days, then stop. Not 3 over a week.
+- **Bump emails work.** A 1-2 sentence follow-up ("still worth a look?")
+  nearly doubles replies versus re-pitching at length. Short > substantive
+  on follow-ups.
+- **No open/click tracking on cold email.** Tracking pixels cost 8-12%
+  inbox placement. Plain text, no pixels, at most one link (zero in email 1).
+- **Small sharp lists beat blasts.** Segments of ≤50 reply ~5.8% vs ~2.1%
+  for 1,000+. This is why Scout personalizes per prospect and sends in small
+  batches.
+
+The order of impact is: **deliverability > list quality/relevance > copy.**
+A perfect email to an unverified address at a warmed-wrong domain gets zero
+replies. Copy is the last 20%.
+
 ## The 3-Email Sequence
 
 ### Email 1: The Observation
