@@ -218,6 +218,30 @@ MIGRATIONS: list[str] = [
     CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_events_request
         ON usage_events(request_key) WHERE request_key != '';
     """,
+    # ── v4: honest email statuses + per-domain pattern cache ──
+    """
+    -- verified: a provider confirmed the mailbox exists
+    -- risky:    catch-all / accept-all domain — sendable only in low volume
+    -- guess:    pattern guess, never verified — never auto-sent
+    -- invalid:  provider said undeliverable
+    ALTER TABLE prospects ADD COLUMN email_status TEXT DEFAULT '';
+
+    -- Backfill: the old email_verified flag over-reported (pattern guesses
+    -- at any MX-bearing domain were marked verified), so every existing
+    -- address is downgraded to an honest 'guess' and must re-verify.
+    UPDATE prospects SET email_status = 'guess', email_verified = 0
+        WHERE email != '';
+
+    CREATE TABLE IF NOT EXISTS email_patterns (
+        domain TEXT PRIMARY KEY,
+        pattern TEXT DEFAULT '',
+        source TEXT DEFAULT '',
+        confidence REAL DEFAULT 0.0,
+        mx_type TEXT DEFAULT '',
+        is_catch_all INTEGER DEFAULT -1,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -342,6 +366,7 @@ class StateManager:
         d = dict(row)
         d["email_verified"] = bool(d.get("email_verified", 0))
         d["phone_verified"] = bool(d.get("phone_verified", 0))
+        d["email_status"] = d.get("email_status") or ""
         return Prospect(**d)
 
     async def add_prospect(self, prospect: Prospect) -> str:
@@ -355,15 +380,16 @@ class StateManager:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO prospects
                    (id, company_id, first_name, last_name, email, email_verified,
-                    phone, phone_verified, linkedin_url, title, seniority,
-                    department, source, source_url, status, score,
+                    email_status, phone, phone_verified, linkedin_url, title,
+                    seniority, department, source, source_url, status, score,
                     personalization_notes, company, industry, company_size,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     prospect.id, prospect.company_id,
                     prospect.first_name, prospect.last_name,
                     prospect.email, int(prospect.email_verified),
+                    prospect.email_status,
                     prospect.phone, int(prospect.phone_verified),
                     prospect.linkedin_url, prospect.title,
                     prospect.seniority, prospect.department,
@@ -433,6 +459,77 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return self._prospect_from_row(row) if row else None
+
+    async def update_prospect_email(
+        self, prospect_id: str, email: str, email_status: str
+    ):
+        """Set a prospect's email + honesty status (verified/risky/guess/invalid)."""
+        async with self._connect() as db:
+            await db.execute(
+                """UPDATE prospects
+                   SET email = ?, email_status = ?, email_verified = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    _norm(email), email_status,
+                    1 if email_status == "verified" else 0,
+                    _utcnow().isoformat(), prospect_id,
+                ),
+            )
+            await db.commit()
+
+    # ── Email pattern cache (per-domain) ──
+
+    async def get_email_pattern(self, domain: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM email_patterns WHERE domain = ?", (_norm(domain),)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def save_email_pattern(
+        self,
+        domain: str,
+        pattern: str = "",
+        source: str = "",
+        confidence: float = 0.0,
+        mx_type: str = "",
+        is_catch_all: int | None = None,
+    ):
+        """Upsert what we've learned about a domain's email conventions.
+
+        Only overwrites the stored pattern when the new one has equal or
+        higher confidence; mx_type/is_catch_all always refresh.
+        """
+        domain = _norm(domain)
+        if not domain:
+            return
+        async with self._connect() as db:
+            await db.execute(
+                """INSERT INTO email_patterns
+                       (domain, pattern, source, confidence, mx_type, is_catch_all, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(domain) DO UPDATE SET
+                       pattern = CASE WHEN excluded.confidence >= email_patterns.confidence
+                                       AND excluded.pattern != ''
+                                      THEN excluded.pattern ELSE email_patterns.pattern END,
+                       source = CASE WHEN excluded.confidence >= email_patterns.confidence
+                                      AND excluded.pattern != ''
+                                     THEN excluded.source ELSE email_patterns.source END,
+                       confidence = MAX(email_patterns.confidence, excluded.confidence),
+                       mx_type = CASE WHEN excluded.mx_type != ''
+                                      THEN excluded.mx_type ELSE email_patterns.mx_type END,
+                       is_catch_all = CASE WHEN excluded.is_catch_all != -1
+                                           THEN excluded.is_catch_all
+                                           ELSE email_patterns.is_catch_all END,
+                       updated_at = CURRENT_TIMESTAMP""",
+                (
+                    domain, pattern, source, float(confidence), mx_type,
+                    -1 if is_catch_all is None else int(is_catch_all),
+                ),
+            )
+            await db.commit()
 
     async def prospect_exists(
         self, email: str = "", linkedin_url: str = "",

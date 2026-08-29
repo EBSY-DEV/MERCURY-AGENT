@@ -17,6 +17,8 @@ class Prospect(BaseModel):
     last_name: str = ""        # required for a valid contact
     email: str = ""
     email_verified: bool = False
+    # verified / risky (catch-all) / guess (never auto-sent) / invalid / ""
+    email_status: str = ""
     phone: str = ""
     phone_verified: bool = False
     linkedin_url: str = ""

@@ -17,6 +17,12 @@ EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 # we never re-send to someone already contacted, replied, opted out, or lost.
 SENDABLE_STATUSES = {"new", "queued"}
 
+# Email confidence levels safe to send to. "verified" only by default;
+# "risky" (catch-all domains) is opt-in via config. Never send to a "guess"
+# or "invalid" address — that bounces and burns the sending domain.
+SENDABLE_EMAIL_STATUSES = {"verified"}
+SENDABLE_EMAIL_STATUSES_WITH_RISKY = {"verified", "risky"}
+
 
 class Sender:
     def __init__(
@@ -125,9 +131,15 @@ class Sender:
             logger.error(f"Sender: Failed to set emails for campaign {campaign_id}")
             return
 
-        # 3. Add leads — validated, deduped, and only never-contacted prospects
+        # 3. Add leads — validated, deduped, never-contacted, deliverable-only
+        allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
+        sendable_email = (
+            SENDABLE_EMAIL_STATUSES_WITH_RISKY if allow_risky
+            else SENDABLE_EMAIL_STATUSES
+        )
         prospects = []
         seen_emails: set[str] = set()
+        skipped_unverified = 0
         for prospect_id in campaign.prospect_ids:
             prospect = await self.state.get_prospect(prospect_id)
             if not prospect or not prospect.email:
@@ -144,8 +156,23 @@ class Sender:
                     f"Sender: Skipping {email} (status '{prospect.status}' is not sendable)."
                 )
                 continue
+            # Deliverability gate: never send to unverified/guessed addresses —
+            # bounces are the fastest way to torch a sending domain.
+            if (prospect.email_status or "guess") not in sendable_email:
+                skipped_unverified += 1
+                logger.debug(
+                    f"Sender: Skipping {email} (email_status "
+                    f"'{prospect.email_status or 'guess'}' not deliverable)."
+                )
+                continue
             seen_emails.add(email)
             prospects.append(prospect)
+
+        if skipped_unverified:
+            logger.info(
+                f"Sender: Held back {skipped_unverified} prospect(s) with "
+                f"unverified emails from '{campaign.name}'."
+            )
 
         if not prospects:
             # Retry path: leads were already staged and marked 'contacted'

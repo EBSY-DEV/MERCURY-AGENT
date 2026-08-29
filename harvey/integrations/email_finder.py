@@ -1,9 +1,22 @@
-"""Email discovery — find email addresses without paid tools.
+"""Email discovery — pattern-first, verify-once, honest about confidence.
 
-Verification order:
-1. Hunter.io (if HUNTER_API_KEY is set) — most reliable.
-2. SMTP RCPT-TO probing — free fallback, degrades gracefully.
-3. Pattern best-guess — when nothing can be verified.
+Raw SMTP probing is largely dead against Google Workspace and Microsoft
+365 (which host most B2B mail): they tarpit probers or accept every
+recipient and bounce later. So instead of brute-forcing every name
+permutation, this pipeline:
+
+1. Classifies the domain by its MX host (google / microsoft / gateway / other).
+2. Derives the domain's email PATTERN once — from cache, then Hunter's
+   free domain-search, then known addresses scraped off the site, else a
+   sensible default — collapsing N guesses to one candidate.
+3. Verifies that single candidate through the best available channel for
+   the domain type: a real-verdict API (Reoon, ZeroBounce for the big
+   providers), Hunter, or SMTP for small self-hosted servers.
+4. Detects catch-all domains and buckets them as ``risky`` instead of
+   pretending they're verified.
+
+Every result carries an honest status: verified / risky / guess / invalid.
+Only ``verified`` (and optionally ``risky``) should ever be emailed.
 """
 
 import asyncio
@@ -11,6 +24,7 @@ import logging
 import os
 import random
 import re
+from dataclasses import dataclass
 from typing import Optional
 
 import dns.resolver
@@ -19,16 +33,47 @@ import httpx
 
 logger = logging.getLogger("harvey.email_finder")
 
-# Cache MX records per domain to avoid repeated lookups.
-# Failed lookups are cached as None so we don't hammer DNS.
+# Cache MX host + type per domain to avoid repeated lookups.
 _mx_cache: dict[str, Optional[str]] = {}
 
-HUNTER_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
-HUNTER_MAX_RETRIES = 3
+API_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+
+# Named email-format patterns → builder. {f}=first, {l}=last, {fi}=first initial,
+# {li}=last initial. Ordered by real-world prevalence for the default fallback.
+PATTERN_BUILDERS = {
+    "{f}.{l}": lambda f, l: f"{f}.{l}",
+    "{f}{l}": lambda f, l: f"{f}{l}",
+    "{fi}{l}": lambda f, l: f"{f[0]}{l}",
+    "{f}": lambda f, l: f"{f}",
+    "{fi}.{l}": lambda f, l: f"{f[0]}.{l}",
+    "{f}_{l}": lambda f, l: f"{f}_{l}",
+    "{l}": lambda f, l: f"{l}",
+    "{l}.{f}": lambda f, l: f"{l}.{f}",
+    "{f}-{l}": lambda f, l: f"{f}-{l}",
+    "{l}{fi}": lambda f, l: f"{l}{f[0]}",
+}
+DEFAULT_PATTERN = "{f}.{l}"
+
+
+@dataclass
+class EmailResult:
+    """Outcome of an email lookup. status is the source of truth."""
+    email: str
+    status: str          # verified / risky / guess / invalid
+    pattern: str = ""
+    mx_type: str = ""
+
+    @property
+    def verified(self) -> bool:
+        return self.status == "verified"
+
+    @property
+    def sendable(self) -> bool:
+        """Safe to send cold: confirmed mailbox only (risky is opt-in elsewhere)."""
+        return self.status == "verified"
 
 
 def _clean_domain(domain: str) -> str:
-    """Normalize a domain: strip scheme, www, path, whitespace."""
     domain = (domain or "").strip().lower()
     domain = re.sub(r"^https?://", "", domain)
     domain = domain.split("/")[0].split("?")[0]
@@ -37,54 +82,68 @@ def _clean_domain(domain: str) -> str:
     return domain
 
 
-def generate_patterns(first_name: str, last_name: str, domain: str) -> list[str]:
-    """Generate common email patterns for a person at a domain."""
-    first = (first_name or "").lower().strip()
-    last = (last_name or "").lower().strip()
+def _clean_name_part(value: str) -> str:
+    return re.sub(r"[^a-z]", "", (value or "").lower())
+
+
+def build_email(pattern: str, first: str, last: str, domain: str) -> str:
+    """Render a named pattern into an address, or '' if it can't be built."""
+    first = _clean_name_part(first)
+    last = _clean_name_part(last)
     domain = _clean_domain(domain)
-
-    # Remove non-alpha characters BEFORE the empty check — otherwise names
-    # with no ascii letters slip through and first[0] raises IndexError.
-    first = re.sub(r"[^a-z]", "", first)
-    last = re.sub(r"[^a-z]", "", last)
-
     if not first or not last or not domain:
-        return []
+        return ""
+    builder = PATTERN_BUILDERS.get(pattern)
+    if not builder:
+        return ""
+    try:
+        local = builder(first, last)
+    except IndexError:
+        return ""
+    return f"{local}@{domain}" if local else ""
 
-    patterns = [
-        f"{first}@{domain}",
-        f"{first}.{last}@{domain}",
-        f"{first}{last}@{domain}",
-        f"{first[0]}{last}@{domain}",
-        f"{first}{last[0]}@{domain}",
-        f"{first[0]}.{last}@{domain}",
-        f"{last}.{first}@{domain}",
-        f"{last}@{domain}",
-        f"{first}_{last}@{domain}",
-        f"{first}-{last}@{domain}",
-    ]
-    # Dedupe while preserving order (short names can collide).
-    return list(dict.fromkeys(patterns))
+
+def generate_patterns(first_name: str, last_name: str, domain: str) -> list[str]:
+    """All candidate addresses for a person, most-likely first (deduped)."""
+    out = []
+    for pattern in PATTERN_BUILDERS:
+        email = build_email(pattern, first_name, last_name, domain)
+        if email:
+            out.append(email)
+    return list(dict.fromkeys(out))
+
+
+# ── MX classification ──
+
+def classify_mx(mx_host: str) -> str:
+    """Bucket a domain by its mail host — decides the verification strategy."""
+    if not mx_host:
+        return "none"
+    h = mx_host.lower()
+    if "google" in h or "googlemail" in h or "aspmx.l" in h:
+        return "google"
+    if "outlook" in h or "protection.outlook" in h or "microsoft" in h:
+        return "microsoft"
+    if any(g in h for g in ("pphosted", "mimecast", "barracuda", "proofpoint",
+                            "messagelabs", "cisco", "fortinet", "trendmicro")):
+        return "gateway"
+    return "other"
 
 
 async def get_mx_host(domain: str) -> Optional[str]:
-    """Get the primary MX host for a domain."""
+    """Primary MX host for a domain (cached; None on failure)."""
     domain = _clean_domain(domain)
     if not domain:
         return None
     if domain in _mx_cache:
         return _mx_cache[domain]
-
     try:
         loop = asyncio.get_event_loop()
         answers = await loop.run_in_executor(
             None, lambda: dns.resolver.resolve(domain, "MX")
         )
         records = sorted(answers, key=lambda x: x.preference)
-        if not records:
-            _mx_cache[domain] = None
-            return None
-        mx_host = str(records[0].exchange).rstrip(".")
+        mx_host = str(records[0].exchange).rstrip(".") if records else None
         _mx_cache[domain] = mx_host or None
         return _mx_cache[domain]
     except Exception as e:
@@ -93,43 +152,221 @@ async def get_mx_host(domain: str) -> Optional[str]:
         return None
 
 
-async def verify_email_smtp(email: str) -> bool:
-    """Verify an email exists via SMTP RCPT TO check.
+# ── Pattern derivation ──
 
-    Note: Many servers don't support this (catch-all domains, etc.)
-    so a failed check doesn't guarantee the email is invalid.
-    A successful check is a strong signal though.
+def infer_pattern_from_email(email: str, first: str, last: str) -> Optional[str]:
+    """Given one known address, work out which named pattern produced it."""
+    email = (email or "").strip().lower()
+    if "@" not in email:
+        return None
+    local = email.split("@", 1)[0]
+    first = _clean_name_part(first)
+    last = _clean_name_part(last)
+    if not first or not last:
+        return None
+    for pattern, builder in PATTERN_BUILDERS.items():
+        try:
+            if builder(first, last) == local:
+                return pattern
+        except IndexError:
+            continue
+    return None
+
+
+async def _hunter_domain_pattern(domain: str, api_key: str) -> Optional[tuple[str, float]]:
+    """Hunter's free domain-search returns the org's dominant email pattern.
+
+    Hunter formats it with {first}/{last}/{f} tokens; translate to ours.
+    Returns (named_pattern, confidence 0-1) or None.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+            resp = await client.get(
+                "https://api.hunter.io/v2/domain-search",
+                params={"domain": domain, "api_key": api_key, "limit": 1},
+            )
+    except httpx.HTTPError as e:
+        logger.debug(f"Hunter domain-search failed for {domain}: {e}")
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = (resp.json() or {}).get("data") or {}
+    except ValueError:
+        return None
+
+    hunter_pattern = data.get("pattern") or ""
+    translated = _translate_hunter_pattern(hunter_pattern)
+    if translated:
+        # Hunter's presence of a pattern is a strong signal; scale by how
+        # many known emails back it (capped).
+        n = len(data.get("emails") or [])
+        confidence = min(0.7 + 0.05 * n, 0.95)
+        return translated, confidence
+    return None
+
+
+def _translate_hunter_pattern(hunter_pattern: str) -> Optional[str]:
+    """Map Hunter's {first}.{last}-style tokens to our named patterns."""
+    if not hunter_pattern:
+        return None
+    p = hunter_pattern.lower().strip()
+    mapping = {
+        "{first}.{last}": "{f}.{l}",
+        "{first}{last}": "{f}{l}",
+        "{f}{last}": "{fi}{l}",
+        "{first}": "{f}",
+        "{f}.{last}": "{fi}.{l}",
+        "{first}_{last}": "{f}_{l}",
+        "{last}": "{l}",
+        "{last}.{first}": "{l}.{f}",
+        "{first}-{last}": "{f}-{l}",
+        "{last}{f}": "{l}{fi}",
+    }
+    return mapping.get(p)
+
+
+def _hunter_api_key() -> str:
+    return os.getenv("HUNTER_API_KEY", "").strip()
+
+
+async def derive_pattern(
+    domain: str,
+    known_emails: Optional[list[tuple[str, str, str]]] = None,
+    state=None,
+) -> tuple[str, str, float]:
+    """Determine a domain's email pattern. Returns (pattern, source, confidence).
+
+    Order: DB cache → a known address for this domain (scraped mailto,
+    GitHub, etc.) → Hunter domain-search → default. This is the step that
+    collapses six guesses to one and is where free tiers stretch furthest.
+    """
+    domain = _clean_domain(domain)
+
+    if state is not None:
+        try:
+            cached = await state.get_email_pattern(domain)
+            if cached and cached.get("pattern"):
+                return cached["pattern"], cached.get("source", "cache"), cached.get("confidence", 0.6)
+        except Exception as e:
+            logger.debug(f"Pattern cache read failed for {domain}: {e}")
+
+    # A confirmed address for this domain reveals the pattern for free.
+    for email, first, last in known_emails or []:
+        if email.split("@")[-1].lower() == domain:
+            inferred = infer_pattern_from_email(email, first, last)
+            if inferred:
+                return inferred, "known_email", 0.9
+
+    key = _hunter_api_key()
+    if key:
+        result = await _hunter_domain_pattern(domain, key)
+        if result:
+            return result[0], "hunter_domain_search", result[1]
+
+    return DEFAULT_PATTERN, "default", 0.3
+
+
+# ── Verification channels ──
+
+async def verify_reoon(email: str, api_key: str) -> Optional[dict]:
+    """Reoon email-verifier — generous free tier, good catch-all flagging.
+
+    Returns {'status': ..., 'catch_all': bool} or None if unavailable.
+    Reoon 'status' values: valid / invalid / disabled / catch_all / unknown.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+            resp = await client.get(
+                "https://emailverifier.reoon.com/api/v1/verify",
+                params={"email": email, "key": api_key, "mode": "power"},
+            )
+    except httpx.HTTPError as e:
+        logger.debug(f"Reoon request failed for {email}: {e}")
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    status = str(data.get("status") or "").lower()
+    is_catch_all = bool(data.get("is_catch_all") or status == "catch_all")
+    return {"status": status, "catch_all": is_catch_all}
+
+
+async def verify_zerobounce(email: str, api_key: str) -> Optional[dict]:
+    """ZeroBounce — its 2026 engine is the reliable one for M365/Workspace catch-alls."""
+    try:
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+            resp = await client.get(
+                "https://api.zerobounce.net/v2/validate",
+                params={"email": email, "api_key": api_key},
+            )
+    except httpx.HTTPError as e:
+        logger.debug(f"ZeroBounce request failed for {email}: {e}")
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    status = str(data.get("status") or "").lower()
+    sub = str(data.get("sub_status") or "").lower()
+    return {"status": status, "catch_all": sub == "catch-all" or status == "catch-all"}
+
+
+async def verify_hunter(email: str, api_key: str) -> Optional[dict]:
+    try:
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+            resp = await client.get(
+                "https://api.hunter.io/v2/email-verifier",
+                params={"email": email, "api_key": api_key},
+            )
+    except httpx.HTTPError as e:
+        logger.debug(f"Hunter verify failed for {email}: {e}")
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = (resp.json() or {}).get("data") or {}
+    except ValueError:
+        return None
+    status = str(data.get("status") or data.get("result") or "").lower()
+    return {"status": status, "catch_all": bool(data.get("accept_all"))}
+
+
+async def verify_email_smtp(email: str) -> Optional[bool]:
+    """SMTP RCPT check — only trustworthy for small, self-hosted mail servers.
+
+    Returns True (accepted), False (rejected), or None (couldn't tell).
+    Port 25 is blocked on most cloud hosts, so this frequently returns None.
     """
     if "@" not in email:
         return False
     domain = email.rsplit("@", 1)[1]
     mx_host = await get_mx_host(domain)
     if not mx_host:
-        return False
-
+        return None
     smtp = aiosmtplib.SMTP(hostname=mx_host, port=25, timeout=10)
     try:
         await smtp.connect()
         await smtp.ehlo()
-
-        # Try VRFY first
-        try:
-            code, _ = await smtp.vrfy(email)
-            if code == 250:
-                return True
-        except Exception:
-            pass  # VRFY often disabled
-
-        # Fall back to MAIL FROM + RCPT TO
         await smtp.mail("verify@example.com")
-        code, message = await smtp.rcpt(email)
-
-        # 250 = accepted, 550 = rejected
-        return code == 250
-
+        code, _ = await smtp.rcpt(email)
+        if code == 250:
+            return True
+        if code in (550, 551, 553):
+            return False
+        return None
     except Exception as e:
         logger.debug(f"SMTP verification failed for {email}: {e}")
-        return False
+        return None
     finally:
         try:
             await smtp.quit()
@@ -137,146 +374,159 @@ async def verify_email_smtp(email: str) -> bool:
             pass
 
 
-def _hunter_api_key() -> str:
-    """Hunter is optional; absence just means we degrade to SMTP checks."""
-    return os.getenv("HUNTER_API_KEY", "").strip()
+async def detect_catch_all(domain: str) -> Optional[bool]:
+    """Probe a definitely-fake address; if accepted, the domain is catch-all.
 
-
-async def verify_email_hunter(email: str, api_key: str | None = None) -> Optional[bool]:
-    """Verify an email via Hunter.io.
-
-    Returns True (deliverable), False (undeliverable), or None
-    (unknown / Hunter unavailable / no API key) so callers can
-    degrade gracefully to SMTP verification.
+    Only works where SMTP probing works at all (small hosts). Returns None
+    when we can't tell.
     """
-    key = (api_key or _hunter_api_key())
-    if not key:
-        return None
-
-    def _redact(text: str) -> str:
-        return text.replace(key, "***REDACTED***") if text else ""
-
-    async with httpx.AsyncClient(timeout=HUNTER_TIMEOUT) as client:
-        for attempt in range(HUNTER_MAX_RETRIES + 1):
-            try:
-                resp = await client.get(
-                    "https://api.hunter.io/v2/email-verifier",
-                    params={"email": email, "api_key": key},
-                )
-            except httpx.HTTPError as e:
-                if attempt < HUNTER_MAX_RETRIES:
-                    delay = min(2 ** attempt, 15) * random.uniform(0.5, 1.5)
-                    logger.debug(
-                        f"Hunter request error for {email}: {_redact(str(e))}. "
-                        f"Retrying in {delay:.1f}s."
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-                logger.warning(
-                    f"Hunter verification unavailable for {email}: "
-                    f"{_redact(str(e))}"
-                )
-                return None
-
-            if resp.status_code in (429, 500, 502, 503, 504):
-                if attempt < HUNTER_MAX_RETRIES:
-                    retry_after = resp.headers.get("Retry-After")
-                    try:
-                        delay = min(float(retry_after), 30) if retry_after else 0
-                    except ValueError:
-                        delay = 0
-                    delay = delay or min(2 ** attempt, 15) * random.uniform(0.5, 1.5)
-                    await asyncio.sleep(delay)
-                    continue
-                logger.warning(f"Hunter API error {resp.status_code} for {email}.")
-                return None
-
-            if resp.status_code in (401, 403):
-                logger.warning(
-                    "Hunter API key rejected; falling back to SMTP verification."
-                )
-                return None
-
-            if resp.status_code >= 400:
-                logger.debug(f"Hunter API error {resp.status_code} for {email}.")
-                return None
-
-            try:
-                payload = resp.json()
-            except ValueError:
-                return None
-
-            data = payload.get("data") if isinstance(payload, dict) else None
-            if not isinstance(data, dict):
-                return None
-
-            status = data.get("status") or data.get("result")
-            if status in ("valid", "deliverable"):
-                return True
-            if status in ("invalid", "undeliverable"):
-                return False
-            return None  # risky / unknown / accept_all
-
+    fake = f"zz-no-such-user-{random.randint(10000, 99999)}@{_clean_domain(domain)}"
+    result = await verify_email_smtp(fake)
+    if result is True:
+        return True   # accepted a fake address → catch-all
+    if result is False:
+        return False  # rejected a fake address → not catch-all
     return None
 
+
+def _status_from_verdict(verdict: dict) -> Optional[str]:
+    """Map a provider verdict dict to our status, or None if inconclusive."""
+    if verdict.get("catch_all"):
+        return "risky"
+    status = verdict.get("status", "")
+    if status in ("valid", "deliverable"):
+        return "verified"
+    if status in ("invalid", "undeliverable", "disabled"):
+        return "invalid"
+    if status in ("catch_all", "catch-all", "accept_all"):
+        return "risky"
+    return None  # unknown / risky-unknown — inconclusive
+
+
+async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str], bool]:
+    """Run the best available verifier for this domain type.
+
+    Returns (status_or_None, catch_all_seen). Order is chosen so scarce
+    paid-ish credits are spent only where they actually resolve the domain.
+    """
+    reoon_key = getattr(env, "reoon_api_key", "") if env else ""
+    zerobounce_key = getattr(env, "zerobounce_api_key", "") if env else ""
+    hunter_key = _hunter_api_key()
+
+    catch_all_seen = False
+
+    # Big providers: ZeroBounce first (its engine cracks their catch-alls),
+    # then Reoon, then Hunter. SMTP is useless/misleading here.
+    if mx_type in ("google", "microsoft", "gateway"):
+        channels = []
+        if zerobounce_key:
+            channels.append(lambda: verify_zerobounce(email, zerobounce_key))
+        if reoon_key:
+            channels.append(lambda: verify_reoon(email, reoon_key))
+        if hunter_key:
+            channels.append(lambda: verify_hunter(email, hunter_key))
+        for channel in channels:
+            verdict = await channel()
+            if verdict is None:
+                continue
+            if verdict.get("catch_all"):
+                catch_all_seen = True
+            status = _status_from_verdict(verdict)
+            if status is not None:
+                return status, catch_all_seen
+        return None, catch_all_seen
+
+    # Small / self-hosted: Reoon → SMTP (still works here) → Hunter.
+    if reoon_key:
+        verdict = await verify_reoon(email, reoon_key)
+        if verdict:
+            if verdict.get("catch_all"):
+                catch_all_seen = True
+            status = _status_from_verdict(verdict)
+            if status is not None:
+                return status, catch_all_seen
+
+    smtp = await verify_email_smtp(email)
+    if smtp is True:
+        # Confirm it's not just a catch-all before trusting "verified".
+        if await detect_catch_all(email.split("@")[1]) is True:
+            return "risky", True
+        return "verified", catch_all_seen
+    if smtp is False:
+        return "invalid", catch_all_seen
+
+    if hunter_key:
+        verdict = await verify_hunter(email, hunter_key)
+        if verdict:
+            if verdict.get("catch_all"):
+                catch_all_seen = True
+            status = _status_from_verdict(verdict)
+            if status is not None:
+                return status, catch_all_seen
+
+    return None, catch_all_seen
+
+
+# ── Top-level entry point ──
 
 async def find_email(
     first_name: str,
     last_name: str,
     domain: str,
     verify: bool = True,
-) -> Optional[str]:
-    """Try to find a valid email for a person at a company domain.
+    env=None,
+    state=None,
+    known_emails: Optional[list[tuple[str, str, str]]] = None,
+) -> EmailResult:
+    """Find and honestly grade one email for a person at a company.
 
-    1. Generate common email patterns
-    2. Check MX records exist for domain
-    3. Verify each pattern (Hunter if configured, else SMTP)
-    4. Return first verified email, or best guess if verification unavailable
+    Returns an EmailResult whose ``status`` is verified / risky / guess /
+    invalid. When ``verify`` is False (or no verifier is configured), the
+    best pattern guess is returned as ``guess`` — never as verified.
     """
-    patterns = generate_patterns(first_name, last_name, domain)
-    if not patterns:
-        return None
+    domain = _clean_domain(domain)
+    if not (first_name and last_name and domain):
+        return EmailResult(email="", status="invalid")
 
-    # first.last@domain is the most common corporate pattern — use it as
-    # the consistent best guess everywhere.
-    clean = _clean_domain(domain)
-    first = re.sub(r"[^a-z]", "", (first_name or "").lower())
-    last = re.sub(r"[^a-z]", "", (last_name or "").lower())
-    best_guess = f"{first}.{last}@{clean}"
-
-    # First check if domain has MX records at all
-    mx_host = await get_mx_host(clean)
+    mx_host = await get_mx_host(domain)
     if not mx_host:
-        logger.info(f"No MX records for {clean}. Returning best guess.")
-        return best_guess
+        # No MX → cannot receive mail at all.
+        guess = build_email(DEFAULT_PATTERN, first_name, last_name, domain)
+        return EmailResult(email=guess, status="invalid", mx_type="none")
+
+    mx_type = classify_mx(mx_host)
+
+    pattern, source, confidence = await derive_pattern(
+        domain, known_emails=known_emails, state=state
+    )
+    candidate = build_email(pattern, first_name, last_name, domain)
+    if not candidate:
+        candidate = build_email(DEFAULT_PATTERN, first_name, last_name, domain)
+        pattern = DEFAULT_PATTERN
+
+    if state is not None:
+        try:
+            await state.save_email_pattern(
+                domain, pattern=pattern, source=source,
+                confidence=confidence, mx_type=mx_type,
+            )
+        except Exception as e:
+            logger.debug(f"Pattern cache write failed for {domain}: {e}")
 
     if not verify:
-        return best_guess
+        return EmailResult(email=candidate, status="guess", pattern=pattern, mx_type=mx_type)
 
-    use_hunter = bool(_hunter_api_key())
+    status, catch_all = await _verify_candidate(candidate, mx_type, env)
 
-    # Try to verify each pattern
-    for email in patterns:
-        logger.debug(f"Checking {email}...")
+    if catch_all and state is not None:
         try:
-            is_valid: Optional[bool] = None
-            if use_hunter:
-                is_valid = await verify_email_hunter(email)
-                if is_valid is None:
-                    # Hunter couldn't say — degrade to SMTP for this address
-                    is_valid = await verify_email_smtp(email)
-            else:
-                is_valid = await verify_email_smtp(email)
+            await state.save_email_pattern(domain, mx_type=mx_type, is_catch_all=1)
+        except Exception:
+            pass
 
-            if is_valid:
-                logger.info(f"Verified email: {email}")
-                return email
-        except Exception as e:
-            logger.debug(f"Verification error for {email}: {e}")
+    if status is None:
+        # Verification couldn't decide — an honest guess, never "verified".
+        status = "guess"
 
-        # Rate limit between checks (jittered so probes don't look scripted)
-        await asyncio.sleep(random.uniform(0.8, 2.0))
-
-    # If no verification worked, return the most common pattern
-    logger.info(f"No verified email found. Best guess: {best_guess}")
-    return best_guess
+    logger.info(f"Email for {first_name} {last_name}@{domain}: {candidate} [{status}]")
+    return EmailResult(email=candidate, status=status, pattern=pattern, mx_type=mx_type)

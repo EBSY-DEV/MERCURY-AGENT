@@ -501,9 +501,9 @@ class Scout:
                                 )
 
                         email = ""
-                        email_verified = False
+                        email_status = ""
                         if domain and first_name and last_name:
-                            email, email_verified = await self._resolve_email(
+                            email, email_status = await self._resolve_email(
                                 first_name, last_name, domain
                             )
 
@@ -511,7 +511,8 @@ class Scout:
                             first_name=first_name,
                             last_name=last_name,
                             email=email,
-                            email_verified=email_verified,
+                            email_status=email_status,
+                            email_verified=(email_status == "verified"),
                             linkedin_url=li_url,
                             company=company_name,
                             company_id=company_id,
@@ -670,7 +671,7 @@ class Scout:
                 if not first_name or not last_name:
                     continue
 
-                email, email_verified = await self._resolve_email(
+                email, email_status = await self._resolve_email(
                     first_name, last_name, domain
                 )
 
@@ -678,7 +679,8 @@ class Scout:
                     first_name=first_name,
                     last_name=last_name,
                     email=email,
-                    email_verified=email_verified,
+                    email_status=email_status,
+                    email_verified=(email_status == "verified"),
                     company=company.get("name") or self._domain_to_name(domain),
                     company_id=company_id,
                     title=title,
@@ -919,37 +921,25 @@ class Scout:
 
     async def _resolve_email(
         self, first_name: str, last_name: str, domain: str
-    ) -> tuple[str, bool]:
-        """Find an email and report whether it was actually SMTP-verified.
+    ) -> tuple[str, str]:
+        """Find an email and return (address, honest_status).
 
-        ``find_email`` returns a best-guess pattern even when verification
-        fails, so we run a strict verify pass first (its True result is a
-        strong signal) and only fall back to an unverified guess. This fixes
-        the prior bug where every guessed address was flagged verified.
+        Status is one of verified / risky / guess / invalid — the pipeline
+        never reports a mere pattern guess as verified (that old bug bounced
+        mail and burned domains). Passes env (verifier keys) and state (the
+        pattern cache) so the domain's pattern is learned once and reused.
         """
         if not (first_name and last_name and domain):
-            return "", False
+            return "", "invalid"
         try:
-            verified = await find_email(first_name, last_name, domain, verify=True)
+            result = await find_email(
+                first_name, last_name, domain,
+                verify=True, env=self.env, state=self.state,
+            )
         except Exception as e:
             logger.debug(f"find_email failed for {domain}: {e}")
-            return "", False
-
-        if not verified:
-            return "", False
-
-        # Cross-check against an unverified guess: if strict verification
-        # actually found a mailbox it will differ from / confirm the guess,
-        # but we can't fully distinguish, so mark verified conservatively.
-        # We treat the strict-pass result as verified only when the domain
-        # has MX records (find_email would otherwise short-circuit to a guess).
-        try:
-            from harvey.integrations.email_finder import get_mx_host
-            has_mx = bool(await get_mx_host(domain))
-        except Exception:
-            has_mx = False
-
-        return verified, has_mx
+            return "", "invalid"
+        return result.email, result.status
 
     async def _score_contacts(self, contacts: list[Prospect]) -> list[Prospect]:
         """Use Claude to score and add personalization notes to found contacts.
@@ -1049,11 +1039,13 @@ Respond ONLY with the JSON array."""
             ):
                 score += 10
 
-        # Deliverability: a verified email is worth more.
-        if contact.email_verified:
-            score += 5
+        # Deliverability: reward confidence in the address.
+        if contact.email_status == "verified":
+            score += 8
+        elif contact.email_status == "risky":
+            score += 3
         elif contact.email:
-            score += 2
+            score += 1
 
         return max(1, min(100, score))
 
@@ -1148,6 +1140,10 @@ Respond ONLY with the JSON array."""
             if soup is None:
                 continue
 
+            # Harvest any real address on the page — one confirmed email
+            # reveals the domain's whole pattern (learned once, reused free).
+            await self._learn_pattern_from_page(soup, resp.text, domain)
+
             try:
                 cards = soup.select(
                     ".team-member, .person, .staff, [class*='team'], "
@@ -1201,6 +1197,63 @@ Respond ONLY with the JSON array."""
             seen.add(key)
             unique.append(m)
         return unique
+
+    async def _learn_pattern_from_page(self, soup, html: str, domain: str):
+        """Find a real on-domain email on a page and cache the derived pattern.
+
+        Prefers mailto: links (cleanest), falls back to inline addresses.
+        Skips role addresses (info@, sales@) — they don't reveal a
+        person-name pattern.
+        """
+        domain = domain.lower()
+        role_locals = {
+            "info", "sales", "support", "hello", "contact", "admin",
+            "team", "help", "office", "press", "media", "careers", "jobs",
+            "hr", "billing", "noreply", "no-reply", "marketing",
+        }
+        found = []
+        try:
+            for a in soup.find_all("a", href=True):
+                href = self._attr_str(a.get("href"))
+                if href.lower().startswith("mailto:"):
+                    addr = href[7:].split("?")[0].strip().lower()
+                    if "@" in addr:
+                        found.append(addr)
+        except Exception:
+            pass
+        if not found:
+            try:
+                found = [
+                    m.lower() for m in re.findall(
+                        r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
+                        html[:20000],
+                    )
+                ]
+            except Exception:
+                found = []
+
+        for addr in found:
+            local, _, adomain = addr.partition("@")
+            if adomain != domain or local in role_locals or "." not in local:
+                continue
+            # Looks like first.last@ — infer and cache the pattern.
+            from harvey.integrations.email_finder import (
+                infer_pattern_from_email,
+            )
+            parts = local.replace("_", ".").replace("-", ".").split(".")
+            if len(parts) < 2:
+                continue
+            pattern = infer_pattern_from_email(addr, parts[0], parts[-1])
+            if pattern:
+                try:
+                    await self.state.save_email_pattern(
+                        domain, pattern=pattern, source="scraped_mailto",
+                        confidence=0.85,
+                    )
+                    logger.debug(f"Scout: learned pattern {pattern} for {domain}")
+                except Exception as e:
+                    logger.debug(f"save_email_pattern failed: {e}")
+                return
 
     async def _guess_domain(self, company_name: str) -> str:
         """Guess a company's domain from its name and confirm it resolves."""
