@@ -56,6 +56,10 @@ class ICPConfig(BaseModel):
     company_size: str
     titles: list[str]
     geography: list[str]
+    # Role keywords that indicate a company is in-market right now (a company
+    # hiring a "Head of Growth" is buying growth tooling). Empty → falls back
+    # to `titles`. Used for careers-page scanning and job-board discovery.
+    hiring_signals: list[str] = []
 
 
 class EmailChannelConfig(BaseModel):

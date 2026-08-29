@@ -29,6 +29,7 @@ import json
 import logging
 import random
 import re
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, quote_plus, urlparse
 
 import httpx
@@ -125,6 +126,9 @@ class Scout:
         strategies = []
         if self.config.channels.linkedin.enabled and self.env.linkedin_email:
             strategies.append(("linkedin", self._prospect_via_linkedin))
+        # Job boards first: hiring is the strongest intent signal, and the
+        # strategy self-skips when python-jobspy isn't installed.
+        strategies.append(("hiring_boards", self._prospect_via_hiring_boards))
         strategies.append(("profile_search", self._prospect_via_profile_search))
         strategies.append(("company_discovery", self._prospect_via_company_discovery))
 
@@ -655,48 +659,26 @@ class Scout:
                 source_url=company.get("source_url", ""),
             )
 
+            # Buying signals: what they run, and whether they're hiring for
+            # roles that suggest they're in-market. Signals are gold for
+            # personalization — reference something true and current.
+            signal_note = ""
             try:
-                team_members = await self._scrape_team_page(domain)
+                signal_note = await self._enrich_company_signals(
+                    company_id, domain, homepage_html=company.get("_homepage_html", "")
+                )
             except Exception as e:
-                logger.debug(f"Team scrape failed for {domain}: {e}")
-                team_members = []
+                logger.debug(f"Signal enrichment failed for {domain}: {e}")
 
-            for member in team_members:
-                title = member.get("title", "")
-                if not self._title_matches_icp(title):
-                    continue
-
-                first_name = member.get("first_name", "")
-                last_name = member.get("last_name", "")
-                if not first_name or not last_name:
-                    continue
-
-                email, email_status = await self._resolve_email(
-                    first_name, last_name, domain
-                )
-
-                prospect = Prospect(
-                    first_name=first_name,
-                    last_name=last_name,
-                    email=email,
-                    email_status=email_status,
-                    email_verified=(email_status == "verified"),
-                    company=company.get("name") or self._domain_to_name(domain),
-                    company_id=company_id,
-                    title=title,
-                    seniority=self._infer_seniority(title),
-                    industry=company.get("industry", default_industry),
-                    source="company_website",
-                    source_url=f"https://{domain}",
-                )
-
-                if not prospect.is_valid():
-                    continue
-                if await self._is_duplicate_prospect(prospect):
-                    continue
-
-                self._remember_prospect(prospect)
-                all_contacts.append(prospect)
+            contacts = await self._contacts_from_company(
+                company_id=company_id,
+                domain=domain,
+                company_name=company.get("name") or self._domain_to_name(domain),
+                industry=company.get("industry", default_industry),
+                signal_note=signal_note,
+                source="company_website",
+            )
+            all_contacts.extend(contacts)
 
         if not all_contacts:
             logger.info("Scout: No ICP-matching contacts found on team pages.")
@@ -1047,6 +1029,11 @@ Respond ONLY with the JSON array."""
         elif contact.email:
             score += 1
 
+        # Timely buying signals (hiring for a relevant role right now)
+        # outperform static fit — reward them strongly.
+        if "Signal: hiring" in (contact.personalization_notes or ""):
+            score += 10
+
         return max(1, min(100, score))
 
     # ── Shared utilities ──
@@ -1091,6 +1078,9 @@ Respond ONLY with the JSON array."""
         resp = await self._fetch(f"https://{domain}", timeout=SCRAPE_TIMEOUT, retries=2)
         if resp is None:
             return info
+
+        # Keep the raw HTML so signal detection reuses this fetch.
+        info["_homepage_html"] = resp.text
 
         soup = self._safe_soup(resp.text)
         if soup is None:
@@ -1197,6 +1187,298 @@ Respond ONLY with the JSON array."""
             seen.add(key)
             unique.append(m)
         return unique
+
+    async def _contacts_from_company(
+        self,
+        company_id: str,
+        domain: str,
+        company_name: str,
+        industry: str,
+        signal_note: str = "",
+        source: str = "company_website",
+    ) -> list[Prospect]:
+        """Team-page scrape → ICP-matched, email-resolved, deduped prospects."""
+        try:
+            team_members = await self._scrape_team_page(domain)
+        except Exception as e:
+            logger.debug(f"Team scrape failed for {domain}: {e}")
+            return []
+
+        contacts: list[Prospect] = []
+        for member in team_members:
+            title = member.get("title", "")
+            if not self._title_matches_icp(title):
+                continue
+
+            first_name = member.get("first_name", "")
+            last_name = member.get("last_name", "")
+            if not first_name or not last_name:
+                continue
+
+            email, email_status = await self._resolve_email(
+                first_name, last_name, domain
+            )
+
+            prospect = Prospect(
+                first_name=first_name,
+                last_name=last_name,
+                email=email,
+                email_status=email_status,
+                email_verified=(email_status == "verified"),
+                company=company_name,
+                company_id=company_id,
+                title=title,
+                seniority=self._infer_seniority(title),
+                industry=industry,
+                source=source,
+                source_url=f"https://{domain}",
+                personalization_notes=signal_note,
+            )
+
+            if not prospect.is_valid():
+                continue
+            if await self._is_duplicate_prospect(prospect):
+                continue
+
+            self._remember_prospect(prospect)
+            contacts.append(prospect)
+        return contacts
+
+    # ── Strategy 4: Job boards — companies hiring for signal roles ──
+
+    async def _prospect_via_hiring_boards(self) -> int:
+        """Discover companies via job postings — the strongest intent signal.
+
+        A company actively hiring a relevant role is in-market *right now*.
+        Uses python-jobspy when installed (optional dependency:
+        `pip install python-jobspy`); silently skipped otherwise.
+        """
+        try:
+            from jobspy import scrape_jobs
+        except ImportError:
+            logger.debug("Scout: python-jobspy not installed; skipping job boards.")
+            return 0
+
+        keywords = self._signal_role_keywords()
+        if not keywords:
+            return 0
+        search_term = keywords[0]
+        geo = self.config.icp.geography[0] if self.config.icp.geography else ""
+
+        logger.info(f"Scout: Searching job boards for '{search_term}' roles...")
+        loop = asyncio.get_event_loop()
+
+        def _search():
+            return scrape_jobs(
+                site_name=["indeed"],
+                search_term=search_term,
+                location=geo,
+                results_wanted=15,
+                hours_old=24 * 14,  # fresh signal only: last two weeks
+            )
+
+        try:
+            df = await asyncio.wait_for(
+                loop.run_in_executor(None, _search), timeout=120
+            )
+        except Exception as e:
+            logger.warning(f"Scout: job-board search failed: {e}")
+            return 0
+        if df is None or getattr(df, "empty", True):
+            return 0
+
+        default_industry = (
+            self.config.icp.industries[0] if self.config.icp.industries else ""
+        )
+        today = datetime.now(timezone.utc).date().isoformat()
+        all_contacts: list[Prospect] = []
+        companies_used = 0
+
+        try:
+            rows = df.to_dict("records")
+        except Exception:
+            return 0
+
+        seen_names: set[str] = set()
+        for row in rows:
+            if companies_used >= 5:
+                break
+            company_name = str(row.get("company") or "").strip()
+            job_title = str(row.get("title") or "").strip()[:80]
+            if not company_name or company_name.lower() in seen_names:
+                continue
+            seen_names.add(company_name.lower())
+
+            try:
+                domain = await self._guess_domain(company_name)
+            except Exception:
+                domain = ""
+            if not self._is_candidate_domain(domain):
+                continue
+            if await self.state.company_exists(domain):
+                self._seen_domains.add(domain)
+                continue
+            self._seen_domains.add(domain)
+            companies_used += 1
+
+            info = await self._scrape_company_info(domain)
+            company_id = await self._ensure_company(
+                name=info.get("name") or company_name,
+                domain=domain,
+                website=info.get("website", f"https://{domain}"),
+                description=info.get("description", ""),
+                industry=default_industry,
+                source="job_board",
+                source_url=str(row.get("job_url") or ""),
+            )
+
+            signal = {"type": "hiring", "detail": job_title, "found_at": today}
+            try:
+                await self.state.update_company_signals(
+                    company_id, new_signals=[signal]
+                )
+            except Exception as e:
+                logger.debug(f"update_company_signals failed: {e}")
+
+            signal_note = f"Signal: hiring {job_title} (posted on job board)"
+            from harvey.integrations.tech_detect import detect_tech
+            tech = detect_tech(info.get("_homepage_html", ""))
+            if tech:
+                await self.state.update_company_signals(company_id, tech_stack=tech)
+                signal_note += ". Tech on site: " + ", ".join(tech[:5])
+
+            contacts = await self._contacts_from_company(
+                company_id=company_id,
+                domain=domain,
+                company_name=info.get("name") or company_name,
+                industry=default_industry,
+                signal_note=signal_note[:400],
+                source="job_board",
+            )
+            all_contacts.extend(contacts)
+
+        if not all_contacts:
+            logger.info("Scout: job-board sweep found no ICP-matching contacts.")
+            return 0
+
+        scored = await self._score_contacts(all_contacts)
+        count = 0
+        for prospect in scored:
+            await self.state.add_prospect(prospect)
+            count += 1
+            logger.info(
+                f"Scout: Added {prospect.full_name()} ({prospect.title}) "
+                f"at {prospect.company} via job-board signal [score: {prospect.score}]"
+            )
+            if count >= MAX_PROSPECTS_PER_CYCLE:
+                break
+        return count
+
+    # ── Buying signals (tech stack + hiring) ──
+
+    def _signal_role_keywords(self) -> list[str]:
+        """Role keywords that indicate in-market intent (config or ICP titles)."""
+        keywords = [
+            k.strip().lower()
+            for k in (getattr(self.config.icp, "hiring_signals", None) or [])
+            if k.strip()
+        ]
+        if keywords:
+            return keywords
+        return [t.strip().lower() for t in self.config.icp.titles if t.strip()]
+
+    async def _enrich_company_signals(
+        self, company_id: str, domain: str, homepage_html: str = ""
+    ) -> str:
+        """Detect tech stack + hiring signals, persist them, return a note.
+
+        The returned note seeds prospects' personalization_notes so the
+        Writer references something true and current instead of flattery.
+        """
+        from harvey.integrations.tech_detect import detect_tech
+
+        if not homepage_html:
+            resp = await self._fetch(
+                f"https://{domain}", timeout=SCRAPE_TIMEOUT, retries=1
+            )
+            homepage_html = resp.text if resp is not None else ""
+
+        tech = detect_tech(homepage_html)
+
+        signals: list[dict] = []
+        try:
+            hiring_roles = await self._scrape_hiring_signals(domain)
+        except Exception as e:
+            logger.debug(f"Hiring scan failed for {domain}: {e}")
+            hiring_roles = []
+        today = datetime.now(timezone.utc).date().isoformat()
+        for role in hiring_roles:
+            signals.append({"type": "hiring", "detail": role, "found_at": today})
+
+        if tech or signals:
+            try:
+                await self.state.update_company_signals(
+                    company_id, tech_stack=tech, new_signals=signals
+                )
+            except Exception as e:
+                logger.debug(f"update_company_signals failed for {domain}: {e}")
+
+        notes = []
+        if hiring_roles:
+            notes.append("Signal: hiring " + ", ".join(hiring_roles[:2]))
+        if tech:
+            notes.append("Tech on site: " + ", ".join(tech[:5]))
+        note = ". ".join(notes)
+        if note:
+            logger.info(f"Scout: signals for {domain} — {note}")
+        return note[:400]
+
+    _CAREERS_PATHS = ("/careers", "/jobs", "/careers/", "/join-us", "/join",
+                      "/about/careers", "/company/careers", "/work-with-us")
+
+    async def _scrape_hiring_signals(self, domain: str) -> list[str]:
+        """Scan the company's careers page for open roles matching our
+        signal keywords. Returns matched role titles (deduped, capped)."""
+        keywords = self._signal_role_keywords()
+        if not keywords:
+            return []
+
+        for path in self._CAREERS_PATHS:
+            resp = await self._fetch(
+                f"https://{domain}{path}", timeout=SCRAPE_TIMEOUT, retries=1
+            )
+            if resp is None:
+                continue
+            soup = self._safe_soup(resp.text)
+            if soup is None:
+                continue
+
+            roles: list[str] = []
+            seen = set()
+            try:
+                elements = soup.select("a, h2, h3, h4, li")
+            except Exception:
+                elements = []
+            for el in elements[:400]:
+                text = re.sub(r"\s+", " ", el.get_text()).strip()
+                if not (4 <= len(text) <= 80):
+                    continue
+                low = text.lower()
+                if not any(k in low for k in keywords):
+                    continue
+                key = low[:60]
+                if key in seen:
+                    continue
+                seen.add(key)
+                roles.append(text[:80])
+                if len(roles) >= 3:
+                    return roles
+            if roles:
+                return roles
+            # A reachable careers page with no keyword hits still means we
+            # checked — don't try more paths for this domain.
+            return []
+        return []
 
     async def _learn_pattern_from_page(self, soup, html: str, domain: str):
         """Find a real on-domain email on a page and cache the derived pattern.

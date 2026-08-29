@@ -153,6 +153,7 @@ Users will come back with questions and tasks. Common ones:
 - **"I want to change what Harvey says"** → Skills are in `skills/`, prompts are in `prompts/`. Both are plain markdown files. Edit them directly.
 - **"Train Harvey on a different product"** → `harvey train <new-url>`
 - **"How do I see the database?"** → It's at `data/harvey.db`. They can open it with any SQLite tool, or ask you to query it.
+- **"I just want the prospect list"** → `harvey export` writes a sequencer-ready CSV (verified/risky emails only; `--all` for everything). Also available as Export buttons on the dashboard's Contacts tab. Harvey is valuable purely as a list-builder even if the user never lets it send.
 
 ---
 
@@ -166,7 +167,7 @@ Users will come back with questions and tasks. Common ones:
 - **Skills** (`skills/`): Markdown knowledge files injected into agent prompts
 
 ### Sub-Agents
-- **Scout**: Python does all web searching (DuckDuckGo → Bing → Google → Serper API) and email resolution (pattern-first: cache → scraped mailto → Hunter domain search → default, then verify one candidate via Reoon/ZeroBounce/Hunter/SMTP; catch-alls flagged `risky`). Claude only scores/personalizes found data.
+- **Scout**: Python does all web searching (DuckDuckGo → Bing → Google → Serper API) and email resolution (pattern-first: cache → scraped mailto → Hunter domain search → default, then verify one candidate via Reoon/ZeroBounce/Hunter/SMTP; catch-alls flagged `risky`). Claude only scores/personalizes found data. Scout also collects **buying signals**: tech stack detected on each company's site (HubSpot, Shopify, Intercom, ~35 tools — zero extra requests) and hiring signals from careers pages. With `pip install python-jobspy` (optional), a job-board strategy discovers companies actively hiring for roles in `icp.hiring_signals` (falls back to `icp.titles`) — the strongest in-market signal. Signals land in prospects' personalization notes and boost their score.
 - **Writer**: Generates 3-email sequences (Email 1 < 75 words, Email 2 < 75, Email 3 < 40). Strict ban list on AI patterns.
 - **Sender**: Deploys to Instantly API. Enforces daily send limits.
 - **Handler**: Classifies reply intent, advances conversation stage, auto-responds. Has reply deduplication.
@@ -188,6 +189,8 @@ harvey train <url>           # Train on a product website
 harvey status                # Pipeline summary
 harvey usage                 # Claude quota gauges + per-agent token/cost report
 harvey usage --reconcile     # Also backfill usage from Claude Code transcripts
+harvey export                # Deliverable prospects → sequencer-ready CSV (prospects.csv)
+harvey export --all          # Full raw list, no filters
 ```
 
 ### Common Issues

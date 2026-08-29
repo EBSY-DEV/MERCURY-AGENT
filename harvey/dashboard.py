@@ -572,6 +572,30 @@ async def get_prospects():
     return rows
 
 
+@app.get("/api/export/prospects.csv")
+async def export_prospects(all: bool = False, min_score: int = 0, email_status: str = ""):
+    """Sequencer-ready CSV download of the prospect list."""
+    from fastapi.responses import PlainTextResponse
+    from harvey.state import StateManager
+    from harvey.export import export_prospects_csv
+
+    state = StateManager(db_path=str(DB_PATH))
+    try:
+        await state.init_db()
+        statuses = [s.strip() for s in email_status.split(",") if s.strip()] or None
+        _, text = await export_prospects_csv(
+            state, email_statuses=statuses, min_score=min_score, include_all=all,
+        )
+    except Exception as e:
+        logger.warning("Prospect export failed: %s", e)
+        text = ""
+    return PlainTextResponse(
+        text,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="prospects.csv"'},
+    )
+
+
 @app.get("/api/campaigns")
 async def get_campaigns():
     rows = await query_db("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 100")
@@ -1106,7 +1130,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <!-- Contacts -->
 <div id="prospects" class="section">
-  <div class="section-head"><h2>Contacts</h2><p>People Harvey has found and verified.</p></div>
+  <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
+    <div><h2>Contacts</h2><p>People Harvey has found and verified.</p></div>
+    <div style="display:flex;gap:8px;flex-shrink:0">
+      <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv" download>Export deliverable CSV</a>
+      <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv?all=true" download>Export all</a>
+    </div>
+  </div>
   <div id="prospects-table"></div>
 </div>
 

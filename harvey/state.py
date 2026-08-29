@@ -242,6 +242,11 @@ MIGRATIONS: list[str] = [
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """,
+    # ── v5: buying signals on companies (tech stack, hiring, etc.) ──
+    """
+    ALTER TABLE companies ADD COLUMN tech_stack_json TEXT DEFAULT '[]';
+    ALTER TABLE companies ADD COLUMN signals_json TEXT DEFAULT '[]';
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -292,6 +297,18 @@ class StateManager:
 
     # ── Companies ──
 
+    @staticmethod
+    def _company_from_row(row: aiosqlite.Row) -> Company:
+        d = dict(row)
+        for json_col, field in (("tech_stack_json", "tech_stack"), ("signals_json", "signals")):
+            raw = d.pop(json_col, None)
+            try:
+                parsed = json.loads(raw) if raw else []
+            except (json.JSONDecodeError, TypeError):
+                parsed = []
+            d[field] = parsed if isinstance(parsed, list) else []
+        return Company(**d)
+
     async def add_company(self, company: Company) -> str:
         """Insert a company. If one with the same domain exists, return its id."""
         if not company.id:
@@ -302,13 +319,14 @@ class StateManager:
                 """INSERT OR IGNORE INTO companies
                    (id, name, domain, website, description, industry,
                     company_size, location, source, source_url, notes,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    tech_stack_json, signals_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     company.id, company.name, company.domain, company.website,
                     company.description, company.industry, company.company_size,
                     company.location, company.source, company.source_url,
                     company.notes,
+                    json.dumps(company.tech_stack), json.dumps(company.signals),
                     company.created_at.isoformat(),
                     company.updated_at.isoformat(),
                 ),
@@ -324,6 +342,57 @@ class StateManager:
                         company.id = row[0]
         return company.id
 
+    async def update_company_signals(
+        self,
+        company_id: str,
+        tech_stack: list[str] | None = None,
+        new_signals: list[dict] | None = None,
+    ):
+        """Merge freshly-detected tech + signals into a company record.
+
+        Signals are appended with dedup on (type, detail) so re-scans
+        don't multiply the same finding.
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT tech_stack_json, signals_json FROM companies WHERE id = ?",
+                (company_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if not row:
+                return
+
+            def _load(raw):
+                try:
+                    parsed = json.loads(raw) if raw else []
+                except (json.JSONDecodeError, TypeError):
+                    parsed = []
+                return parsed if isinstance(parsed, list) else []
+
+            tech = _load(row["tech_stack_json"])
+            signals = _load(row["signals_json"])
+
+            for t in tech_stack or []:
+                if t not in tech:
+                    tech.append(t)
+            seen = {(s.get("type"), s.get("detail")) for s in signals if isinstance(s, dict)}
+            for s in new_signals or []:
+                if not isinstance(s, dict):
+                    continue
+                if (s.get("type"), s.get("detail")) in seen:
+                    continue
+                signals.append(s)
+                seen.add((s.get("type"), s.get("detail")))
+
+            await db.execute(
+                "UPDATE companies SET tech_stack_json = ?, signals_json = ?, "
+                "updated_at = ? WHERE id = ?",
+                (json.dumps(tech), json.dumps(signals),
+                 _utcnow().isoformat(), company_id),
+            )
+            await db.commit()
+
     async def get_company(self, company_id: str) -> Company | None:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -331,7 +400,7 @@ class StateManager:
                 "SELECT * FROM companies WHERE id = ?", (company_id,)
             ) as cursor:
                 row = await cursor.fetchone()
-                return Company(**dict(row)) if row else None
+                return self._company_from_row(row) if row else None
 
     async def get_company_by_domain(self, domain: str) -> Company | None:
         async with self._connect() as db:
@@ -340,7 +409,7 @@ class StateManager:
                 "SELECT * FROM companies WHERE domain = ?", (_norm(domain),)
             ) as cursor:
                 row = await cursor.fetchone()
-                return Company(**dict(row)) if row else None
+                return self._company_from_row(row) if row else None
 
     async def get_contacts_for_company(self, company_id: str) -> list[Prospect]:
         async with self._connect() as db:
