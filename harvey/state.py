@@ -1159,15 +1159,6 @@ class StateManager:
             await db.commit()
             return cursor.rowcount > 0
 
-    async def get_recorded_session_ids(self) -> set[str]:
-        """Session IDs already captured live (skip during reconciliation)."""
-        async with self._connect() as db:
-            async with db.execute(
-                "SELECT DISTINCT session_id FROM usage_events "
-                "WHERE source = 'result_json' AND session_id != ''"
-            ) as cursor:
-                return {row[0] for row in await cursor.fetchall()}
-
     _USAGE_SUM = (
         "COUNT(DISTINCT CASE WHEN session_id != '' THEN session_id ELSE id END) AS calls, "
         "SUM(input_tokens) AS input_tokens, "

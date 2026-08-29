@@ -10,12 +10,6 @@ import pytest_asyncio
 
 from harvey.brain import Brain
 from harvey.state import StateManager
-from harvey.usage import (
-    compute_cost,
-    match_pricing,
-    parse_transcript_events,
-    reconcile_transcripts,
-)
 from harvey.integrations.quota import _parse_window, _token_from_json_blob
 
 
@@ -88,34 +82,6 @@ async def test_request_key_dedup(state):
     assert totals["today"]["output_tokens"] == 50
 
 
-# ── pricing ──
-
-
-def test_match_pricing_prefixes():
-    assert match_pricing("claude-opus-4-8") == (5.0, 25.0)
-    assert match_pricing("claude-opus-4-5-20251101") == (5.0, 25.0)
-    # Dated Opus 4.0 must NOT get the modern rate
-    assert match_pricing("claude-opus-4-20250514") == (15.0, 75.0)
-    assert match_pricing("claude-haiku-4-5-20251001") == (1.0, 5.0)
-    assert match_pricing("claude-fable-5") == (10.0, 50.0)
-    assert match_pricing("gpt-4o") is None
-    assert match_pricing("") is None
-
-
-def test_compute_cost_with_cache_tiers():
-    # 1M of everything on Haiku: 1 + 5 + 0.1 + 1.25 + 2.0
-    cost = compute_cost(
-        "claude-haiku-4-5",
-        input_tokens=1_000_000,
-        output_tokens=1_000_000,
-        cache_read_tokens=1_000_000,
-        cache_write_5m_tokens=1_000_000,
-        cache_write_1h_tokens=1_000_000,
-    )
-    assert cost == pytest.approx(1 + 5 + 0.1 + 1.25 + 2.0)
-    assert compute_cost("unknown-model", output_tokens=1000) == 0.0
-
-
 # ── Brain result-JSON parsing ──
 
 
@@ -171,82 +137,13 @@ async def test_brain_records_usage_from_payload(state):
     assert by_model[0]["model"] == "claude-haiku-4-5-20251001"
 
 
-# ── transcript reconciliation ──
-
-
-def _write_transcript(path: Path, entries: list[dict]):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
-        for e in entries:
-            f.write(json.dumps(e) + "\n")
-
-
-def _assistant_entry(msg_id, req_id, session, output_tokens, cost=None):
-    return {
-        "type": "assistant",
-        "sessionId": session,
-        "requestId": req_id,
-        "timestamp": "2026-08-28T20:15:03.123Z",
-        "costUSD": cost,
-        "message": {
-            "id": msg_id,
-            "model": "claude-opus-4-8",
-            "usage": {
-                "input_tokens": 10,
-                "output_tokens": output_tokens,
-                "cache_read_input_tokens": 100,
-                "cache_creation_input_tokens": 50,
-                "cache_creation": {
-                    "ephemeral_1h_input_tokens": 50,
-                    "ephemeral_5m_input_tokens": 0,
-                },
-            },
-        },
-    }
-
-
-def test_parse_transcript_keeps_last_duplicate(tmp_path):
-    transcript = tmp_path / "projects" / "proj" / "sess.jsonl"
-    _write_transcript(transcript, [
-        _assistant_entry("msg_1", "req_1", "sess-x", 5),     # streaming snapshot
-        _assistant_entry("msg_1", "req_1", "sess-x", 51),    # authoritative final
-        {"type": "user", "message": {"content": "hi"}},       # ignored
-        {"not": "even a dict of the right shape"},            # ignored
-    ])
-    events = parse_transcript_events(transcript)
-    assert len(events) == 1
-    event = events["msg_1:req_1"]
-    assert event["output_tokens"] == 51
-    # costUSD null on Max → computed from pricing (Opus 4-8: $5/$25)
-    expected = compute_cost(
-        "claude-opus-4-8", input_tokens=10, output_tokens=51,
-        cache_read_tokens=100, cache_write_1h_tokens=50,
-    )
-    assert event["cost_usd"] == pytest.approx(expected)
-    assert event["created_at"] == "2026-08-28 20:15:03"
-
-
 @pytest.mark.asyncio
-async def test_reconcile_skips_live_sessions_and_is_idempotent(state, tmp_path):
-    # Session recorded live by the Brain → its transcript must be skipped
-    await state.record_usage_event(
-        agent="writer", session_id="sess-live", model="claude-opus-4-8",
-        output_tokens=99, source="result_json",
-    )
-    _write_transcript(tmp_path / "projects" / "p1" / "a.jsonl",
-                      [_assistant_entry("m1", "r1", "sess-live", 99)])
-    _write_transcript(tmp_path / "projects" / "p2" / "b.jsonl",
-                      [_assistant_entry("m2", "r2", "sess-other", 40)])
-
-    inserted = await reconcile_transcripts(state, since_days=7, config_dir=tmp_path)
-    assert inserted == 1  # only sess-other
-
-    # Second run inserts nothing (request_key unique index)
-    inserted_again = await reconcile_transcripts(state, since_days=7, config_dir=tmp_path)
-    assert inserted_again == 0
-
-    totals = await state.usage_totals()
-    assert totals["month"]["output_tokens"] == 99 + 40
+async def test_usage_is_harvey_only(state):
+    """Sanity: the ledger only contains rows Harvey's Brain wrote. There is
+    no transcript scan to pull in other projects' Claude sessions."""
+    import harvey.usage as usage_mod
+    assert not hasattr(usage_mod, "reconcile_transcripts")
+    assert not hasattr(usage_mod, "parse_transcript_events")
 
 
 # ── quota client helpers ──
