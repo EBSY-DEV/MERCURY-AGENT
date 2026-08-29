@@ -159,11 +159,6 @@ def cmd_usage(args):
         state = StateManager()
         await state.init_db()
 
-        if args.reconcile:
-            from harvey.usage import reconcile_transcripts
-            inserted = await reconcile_transcripts(state, since_days=args.days)
-            print(f"\n  Reconciled transcripts: {inserted} event(s) backfilled.")
-
         # Live quota (best-effort; undocumented endpoint)
         from harvey.integrations.quota import QuotaClient
         windows = None
@@ -426,10 +421,6 @@ def main():
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show Claude usage and quota")
     sub.add_argument("--days", type=int, default=30, help="Breakdown window (default: 30)")
-    sub.add_argument(
-        "--reconcile", action="store_true",
-        help="Backfill usage from Claude Code transcripts first",
-    )
     sub.set_defaults(func=cmd_usage)
 
     args = parser.parse_args()
