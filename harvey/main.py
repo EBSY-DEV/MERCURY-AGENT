@@ -134,7 +134,7 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     from harvey.agents.analyst import Analyst
 
     scout = Scout(brain, state, config, env)
-    writer = Writer(brain, state, config)
+    writer = Writer(brain, state, config, env)
     sender = Sender(brain, state, config, env)
     handler = Handler(brain, state, config, env)
     analyst = Analyst(state)
@@ -194,6 +194,12 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 tasks.append(("send_campaign", sender.run()))
             elif action == "idle":
                 tasks.append(("analyze", analyst.run()))
+
+            # Native mail providers drain the outbox every cycle — due sends
+            # and approved replies must go out on schedule regardless of the
+            # cycle's primary action.
+            if sender.is_native and not any(n == "send_campaign" for n, _ in tasks):
+                tasks.append(("send_outbox", sender.run()))
 
             if len(tasks) > 1:
                 logger.info(f"Running {len(tasks)} agents in parallel: {[t[0] for t in tasks]}")

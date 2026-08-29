@@ -67,21 +67,34 @@ python -m playwright install chromium
 
 ### Step 2: API Keys (`.env`)
 
-Only Instantly is required. Ask for it first, then mention the optional ones:
+Harvey needs an **email provider** (to send + read replies) and, strongly recommended, an **email verifier**. Pick one provider:
 
 ```
-INSTANTLY_API_KEY=          # Required — from Instantly Settings → Integrations
-LINKEDIN_EMAIL=             # Optional — for LinkedIn prospecting
-LINKEDIN_PASSWORD=          # Optional — for LinkedIn prospecting
-CLOUDFLARE_ACCOUNT_ID=      # Optional — for deep JS-rendered website crawling
-CLOUDFLARE_API_TOKEN=       # Optional — for deep JS-rendered website crawling
-REOON_API_KEY=              # Optional — email verification (600 free/mo; best free tier)
-ZEROBOUNCE_API_KEY=         # Optional — email verification (100 free/mo; best for M365/Workspace catch-alls)
-HUNTER_API_KEY=             # Optional — email pattern lookup + verification (50 free/mo)
-SERPER_API_KEY=             # Optional — for reliable web search ($5/mo at serper.dev)
+# --- Email provider: choose ONE, set channels.email.provider to match ---
+GMAIL_CLIENT_ID=            # Recommended: Gmail/Workspace. Then run 'harvey gmail auth'
+GMAIL_CLIENT_SECRET=
+# --- or SMTP+IMAP (AgentMail, Fastmail, Workspace app password) ---
+SMTP_HOST=  SMTP_PORT=587  SMTP_USERNAME=  SMTP_PASSWORD=
+IMAP_HOST=  IMAP_PORT=993
+# --- or legacy Instantly ---
+INSTANTLY_API_KEY=
+
+# --- Email verification (add at least one; else emails stay 'guess') ---
+REOON_API_KEY=              # 600 free/mo — best free tier
+ZEROBOUNCE_API_KEY=         # 100 free/mo — best for M365/Workspace catch-alls
+HUNTER_API_KEY=             # 50 free/mo + pattern lookup
+
+# --- Optional ---
+LINKEDIN_EMAIL=  LINKEDIN_PASSWORD=   # LinkedIn prospecting
+CLOUDFLARE_ACCOUNT_ID=  CLOUDFLARE_API_TOKEN=   # deep JS crawling for training
+SERPER_API_KEY=            # reliable web search ($5/mo at serper.dev)
 ```
 
-**Email verification matters:** Harvey learns each company's email *pattern* and verifies ONE candidate rather than guessing (raw SMTP probing no longer works against Google Workspace / Microsoft 365). Add any one of Reoon / ZeroBounce / Hunter to get verified addresses. Without a verifier key, found emails are marked `guess` and are **never sent** — so at least one key is strongly recommended before running campaigns.
+**Recommended provider — Gmail:** for <50 cold emails/day, a real Google Workspace mailbox on a *dedicated secondary domain* (never the main one) is the most deliverable, cheapest (~$7/mo) option. Set `channels.email.provider: gmail` in harvey.yaml, put the OAuth client id/secret in `.env`, then run `harvey gmail auth` (one-time browser login). SMTP works with any mailbox (AgentMail, Fastmail). Instantly still works as a legacy option.
+
+**Email verification matters:** Harvey learns each company's email *pattern* and verifies ONE candidate rather than guessing (raw SMTP probing no longer works against Google Workspace / Microsoft 365). Without a verifier key, found emails are marked `guess` and are **never sent**.
+
+**Approval by default:** with a native provider, every outgoing email waits in the **Outbox** for your approval (dashboard Outbox tab, or `harvey outbox`). Once you trust the output, set `channels.email.require_approval: false` in harvey.yaml for full autopilot.
 
 After getting the Instantly API key, test it:
 ```bash
@@ -169,8 +182,8 @@ Users will come back with questions and tasks. Common ones:
 ### Sub-Agents
 - **Scout**: Python does all web searching (DuckDuckGo → Bing → Google → Serper API) and email resolution (pattern-first: cache → scraped mailto → Hunter domain search → default, then verify one candidate via Reoon/ZeroBounce/Hunter/SMTP; catch-alls flagged `risky`). Claude only scores/personalizes found data. Scout also collects **buying signals**: tech stack detected on each company's site (HubSpot, Shopify, Intercom, ~35 tools — zero extra requests) and hiring signals from careers pages. With `pip install python-jobspy` (optional), a job-board strategy discovers companies actively hiring for roles in `icp.hiring_signals` (falls back to `icp.titles`) — the strongest in-market signal. Signals land in prospects' personalization notes and boost their score.
 - **Writer**: Generates 3-email sequences (Email 1 < 75 words, Email 2 < 75, Email 3 < 40). Strict ban list on AI patterns.
-- **Sender**: Deploys to Instantly API. Enforces daily send limits.
-- **Handler**: Classifies reply intent, advances conversation stage, auto-responds. Has reply deduplication.
+- **Sender**: Native providers (gmail/smtp) render merge vars per prospect and STAGE each email into the `outbox` (pending_review → approved → sent) with a scheduled send time; each heartbeat drains due, approved items with human-like pacing, the daily cap, the deterministic pre-send gate, and stop-on-reply. Legacy Instantly path deploys campaigns via API. Enforces daily send limits either way.
+- **Handler**: Polls the provider (or Instantly) for replies, dedups them, classifies intent, advances conversation stage, and queues auto-responses through the same outbox approval ladder. On native providers it also detects bounces → marks the address invalid, cancels the prospect's queued sends, and trips a global kill switch past a bounce-rate threshold.
 - **Analyst**: Runs on idle cycles. Generates `data/analytics.json` with pipeline stats and insights.
 
 ### Conversation Stages
@@ -191,6 +204,10 @@ harvey usage                 # Claude quota gauges + per-agent token/cost report
 harvey usage --reconcile     # Also backfill usage from Claude Code transcripts
 harvey export                # Deliverable prospects → sequencer-ready CSV (prospects.csv)
 harvey export --all          # Full raw list, no filters
+harvey gmail auth            # One-time Gmail OAuth (when provider: gmail)
+harvey gmail test            # Verify the Gmail connection
+harvey outbox                # Review queued emails; --approve <id> / --approve-all / --reject <id>
+harvey sending pause|resume  # Kill switch for all outbound
 ```
 
 ### Common Issues

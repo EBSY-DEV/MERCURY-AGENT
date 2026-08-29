@@ -1,15 +1,28 @@
-"""Handler — monitors replies and manages conversations."""
+"""Handler — monitors replies and manages conversations.
+
+Works against Instantly (legacy) or a native mail provider (Gmail/SMTP).
+The native path also owns bounce handling: a bounce marks the address
+invalid, cancels the prospect's queued sends, and — past a bounce-rate
+threshold — flips the global kill switch so a bad list can't torch the
+sending domain while nobody's watching.
+"""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from harvey.brain import Brain
 from harvey.config import HarveyConfig, EnvConfig
 from harvey.integrations.instantly import InstantlyClient
+from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.models.conversation import Conversation, Message
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.handler")
+
+KILL_SWITCH_KEY = "sending_paused"
+BOUNCE_COUNT_KEY = "bounce_count"
+# Kill switch only engages after this many sends (a tiny sample lies).
+MIN_SENDS_FOR_KILL_SWITCH = 10
 
 INTENT_LABELS = {
     "interested",
@@ -77,7 +90,15 @@ class Handler:
         self.state = state
         self.config = config
         self.instantly = InstantlyClient(env.instantly_api_key)
+        self.provider = get_mail_provider(config, env)
         self.skills = ""
+
+    @property
+    def is_native(self) -> bool:
+        return (
+            self.config.channels.email.provider in NATIVE_PROVIDERS
+            and self.provider is not None
+        )
 
     async def run(self):
         """Check for new replies and handle them."""
@@ -87,6 +108,10 @@ class Handler:
         self.skills = self.brain.load_skills_for_agent("handler")
 
         if not self.config.channels.email.enabled:
+            return
+
+        if self.is_native:
+            await self._run_native()
             return
 
         # 1. Fetch active campaigns
@@ -142,7 +167,7 @@ class Handler:
         logger.info(f"Handler: Reply from {lead_email}")
 
         try:
-            await self._process_reply(lead_email, reply_text, reply_uuid, campaign)
+            await self._process_reply(lead_email, reply_text, reply_uuid, campaign.id)
         finally:
             # ALWAYS mark processed — even on early exits (opt-out, OOO,
             # unknown prospect) — so the same reply is never re-handled
@@ -151,7 +176,14 @@ class Handler:
                 await self.state.mark_reply_processed(reply_uuid)
         return True
 
-    async def _process_reply(self, lead_email: str, reply_text: str, reply_uuid: str, campaign):
+    async def _process_reply(
+        self,
+        lead_email: str,
+        reply_text: str,
+        reply_uuid: str,
+        campaign_id: str = "",
+        reply_meta: dict | None = None,
+    ):
         """Classify, record, and respond to a single reply."""
         # Find the prospect by email (indexed lookup)
         prospect = await self.state.get_prospect_by_email(lead_email)
@@ -159,8 +191,18 @@ class Handler:
             logger.warning(f"Handler: No prospect found for {lead_email}")
             return
 
-        # Update prospect status
+        # Update prospect status + stop-on-reply: a human answered, so every
+        # queued sequence email for them is now wrong to send.
         await self.state.update_prospect_status(prospect.id, "replied")
+        try:
+            cancelled = await self.state.cancel_pending_outbox_for_prospect(prospect.id)
+            if cancelled:
+                logger.info(
+                    f"Handler: cancelled {cancelled} queued email(s) for "
+                    f"{lead_email} (they replied)."
+                )
+        except Exception as e:
+            logger.debug(f"Handler: outbox cancel failed: {e}")
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
@@ -183,7 +225,7 @@ class Handler:
             convo = Conversation(
                 id="",
                 prospect_id=prospect.id,
-                campaign_id=campaign.id,
+                campaign_id=campaign_id,
                 channel="email",
                 thread=[
                     Message(sender="prospect", content=reply_text),
@@ -257,8 +299,13 @@ class Handler:
             logger.warning(f"Handler: Could not generate response for {lead_email}")
             return
 
-        # Send via Instantly
-        if reply_uuid:
+        # Send the response — natively through the outbox approval ladder,
+        # or immediately via Instantly (legacy).
+        if self.is_native:
+            await self._queue_native_reply(
+                response, prospect, convo, reply_meta or {}, intent
+            )
+        elif reply_uuid:
             result = await self.instantly.send_reply(reply_uuid, response)
             if result is not None:
                 # Add our response to conversation
@@ -278,6 +325,132 @@ class Handler:
                         "response_preview": response[:100],
                     },
                 )
+
+    # ── Native provider path (Gmail / SMTP) ──
+
+    async def _run_native(self):
+        """Poll the mailbox, split bounces from human replies, handle both."""
+        if not self.provider.is_configured():
+            logger.debug(
+                f"Handler: provider '{self.provider.name}' not configured yet."
+            )
+            return
+
+        try:
+            inbound = await self.provider.get_replies()
+        except Exception as e:
+            logger.error(f"Handler: fetching replies failed: {e}")
+            return
+
+        handled = 0
+        for msg in inbound:
+            dedup_key = msg.provider_id or msg.message_id
+            if not dedup_key or await self.state.is_reply_processed(dedup_key):
+                continue
+            try:
+                if msg.is_bounce:
+                    await self._handle_bounce(msg)
+                elif msg.body.strip():
+                    await self._process_reply(
+                        msg.from_email,
+                        msg.body.strip(),
+                        reply_uuid="",
+                        reply_meta={
+                            "thread_ref": msg.thread_ref,
+                            "message_id": msg.message_id,
+                            "subject": msg.subject,
+                        },
+                    )
+                handled += 1
+            except Exception as e:
+                logger.error(f"Handler: error processing {msg.from_email}: {e}")
+            finally:
+                await self.state.mark_reply_processed(dedup_key)
+
+        if handled:
+            logger.info(f"Handler: processed {handled} inbound message(s).")
+        else:
+            logger.info("Handler: no new replies.")
+
+    async def _handle_bounce(self, msg):
+        """A bounce is a data bug AND a reputation threat. Fix both."""
+        outbox_item = await self.state.find_outbox_by_message_id(msg.in_reply_to)
+        prospect = None
+        if outbox_item:
+            prospect = await self.state.get_prospect(outbox_item["prospect_id"])
+
+        if prospect:
+            await self.state.update_prospect_email(
+                prospect.id, prospect.email, "invalid"
+            )
+            cancelled = await self.state.cancel_pending_outbox_for_prospect(
+                prospect.id, reason="bounced"
+            )
+            logger.warning(
+                f"Handler: BOUNCE for {prospect.email} — marked invalid, "
+                f"cancelled {cancelled} queued email(s)."
+            )
+        else:
+            logger.warning(
+                f"Handler: bounce received ({msg.subject[:60]}) but couldn't "
+                "match it to a sent email."
+            )
+
+        bounces = await self.state.increment_setting(BOUNCE_COUNT_KEY)
+        total_sent = await self.state.count_outbox_sent()
+        await self.state.log_action(
+            action_type="bounce",
+            agent="handler",
+            details={"prospect": prospect.email if prospect else "unknown",
+                     "bounces": bounces, "total_sent": total_sent},
+        )
+
+        max_rate = getattr(self.config.channels.email, "max_bounce_rate", 0.05)
+        if (
+            max_rate > 0
+            and total_sent >= MIN_SENDS_FOR_KILL_SWITCH
+            and bounces / total_sent > max_rate
+        ):
+            reason = (
+                f"bounce rate {bounces}/{total_sent} exceeded "
+                f"{max_rate:.0%} — check list quality before resuming"
+            )
+            await self.state.set_setting(KILL_SWITCH_KEY, reason)
+            logger.error(f"Handler: KILL SWITCH ENGAGED — {reason}")
+
+    async def _queue_native_reply(
+        self, response: str, prospect, convo, reply_meta: dict, intent: str
+    ):
+        """Route Harvey's reply through the outbox (approval ladder applies)."""
+        require_approval = getattr(
+            self.config.channels.email, "require_approval", True
+        )
+        subject = reply_meta.get("subject", "")
+        if subject and not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
+
+        item_id = await self.state.add_outbox_item(
+            prospect_id=prospect.id,
+            conversation_id=convo.id,
+            kind="reply",
+            to_email=prospect.email,
+            subject=subject or "Re: your note",
+            body=response,
+            send_at=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            status="pending_review" if require_approval else "approved",
+            provider=self.provider.name if self.provider else "",
+            thread_ref=reply_meta.get("thread_ref", ""),
+            in_reply_to=reply_meta.get("message_id", ""),
+        )
+        if item_id:
+            mode = "queued for your approval" if require_approval else "queued to send"
+            logger.info(f"Handler: reply to {prospect.email} {mode} ({intent}).")
+            await self.state.log_action(
+                action_type="reply_queued",
+                agent="handler",
+                details={"prospect_email": prospect.email, "intent": intent,
+                         "response_preview": response[:100]},
+            )
 
     async def _classify_intent(self, reply_text: str, prospect) -> str:
         """Ask the brain to classify the reply's intent."""

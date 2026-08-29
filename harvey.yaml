@@ -47,8 +47,11 @@ icp:
 channels:
   email:
     enabled: true
-    provider: "instantly"
+    provider: "instantly"      # gmail (recommended) | smtp | instantly
     max_daily_sends: 50
+    require_approval: true      # native providers: emails wait in the Outbox
+    send_to_risky: false        # also send to catch-all domains (off = safest)
+    max_bounce_rate: 0.05       # pause all sending if bounces exceed this
   linkedin:
     enabled: true
     max_daily_connections: 20

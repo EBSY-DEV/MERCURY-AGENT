@@ -64,12 +64,21 @@ class ICPConfig(BaseModel):
 
 class EmailChannelConfig(BaseModel):
     enabled: bool = True
+    # "instantly" (legacy), "gmail" (Gmail/Workspace via API — recommended),
+    # or "smtp" (any SMTP+IMAP mailbox: AgentMail, Fastmail, ...)
     provider: str = "instantly"
     max_daily_sends: int = 50
     # When True, also send to catch-all ("risky") domains, not just verified
     # mailboxes. Off by default — catch-alls accept everything, so a bad
     # guess still bounces.
     send_to_risky: bool = False
+    # Copilot mode (native providers): every outgoing email waits in the
+    # outbox for your approval (dashboard → Outbox, or `harvey outbox`).
+    # Set false for full autopilot once you trust the output.
+    require_approval: bool = True
+    # Kill switch: pause all sending when bounces exceed this fraction of
+    # sent mail (measured over the trailing sends). 0 disables the switch.
+    max_bounce_rate: float = 0.05
 
     @field_validator("max_daily_sends")
     @classmethod
@@ -154,6 +163,17 @@ class EnvConfig(BaseModel):
     serper_api_key: str = ""
     reoon_api_key: str = ""
     zerobounce_api_key: str = ""
+    # Native mail providers (channels.email.provider: gmail | smtp)
+    gmail_client_id: str = ""
+    gmail_client_secret: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_username: str = ""
+    imap_password: str = ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
@@ -217,12 +237,17 @@ def load_env() -> EnvConfig:
         serper_api_key=os.getenv("SERPER_API_KEY", "").strip(),
         reoon_api_key=os.getenv("REOON_API_KEY", "").strip(),
         zerobounce_api_key=os.getenv("ZEROBOUNCE_API_KEY", "").strip(),
+        gmail_client_id=os.getenv("GMAIL_CLIENT_ID", "").strip(),
+        gmail_client_secret=os.getenv("GMAIL_CLIENT_SECRET", "").strip(),
+        smtp_host=os.getenv("SMTP_HOST", "").strip(),
+        smtp_port=int(os.getenv("SMTP_PORT", "587").strip() or 587),
+        smtp_username=os.getenv("SMTP_USERNAME", "").strip(),
+        smtp_password=os.getenv("SMTP_PASSWORD", "").strip(),
+        imap_host=os.getenv("IMAP_HOST", "").strip(),
+        imap_port=int(os.getenv("IMAP_PORT", "993").strip() or 993),
+        imap_username=os.getenv("IMAP_USERNAME", "").strip(),
+        imap_password=os.getenv("IMAP_PASSWORD", "").strip(),
     )
-    if not env.instantly_api_key:
-        logger.warning(
-            "INSTANTLY_API_KEY is not set — email sending will be disabled "
-            "until it's added to .env."
-        )
     return env
 
 
