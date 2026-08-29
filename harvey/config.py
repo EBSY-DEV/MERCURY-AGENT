@@ -62,6 +62,10 @@ class EmailChannelConfig(BaseModel):
     enabled: bool = True
     provider: str = "instantly"
     max_daily_sends: int = 50
+    # When True, also send to catch-all ("risky") domains, not just verified
+    # mailboxes. Off by default — catch-alls accept everything, so a bad
+    # guess still bounces.
+    send_to_risky: bool = False
 
     @field_validator("max_daily_sends")
     @classmethod
@@ -144,6 +148,8 @@ class EnvConfig(BaseModel):
     linkedin_password: str = ""
     hunter_api_key: str = ""
     serper_api_key: str = ""
+    reoon_api_key: str = ""
+    zerobounce_api_key: str = ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
@@ -205,6 +211,8 @@ def load_env() -> EnvConfig:
         linkedin_password=os.getenv("LINKEDIN_PASSWORD", "").strip(),
         hunter_api_key=os.getenv("HUNTER_API_KEY", "").strip(),
         serper_api_key=os.getenv("SERPER_API_KEY", "").strip(),
+        reoon_api_key=os.getenv("REOON_API_KEY", "").strip(),
+        zerobounce_api_key=os.getenv("ZEROBOUNCE_API_KEY", "").strip(),
     )
     if not env.instantly_api_key:
         logger.warning(

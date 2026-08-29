@@ -965,6 +965,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   tbody tr { transition: background .1s; }
   tbody tr:hover td { background: rgba(255,255,255,0.02); }
   .verified { color: var(--accent); }
+  .email-tag { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; padding: 1px 6px; border-radius: 4px; margin-left: 6px; }
+  .email-tag.verified { color: var(--accent); background: var(--accent-soft); }
+  .email-tag.risky { color: var(--amber); background: rgba(229,181,103,0.12); }
+  .email-tag.guess { color: var(--text-3); background: rgba(255,255,255,0.05); }
+  .email-tag.invalid { color: var(--red); background: rgba(224,108,117,0.12); }
   .muted { color: var(--text-3); }
 
   .badge {
@@ -1599,6 +1604,15 @@ function fmtTokens(n) {
 
 function fmtCost(v) { return '$' + (v || 0).toFixed(2); }
 
+function emailTag(p) {
+  if (!p.email) return '';
+  // Fall back to the legacy boolean for rows predating email_status.
+  const status = p.email_status || (p.email_verified ? 'verified' : 'guess');
+  const labels = {verified: 'verified', risky: 'catch-all', guess: 'guess', invalid: 'invalid'};
+  if (!labels[status]) return '';
+  return ' <span class="email-tag ' + status + '">' + labels[status] + '</span>';
+}
+
 async function loadUsage() {
   const data = await api('/api/usage');
   const statsEl = document.getElementById('usage-stats');
@@ -1734,7 +1748,7 @@ async function showCompanyContacts(index) {
   } else {
     html += '<div class="table-card"><table><thead><tr><th>Name</th><th>Title</th><th>Email</th><th>Phone</th><th>LinkedIn</th><th>Status</th><th>Source</th></tr></thead><tbody>';
     for (const p of data) {
-      const emailIcon = p.email_verified ? ' <span class="verified">&#10003;</span>' : '';
+      const emailIcon = emailTag(p);
       const phoneIcon = p.phone_verified ? ' <span class="verified">&#10003;</span>' : '';
       html += '<tr><td>' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</td>' +
         '<td>' + escHtml(p.title) + '</td><td>' + escHtml(p.email) + emailIcon + '</td>' +
@@ -1780,7 +1794,7 @@ async function loadProspects() {
   }
   let html = '<div class="table-card"><table><thead><tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th><th>Status</th><th>Source</th><th>Added</th><th></th></tr></thead><tbody>';
   data.forEach((p, i) => {
-    const emailV = p.email ? (escHtml(p.email) + (p.email_verified ? ' <span class="verified">&#10003;</span>' : '')) : '';
+    const emailV = p.email ? (escHtml(p.email) + emailTag(p)) : '';
     const phoneV = p.phone ? (escHtml(p.phone) + (p.phone_verified ? ' <span class="verified">&#10003;</span>' : '')) : '';
     html += '<tr><td>' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</td>' +
       '<td>' + escHtml(p.title) + '</td><td>' + escHtml(p.company) + '</td>' +

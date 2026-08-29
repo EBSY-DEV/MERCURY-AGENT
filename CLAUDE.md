@@ -38,7 +38,7 @@ People will ask "how does this work?" — explain it simply:
 
 - **"What does Harvey do?"** → It's like having a tireless sales assistant. Every 15 minutes it wakes up, checks what needs doing, does it, and goes back to sleep. It finds prospects, writes emails, sends campaigns, and responds to replies.
 
-- **"How does it find people?"** → It searches the web (DuckDuckGo, Bing, Google) for companies matching your target profile, visits their websites, finds team members, and verifies their email addresses. No expensive tools needed.
+- **"How does it find people?"** → It searches the web (DuckDuckGo, Bing, Google) for companies matching your target profile, visits their websites, and finds team members. For emails, it learns each company's address pattern (from their site, or a free Hunter domain lookup) and verifies a single candidate through a free verification tier — every address is tagged verified / catch-all / guess, and only deliverable ones get sent. No expensive tools needed.
 
 - **"How does it write emails?"** → It uses proven cold email frameworks (like AIDA and PAS) with strict rules — short, personal, no AI-sounding language. Each email is tailored to the specific person and their company.
 
@@ -75,9 +75,13 @@ LINKEDIN_EMAIL=             # Optional — for LinkedIn prospecting
 LINKEDIN_PASSWORD=          # Optional — for LinkedIn prospecting
 CLOUDFLARE_ACCOUNT_ID=      # Optional — for deep JS-rendered website crawling
 CLOUDFLARE_API_TOKEN=       # Optional — for deep JS-rendered website crawling
-HUNTER_API_KEY=             # Optional — for email verification fallback
+REOON_API_KEY=              # Optional — email verification (600 free/mo; best free tier)
+ZEROBOUNCE_API_KEY=         # Optional — email verification (100 free/mo; best for M365/Workspace catch-alls)
+HUNTER_API_KEY=             # Optional — email pattern lookup + verification (50 free/mo)
 SERPER_API_KEY=             # Optional — for reliable web search ($5/mo at serper.dev)
 ```
+
+**Email verification matters:** Harvey learns each company's email *pattern* and verifies ONE candidate rather than guessing (raw SMTP probing no longer works against Google Workspace / Microsoft 365). Add any one of Reoon / ZeroBounce / Hunter to get verified addresses. Without a verifier key, found emails are marked `guess` and are **never sent** — so at least one key is strongly recommended before running campaigns.
 
 After getting the Instantly API key, test it:
 ```bash
@@ -162,7 +166,7 @@ Users will come back with questions and tasks. Common ones:
 - **Skills** (`skills/`): Markdown knowledge files injected into agent prompts
 
 ### Sub-Agents
-- **Scout**: Python does all web searching (DuckDuckGo → Bing → Google → Serper API). Claude only scores/personalizes found data.
+- **Scout**: Python does all web searching (DuckDuckGo → Bing → Google → Serper API) and email resolution (pattern-first: cache → scraped mailto → Hunter domain search → default, then verify one candidate via Reoon/ZeroBounce/Hunter/SMTP; catch-alls flagged `risky`). Claude only scores/personalizes found data.
 - **Writer**: Generates 3-email sequences (Email 1 < 75 words, Email 2 < 75, Email 3 < 40). Strict ban list on AI patterns.
 - **Sender**: Deploys to Instantly API. Enforces daily send limits.
 - **Handler**: Classifies reply intent, advances conversation stage, auto-responds. Has reply deduplication.

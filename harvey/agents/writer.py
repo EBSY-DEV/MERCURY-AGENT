@@ -30,10 +30,18 @@ class Writer:
             logger.info("Writer: No new prospects to write for.")
             return
 
-        # Filter to only those with emails
-        prospects_with_email = [p for p in new_prospects if p.email]
+        # Only write for prospects we can actually deliver to. Guessed and
+        # invalid addresses are skipped so we don't spend Claude calls (or
+        # sending reputation) on mail that will bounce.
+        deliverable = {"verified", "risky"}
+        prospects_with_email = [
+            p for p in new_prospects
+            if p.email and (p.email_status or "guess") in deliverable
+        ]
         if not prospects_with_email:
-            logger.info("Writer: No prospects with verified emails.")
+            logger.info(
+                "Writer: No prospects with deliverable (verified/risky) emails yet."
+            )
             return
 
         # Batch prospects into campaign groups (by industry/title for relevance)
