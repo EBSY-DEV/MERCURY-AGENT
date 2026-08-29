@@ -19,7 +19,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 logger = logging.getLogger("harvey.dashboard")
 
-PROJECT_ROOT = Path(__file__).parent.parent
+from harvey.paths import PROJECT_ROOT  # noqa: E402
 DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 ENV_FILE = PROJECT_ROOT / ".env"
 CONFIG_FILE = PROJECT_ROOT / "harvey.yaml"
@@ -503,6 +503,67 @@ async def get_stats():
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+_USAGE_SUM = (
+    "COUNT(DISTINCT CASE WHEN session_id != '' THEN session_id ELSE id END) AS calls, "
+    "COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+    "COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+    "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
+    "COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens, "
+    "ROUND(COALESCE(SUM(cost_usd), 0), 4) AS cost_usd"
+)
+
+_quota_client = None
+
+
+@app.get("/api/usage")
+async def get_usage():
+    """Token/cost accounting + live subscription quota for the Usage tab."""
+    global _quota_client
+
+    totals = {}
+    for label, where in (
+        ("today", "date(created_at) = date('now')"),
+        ("week", "created_at >= datetime('now', '-7 days')"),
+        ("month", "created_at >= datetime('now', '-30 days')"),
+    ):
+        rows = await query_db(f"SELECT {_USAGE_SUM} FROM usage_events WHERE {where}")
+        totals[label] = rows[0] if rows else {}
+
+    def grouped(expr, alias):
+        return (
+            f"SELECT {expr} AS {alias}, {_USAGE_SUM} FROM usage_events "
+            f"WHERE created_at >= datetime('now', '-30 days') "
+            f"GROUP BY {alias} ORDER BY cost_usd DESC LIMIT 25"
+        )
+
+    by_agent = await query_db(grouped("CASE WHEN agent = '' THEN 'other' ELSE agent END", "agent"))
+    by_task = await query_db(grouped("CASE WHEN task = '' THEN 'other' ELSE task END", "task"))
+    by_model = await query_db(grouped("CASE WHEN model = '' THEN 'unknown' ELSE model END", "model"))
+    by_day = await query_db(
+        f"SELECT date(created_at) AS day, {_USAGE_SUM} FROM usage_events "
+        f"WHERE created_at >= datetime('now', '-30 days') "
+        f"GROUP BY day ORDER BY day ASC"
+    )
+
+    quota = None
+    try:
+        from harvey.integrations.quota import QuotaClient
+        if _quota_client is None:
+            _quota_client = QuotaClient()
+        quota = await _quota_client.get_utilization()
+    except Exception as e:
+        logger.debug("Quota lookup failed: %s", e)
+
+    return {
+        "quota": quota,
+        "totals": totals,
+        "by_day": by_day,
+        "by_agent": by_agent,
+        "by_task": by_task,
+        "by_model": by_model,
+    }
 
 
 @app.get("/api/prospects")
@@ -1009,6 +1070,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <button onclick="showTab('campaigns', this)">Campaigns</button>
   <button onclick="showTab('conversations', this)">Conversations</button>
   <button onclick="showTab('activity', this)">Activity</button>
+  <button onclick="showTab('usage', this)">Usage</button>
   <button onclick="showTab('settings', this)">Settings</button>
   <button onclick="showTab('controls', this)">Controls</button>
   <button onclick="showTab('help', this)">Help</button>
@@ -1059,6 +1121,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <div id="activity" class="section">
   <div class="section-head"><h2>Activity</h2><p>A running log of every action Harvey's agents have taken.</p></div>
   <div id="activity-list"></div>
+</div>
+
+<!-- Usage -->
+<div id="usage" class="section">
+  <div class="section-head"><h2>Usage</h2><p>What Harvey is spending — real subscription quota, tokens, and equivalent API cost per agent and task.</p></div>
+  <div id="usage-quota" class="card" style="display:none"></div>
+  <div class="stats-grid" id="usage-stats"></div>
+  <div class="card" id="usage-daily" style="display:none"></div>
+  <div id="usage-tables"></div>
 </div>
 
 <!-- Settings -->
@@ -1317,6 +1388,7 @@ function loadCurrentTab() {
     case 'campaigns': loadCampaigns(); break;
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
+    case 'usage': loadUsage(); break;
     case 'settings': loadSettings(); break;
     case 'controls': loadHarveyStatus(); loadLogs(); break;
   }
@@ -1517,6 +1589,112 @@ async function loadStats() {
       '<span class="chip">Claude calls today <b>' + escHtml(String(data.claude_calls_today || 0)) + '</b></span>');
 }
 
+function fmtTokens(n) {
+  n = n || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+
+function fmtCost(v) { return '$' + (v || 0).toFixed(2); }
+
+async function loadUsage() {
+  const data = await api('/api/usage');
+  const statsEl = document.getElementById('usage-stats');
+  if (!data) { statsEl.innerHTML = offlineState(); return; }
+
+  // Quota gauges — the same numbers `/usage` shows in Claude Code.
+  const quotaEl = document.getElementById('usage-quota');
+  if (data.quota && Object.keys(data.quota).length) {
+    const labels = {five_hour: '5-hour window', seven_day: 'Weekly'};
+    let qHtml = '<h2>Claude Subscription Quota</h2>';
+    for (const [key, w] of Object.entries(data.quota)) {
+      const pct = Math.min(100, Math.max(0, w.utilization || 0));
+      const color = pct >= 80 ? 'yellow' : 'green';
+      const resets = w.resets_at ? 'resets ' + formatDate(w.resets_at) : '';
+      qHtml += '<div class="progress-wrap">' +
+        '<div class="progress-label">' +
+          '<span class="text">' + escHtml(labels[key] || key) + (resets ? ' &middot; ' + escHtml(resets) : '') + '</span>' +
+          '<span class="pct">' + pct.toFixed(0) + '%</span>' +
+        '</div>' +
+        '<div class="progress-bar"><div class="progress-fill ' + color + '" style="width:' + pct + '%"></div></div>' +
+      '</div>';
+    }
+    quotaEl.innerHTML = qHtml;
+    quotaEl.style.display = 'block';
+  } else {
+    quotaEl.style.display = 'none';
+  }
+
+  // Totals cards
+  const t = data.totals || {};
+  const card = (label, p) => {
+    p = p || {};
+    return '<div class="stat-card"><div class="label">' + label + '</div>' +
+      '<div class="value">' + fmtCost(p.cost_usd) + '</div>' +
+      '<div class="breakdown">' +
+        '<span class="chip">calls <b>' + (p.calls || 0) + '</b></span>' +
+        '<span class="chip">out <b>' + fmtTokens(p.output_tokens) + '</b></span>' +
+        '<span class="chip">in <b>' + fmtTokens(p.input_tokens) + '</b></span>' +
+        '<span class="chip">cached <b>' + fmtTokens(p.cache_read_tokens) + '</b></span>' +
+      '</div></div>';
+  };
+  statsEl.innerHTML = card('Today', t.today) + card('Last 7 Days', t.week) + card('Last 30 Days', t.month);
+
+  // Daily bars
+  const dailyEl = document.getElementById('usage-daily');
+  const days = data.by_day || [];
+  if (days.length) {
+    const maxCost = Math.max(...days.map(d => d.cost_usd || 0), 0.0001);
+    let dHtml = '<h2>Daily Cost (equivalent API price, 30 days)</h2>';
+    for (const d of days.slice(-30)) {
+      const pct = Math.max(2, (d.cost_usd || 0) / maxCost * 100);
+      dHtml += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;font-size:12px">' +
+        '<span class="muted" style="width:78px;flex-shrink:0;font-family:var(--mono)">' + escHtml(d.day || '') + '</span>' +
+        '<div style="flex:1;background:rgba(255,255,255,0.05);border-radius:99px;height:10px;overflow:hidden">' +
+          '<div style="width:' + pct + '%;height:100%;border-radius:99px;background:linear-gradient(90deg,var(--accent-deep),var(--accent))"></div>' +
+        '</div>' +
+        '<span style="width:120px;text-align:right;font-variant-numeric:tabular-nums">' + fmtCost(d.cost_usd) +
+          ' <span class="muted">&middot; ' + (d.calls || 0) + ' calls</span></span>' +
+      '</div>';
+    }
+    dailyEl.innerHTML = dHtml;
+    dailyEl.style.display = 'block';
+  } else {
+    dailyEl.style.display = 'none';
+  }
+
+  // Breakdown tables
+  const tablesEl = document.getElementById('usage-tables');
+  const table = (title, rows, keyName) => {
+    if (!rows || !rows.length) return '';
+    let h = '<div class="card"><h2>' + title + '</h2><div class="table-card"><table><thead><tr>' +
+      '<th>' + keyName + '</th><th>Calls</th><th>Input</th><th>Output</th><th>Cache read</th><th>Est. cost</th>' +
+      '</tr></thead><tbody>';
+    for (const r of rows) {
+      h += '<tr><td>' + escHtml(String(r[keyName.toLowerCase()] || '')) + '</td>' +
+        '<td>' + (r.calls || 0) + '</td>' +
+        '<td class="muted">' + fmtTokens(r.input_tokens) + '</td>' +
+        '<td>' + fmtTokens(r.output_tokens) + '</td>' +
+        '<td class="muted">' + fmtTokens(r.cache_read_tokens) + '</td>' +
+        '<td>' + fmtCost(r.cost_usd) + '</td></tr>';
+    }
+    return h + '</tbody></table></div></div>';
+  };
+
+  const anyRows = (data.by_agent || []).length || (data.by_task || []).length;
+  if (!anyRows) {
+    tablesEl.innerHTML = emptyState('&#9680;', 'No usage recorded yet',
+      'Once Harvey starts making Claude calls, every one is logged here with exact tokens and equivalent API cost. Run <b>harvey usage --reconcile</b> to backfill from Claude Code transcripts.');
+  } else {
+    tablesEl.innerHTML =
+      table('By Agent (30 days)', data.by_agent, 'Agent') +
+      table('By Task (30 days)', data.by_task, 'Task') +
+      table('By Model (30 days)', data.by_model, 'Model');
+  }
+}
+
 async function loadCompanies() {
   companyDrill = false;
   const el = document.getElementById('companies-list');
@@ -1706,6 +1884,7 @@ setInterval(() => {
     case 'campaigns': loadCampaigns(); break;
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
+    case 'usage': loadUsage(); break;
     case 'controls': loadLogs(); break;
     // settings & help: never auto-refreshed (user may be typing)
   }

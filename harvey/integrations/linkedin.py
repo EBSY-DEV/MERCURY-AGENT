@@ -16,7 +16,9 @@ from urllib.parse import quote_plus
 
 logger = logging.getLogger("harvey.linkedin")
 
-DATA_DIR = Path(__file__).parent.parent.parent / "data"
+from harvey.paths import PROJECT_ROOT
+
+DATA_DIR = PROJECT_ROOT / "data"
 COOKIES_PATH = DATA_DIR / "linkedin_cookies.json"
 ACTIVITY_PATH = DATA_DIR / "linkedin_activity.json"
 

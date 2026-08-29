@@ -996,7 +996,10 @@ Score criteria:
 Respond ONLY with the JSON array."""
 
         try:
-            result = await self.brain.think_json(prompt, session_id="harvey-scout-score")
+            result = await self.brain.think_json(
+                prompt, session_id="harvey-scout-score",
+                agent="scout", task="score_contacts",
+            )
         except Exception as e:
             logger.warning(f"Scout: Claude scoring errored ({e}); using heuristic scores.")
             result = None

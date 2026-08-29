@@ -23,6 +23,15 @@ class Analyst:
         """Generate analytics report from current pipeline data."""
         logger.info("Analyst: Running performance analysis...")
 
+        # Idle cycles are the cheap moment to reconcile usage accounting
+        # against Claude Code's transcripts (catches crashed calls and
+        # non-Harvey usage on this machine). Best-effort only.
+        try:
+            from harvey.usage import reconcile_transcripts
+            await reconcile_transcripts(self.state)
+        except Exception as e:
+            logger.debug(f"Analyst: usage reconcile skipped: {e}")
+
         report = {
             "generated_at": datetime.utcnow().isoformat(),
             "pipeline": await self._pipeline_summary(),

@@ -153,11 +153,15 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                     break
                 continue
 
-            # 2. Check usage budget
-            if not await brain.is_within_budget(max_calls):
+            # 2. Check usage budget (real subscription quota when readable,
+            # else Harvey's own call counter)
+            if not await brain.is_within_budget(
+                max_calls, max_percent=config.usage.max_daily_claude_percent
+            ):
                 logger.info(
-                    f"Daily usage limit reached ({max_calls} calls). "
-                    "Sleeping 1h, then re-checking (resets at midnight)."
+                    f"Claude usage limit reached "
+                    f"({config.usage.max_daily_claude_percent}% of quota or "
+                    f"{max_calls} calls). Sleeping 1h, then re-checking."
                 )
                 if await _interruptible_sleep(3600, stop_event):
                     break
@@ -242,7 +246,8 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
 def _needs_setup() -> bool:
     """Check if Harvey needs first-time setup."""
     from pathlib import Path
-    project_root = Path(__file__).parent.parent
+    from harvey.paths import PROJECT_ROOT
+    project_root = PROJECT_ROOT
     env_file = project_root / ".env"
     config_file = project_root / "harvey.yaml"
 
