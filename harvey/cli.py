@@ -217,6 +217,44 @@ def cmd_usage(args):
     asyncio.run(_usage())
 
 
+def cmd_export(args):
+    """Export the prospect list as a sequencer-ready CSV."""
+    from harvey.state import StateManager
+    from harvey.export import export_prospects_csv
+
+    async def _export():
+        state = StateManager()
+        await state.init_db()
+
+        email_statuses = None
+        if args.email_status:
+            email_statuses = [s.strip() for s in args.email_status.split(",") if s.strip()]
+        statuses = None
+        if args.status:
+            statuses = [s.strip() for s in args.status.split(",") if s.strip()]
+
+        count, _ = await export_prospects_csv(
+            state,
+            out_path=args.out,
+            email_statuses=email_statuses,
+            min_score=args.min_score,
+            statuses=statuses,
+            include_all=args.all,
+        )
+        scope = "all prospects" if args.all else (
+            f"email status {email_statuses or ['verified', 'risky']}"
+            + (f", score >= {args.min_score}" if args.min_score else "")
+        )
+        print(f"\n  Exported {count} prospect(s) to {args.out}  ({scope})")
+        if count == 0 and not args.all:
+            print("  Tip: no deliverable emails yet? Add a REOON_API_KEY to .env so")
+            print("  Harvey can verify addresses, or use --all for the raw list.\n")
+        else:
+            print("  The CSV imports directly into Instantly, Smartlead, or any sequencer.\n")
+
+    asyncio.run(_export())
+
+
 def main():
     from harvey.paths import PROJECT_ROOT
     project_root = str(PROJECT_ROOT)
@@ -260,6 +298,20 @@ def main():
     # harvey status
     sub = subparsers.add_parser("status", help="Show pipeline status")
     sub.set_defaults(func=cmd_status)
+
+    # harvey export
+    sub = subparsers.add_parser(
+        "export", help="Export prospects as a sequencer-ready CSV"
+    )
+    sub.add_argument("--out", default="prospects.csv", help="Output file (default: prospects.csv)")
+    sub.add_argument(
+        "--email-status", default="",
+        help="Comma-separated statuses to include (default: verified,risky)",
+    )
+    sub.add_argument("--min-score", type=int, default=0, help="Minimum ICP score")
+    sub.add_argument("--status", default="", help="Comma-separated pipeline statuses (e.g. new,queued)")
+    sub.add_argument("--all", action="store_true", help="Export everything, no filters")
+    sub.set_defaults(func=cmd_export)
 
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show Claude usage and quota")

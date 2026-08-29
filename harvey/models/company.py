@@ -22,6 +22,10 @@ class Company(BaseModel):
     source: str = ""          # how we found them: google_dork, linkedin, company_scrape
     source_url: str = ""      # specific URL where we found the info
     notes: str = ""
+    # Buying signals: detected tools on their site, and timely triggers
+    # (hiring, funding, ...) as [{"type": ..., "detail": ..., "found_at": ...}]
+    tech_stack: list[str] = Field(default_factory=list)
+    signals: list[dict] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 

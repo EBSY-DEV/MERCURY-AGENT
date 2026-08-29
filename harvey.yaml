@@ -39,6 +39,10 @@ icp:
     - "Director of Marketing"
   geography:
     - "United States"
+  # Roles that signal a company is in-market RIGHT NOW (a company hiring a
+  # "Head of Growth" is shopping for growth tooling). Used for careers-page
+  # scanning and job-board discovery. Empty = fall back to titles above.
+  hiring_signals: []
 
 channels:
   email:
