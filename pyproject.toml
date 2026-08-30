@@ -49,3 +49,7 @@ harvey = "harvey.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["harvey*"]
+
+# The dashboard's HTML/CSS/JS are real files, served from disk.
+[tool.setuptools.package-data]
+harvey = ["web/*"]
