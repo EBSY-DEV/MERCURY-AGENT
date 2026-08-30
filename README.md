@@ -102,7 +102,7 @@ Profiling and outbox draining ride along on **every** cycle regardless, because 
 
 ### Prerequisites
 
-- Python 3.11+
+- **Python 3.11+** — check with `python3 --version`. macOS ships 3.9; if that's what you have, `brew install python@3.13` first.
 - An active **Claude Pro or Max** subscription, with the CLI logged in (`claude login`)
 - A mailbox to send from — Gmail/Workspace recommended, on a *dedicated secondary domain*
 
@@ -119,8 +119,9 @@ Then say: **"set up Harvey for me"**. The repo ships a `CLAUDE.md` that turns Cl
 ### Or do it yourself
 
 ```bash
-# 1. Install
-python3 -m venv .venv && source .venv/bin/activate && pip install -e .
+# 1. Install — note python3.13, not python3. On macOS bare `python3` is the
+#    system 3.9, and a venv built from it can't run Harvey.
+python3.13 -m venv .venv && source .venv/bin/activate && pip install -e .
 
 # 2. Configure — every variable is documented inline with where to get it
 cp .env.example .env && $EDITOR .env
@@ -435,6 +436,8 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 **`ModuleNotFoundError: No module named 'harvey'` after install (macOS)** — Python 3.13 silently ignores `.pth` files carrying the macOS hidden flag, and some Macs propagate that flag into `.venv`. Run `harvey install` again (it auto-fixes), or: `ln -s "$(pwd)/harvey" .venv/lib/python3.13/site-packages/harvey`
 
 **`externally-managed-environment`** — Use a venv, not system Python.
+
+**`SyntaxError` or odd `ImportError`s right after install (macOS)** — Your venv is Python 3.9. `python3 -m venv` builds from `/usr/bin/python3`, which macOS keeps at 3.9. Check with `.venv/bin/python -V`, then rebuild: `rm -rf .venv && python3.13 -m venv .venv && source .venv/bin/activate && pip install -e .`
 
 **Claude headless mode fails** — `claude login`, and confirm the subscription is active. Test with `claude -p "say hi"`. In Docker, mount `~/.claude` into the container.
 
