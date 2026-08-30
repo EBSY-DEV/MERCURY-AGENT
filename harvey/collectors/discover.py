@@ -472,10 +472,17 @@ class OpenStreetMap(DiscoveryProvider):
               "under 2,000 roofers for the entire US. Great for a free trial "
               "run or as a cross-reference; not a complete list.")
 
-    ENDPOINT = "https://overpass-api.de/api/interpreter"
+    # Several public Overpass instances run the same API. The main one
+    # throttles readily, so try the mirrors before giving up — a free source
+    # that fails half the time is not usable as a default.
+    ENDPOINTS = (
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
+    )
     # Overpass etiquette for a shipped tool: modest volume, no parallelism.
     MIN_INTERVAL = 2.0
-    BACKOFF = 30.0
+    BACKOFF = 5.0
 
     # A friendly term maps to the OSM tags that actually carry those businesses.
     TAG_MAP = {
@@ -526,26 +533,32 @@ class OpenStreetMap(DiscoveryProvider):
         )
         body = f"[out:json][timeout:40];({clauses});out center {query.limit};"
 
-        # Overpass is a free volunteer service and 504s readily under load —
-        # a cold first request very often does. Retry once with a real
-        # backoff, then RAISE: returning [] would make a throttled run look
-        # exactly like a market with no businesses in it.
+        # Overpass is a free volunteer service and 429s/504s readily under
+        # load. Walk the mirrors, then RAISE: returning [] would make a
+        # throttled run look exactly like a market with no businesses in it.
         headers = {"User-Agent": "Harvey/0.1 (open-source sales agent; "
                                  "github.com/ethanplusai/harvey)"}
-        for attempt in range(2):
-            r = await client.post(self.ENDPOINT, content=body.encode(),
-                                  headers=headers)
+        r = None
+        for i, endpoint in enumerate(self.ENDPOINTS):
+            if i:
+                await asyncio.sleep(self.BACKOFF)
+            try:
+                r = await client.post(endpoint, content=body.encode(),
+                                      headers=headers)
+            except httpx.HTTPError as e:
+                logger.warning("osm: %s unreachable (%s)", endpoint, e)
+                continue
             if r.status_code not in (429, 504):
                 break
-            if attempt == 0:
-                logger.warning("osm: throttled (%s) — backing off %ss",
-                               r.status_code, self.BACKOFF)
-                await asyncio.sleep(self.BACKOFF)
+            logger.warning("osm: %s is throttling (%s) — trying the next mirror",
+                           endpoint, r.status_code)
         else:
             raise RuntimeError(
-                f"Overpass is throttling (HTTP {r.status_code}). This is a free "
-                f"community service — wait a minute and re-run, or use a paid "
-                f"provider for bulk work.")
+                "Every public Overpass mirror is throttling right now. This is "
+                "free volunteer infrastructure — wait a few minutes and re-run, "
+                "or use a paid provider for bulk work.")
+        if r is None:
+            raise RuntimeError("Could not reach any Overpass mirror.")
         r.raise_for_status()
 
         out = []

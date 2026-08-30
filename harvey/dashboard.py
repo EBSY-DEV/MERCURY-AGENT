@@ -841,8 +841,9 @@ async def start_discovery(request: Request):
         return JSONResponse({"success": False, "message": "a run is already going"},
                             status_code=409)
     try:
-        from harvey.collectors.discover import PROVIDERS, run_discovery
+        from harvey.collectors.discover import PROVIDERS
         from harvey.config import load_config
+        from harvey.pipeline import run_prospecting
 
         body = await request.json()
         provider = body.get("provider") or ""
@@ -863,9 +864,16 @@ async def start_discovery(request: Request):
         async def _go():
             global _discovery_report
             try:
-                report = await run_discovery(state, config, provider, queries,
-                                             max_spend=max_spend)
-                _discovery_report = report.as_dict()
+                # Discovery chains straight into profiling: reading the sites
+                # is free, and it is what makes the results worth anything.
+                result = await run_prospecting(state, config, provider, queries,
+                                               max_spend=max_spend)
+                _discovery_report = {
+                    **(result.discover or {}),
+                    "profiled_companies": result.profiled_companies,
+                    "profile_observations": result.profile_observations,
+                    "errors": result.errors,
+                }
             except Exception as exc:
                 logger.exception("discovery run failed")
                 _discovery_report = {"errors": [str(exc)], "stopped": "failed"}
@@ -873,6 +881,45 @@ async def start_discovery(request: Request):
         _discovery_report = None
         _discovery_task = asyncio.create_task(_go())
         return {"success": True, "queries": len(queries)}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/profile/run")
+async def start_profile():
+    """Read the websites of everything discovered but not yet looked at.
+
+    Free and model-free, so there is nothing to estimate and no cap to set.
+    """
+    global _discovery_task, _discovery_report
+
+    if _discovery_task and not _discovery_task.done():
+        return JSONResponse({"success": False, "message": "a run is already going"},
+                            status_code=409)
+    try:
+        from harvey.pipeline import run_profile_stage
+
+        state = _state()
+        await state.init_db()
+        pending = await state.count_companies_needing_profile()
+        if not pending:
+            return {"success": True, "pending": 0}
+
+        async def _go():
+            global _discovery_report
+            try:
+                companies, observations, _ = await run_profile_stage(state, limit=200)
+                _discovery_report = {
+                    "profiled_companies": companies,
+                    "profile_observations": observations,
+                }
+            except Exception as exc:
+                logger.exception("profile run failed")
+                _discovery_report = {"errors": [str(exc)], "stopped": "failed"}
+
+        _discovery_report = None
+        _discovery_task = asyncio.create_task(_go())
+        return {"success": True, "pending": pending}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
@@ -921,6 +968,7 @@ async def get_today():
         companies = await query_db("SELECT COUNT(*) AS n FROM companies")
         n_companies = companies[0]["n"] if companies else 0
 
+        unprofiled_count = await state.count_companies_needing_profile()
         stats = {
             "companies": n_companies,
             "prospects": sum(counts.values()),
@@ -928,6 +976,7 @@ async def get_today():
             "outbox_pending": len(pending),
             "outbox_approved": len(approved),
             "open_conversations": open_convos,
+            "unprofiled": unprofiled_count,
         }
 
         # Ordered by how much it blocks Harvey from doing anything at all.
@@ -975,6 +1024,17 @@ async def get_today():
                 "detail": ("Signals are confirmed but nothing has been collected. "
                            "Discovery is free to try — no account needed."),
                 "action": "Find businesses", "tab": "discover",
+            })
+
+        unprofiled = unprofiled_count
+        if unprofiled:
+            items.append({
+                "key": "profile", "tone": "good",
+                "title": f"{unprofiled} companies not looked at yet",
+                "detail": ("Reading their websites is free and it is what makes "
+                           "an email specific — who their agency is, what they "
+                           "are missing, whether they are spending on ads."),
+                "action": "Read their sites", "tab": "discover",
             })
 
         if pending:

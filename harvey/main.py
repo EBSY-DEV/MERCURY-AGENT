@@ -10,6 +10,7 @@ import pytz
 
 from harvey.brain import Brain
 from harvey.config import ConfigError, load_config, load_env, HarveyConfig
+from harvey.pipeline import run_profile_stage
 from harvey.state import StateManager
 
 logging.basicConfig(
@@ -200,6 +201,13 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             # cycle's primary action.
             if sender.is_native and not any(n == "send_campaign" for n, _ in tasks):
                 tasks.append(("send_outbox", sender.run()))
+
+            # Profiling rides along every cycle. It is three HTTP requests per
+            # business with no model call, so it costs nothing against the
+            # Claude budget the rest of this loop is rationing — and it is what
+            # turns a name and a domain into something worth writing about.
+            if summary.get("unprofiled", 0):
+                tasks.append(("profile", run_profile_stage(state, limit=25)))
 
             if len(tasks) > 1:
                 logger.info(f"Running {len(tasks)} agents in parallel: {[t[0] for t in tasks]}")
