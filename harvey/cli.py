@@ -7,8 +7,37 @@ import sys
 from pathlib import Path
 
 
+MIN_PYTHON = (3, 11)
+
+
+def _check_python_version():
+    """Refuse to install on a Python that cannot run Harvey.
+
+    `python3 -m venv .venv` on macOS builds the venv from /usr/bin/python3,
+    which is 3.9 — old enough that Harvey's `X | Y` type syntax fails at
+    import. The install itself appears to succeed and the failure surfaces
+    later as an unrelated-looking ImportError, so check up front and name the
+    fix.
+    """
+    if sys.version_info >= MIN_PYTHON:
+        return
+
+    have = f"{sys.version_info.major}.{sys.version_info.minor}"
+    want = f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
+    print(f"\n  Harvey needs Python {want} or newer. This is Python {have}.")
+    print(f"  ({sys.executable})\n")
+    print("  On macOS, `python3` is usually the system 3.9, so a venv built")
+    print("  with it is 3.9 too. Build the venv from a newer Python instead:\n")
+    print("    brew install python@3.13")
+    print("    rm -rf .venv")
+    print("    $(brew --prefix)/bin/python3.13 -m venv .venv")
+    print("    source .venv/bin/activate && pip install -e .\n")
+    sys.exit(1)
+
+
 def cmd_install(args):
     """Install all dependencies including Playwright browsers."""
+    _check_python_version()
     print("\n  Installing Harvey dependencies...\n")
 
     # Install Python packages
