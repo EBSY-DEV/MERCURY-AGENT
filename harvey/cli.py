@@ -320,6 +320,31 @@ def cmd_outbox(args):
     asyncio.run(_outbox())
 
 
+def cmd_profile(args):
+    """Read what companies' own websites say about them. Free, no Claude calls."""
+    from harvey.state import StateManager
+    from harvey.pipeline import run_profile_stage
+
+    async def _profile():
+        state = StateManager()
+        await state.init_db()
+
+        pending = await state.count_companies_needing_profile(args.stale_days)
+        if not pending:
+            print("\n  Nothing to profile. Every company with a website has "
+                  "been read recently.\n")
+            return
+
+        print(f"\n  {pending} companies need profiling. Reading up to "
+              f"{args.limit}...\n")
+        companies, observations, _ = await run_profile_stage(
+            state, limit=args.limit, stale_days=args.stale_days)
+        print(f"  Read {companies} sites → {observations} observations (free)")
+        print("\n  See what turned up: harvey dashboard → Signals\n")
+
+    asyncio.run(_profile())
+
+
 def cmd_discover(args):
     """Find businesses. The only stage that spends money, so it estimates first."""
     from harvey.state import StateManager
@@ -375,18 +400,30 @@ def cmd_discover(args):
             return
 
         print("\n  Running...\n")
-        report = await run_discovery(state, config, args.provider, queries,
-                                     max_spend=args.max_spend)
+        from harvey.pipeline import run_prospecting
 
-        r = report
-        print(f"  Found {r.found} results across {r.queries} queries")
-        print(f"    {r.new_companies} new companies, {r.known_companies} already known")
-        print(f"    {r.junk} filtered out as directories/aggregators")
-        print(f"    {r.observations} observations recorded")
-        print(f"    actual cost: ${r.actual_cost:.4f}")
-        if r.stopped:
-            print(f"\n  Stopped early: {r.stopped}")
-        for err in r.errors[:5]:
+        result = await run_prospecting(
+            state, config, args.provider, queries,
+            max_spend=args.max_spend, profile=not args.no_profile,
+        )
+        r = result.discover or {}
+        print(f"  DISCOVER — {r.get('found', 0)} results across "
+              f"{r.get('queries', 0)} queries")
+        print(f"    {r.get('new_companies', 0)} new companies, "
+              f"{r.get('known_companies', 0)} already known")
+        print(f"    {r.get('junk', 0)} filtered out as directories/aggregators")
+        print(f"    {r.get('observations', 0)} observations recorded")
+        print(f"    actual cost: ${r.get('actual_cost', 0):.4f}")
+        if r.get("stopped"):
+            print(f"    stopped early: {r['stopped']}")
+
+        if args.no_profile:
+            print("\n  PROFILE — skipped (--no-profile)")
+        else:
+            print(f"\n  PROFILE — {result.profiled_companies} sites read, "
+                  f"{result.profile_observations} observations  (free)")
+
+        for err in result.errors[:5]:
             print(f"    ! {err}")
         print("\n  Next: harvey dashboard → Signals → cohort builder\n")
 
@@ -565,7 +602,17 @@ def main():
                      help="Max records per query (default: 100)")
     sub.add_argument("--max-spend", type=float, default=1.0,
                      help="Hard cap in dollars (default: 1.00)")
+    sub.add_argument("--no-profile", action="store_true",
+                     help="Don't profile what was found (profiling is free)")
     sub.set_defaults(func=cmd_discover)
+
+    sub = subparsers.add_parser(
+        "profile", help="Read discovered companies' websites (free, no Claude)")
+    sub.add_argument("--limit", type=int, default=200,
+                     help="Max sites to read (default: 200)")
+    sub.add_argument("--stale-days", type=int, default=90,
+                     help="Re-read a site after this many days (default: 90)")
+    sub.set_defaults(func=cmd_profile)
 
     sub = subparsers.add_parser(
         "signals", help="Review/confirm which signals Harvey prospects against")

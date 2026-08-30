@@ -499,10 +499,10 @@ async def test_overpass_throttling_is_an_error_not_an_empty_market(monkeypatch):
     """A silent [] on a 504 is indistinguishable from 'no businesses here',
     which is how a throttled run gets mistaken for a clean one."""
     monkeypatch.setattr(D.OpenStreetMap, "BACKOFF", 0.0)
-    calls = {"n": 0}
+    seen = []
 
     def handler(request):
-        calls["n"] += 1
+        seen.append(str(request.url))
         return httpx.Response(504, text="")
 
     provider = D.OpenStreetMap()
@@ -510,11 +510,11 @@ async def test_overpass_throttling_is_an_error_not_an_empty_market(monkeypatch):
         async with _client(handler) as client:
             await provider.fetch(client, {}, D.DiscoveryQuery(
                 term="roofer", coordinate="39.7,-104.9,40"))
-    assert calls["n"] == 2, "it should retry once before giving up"
+    assert seen == list(D.OpenStreetMap.ENDPOINTS), "every mirror should be tried"
 
 
 @pytest.mark.asyncio
-async def test_overpass_recovers_on_the_retry(monkeypatch):
+async def test_overpass_falls_over_to_the_next_mirror(monkeypatch):
     monkeypatch.setattr(D.OpenStreetMap, "BACKOFF", 0.0)
     calls = {"n": 0}
 

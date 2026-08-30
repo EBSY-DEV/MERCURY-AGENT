@@ -1062,20 +1062,45 @@ class StateManager:
             async with db.execute(sql, params) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
 
+    # A boolean signal is recorded either way: "checked, not running ads" is a
+    # real finding, and a later flip from 0 to 1 is a real event. But a COHORT
+    # asks who *has* the signal, so it must read the value, not merely the
+    # presence of a row. Without this, "companies running Google Ads" silently
+    # means "companies we checked for Google Ads" — which is everyone.
+    #
+    # `latest` is the current view of the world (newest observation per company
+    # and signal, with history still on disk underneath). `positive` is the
+    # subset where the finding is actually true — value_num IS NULL covers text
+    # signals like INCUMBENT_AGENCY, where the row's existence IS the finding.
+    _CURRENT_CTE = """
+    WITH latest AS (
+        SELECT o.* FROM observations o
+        JOIN (SELECT company_id, signal_code, MAX(observed_at) AS t
+              FROM observations GROUP BY company_id, signal_code) newest
+          ON newest.company_id = o.company_id
+         AND newest.signal_code = o.signal_code
+         AND newest.t = o.observed_at
+    ),
+    positive AS (
+        SELECT * FROM latest WHERE value_num IS NULL OR value_num != 0
+    )
+    """
+
     async def signal_counts(self) -> list[dict]:
-        """How many entities carry each signal — the cohort sizes."""
+        """How many entities actually carry each signal — the cohort sizes."""
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                """SELECT o.signal_code,
-                          COALESCE(sc.label, o.signal_code) AS label,
-                          sc.status AS status,
-                          COUNT(DISTINCT o.company_id) AS companies,
-                          COUNT(*) AS observations
-                   FROM observations o
-                   LEFT JOIN signal_codes sc ON sc.code = o.signal_code
-                   GROUP BY o.signal_code
-                   ORDER BY companies DESC"""
+                self._CURRENT_CTE + """
+                SELECT p.signal_code,
+                       COALESCE(sc.label, p.signal_code) AS label,
+                       sc.status AS status,
+                       COUNT(DISTINCT p.company_id) AS companies,
+                       COUNT(*) AS observations
+                FROM positive p
+                LEFT JOIN signal_codes sc ON sc.code = p.signal_code
+                GROUP BY p.signal_code
+                ORDER BY companies DESC"""
             ) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
 
@@ -1094,8 +1119,8 @@ class StateManager:
         if not require:
             return []
         req_ph = ",".join("?" for _ in require)
-        sql = (
-            "SELECT company_id FROM observations "
+        sql = self._CURRENT_CTE + (
+            f"SELECT company_id FROM positive "
             f"WHERE signal_code IN ({req_ph}) AND company_id != '' "
             "AND confidence >= ? "
             "GROUP BY company_id HAVING COUNT(DISTINCT signal_code) = ?"
@@ -1105,7 +1130,7 @@ class StateManager:
             exc_ph = ",".join("?" for _ in exclude)
             sql += (
                 " AND company_id NOT IN ("
-                f"SELECT company_id FROM observations WHERE signal_code IN ({exc_ph})"
+                f"SELECT company_id FROM positive WHERE signal_code IN ({exc_ph})"
                 ")"
             )
             params.extend(exclude)
@@ -1114,6 +1139,54 @@ class StateManager:
         async with self._connect() as db:
             async with db.execute(sql, params) as cursor:
                 return [row[0] for row in await cursor.fetchall()]
+
+    async def companies_needing_profile(
+        self, limit: int = 100, stale_days: int = 90
+    ) -> list[dict]:
+        """Companies a profile run should visit next.
+
+        Never profiled, or last profiled longer ago than ``stale_days``. The
+        staleness window is what makes re-observation a time series rather
+        than a duplicate: "they dropped their agency last quarter" is only
+        visible if you look again.
+
+        Businesses with no domain are excluded — there is no site to read.
+        They are not a failure, they are the NO_WEBSITE cohort.
+        """
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT c.id, c.name, c.domain
+                   FROM companies c
+                   LEFT JOIN (
+                       SELECT company_id, MAX(observed_at) AS last_seen
+                       FROM observations WHERE collector = 'profile'
+                       GROUP BY company_id
+                   ) p ON p.company_id = c.id
+                   WHERE c.domain != ''
+                     AND (p.last_seen IS NULL
+                          OR p.last_seen < datetime('now', ?))
+                   ORDER BY c.created_at DESC
+                   LIMIT ?""",
+                (f"-{int(stale_days)} days", int(limit)),
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def count_companies_needing_profile(self, stale_days: int = 90) -> int:
+        async with self._connect() as db:
+            async with db.execute(
+                """SELECT COUNT(*) FROM companies c
+                   LEFT JOIN (
+                       SELECT company_id, MAX(observed_at) AS last_seen
+                       FROM observations WHERE collector = 'profile'
+                       GROUP BY company_id
+                   ) p ON p.company_id = c.id
+                   WHERE c.domain != ''
+                     AND (p.last_seen IS NULL OR p.last_seen < datetime('now', ?))""",
+                (f"-{int(stale_days)} days",),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else 0
 
     # ── Run log (what ran, when, what it produced and cost) ──
 
@@ -1644,4 +1717,8 @@ class StateManager:
             "active_campaigns": active_campaigns,
             "open_conversations": open_conversations,
             "usage_today": usage_today,
+            # Companies discovered but not yet read. The heartbeat profiles
+            # these every cycle — it is free, so it never competes with the
+            # Claude budget the rest of the loop is rationing.
+            "unprofiled": await self.count_companies_needing_profile(),
         }
