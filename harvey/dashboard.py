@@ -761,6 +761,134 @@ async def get_activity():
 # ── Dashboard UI ──
 
 
+# ── Discovery: the provider menu, an estimate, and a run ──
+#
+# This is the only stage that spends money, so the UI never starts one without
+# showing what it will cost first.
+
+_discovery_task: asyncio.Task | None = None
+_discovery_report: dict | None = None
+
+
+def _discovery_queries(body: dict, config):
+    from harvey.collectors.discover import build_queries
+
+    cities = [c.strip() for c in (body.get("cities") or []) if c.strip()] or None
+    return build_queries(
+        config, cities=cities,
+        depth=int(body.get("depth") or 30),
+        limit=int(body.get("limit") or 100),
+    )
+
+
+@app.get("/api/discover/providers")
+async def get_discovery_providers():
+    """What each source does, what it costs, and whether it's ready to use."""
+    try:
+        from harvey.collectors.discover import DEFAULT_PROVIDER, provider_menu
+        from harvey.config import load_env
+
+        state = _state()
+        await state.init_db()
+        return {
+            "providers": provider_menu(load_env().model_dump()),
+            "default": DEFAULT_PROVIDER,
+            "selected": await state.get_setting("discovery_provider") or DEFAULT_PROVIDER,
+            "paused": await state.get_setting("discovery_paused"),
+            "running": bool(_discovery_task and not _discovery_task.done()),
+            "last_report": _discovery_report,
+        }
+    except Exception as e:
+        logger.exception("discovery providers failed")
+        return {"providers": [], "error": str(e)}
+
+
+@app.post("/api/discover/estimate")
+async def estimate_discovery(request: Request):
+    """Projected spend and the exact query list, before anything is called."""
+    try:
+        from harvey.collectors.discover import PROVIDERS, estimate_cost
+        from harvey.config import load_config
+
+        body = await request.json()
+        provider = body.get("provider") or ""
+        if provider not in PROVIDERS:
+            return JSONResponse({"error": f"unknown provider {provider!r}"},
+                                status_code=400)
+
+        queries = _discovery_queries(body, load_config())
+        return {
+            "provider": provider,
+            "queries": [q.keyword() for q in queries],
+            "query_count": len(queries),
+            "estimated_cost": round(estimate_cost(provider, queries), 4),
+            "free": PROVIDERS[provider].estimate(queries) == 0,
+        }
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/discover/run")
+async def start_discovery(request: Request):
+    """Kick off a run in the background and hand back immediately.
+
+    Discovery takes minutes, not milliseconds — holding the request open
+    would just time out. Progress shows up in the run log.
+    """
+    global _discovery_task, _discovery_report
+
+    if _discovery_task and not _discovery_task.done():
+        return JSONResponse({"success": False, "message": "a run is already going"},
+                            status_code=409)
+    try:
+        from harvey.collectors.discover import PROVIDERS, run_discovery
+        from harvey.config import load_config
+
+        body = await request.json()
+        provider = body.get("provider") or ""
+        if provider not in PROVIDERS:
+            return JSONResponse({"success": False,
+                                 "message": f"unknown provider {provider!r}"},
+                                status_code=400)
+
+        config = load_config()
+        queries = _discovery_queries(body, config)
+        max_spend = float(body.get("max_spend") or 1.0)
+
+        state = _state()
+        await state.init_db()
+        await state.set_setting("discovery_provider", provider)
+        await state.set_setting("discovery_paused", "")
+
+        async def _go():
+            global _discovery_report
+            try:
+                report = await run_discovery(state, config, provider, queries,
+                                             max_spend=max_spend)
+                _discovery_report = report.as_dict()
+            except Exception as exc:
+                logger.exception("discovery run failed")
+                _discovery_report = {"errors": [str(exc)], "stopped": "failed"}
+
+        _discovery_report = None
+        _discovery_task = asyncio.create_task(_go())
+        return {"success": True, "queries": len(queries)}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/discover/stop")
+async def stop_discovery():
+    """Kill switch. Read between batches, so an in-flight run stops cleanly."""
+    try:
+        state = _state()
+        await state.init_db()
+        await state.set_setting("discovery_paused", "stopped from dashboard")
+        return {"success": True}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
 @app.get("/api/today")
 async def get_today():
     """What needs a human, right now.
@@ -838,6 +966,15 @@ async def get_today():
                 "title": "No signals confirmed",
                 "detail": "Every signal is rejected, so prospecting has nothing to collect.",
                 "action": "Review signals", "tab": "signals",
+            })
+
+        if not n_companies and confirmed:
+            items.append({
+                "key": "discover", "tone": "good",
+                "title": "No companies yet",
+                "detail": ("Signals are confirmed but nothing has been collected. "
+                           "Discovery is free to try — no account needed."),
+                "action": "Find businesses", "tab": "discover",
             })
 
         if pending:

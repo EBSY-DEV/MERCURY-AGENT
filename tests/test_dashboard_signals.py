@@ -167,7 +167,7 @@ def test_today_leads_with_unconfirmed_signals(client):
     assert "signals" in keys
     item = next(i for i in data["items"] if i["key"] == "signals")
     assert item["tab"] == "signals"
-    assert "19" in item["title"]
+    assert str(len(SIGNAL_CATALOG)) in item["title"]
 
 
 def test_today_flags_a_fully_rejected_vocabulary(client):

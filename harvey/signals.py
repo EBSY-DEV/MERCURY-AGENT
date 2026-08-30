@@ -46,6 +46,62 @@ SIGNAL_CATALOG: list[dict] = [
         "confidence_floor": 0.0,
     },
 
+    {
+        "code": "NO_WEBSITE",
+        "label": "No website at all",
+        "description": (
+            "The business has a listing and a phone number but no site. If you "
+            "sell websites this is the highest-intent signal that exists — and "
+            "it is a filter you can query for directly, not something you infer."
+        ),
+        "category": "discovery",
+        "value_type": "bool",
+        "collector": "discover",
+        "cost_note": "included in the business listing lookup",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "UNCLAIMED_LISTING",
+        "label": "Unclaimed Google listing",
+        "description": (
+            "Nobody has claimed their Google Business Profile, so they are not "
+            "managing how they show up locally. Strong signal for anyone "
+            "selling local marketing."
+        ),
+        "category": "discovery",
+        "value_type": "bool",
+        "collector": "discover",
+        "cost_note": "included in the business listing lookup",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "REVIEW_RATING",
+        "label": "Review rating",
+        "description": (
+            "Their average star rating. Useful in both directions: a low "
+            "rating is a reputation problem to solve, a high one with few "
+            "reviews is proof they are good but invisible."
+        ),
+        "category": "discovery",
+        "value_type": "num",
+        "collector": "discover",
+        "cost_note": "included in the business listing lookup",
+        "confidence_floor": 0.0,
+    },
+    {
+        "code": "REVIEW_COUNT",
+        "label": "Number of reviews",
+        "description": (
+            "How many reviews they have. A rough proxy for size and for how "
+            "much attention they pay to their online presence."
+        ),
+        "category": "discovery",
+        "value_type": "num",
+        "collector": "discover",
+        "cost_note": "included in the business listing lookup",
+        "confidence_floor": 0.0,
+    },
+
     # ── Profile: what they are (free — HTML Harvey already fetches) ──
     {
         "code": "INCUMBENT_AGENCY",

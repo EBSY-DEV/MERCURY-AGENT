@@ -60,6 +60,11 @@ class ICPConfig(BaseModel):
     # hiring a "Head of Growth" is buying growth tooling). Empty → falls back
     # to `titles`. Used for careers-page scanning and job-board discovery.
     hiring_signals: list[str] = []
+    # Discovery needs a radius, not a place name. Maps each entry in
+    # `geography` to "lat,lng,radius_km" — e.g.
+    #   "Denver, CO": "39.7392,-104.9903,50"
+    # Without one, listings providers can only match on the business name.
+    geo_coordinates: dict[str, str] = {}
 
 
 class EmailChannelConfig(BaseModel):
@@ -157,6 +162,10 @@ class HarveyConfig(BaseModel):
 
 class EnvConfig(BaseModel):
     instantly_api_key: str = ""
+    # Discovery providers
+    dataforseo_login: str = ""
+    dataforseo_password: str = ""
+    dataforseo_sandbox: str = ""   # any truthy value routes to the free sandbox
     linkedin_email: str = ""
     linkedin_password: str = ""
     hunter_api_key: str = ""
@@ -231,6 +240,9 @@ def load_env() -> EnvConfig:
     load_dotenv()
     env = EnvConfig(
         instantly_api_key=os.getenv("INSTANTLY_API_KEY", "").strip(),
+        dataforseo_login=os.getenv("DATAFORSEO_LOGIN", "").strip(),
+        dataforseo_password=os.getenv("DATAFORSEO_PASSWORD", "").strip(),
+        dataforseo_sandbox=os.getenv("DATAFORSEO_SANDBOX", "").strip(),
         linkedin_email=os.getenv("LINKEDIN_EMAIL", "").strip(),
         linkedin_password=os.getenv("LINKEDIN_PASSWORD", "").strip(),
         hunter_api_key=os.getenv("HUNTER_API_KEY", "").strip(),

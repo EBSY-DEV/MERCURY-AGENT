@@ -19,8 +19,13 @@ class Company(BaseModel):
     industry: str = ""
     company_size: str = ""
     location: str = ""
+    phone: str = ""
     source: str = ""          # how we found them: google_dork, linkedin, company_scrape
     source_url: str = ""      # specific URL where we found the info
+    # Provider-stable identity ("dataforseo:ChIJ...", "osm:node/123"). The
+    # dedup key for businesses that have no website — which are precisely the
+    # best prospects for anyone selling one.
+    external_id: str = ""
     notes: str = ""
     # Buying signals: detected tools on their site, and timely triggers
     # (hiring, funding, ...) as [{"type": ..., "detail": ..., "found_at": ...}]

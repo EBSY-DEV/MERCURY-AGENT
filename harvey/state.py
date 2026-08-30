@@ -362,6 +362,18 @@ MIGRATIONS: list[str] = [
 
     CREATE INDEX IF NOT EXISTS idx_runs_stage_started ON runs(stage, started_at);
     """,
+    # ── v8: discovery — entity resolution for businesses without a website ──
+    """
+    -- The best prospect for anyone selling websites is a business that has
+    -- none, so `domain` cannot be the only identity key. `external_id` holds
+    -- the provider's stable id ("dataforseo:ChIJ...", "osm:node/123") and is
+    -- what dedups a re-run for those records.
+    ALTER TABLE companies ADD COLUMN external_id TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN phone TEXT DEFAULT '';
+
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_external
+        ON companies(external_id) WHERE external_id != '';
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -425,7 +437,13 @@ class StateManager:
         return Company(**d)
 
     async def add_company(self, company: Company) -> str:
-        """Insert a company. If one with the same domain exists, return its id."""
+        """Insert a company, or return the id of the one already recorded.
+
+        Identity is the normalised domain when there is one, and the
+        provider's ``external_id`` when there isn't — a business with no
+        website still has to dedup across re-runs, and for anyone selling
+        websites those are the best prospects on the list.
+        """
         if not company.id:
             company.id = _new_id()
         company.domain = _norm(company.domain)
@@ -433,28 +451,34 @@ class StateManager:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO companies
                    (id, name, domain, website, description, industry,
-                    company_size, location, source, source_url, notes,
-                    tech_stack_json, signals_json, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    company_size, location, phone, source, source_url,
+                    external_id, notes, tech_stack_json, signals_json,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     company.id, company.name, company.domain, company.website,
                     company.description, company.industry, company.company_size,
-                    company.location, company.source, company.source_url,
-                    company.notes,
+                    company.location, company.phone, company.source,
+                    company.source_url, company.external_id, company.notes,
                     json.dumps(company.tech_stack), json.dumps(company.signals),
                     company.created_at.isoformat(),
                     company.updated_at.isoformat(),
                 ),
             )
             await db.commit()
-            if cursor.rowcount == 0 and company.domain:
-                # Unique-domain conflict: hand back the existing record's id.
-                async with db.execute(
-                    "SELECT id FROM companies WHERE domain = ?", (company.domain,)
-                ) as cur:
-                    row = await cur.fetchone()
-                    if row:
-                        company.id = row[0]
+            if cursor.rowcount == 0:
+                # Uniqueness conflict: hand back the existing record's id.
+                for column, value in (("domain", company.domain),
+                                      ("external_id", company.external_id)):
+                    if not value:
+                        continue
+                    async with db.execute(
+                        f"SELECT id FROM companies WHERE {column} = ?", (value,)
+                    ) as cur:
+                        row = await cur.fetchone()
+                        if row:
+                            company.id = row[0]
+                            break
         return company.id
 
     async def update_company_signals(
@@ -522,6 +546,22 @@ class StateManager:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 "SELECT * FROM companies WHERE domain = ?", (_norm(domain),)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return self._company_from_row(row) if row else None
+
+    async def get_company_by_external_id(self, external_id: str) -> Company | None:
+        """Look a company up by its provider-stable id.
+
+        The identity path for businesses with no website — which is exactly
+        the cohort worth the most to anyone selling one.
+        """
+        if not external_id:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM companies WHERE external_id = ?", (external_id,)
             ) as cursor:
                 row = await cursor.fetchone()
                 return self._company_from_row(row) if row else None

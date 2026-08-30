@@ -28,6 +28,7 @@
 <nav>
   <button class="active" onclick="showTab('today', this)">Today<span class="nav-count" id="nav-today"></span></button>
   <button onclick="showTab('signals', this)">Signals<span class="nav-count" id="nav-signals"></span></button>
+  <button onclick="showTab('discover', this)">Discover</button>
   <button onclick="showTab('companies', this)">Companies</button>
   <button onclick="showTab('prospects', this)">Contacts</button>
   <button onclick="showTab('campaigns', this)">Campaigns</button>
@@ -73,6 +74,47 @@
     <div id="cohort-builder"></div>
     <div id="cohort-result"></div>
   </div>
+</div>
+
+<!-- Discover: the only stage that spends money -->
+<div id="discover" class="section">
+  <div class="section-head">
+    <h2>Discover</h2>
+    <p>Find businesses matching your ICP. Pick a source, see what it will cost,
+       then run it &mdash; nothing is called until you press the button.</p>
+  </div>
+  <div id="discover-providers"></div>
+
+  <div class="subhead">Run</div>
+  <div class="card">
+    <div class="form-row" style="margin-bottom:14px">
+      <div class="form-group" style="flex:2">
+        <label class="form-label">Cities</label>
+        <input class="form-input" id="disc-cities" placeholder="from your ICP — or override, one per line">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Results per query</label>
+        <input class="form-input" id="disc-limit" type="number" value="100" min="1" max="1000">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Search depth</label>
+        <input class="form-input" id="disc-depth" type="number" value="30" min="10" max="100" step="10">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Spend cap ($)</label>
+        <input class="form-input" id="disc-cap" type="number" value="1.00" min="0" step="0.25">
+      </div>
+    </div>
+    <div id="discover-estimate"></div>
+    <div class="btn-group">
+      <button class="btn btn-secondary" onclick="estimateDiscovery()">Estimate cost</button>
+      <button class="btn btn-primary" id="disc-run" onclick="runDiscovery()" disabled>
+        Estimate first</button>
+      <button class="btn btn-danger" id="disc-stop" onclick="stopDiscovery()" style="display:none">
+        Stop</button>
+    </div>
+  </div>
+  <div id="discover-result"></div>
 </div>
 
 <!-- Companies -->
