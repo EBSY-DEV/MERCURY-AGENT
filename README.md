@@ -1,140 +1,112 @@
 # Harvey
 
-**The autonomous AI sales agent that never stops closing.**
+**An autonomous sales agent that runs on your Claude Code subscription.**
 
-Harvey is an open-source, fully autonomous sales agent that finds prospects, writes personalized cold email campaigns, sends them, monitors replies, handles objections, and books meetings — all without human intervention. Named after Harvey Specter from *Suits*, because the best closer in New York never sleeps.
+Harvey finds businesses worth selling to, learns something specific about each one, writes cold email that references it, sends it, reads the replies, and works the conversation toward a meeting. It runs on your machine, in a loop, on its own.
 
-Harvey runs on your existing Claude Max subscription (zero extra LLM cost), deploys to any VPS with Docker, and replaces expensive prospecting tools by finding leads on its own. It ships with compliant defaults — hard opt-out handling, send limits, honest-identity rules — because outreach that gets your domain blacklisted isn't outreach. Read [Legal & Deliverability](#legal--deliverability-read-this-before-sending-anything) before your first campaign.
+The unusual part: **there is no API bill.** Harvey drives the `claude` CLI in headless mode, so every decision, every email, every reply it handles is billed against the Claude Pro or Max subscription you already pay for. Not an API key. Not per-token. The subscription.
 
 ```
-$ python -m harvey
+$ harvey run
 
 ============================================================
 Harvey is online. Always Be Closing.
 ============================================================
-Database initialized.
-Thinking about what to do next...
-Decision: prospect
-Scout: Starting prospecting cycle...
-Scout: Searching LinkedIn...
-Scout: Added prospect Sarah Chen — VP Marketing at Acme SaaS
-Scout: Added prospect James Rivera — Head of Growth at GrowthCo
-...
+Checking pipeline state...
+Decision: prospect (only 3 new prospects; pipeline needs leads)
+  discover  → 41 businesses in Portland, OR       ($0.00, OpenStreetMap)
+  profile   → 41 sites read, 288 observations     (free, no model calls)
+  scout     → 12 scored against your ICP
+Decision: write_campaign (12 new prospects with no drafts)
+  writer    → 3-email sequence for Cascade Landscaping
+  outbox    → 12 emails waiting for your approval
+Cycle complete. Sleeping for 15 minutes.
 ```
 
 ---
 
-## What Harvey Does
+## Table of contents
 
-Harvey runs a continuous heartbeat loop — wake up, decide what needs doing, do it, log the results, sleep, repeat. Every 15 minutes (configurable), Harvey checks the state of your sales pipeline and takes the highest-priority action.
-
-### The Loop
-
-```
-Wake Up → Check Budget → Decide → Act → Log → Sleep → Repeat
-   ↑                                                    |
-   └────────────────────────────────────────────────────┘
-```
-
-### Sub-Agents
-
-Harvey feels like one agent, but under the hood it coordinates five specialized sub-agents:
-
-| Agent | What It Does |
-|-------|-------------|
-| **Scout** | Finds prospects matching your ICP — via LinkedIn search, Google dorking, company website scraping, and email pattern discovery. No Apollo or ZoomInfo needed. |
-| **Writer** | Crafts personalized 3-email sequences using proven frameworks (AIDA, PAS, BAB). Every email is tailored to the prospect's role, company, and industry. |
-| **Sender** | Deploys campaigns to Instantly (or Woodpecker) via API. Adds leads, sets sequences, activates campaigns, and tracks delivery. |
-| **Handler** | Monitors all replies. Classifies intent (interested, objection, not interested, OOO, wrong person) and auto-responds with context-aware messages that move toward a meeting. |
-| **Analyst** | Tracks what's working — reply rates, campaign performance, intent distribution, ICP segment conversion — and generates actionable insights. Runs during idle cycles. |
-
-### Skills System
-
-Each sub-agent is loaded with foundational sales knowledge from Harvey's skills library:
-
-| Skill | What It Teaches |
-|-------|----------------|
-| **Email Frameworks** | AIDA, PAS, BAB, QVC, 3Ps — when to use each, with templates and selection rules |
-| **Objection Handling** | LAARC framework, responses for Budget/Authority/Need/Timing objections, advanced techniques |
-| **Lead Qualification** | BANT screening, ICP scoring (1-10 scale), MEDDIC for complex deals |
-| **LinkedIn Outreach** | Connection sequences, warm-up strategies, messaging templates, rate limits |
-| **Prospecting Tactics** | Google dorking, company scraping, email discovery, trigger events, referral mining |
-| **Sales Methodology** | Multi-channel orchestration, COSTAR tone calibration, decision priorities, ethical guidelines |
-
-Skills are plain markdown files in the `skills/` directory. Edit them to change how Harvey sells — no code changes needed.
+- [Why the subscription thing matters](#why-the-subscription-thing-matters)
+- [What Harvey actually does](#what-harvey-actually-does)
+- [Quick start](#quick-start)
+- [You confirm what it looks for](#you-confirm-what-it-looks-for)
+- [The prospecting pipeline](#the-prospecting-pipeline)
+- [The skills library](#the-skills-library)
+- [The sub-agents](#the-sub-agents)
+- [Nothing sends without you](#nothing-sends-without-you)
+- [The dashboard](#the-dashboard)
+- [How the data is stored](#how-the-data-is-stored)
+- [Configuration](#configuration)
+- [Legal and deliverability](#legal-and-deliverability)
+- [Troubleshooting](#troubleshooting)
+- [Project structure](#project-structure)
+- [Philosophy](#philosophy)
+- [Roadmap](#roadmap)
 
 ---
 
-## How It Works
+## Why the subscription thing matters
 
-### Architecture
+Every other autonomous sales agent bills you per token. That is the whole reason they cost what they cost: an agent that thinks in a loop, all day, is an agent that burns API credits in a loop, all day. Vendors solve this by thinking less — shorter prompts, cheaper models, fewer passes.
 
-```
-┌─────────────────────────────────────────────────┐
-│                HARVEY (VPS)                      │
-│                                                  │
-│  ┌───────────┐   Heartbeat Loop                  │
-│  │ Scheduler │──► Wake → Decide → Act → Log      │
-│  └───────────┘                                   │
-│                                                  │
-│  ┌─────────────────────────────────────────┐     │
-│  │         Brain (Claude Code CLI)         │     │
-│  │    claude -p (your Max subscription)    │     │
-│  └─────────┬───────────────────────────────┘     │
-│            │                                     │
-│  ┌─────────▼───────────────────────────────┐     │
-│  │            Sub-Agents                   │     │
-│  │  Scout → Writer → Sender → Handler      │     │
-│  └─────────────────────────────────────────┘     │
-│                                                  │
-│  ┌─────────────────────────────────────────┐     │
-│  │          Integrations                   │     │
-│  │  Instantly API │ Playwright │ SMTP      │     │
-│  └─────────────────────────────────────────┘     │
-│                                                  │
-│  ┌─────────────────────────────────────────┐     │
-│  │          State (SQLite)                 │     │
-│  │  Prospects │ Campaigns │ Conversations  │     │
-│  └─────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────┘
+Harvey sidesteps it. It shells out to the `claude` CLI:
+
+```python
+claude -p "<prompt>" --output-format json --dangerously-skip-permissions
 ```
 
-### The Brain
+That is the same subscription-billed path `claude` uses interactively. So Harvey can afford to think properly: full skills library in context, careful personalization per prospect, real reply handling.
 
-Harvey's brain is Claude, accessed through Claude Code's headless mode (`claude -p`). This means Harvey runs on your existing Claude Max subscription — no API keys, no per-token charges, no surprise bills. An always-running autonomous agent would cost hundreds per month on API pricing. With Max, it's included.
+**What this costs you:**
 
-The brain handles all reasoning: deciding what to do next, writing emails, classifying reply intent, generating objection responses, and finding personalization angles.
+| | |
+|---|---|
+| Claude Pro or Max | you already pay for it |
+| Finding businesses | **$0** on the default source, or ~$0.37 per 1,000 on the cheapest paid one |
+| Reading their websites | **$0** — three HTTP requests each, no model call |
+| Writing and sending | your subscription + a mailbox (~$7/mo Google Workspace) |
+| Prospecting tools | **none.** No Apollo, no ZoomInfo, no Clearbit, no Clay. |
 
-### DIY Prospecting
+For comparison, the tools Harvey replaces start at $250–500/month — and they are weakest precisely where Harvey is strongest: small local businesses with 5–50 people, where single-provider contact coverage caps out around 30% and micro-businesses are frequently absent entirely.
 
-Most sales tools charge $200+/month for lead databases. Harvey finds prospects for free:
+**Harvey also budgets itself.** It reads your live subscription quota the same way `/usage` does, and throttles so it always leaves headroom for your own interactive Claude work. Set `max_daily_claude_percent: 80` and Harvey will stop before it starts costing you your own rate limit.
 
-1. **LinkedIn Search** — Playwright browser automation searches for people matching your ICP (title, industry, location). Logs into your LinkedIn account and extracts profiles with human-like behavior patterns.
-
-2. **Google Dorking** — Targeted search queries like `site:linkedin.com/in "VP Marketing" "SaaS"` find profiles indexed by Google.
-
-3. **Company Website Scraping** — Checks /team, /about, /people pages to find decision-makers and their roles.
-
-4. **Email Pattern Discovery** — Given a name and company domain, Harvey tries common email patterns (first.last@, first@, flast@) and verifies them via MX record lookup and SMTP checks. No paid verification service needed.
-
-### Usage Control
-
-Harvey tracks its own Claude usage and lets you set a daily limit. Set `max_daily_claude_percent: 80` in your config and Harvey will stop working when it hits 80% of its daily budget — then pick back up the next morning.
-
-Quiet hours are also configurable. Harvey won't run between 10pm and 7am (or whatever you set).
+> **Honest caveat.** Running an agent against a subscription is a grey area worth understanding for yourself. Anthropic's terms permit personal automation of your own account; they prohibit reselling access or sharing credentials. Harvey runs locally as you, with your login. Don't turn it into a service for other people.
 
 ---
 
-## Quick Start (5 Minutes)
+## What Harvey actually does
+
+Harvey runs a heartbeat: wake up, check the budget, decide what most needs doing, do it, log it, sleep. Every 15 minutes by default.
+
+```
+                 ┌──────────────────────────────────────┐
+                 ↓                                      │
+   Wake  →  Quiet hours?  →  Budget OK?  →  Decide  →  Act  →  Log  →  Sleep
+                 │               │
+              (sleep)         (sleep)
+```
+
+It decides deterministically, not by asking Claude what to do — that would burn a call on something derivable from four counts:
+
+```
+handle replies  >  send campaigns  >  write campaigns  >  prospect  >  idle (analyze)
+```
+
+Profiling and outbox draining ride along on **every** cycle regardless, because they cost nothing and have to happen on schedule.
+
+---
+
+## Quick start
 
 ### Prerequisites
 
-- [Claude Code CLI](https://claude.ai/download) installed and authenticated (`claude login`) with a Max subscription
 - Python 3.11+
-- An [Instantly](https://instantly.ai) account with API access — Growth plan or higher (for cold email)
-- A LinkedIn account (for prospecting — optional, and see the [ToS warning](#legal--deliverability-read-this-before-sending-anything) below)
+- An active **Claude Pro or Max** subscription, with the CLI logged in (`claude login`)
+- A mailbox to send from — Gmail/Workspace recommended, on a *dedicated secondary domain*
 
-### Option A — Let Claude set you up (easiest)
+### Easiest: let Claude set it up
 
 ```bash
 git clone https://github.com/ethanplusai/harvey.git
@@ -142,371 +114,392 @@ cd harvey
 claude
 ```
 
-Claude reads the project, sees it's unconfigured, and walks you through everything — installs dependencies, connects your email platform, trains on your product, and gets Harvey running. Just follow along.
+Then say: **"set up Harvey for me"**. The repo ships a `CLAUDE.md` that turns Claude Code into the setup wizard — it checks what state you're in, installs what's missing, asks what it needs, and trains Harvey on your product.
 
-### Option B — Manual (still 5 minutes)
+### Or do it yourself
 
 ```bash
-# 1. Clone and install (~1 min)
-git clone https://github.com/ethanplusai/harvey.git
-cd harvey
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-python -m playwright install chromium   # only needed for LinkedIn prospecting
+# 1. Install
+python3 -m venv .venv && source .venv/bin/activate && pip install -e .
 
-# 2. Add your API keys (~1 min)
-cp .env.example .env
-# Edit .env — only INSTANTLY_API_KEY is required; every variable is
-# documented inline with where to get it.
+# 2. Configure — every variable is documented inline with where to get it
+cp .env.example .env && $EDITOR .env
 
-# 3. Run the interactive setup wizard (~3 min)
-# Checks prerequisites, tests your keys, and trains Harvey on your
-# product (point it at your website and it teaches itself).
-harvey setup
+# 3. Learn your product from your website
+harvey train https://your-company.com
 
-# 4. Start closing
+# 4. Choose what makes a good prospect (see below — this one matters)
+harvey signals --confirm free
+
+# 5. Find businesses. Free source, no account needed.
+harvey discover
+
+# 6. Watch it work
+harvey dashboard          # http://localhost:5555
 harvey run
 ```
 
-Other commands:
+---
+
+## You confirm what it looks for
+
+This is the part that makes Harvey different from a black box, and it is deliberately not skippable.
+
+Harvey knows how to collect **23 signals** about a business. It does not collect any of them until you say so. On first run it *proposes* the catalog; you confirm, skip, or reject each one in the dashboard or from the terminal:
 
 ```bash
-harvey setup              # Re-run the setup wizard
-harvey status             # Show pipeline summary
-harvey train <url>        # Re-train on a new product website
-harvey train <url> 500    # Crawl more pages for larger sites
+harvey signals                       # review the catalog
+harvey signals --confirm free        # everything that costs nothing (21 of them)
+harvey signals --confirm SERP_RANK   # a paid one, opted into explicitly
 ```
 
-```
-╔══════════════════════════════════════════════════════════╗
-║                                                          ║
-║   Harvey Setup Wizard                                    ║
-║   Let's get you closing deals.                           ║
-║                                                          ║
-╚══════════════════════════════════════════════════════════╝
+Every signal shows what it is in plain language, **what it costs**, and how many companies already carry it.
 
-  Harvey: Hey. I'm Harvey. Let's get me set up so I can start
-  Harvey: closing deals for you. I'll walk you through everything.
-  Harvey: This takes about 5 minutes.
-```
+| | Signal | What it tells you |
+|---|---|---|
+| **Discovery** | `SERP_RANK` | Where they rank for their own core search. Positions 11–30 are the sweet spot: visible enough to be trying, and losing. |
+| | `NO_WEBSITE` | They have a listing and a phone and no site. If you sell websites, the highest-intent signal that exists. |
+| | `UNCLAIMED_LISTING` | Nobody has claimed their Google Business Profile. |
+| | `REVIEW_RATING` / `REVIEW_COUNT` | Good but invisible, or visible but struggling. |
+| **Profile** | `INCUMBENT_AGENCY` | Who currently has the account, credited in their own footer. Every detection builds a roster you can target as a whole book of business. |
+| | `RUNNING_GOOGLE_ADS` / `RUNNING_META_ADS` | They are spending on acquisition *today*. The strongest budget signal available for free. |
+| | `NO_ONLINE_BOOKING` | Leads have to phone in, so after-hours demand is lost. |
+| | `NO_SCHEMA_MARKUP` | A concrete, checkable SEO gap you can name in an email. |
+| | `BLOG_STALE` | Content marketing started and abandoned. |
+| | `SITE_PAGE_COUNT`, `TECH_STACK`, `BLOCKS_AI_CRAWLERS`, `HIRING_ROLE` | Size, platform, AI-search visibility, and what they're hiring for. |
+| **People** | `CONTACT_FOUND`, `DECISION_MAKER_TITLE`, `LIKELY_OWNER`, `REGISTRY_VERIFIED` | Who decides, and whether they own the place. |
+| **Contact** | `EMAIL_PATTERN`, `EMAIL_STATUS`, `CONTACT_FORM_URL` | Whether you can actually reach them. |
 
-The wizard walks you through 6 steps:
+### Then a cohort is a query, not a list
 
-**Step 1 — Prerequisites Check.** Harvey verifies Claude Code CLI is installed, tests that headless mode works with your Max subscription, and checks all Python dependencies.
-
-**Step 2 — Email Platform.** Harvey asks for your Instantly API key and tests the connection live. If it doesn't work, Harvey tells you exactly what's wrong.
-
-**Step 3 — LinkedIn (optional).** If you want Harvey to prospect on LinkedIn, give it your credentials. If not, Harvey will use Google and company websites instead.
-
-**Step 4 — Cloudflare Crawling (optional).** For deep website crawling with JavaScript rendering. $5/month for ~12,000 pages. Harvey works without it — just uses its built-in crawler instead.
-
-**Step 5 — Product Training.** This is the big one. Harvey asks: *"Train from website URL or enter manually?"*
-
-If you give Harvey your website URL, it deep-crawls the entire site and teaches itself everything:
+Once signals are confirmed, the dashboard's cohort builder turns them into a target set — pick what a good prospect **must have** and what **disqualifies** them, and it counts the matches live:
 
 ```
-  Harvey: Give me a minute — I'm going to crawl https://yourcompany.com
-  Harvey: and learn everything I can about your product.
-
-[1/6] Deep crawling with Cloudflare (up to 100 pages)...
-      Crawling... 47/47 pages (34s)
-      Done! Crawled 47 pages.
-
-[2/6] Analyzing product information...
-      Found: AcmeWidget
-
-[3/6] Identifying ideal customer profile...
-      Target: E-commerce, DTC Brands
-
-[4/6] Analyzing competitive landscape...
-      Identified 4 competitors.
-
-[5/6] Generating objection handling playbook...
-      Prepared 10 objection responses.
-
-[6/6] Building configuration and product knowledge...
-      Generated: skills/product_knowledge.md
-      Generated: skills/competitive_intel.md
+Has a marketing agency  AND  running Google Ads  AND NOT  already has online booking
+→ 23 companies
 ```
 
-From your website, Harvey extracts:
-- Product name, description, features, pricing, and value proposition
-- Key benefits and use cases
-- Ideal customer profile — industries, company sizes, decision-maker titles
-- Pain points and buying triggers
-- Competitor analysis with battle cards
-- Brand tone and voice
-- Objection handling responses specific to your product
-
-If you don't have a website (or prefer to do it manually), Harvey asks you the questions directly — company name, product description, target audience, etc.
-
-**Step 6 — Behavior Settings.** Harvey asks how much of your daily Claude quota it can use, how often to check for work, quiet hours, send limits, and timezone.
-
-After setup, Harvey writes all config files for you. Just run `harvey run` to start closing.
-
-To re-run setup anytime: `harvey setup`
-
-### Deploy to a VPS (always-on)
-
-For always-on operation, deploy with Docker:
-
-```bash
-# Make sure Claude CLI is authenticated first
-claude login
-
-# Start Harvey
-docker compose up -d
-
-# Watch the logs
-docker compose logs -f harvey
-```
-
-### Re-Training on a Different Product
-
-You can re-train Harvey anytime by pointing it at a new website:
-
-```bash
-harvey train https://newproduct.com
-```
-
-Or crawl more pages for larger sites:
-
-```bash
-harvey train https://yourcompany.com 500
-```
-
-#### Deep Crawling with Cloudflare
-
-Harvey can use [Cloudflare's Browser Rendering /crawl API](https://developers.cloudflare.com/browser-rendering/rest-api/crawl-endpoint/) for deep website crawling:
-
-- **JavaScript rendering** — works on SPAs, React sites, dynamic content
-- **Automatic page discovery** — follows sitemaps and internal links
-- **Clean markdown output** — no HTML parsing needed
-- **Up to 100,000 pages** — crawl the entire site, not just key pages
-- **~$5/month** for ~12,000 pages on Cloudflare's paid Workers plan
-
-This is optional. Without Cloudflare credentials, Harvey uses its built-in recursive crawler that follows every internal link it finds. It works great for most sites — just can't render JavaScript.
-
-#### What the Trainer Generates
-
-| File | What's in it |
-|------|-------------|
-| `harvey.yaml` | Complete config — persona, product, ICP, channels, usage limits |
-| `skills/product_knowledge.md` | Everything about your product — features, benefits, use cases, pricing, social proof, pain points, buying triggers, disqualifiers |
-| `skills/competitive_intel.md` | Battle cards for every competitor — how you win, their weaknesses, migration angles, ready-to-use responses |
+That is a campaign with a reason behind it. You know exactly why each of those 23 is on the list, and so does the email Harvey writes them.
 
 ---
 
-## Project Structure
+## The prospecting pipeline
+
+Four stages. Each one runs independently, re-runs safely, and states its cost.
+
+### 1. DISCOVER — who exists
+
+The only stage that spends money, so it always estimates first and never calls anything until you press go.
+
+```bash
+harvey discover --providers   # the menu, with real prices
+harvey discover --estimate    # projected spend, then exits
+harvey discover               # go
+```
+
+| Source | Cost | Free tier | Best for |
+|---|---|---|---|
+| **OpenStreetMap** *(default)* | free | unlimited, no account | Trying the whole pipeline before paying anyone. Coverage is thin for businesses without a storefront — under 2,000 roofers in the entire US — and Harvey says so in the UI rather than quietly under-delivering. |
+| **DataForSEO Business Listings** | $0.372 / 1,000 | $1 credit | Local trades, clinics, contractors. Phone, domain, rating, claimed status — and it can filter for businesses with **no website at all**. |
+| **DataForSEO SERP** | $0.0018 / search | $1 credit + free sandbox | Rank as the buying signal. |
+| **Serper** | ~$0.30–1.00 / 1,000 | 2,500 free, no card | The easiest paid one to try. |
+
+Cities geocode themselves (cached forever, one lookup each). Directories, aggregators and institutions are filtered by pattern, not a blocklist — `en.wikipedia.org` and `biz.yelp.com` never make it in.
+
+> **Depth 20–30, not 100.** Google removed 100-results-per-page in September 2025, so depth 100 is now billed as ten pages nearly everywhere. Below rank 30 it is mostly directories anyway.
+
+### 2. PROFILE — what they are
+
+**Free.** Three HTTP requests per business. No browser, no model call. This is the highest value-per-effort stage in the whole system, because it produces the facts that make an email specific.
+
+Homepage, `robots.txt`, `sitemap.xml`, plus the team and careers pages when they exist — then regex over HTML already in hand. Out comes the incumbent agency, the ad pixels, the missing schema, the abandoned blog, the open roles, the named humans.
+
+Agency detection is the compounding one. Almost every agency credits itself in the footer, and Harvey scores the wording: *"Powered by"* / *"Website by"* → 0.9 confidence; a bare descriptive link → 0.75; an unlabelled link → 0.35 and **not recorded**. A wrong incumbent in an email is worse than saying nothing.
+
+### 3. ENRICH — who decides
+
+Free public registries first. Name plus title from the team page, confirmed against an authoritative registry where one exists — which also filters out your own parsing artifacts, because a "person" who matches nothing usually wasn't one.
+
+### 4. VERIFY — can you reach them
+
+Harvey learns each company's **address pattern** and verifies one candidate, rather than brute-forcing name variations. Raw SMTP probing is not viable from a laptop — outbound port 25 is usually blocked, and Google Workspace and Microsoft 365 accept everything from an unknown IP.
+
+Every address is tagged honestly: `verified` / `risky` (catch-all) / `guess` / `invalid`. **Only deliverable ones are ever sent to.** A guess is never treated as a win.
+
+> Harvey is worth running even if you never let it send. `harvey export` writes a sequencer-ready CSV of everything it found.
+
+---
+
+## The skills library
+
+Harvey's sales knowledge lives in `skills/` as **plain Markdown you can edit**. There is no fine-tuning, no vector store, no retrieval step. Before an agent runs, the skills it needs are concatenated straight into its prompt. Change a file, and the next heartbeat behaves differently — no restart, no code change.
+
+This is the main way you shape Harvey. If its emails are too pushy, edit `email_frameworks.md`. If it mishandles a specific objection, edit `objection_handling.md` and add the response you'd actually give.
+
+### What ships
+
+**`email_frameworks.md`** — 301 lines, the most important file in the repo. Opens with the only rule that matters: *write like a real person sending a real email.* Contains a hard ban list on AI tells (no "I hope this finds you well", no "I wanted to reach out", no "circling back"), compliance rules that override every style rule beneath them, 2026 reply-rate data on length and cadence and why link tracking hurts you, and five frameworks — **AIDA, PAS, BAB, QVC, 3Ps** — with selection rules for when each one fits.
+
+**`signal_playbook.md`** — How to turn a signal into the first line of an email. Which signal wins when a company has several. How to reference something you observed without sounding like you ran a scan on them.
+
+**`objection_handling.md`** — The **LAARC** loop (Listen → Acknowledge → Assess → Respond → Confirm) with worked responses across the four objection families: budget, authority, need, timing. The framing throughout is that you are not "overcoming" an objection, you are finding out what the actual concern is.
+
+**`lead_qualification.md`** — **BANT** for the first screen, ICP scoring 1–10 for prioritization, **MEDDIC** for anything complex. Includes explicit disqualification criteria, which matter more than the qualification ones.
+
+**`sales_methodology.md`** — The operating philosophy: the ABC loop, how a conversation should flow across stages, tone calibration, and the ethical lines Harvey does not cross.
+
+**`offer_strategy.md`** — The offer ladder by engagement level, and the rule that governs it: *never lead with an offer, never pitch in a cold email.* First contact exists to start a conversation. Offers come out only after genuine interest.
+
+**`prospecting_tactics.md`** — Search operators, company-website mining, trigger events, referral paths. Finding people without paying for a database.
+
+**`account_navigation.md`** — Companies versus contacts, multi-threading rules, which door to knock on first when a company has several.
+
+**`linkedin_outreach.md`** — Connection sequences and rate limits, opening with the risk section it should open with: automating LinkedIn violates their ToS, never use a fake identity, and if someone asks whether this is automated, say yes immediately.
+
+**Generated for your product by `harvey train <url>`:**
+
+- **`product_knowledge.md`** — what you sell, the benefits, pricing, use cases, the pain you solve, buying triggers
+- **`competitive_intel.md`** — battle cards per competitor, differentiation angles, migration paths
+
+*(Both are gitignored. Your positioning and pricing shouldn't land in a public repo by accident.)*
+
+### Which agent gets which
+
+Defined in `harvey/brain.py` — edit the map to change it.
+
+| Skill | Scout | Writer | Handler | Sender | LinkedIn |
+|---|:-:|:-:|:-:|:-:|:-:|
+| `prospecting_tactics` | ● | | | | ● |
+| `lead_qualification` | ● | | | | |
+| `account_navigation` | ● | | | | |
+| `signal_playbook` | ● | ● | | | |
+| `email_frameworks` | | ● | | ● | |
+| `sales_methodology` | | ● | ● | | |
+| `offer_strategy` | | ● | ● | | |
+| `objection_handling` | | | ● | | |
+| `linkedin_outreach` | | | | | ● |
+| `product_knowledge` | ● | ● | ● | ● | ● |
+| `competitive_intel` | | ● | ● | | |
+
+Adding a skill: write the file, add its name to `skill_map` in `harvey/brain.py`. That's the whole process.
+
+---
+
+## The sub-agents
+
+Harvey feels like one agent. Underneath it's five, each loaded with different skills.
+
+| Agent | What it does |
+|---|---|
+| **Scout** | Scores and personalizes what the collectors found. Python does the searching and the email resolution; Claude is used only where judgment is actually needed — which is what keeps the token cost sane. |
+| **Writer** | Generates 3-email sequences. Email 1 under 75 words, email 2 under 75, email 3 under 40. Hard ban list on AI-sounding language. |
+| **Sender** | Renders merge variables per prospect and stages each email into the outbox with a send time. Drains due and approved items with human-like pacing, enforcing the daily cap and stop-on-reply. |
+| **Handler** | Polls for replies, dedups them, classifies intent, advances the conversation stage, and queues responses through the same approval ladder. Detects bounces, marks the address invalid, cancels that prospect's queued sends, and trips a global kill switch past a bounce-rate threshold. |
+| **Analyst** | Runs on idle cycles. Pipeline stats, campaign performance, intent distribution, what's actually working. |
+
+Conversation stages: `initial_outreach → engaged → qualifying → presenting → negotiating → closing → closed_won / closed_lost`
+
+---
+
+## Nothing sends without you
+
+By default **every outgoing email waits for your approval.** Harvey is a copilot until you decide otherwise.
+
+The dashboard's Outbox is a decisions desk: one email fills the pane, the rest wait in a rail, and you work the queue with `A` approve, `R` reject, `J`/`K` to move. That shape is deliberate — a wall of stacked drafts invites a single approve-all reflex, which is exactly the review the approval ladder exists to force.
+
+```bash
+harvey outbox                 # review from the terminal
+harvey outbox --approve-all
+harvey sending pause          # kill switch, stops everything mid-flight
+```
+
+Before anything leaves, a **deterministic pre-send gate** — no model involved — rejects: unrendered merge tags, banned phrases, emails over the length cap, too many links, HTML bodies, non-deliverable addresses, and any mismatch between the recipient and the database record.
+
+When you trust it, set `channels.email.require_approval: false` for full autopilot.
+
+---
+
+## The dashboard
+
+```bash
+harvey dashboard     # http://localhost:5555
+```
+
+Plain HTML, CSS and JavaScript served from `harvey/web/`. No build step, no framework, no bundler — edit `app.css` and reload.
+
+- **Today** — what needs a human, then the pipeline, then the collector run log. It opens here, not on a setup checklist, because the question you actually have is "is anything waiting on me?"
+- **Signals** — the confirmation gate and the cohort builder
+- **Discover** — the provider menu with prices side by side, an estimate, then a run
+- **Companies / Contacts** — everything found, with CSV export
+- **Outbox** — the decisions desk
+- **Conversations** — every reply and how Harvey handled it
+- **Usage** — real Claude quota gauges and per-agent token counts. No dollar figures: you're on a subscription, you aren't billed per token, and pretending otherwise would be theater.
+
+One status vocabulary runs through all of it, so "waiting on you" looks identical whether it's an email, a signal, or a campaign.
+
+---
+
+## How the data is stored
+
+SQLite at `data/harvey.db`. One idea drives the schema:
+
+> **Every fact is a row, never a column.**
+
+Not `companies.has_agency`. Not `companies.rank`. A row in `observations`:
+
+```
+observations(company_id, prospect_id, collector, signal_code,
+             value_num, value_text, confidence, evidence_url, observed_at, run_id)
+```
+
+Four things fall out of that, none of which you get from columns:
+
+1. **A new signal needs no migration.** A collector invents a code and it works.
+2. **History is free.** The same signal observed quarterly *is* a time series — and "they dropped their agency last quarter" is a far better trigger than any static fact.
+3. **Confidence and provenance travel with the fact** instead of being lost on overwrite. *"We think their agency is X, 0.9 confidence, here's the URL."*
+4. **A cohort is a query.** Set intersection happens in SQL, not in application code over a capped fetch.
+
+The vocabulary is governed: a database trigger rejects any `signal_code` not in the `signal_codes` table, so a typo fails loudly instead of quietly inventing a junk signal.
+
+Other tables: `companies`, `prospects`, `campaigns`, `conversations`, `outbox`, `actions`, `runs`, `usage_events`, `email_patterns`, `settings`, `feedback`.
+
+---
+
+## Configuration
+
+Two files, both plain text.
+
+**`.env`** — credentials. Every variable documented inline with where to get it. The only required one is a mail provider; everything else is optional.
+
+**`harvey.yaml`** — who Harvey is and who it sells to:
+
+```yaml
+persona:      { name, company, role, email, tone }
+product:      { name, description, pricing, key_benefits, objection_responses, offer }
+icp:          { industries, titles, company_size, geography, hiring_signals, geo_coordinates }
+channels:
+  email:      { provider: gmail | smtp | instantly, max_daily_sends, require_approval,
+                send_to_risky, max_bounce_rate }
+usage:        { max_daily_claude_percent, heartbeat_interval_minutes, quiet_hours }
+```
+
+If `harvey.local.yaml` exists it wins. It's gitignored, so a fork can carry real product configuration while the tracked `harvey.yaml` stays a template — nobody publishes their positioning and pricing by accident.
+
+### Commands
+
+```bash
+harvey run                   # the heartbeat loop
+harvey dashboard             # web UI at localhost:5555
+harvey signals               # review/confirm what to prospect against
+harvey discover              # find businesses; --providers / --estimate
+harvey profile               # read discovered companies' sites (free)
+harvey train <url>           # learn a product from its website
+harvey status                # pipeline summary
+harvey usage                 # Claude quota + per-agent tokens
+harvey outbox                # review queued email
+harvey export                # deliverable prospects → CSV
+harvey sending pause|resume  # kill switch
+harvey gmail auth            # one-time Gmail OAuth
+```
+
+---
+
+## Legal and deliverability
+
+Harvey automates outreach, but **you are the sender.** Cold email is legal in most places when done right and expensive when done wrong — CAN-SPAM penalties run to $53,088 per email. Harvey ships with compliant defaults. Keep them.
+
+**CAN-SPAM (US).** Truthful subject line and accurate from-address — Harvey's copywriting rules forbid fake "re:" threads and impersonation. A working opt-out, honored fast: Harvey treats any opt-out wording as immediate and permanent. Your physical mailing address in the footer — configure this before your first campaign.
+
+**GDPR / PECR (EU & UK).** B2B cold email needs a defensible legitimate interest: the pitch must be genuinely relevant to that person's role, you must know where the data came from, and objecting must be effortless. If you can't say why a specific person would care, Harvey shouldn't email them — and its qualification rules say so.
+
+**Bot disclosure.** Some jurisdictions require disclosing automation. Harvey is instructed to answer truthfully, always, if a prospect asks whether they're talking to an AI. Never configure it otherwise.
+
+**LinkedIn.** Browser automation violates LinkedIn's ToS and can get the account restricted. Off by default. If you turn it on, use an account you can afford to lose.
+
+**Deliverability — warm up or burn out.** Sending cold email from your main domain, or at volume on day one, lands you in spam permanently.
+
+1. Buy a **dedicated sending domain** (`getacme.com`, not `acme.com`).
+2. Set up **SPF, DKIM and DMARC** on it. Without all three, Gmail junks you.
+3. **Warm up for 2–4 weeks** before real volume.
+4. **Ramp slowly** — 10–20/day per inbox, adding ~5/day. The `max_daily_sends: 50` default is a ceiling, not a target.
+5. **Watch bounces.** Above ~3%, stop and fix list quality. Harvey trips its own kill switch past your configured threshold.
+
+*None of this is legal advice. Sending at scale or into regulated industries? Talk to a lawyer.*
+
+---
+
+## Troubleshooting
+
+**`command not found: harvey`** — `source .venv/bin/activate` first.
+
+**`ModuleNotFoundError: No module named 'harvey'` after install (macOS)** — Python 3.13 silently ignores `.pth` files carrying the macOS hidden flag, and some Macs propagate that flag into `.venv`. Run `harvey install` again (it auto-fixes), or: `ln -s "$(pwd)/harvey" .venv/lib/python3.13/site-packages/harvey`
+
+**`externally-managed-environment`** — Use a venv, not system Python.
+
+**Claude headless mode fails** — `claude login`, and confirm the subscription is active. Test with `claude -p "say hi"`. In Docker, mount `~/.claude` into the container.
+
+**Discovery finds nothing** — Confirm signals first (`harvey signals --confirm free`); nothing is collected until you do. If you're on the free OpenStreetMap source, it only covers mapped trades and is thin for service-area businesses — `harvey discover --providers` shows the alternatives.
+
+**Overpass is throttling** — It's free volunteer infrastructure. Harvey walks three mirrors before giving up. Wait a few minutes, or use a paid provider for bulk work.
+
+**Emails land in spam** — Almost always the domain, not the copy. Check SPF/DKIM/DMARC, confirm warmup ran, halve your volume.
+
+**Harvey does nothing during the day** — Check `quiet_hours` and whether it hit `max_daily_claude_percent`. `harvey status` shows current state; the `actions` table logs every decision.
+
+**How do I stop it right now?** — `Ctrl+C`, or `harvey sending pause` to stop outbound while leaving the loop running. State is in SQLite, so it resumes cleanly.
+
+**Where does my data live?** — All local: `data/harvey.db`, `.env`, `harvey.yaml`. Nothing goes anywhere except the APIs you configured.
+
+---
+
+## Project structure
 
 ```
 harvey/
-├── harvey.yaml              # Your config — persona, product, ICP, settings
-├── .env                     # API keys (never committed)
-├── docker-compose.yml       # One-command VPS deployment
-├── Dockerfile
-├── requirements.txt
-│
-├── harvey/
-│   ├── main.py              # Heartbeat loop — the core engine
-│   ├── brain.py             # Claude Code headless wrapper + skills loader
-│   ├── state.py             # SQLite state manager
-│   ├── config.py            # Configuration loader + validation
-│   ├── setup.py             # Interactive first-run setup wizard
-│   ├── trainer.py           # Auto-train Harvey from a website URL
-│   │
-│   ├── agents/
-│   │   ├── scout.py         # DIY prospecting
-│   │   ├── writer.py        # Email sequence generation
-│   │   ├── sender.py        # Campaign deployment via Instantly
-│   │   ├── handler.py       # Reply processing + auto-response
-│   │   └── analyst.py       # Pipeline analytics + performance insights
-│   │
-│   ├── integrations/
-│   │   ├── instantly.py     # Instantly API v2 client
-│   │   ├── linkedin.py      # Playwright browser automation
-│   │   ├── email_finder.py  # Email pattern discovery + SMTP verification
-│   │   └── calendar.py      # (Coming soon) Meeting booking
-│   │
-│   └── models/
-│       ├── prospect.py      # Prospect data model
-│       ├── campaign.py      # Campaign + email sequence models
-│       └── conversation.py  # Conversation thread model
-│
-├── prompts/                 # Prompt templates (editable)
-│   ├── system.md            # Harvey's core persona
-│   ├── scout.md             # Prospecting instructions
-│   ├── writer.md            # Email writing guidelines
-│   └── handler.md           # Reply handling rules
-│
-├── skills/                  # Foundational sales knowledge (editable)
-│   ├── email_frameworks.md
-│   ├── objection_handling.md
-│   ├── lead_qualification.md
-│   ├── linkedin_outreach.md
-│   ├── prospecting_tactics.md
-│   └── sales_methodology.md
-│
-└── data/                    # Runtime data (auto-created)
-    └── harvey.db            # SQLite database
+├── main.py              # heartbeat loop
+├── brain.py             # Claude CLI wrapper + skills loading + usage recording
+├── state.py             # SQLite schema, migrations, observations, cohorts
+├── signals.py           # the 23-signal catalog Harvey proposes
+├── pipeline.py          # DISCOVER → PROFILE chaining
+├── gate.py              # deterministic pre-send checks
+├── dashboard.py         # FastAPI JSON API
+├── collectors/
+│   ├── discover.py      # provider adapters, junk filtering, entity resolution
+│   └── profile.py       # the free HTTP profiler
+├── agents/              # scout, writer, sender, handler, analyst
+├── integrations/        # mail providers, email finder, quota
+└── web/                 # dashboard HTML/CSS/JS — no build step
+
+skills/                  # ← the sales knowledge. Editable Markdown.
+prompts/                 # ← agent system prompts. Also editable Markdown.
+tests/                   # 242 tests
 ```
-
----
-
-## Customization
-
-### Change How Harvey Writes
-
-Edit `prompts/writer.md` to adjust email style, length, tone, or CTA approach. Edit `skills/email_frameworks.md` to change which copywriting frameworks Harvey uses.
-
-### Change How Harvey Handles Objections
-
-Edit `skills/objection_handling.md` to add industry-specific objection responses. Or add them directly in `harvey.yaml` under `product.objection_responses`.
-
-### Change How Harvey Prospects
-
-Edit `skills/prospecting_tactics.md` to adjust search strategies. Edit `skills/lead_qualification.md` to change scoring criteria.
-
-### Add a New Channel
-
-Create a new integration in `harvey/integrations/` and a corresponding agent in `harvey/agents/`. Wire it into the heartbeat loop in `main.py`.
-
----
-
-## How Harvey Decides What To Do
-
-Every heartbeat cycle, Harvey checks the pipeline state and picks the highest-priority action:
-
-| Priority | Action | Trigger |
-|----------|--------|---------|
-| 1 | **Handle replies** | Open conversations with new messages |
-| 2 | **Send campaigns** | Draft campaigns ready to deploy |
-| 3 | **Write campaigns** | New prospects without campaigns |
-| 4 | **Prospect** | Fewer than 20 prospects with status "new" |
-| 5 | **Idle** | Everything is running, nothing needs attention |
-
-Hot leads cool fast — that's why reply handling is always #1.
-
----
-
-## Database
-
-Harvey stores everything in SQLite (`data/harvey.db`):
-
-| Table | What It Stores |
-|-------|---------------|
-| `companies` | Company profiles — name, domain, website, industry, size, how Harvey found them |
-| `prospects` | Contacts — name, email, title, seniority, company link, status, score, personalization notes |
-| `campaigns` | Email sequences — the emails, which prospects are in each campaign, deployment status |
-| `conversations` | Full conversation threads — every message sent and received, intent classification, sales stage |
-| `actions` | Audit log — everything Harvey has done, when, and the result |
-| `usage_log` | Daily Claude usage tracking for budget control |
-| `feedback` | User comments and training feedback on Harvey's work |
-| `processed_replies` | Reply deduplication — prevents double-handling |
-
----
-
-## Legal & Deliverability (Read This Before Sending Anything)
-
-Harvey automates outreach, but **you are the sender**. Cold email is legal in most places when done right and expensive when done wrong (CAN-SPAM fines run to $53,088 *per email*). Harvey ships with compliant defaults — keep them.
-
-### The law, in practice
-
-**CAN-SPAM (US)** — every commercial email must have:
-- A truthful subject line and accurate from-name/address (Harvey's copywriting rules enforce this — no fake "re:" threads, no impersonation)
-- A working unsubscribe mechanism, honored within 10 business days (Harvey treats any opt-out wording — "stop", "remove me", "unsubscribe" — as immediate and permanent)
-- Your valid physical mailing address in the footer — **enable this in your Instantly campaign settings before launching**
-
-**GDPR / PECR (EU & UK)** — B2B cold email requires a defensible *legitimate interest*: the pitch must be genuinely relevant to the recipient's professional role. You must be able to say where you got their data, and objecting must be effortless. If you can't articulate why a specific person would care, Harvey shouldn't email them — and its qualification rules say so.
-
-**Bot disclosure** — some jurisdictions (e.g. California's B.O.T. Act) require disclosing automation in commercial communications. Harvey is instructed to *always* answer truthfully if a prospect asks whether they're talking to an AI. Never configure it otherwise.
-
-**LinkedIn** — browser automation violates LinkedIn's Terms of Service and can get the account restricted or banned. This feature is off by default in the wizard; if you enable it, use conservative limits and an account you can afford to lose.
-
-### Deliverability: warm up or burn out
-
-Sending cold email from your main company domain, or at volume from day one, will land you in spam permanently. Before your first campaign:
-
-1. **Buy a dedicated sending domain** (e.g. `getacme.com` instead of `acme.com`) so your primary domain's reputation is never at risk. Point it at your real site.
-2. **Set up SPF, DKIM, and DMARC** on the sending domain. Instantly's docs walk you through it; without all three, Gmail and Outlook will junk you.
-3. **Warm up for 2–4 weeks** before real volume. Instantly has built-in warmup — turn it on and leave it on.
-4. **Ramp slowly**: start at 10–20 emails/day per inbox, add ~5/day. Harvey's default `max_daily_sends: 50` is a ceiling, not a starting point.
-5. **Watch bounce and spam rates.** Bounce rate above ~3% or any spam complaints: pause, fix your list quality, ramp again. Harvey verifies emails before sending to keep bounces low, but the platform metrics are your ground truth.
-
-None of this is legal advice — if you're sending at scale or into regulated industries, talk to a lawyer.
-
----
-
-## Troubleshooting & FAQ
-
-**`command not found: harvey`** — Activate the venv first: `source .venv/bin/activate`. If you installed with `pip install -e .` inside the venv, the `harvey` command lives there.
-
-**`externally-managed-environment` on pip install** — You're using system Python. Create a venv: `python3 -m venv .venv && source .venv/bin/activate`.
-
-**Claude headless mode fails / setup step 1 fails** — Run `claude login` and confirm your Max subscription is active. Test manually: `claude -p "say hi"`. In Docker, make sure `~/.claude` is mounted into the container (see `docker-compose.yml`).
-
-**Instantly API returns 401** — Wrong key, or your plan doesn't include API access (requires Growth or higher). Regenerate the key under Settings → Integrations → API Keys.
-
-**Emails land in spam** — Almost always a domain problem, not a copy problem. Check SPF/DKIM/DMARC, confirm warmup ran for 2+ weeks, and cut your daily volume in half. See [Legal & Deliverability](#legal--deliverability-read-this-before-sending-anything).
-
-**Harvey isn't finding prospects / search is rate-limited** — Free search backends (DuckDuckGo, Bing) throttle aggressively. Add a `SERPER_API_KEY` (~$5 for 2,500 Google searches) to `.env` for reliable search.
-
-**Training crawl finds almost nothing** — Your site is probably JavaScript-rendered. Add Cloudflare Browser Rendering credentials to `.env` (documented in `.env.example`) or fill in `harvey.yaml` manually via `harvey setup`.
-
-**Harvey does nothing during the day** — Check `quiet_hours` and `timezone` in `harvey.yaml`, and whether it hit `max_daily_claude_percent`. `harvey status` shows current state; the `actions` table in `data/harvey.db` shows every decision it made.
-
-**How do I stop Harvey immediately?** — `Ctrl+C` locally, or `docker compose down` on a VPS. Nothing sends while it's stopped; state is in SQLite so it resumes cleanly.
-
-**Can I run it without LinkedIn?** — Yes. Leave the LinkedIn credentials blank and Harvey prospects via web search and company websites only. This is the recommended (and default) mode.
-
-**Where does my data live?** — Everything is local: `data/harvey.db` (SQLite) plus your `.env` and `harvey.yaml`. Nothing is sent anywhere except to the APIs you configured.
-
----
-
-## Roadmap
-
-- [x] Core heartbeat loop
-- [x] DIY prospecting (LinkedIn + Google + email discovery)
-- [x] Email sequence generation with copywriting frameworks
-- [x] Instantly integration for campaign deployment
-- [x] Reply handling with intent classification
-- [x] Skills system for foundational sales knowledge
-- [x] Usage tracking and daily limits
-- [x] Docker deployment
-- [x] Website trainer — point Harvey at a URL and it learns the product automatically
-- [x] Deep crawling via Cloudflare Browser Rendering API (with built-in fallback)
-- [x] Competitive intelligence — auto-generated battle cards per competitor
-- [x] Interactive setup wizard — Harvey walks you through everything on first run
-- [x] Web dashboard — full control panel at localhost:5555 with setup, settings, pipeline, and controls
-- [x] Analyst agent — pipeline analytics, campaign performance, actionable insights
-- [x] Conversation stage tracking — 8-stage sales pipeline with auto-advancement
-- [x] Multi-backend search — DuckDuckGo, Bing, Serper API fallbacks (no Google dependency)
-- [x] Company/contact separation — companies and contacts as separate entities with linking
-- [x] Reply deduplication — prevents double-handling of the same reply
-- [x] Parallel agent execution — handler runs alongside scout/writer simultaneously
-- [ ] LinkedIn DM outreach
-- [ ] Calendar integration (Cal.com / Calendly) for auto-booking
-- [ ] AI voice cold calling (Bland.ai / Vapi)
-- [ ] SMS/text outreach
-- [ ] Multi-product support — run Harvey for multiple products simultaneously
-- [ ] Team mode — multiple Harveys coordinating across territories
-- [ ] Webhook receiver for real-time reply processing
 
 ---
 
 ## Philosophy
 
-Harvey is built on a few core beliefs:
+**Autonomous doesn't mean unsupervised.** Quiet hours, spend caps, send limits, an approval queue, a deterministic pre-send gate, and a kill switch. Harvey asks before it spends and before it sends, until you tell it not to.
 
-**1. Autonomous doesn't mean reckless.** Harvey has quiet hours, usage limits, rate limiting, and ethical guidelines baked in. It respects opt-outs immediately, never spams, and stops when told to.
+**You decide what a good prospect is.** Harvey proposes signals; you confirm them. A prospect list you can't explain is a prospect list you shouldn't send to.
 
-**2. Expensive tools are optional.** Most sales teams pay $500+/month for prospecting tools, email platforms, and enrichment services. Harvey does prospecting for free, uses your existing email tool, and runs on your existing Claude subscription.
+**If it can be gotten deterministically, don't use a model.** Rank position, tech detection, junk filtering, the priority decision, the pre-send gate — all plain code. Claude is reserved for the parts that genuinely need judgment. That's why this runs on a subscription at all.
 
-**3. Quality beats quantity.** Harvey doesn't blast 10,000 emails. It finds the right people, writes genuinely personalized outreach, and focuses on starting real conversations.
+**A failure is an observation, not silence.** "No team page found" is a finding. "Overpass is throttling" is a finding. Silent failures look exactly like clean results, which is how a broken run gets mistaken for an empty market.
 
-**4. The best sales agent sounds like a person, not a bot.** Harvey's writing is consultative, direct, and human. No jargon, no "I hope this finds you well," no walls of text.
+**The database is the asset, not the agent.** The initial list is worth little. The same signals observed over quarters — who changed agencies, who started spending on ads, who let their content go stale — is worth a great deal.
 
-**5. Everything is editable.** Prompts, skills, config — it's all plain text files. You don't need to be a developer to change how Harvey sells.
+**Everything is editable.** Prompts, skills, config, the dashboard. All plain text. You don't need to be a developer to change how Harvey sells.
+
+---
+
+## Roadmap
+
+**Done:** heartbeat loop · observation data model with governed vocabulary · user-confirmed signal catalog · cohort builder · discovery provider menu with cost estimates · free HTTP profiler with agency detection · pattern-first email finding with honest status · native mail providers (Gmail API, SMTP+IMAP) · outbox approval ladder · deterministic pre-send gate · bounce detection and kill switch · reply handling with intent classification · subscription quota tracking · website trainer · web dashboard · CSV export
+
+**Next:** people enrichment from public registries · consent-gated voice callbacks · calendar integration for auto-booking · scheduled re-observation so signal *changes* trigger outreach · multi-product support
+
+> **On voice:** a fully autonomous AI cold dialer is not on this roadmap, and won't be. Under FCC 24-17 an AI-generated voice is an "artificial voice" under the TCPA, and 47 CFR 64.1200(a)(1) has no B2B exemption — penalties run $500–1,500 per call, uncapped, and some states ban it outright. Voice here will be **consent-gated**: inbound and opt-in-triggered callbacks only.
 
 ---
 
@@ -516,4 +509,4 @@ MIT
 
 ---
 
-*"Put that coffee down. Coffee is for closers."* — Blake, Glengarry Glen Ross
+*"Put that coffee down. Coffee is for closers."* — Blake, *Glengarry Glen Ross*
