@@ -290,6 +290,78 @@ MIGRATIONS: list[str] = [
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """,
+    # ── v7: observation model — every fact is a row, never a column ──
+    """
+    -- The governed vocabulary. A collector may only emit a code that exists
+    -- here (enforced by the observations FK), so a typo fails loudly instead
+    -- of quietly inventing a junk signal. `status` is the user-confirmation
+    -- gate: Harvey PROPOSES signals, the user confirms which ones to
+    -- prospect against, and only confirmed signals get collected.
+    CREATE TABLE IF NOT EXISTS signal_codes (
+        code TEXT PRIMARY KEY,
+        label TEXT DEFAULT '',
+        description TEXT DEFAULT '',
+        category TEXT DEFAULT '',
+        value_type TEXT DEFAULT 'text',
+        collector TEXT DEFAULT '',
+        cost_note TEXT DEFAULT '',
+        status TEXT DEFAULT 'proposed',
+        confidence_floor REAL DEFAULT 0.0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- One row per fact. Confidence and provenance travel WITH the fact, and
+    -- re-observing the same signal over time is a free time series.
+    CREATE TABLE IF NOT EXISTS observations (
+        id TEXT PRIMARY KEY,
+        company_id TEXT DEFAULT '',
+        prospect_id TEXT DEFAULT '',
+        signal_code TEXT NOT NULL,
+        collector TEXT DEFAULT '',
+        value_num REAL,
+        value_text TEXT DEFAULT '',
+        confidence REAL DEFAULT 1.0,
+        evidence_url TEXT DEFAULT '',
+        observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        run_id TEXT DEFAULT ''
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_obs_company ON observations(company_id);
+    CREATE INDEX IF NOT EXISTS idx_obs_signal ON observations(signal_code);
+    CREATE INDEX IF NOT EXISTS idx_obs_company_signal
+        ON observations(company_id, signal_code, observed_at);
+    CREATE INDEX IF NOT EXISTS idx_obs_run ON observations(run_id);
+
+    -- The governed-vocabulary guarantee. A trigger (not a foreign key) so it
+    -- holds regardless of the per-connection foreign_keys pragma, and applies
+    -- only here: the legacy tables default several id columns to '' and would
+    -- break under blanket FK enforcement.
+    CREATE TRIGGER IF NOT EXISTS trg_observations_signal_known
+    BEFORE INSERT ON observations
+    FOR EACH ROW
+    WHEN NEW.signal_code NOT IN (SELECT code FROM signal_codes)
+    BEGIN
+        SELECT RAISE(ABORT, 'unknown signal_code: not in signal_codes vocabulary');
+    END;
+
+    -- A log of what ran, when, how much it produced and cost. Purely a
+    -- record: spend is capped inside the collector, never here.
+    CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        stage TEXT DEFAULT '',
+        status TEXT DEFAULT 'running',
+        provider TEXT DEFAULT '',
+        records INTEGER DEFAULT 0,
+        cost_usd REAL DEFAULT 0.0,
+        params_json TEXT DEFAULT '{}',
+        error TEXT DEFAULT '',
+        started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ended_at TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_runs_stage_started ON runs(stage, started_at);
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -786,6 +858,273 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    # ── Signal vocabulary (governed; user-confirmed before collection) ──
+
+    async def upsert_signal_code(
+        self,
+        code: str,
+        *,
+        label: str = "",
+        description: str = "",
+        category: str = "",
+        value_type: str = "text",
+        collector: str = "",
+        cost_note: str = "",
+        confidence_floor: float = 0.0,
+        status: str | None = None,
+    ):
+        """Register a signal in the vocabulary. Never downgrades a user's
+        decision: an existing row's ``status`` is preserved unless explicitly
+        passed, so re-seeding can't silently re-enable a rejected signal."""
+        async with self._connect() as db:
+            await db.execute(
+                """INSERT INTO signal_codes
+                       (code, label, description, category, value_type,
+                        collector, cost_note, confidence_floor, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, 'proposed'))
+                   ON CONFLICT(code) DO UPDATE SET
+                       label = excluded.label,
+                       description = excluded.description,
+                       category = excluded.category,
+                       value_type = excluded.value_type,
+                       collector = excluded.collector,
+                       cost_note = excluded.cost_note,
+                       confidence_floor = excluded.confidence_floor,
+                       status = COALESCE(?, signal_codes.status),
+                       updated_at = CURRENT_TIMESTAMP""",
+                (code, label, description, category, value_type, collector,
+                 cost_note, float(confidence_floor), status, status),
+            )
+            await db.commit()
+
+    async def get_signal_codes(self, status: str | None = None) -> list[dict]:
+        sql = "SELECT * FROM signal_codes"
+        params: list = []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY category, code"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def set_signal_status(self, code: str, status: str) -> bool:
+        """Confirm / reject a proposed signal. Only confirmed signals are
+        collected — Harvey proposes, the user decides."""
+        if status not in ("proposed", "confirmed", "rejected"):
+            raise ValueError(f"invalid signal status: {status}")
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE signal_codes SET status = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE code = ?",
+                (status, code),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def confirmed_signal_codes(self) -> set[str]:
+        return {r["code"] for r in await self.get_signal_codes(status="confirmed")}
+
+    # ── Observations (every fact is a row, never a column) ──
+
+    async def add_observation(
+        self,
+        signal_code: str,
+        *,
+        company_id: str = "",
+        prospect_id: str = "",
+        collector: str = "",
+        value_num: float | None = None,
+        value_text: str = "",
+        confidence: float = 1.0,
+        evidence_url: str = "",
+        run_id: str = "",
+        observed_at: str | None = None,
+    ) -> str:
+        """Record one fact. Raises if signal_code isn't in the vocabulary —
+        a typo must fail loudly rather than create a junk signal."""
+        obs_id = _new_id()
+        async with self._connect() as db:
+            await db.execute(
+                """INSERT INTO observations
+                       (id, company_id, prospect_id, signal_code, collector,
+                        value_num, value_text, confidence, evidence_url,
+                        observed_at, run_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           COALESCE(?, CURRENT_TIMESTAMP), ?)""",
+                (obs_id, company_id, prospect_id, signal_code, collector,
+                 value_num, value_text, float(confidence), evidence_url,
+                 observed_at, run_id),
+            )
+            await db.commit()
+        return obs_id
+
+    async def add_observations(self, rows: list[dict], run_id: str = "") -> int:
+        """Batch insert. Flushed per batch by callers — a long run that dies
+        must not lose everything it observed."""
+        if not rows:
+            return 0
+        payload = [
+            (
+                _new_id(), r.get("company_id", ""), r.get("prospect_id", ""),
+                r["signal_code"], r.get("collector", ""), r.get("value_num"),
+                r.get("value_text", ""), float(r.get("confidence", 1.0)),
+                r.get("evidence_url", ""), r.get("observed_at"),
+                r.get("run_id", run_id),
+            )
+            for r in rows
+        ]
+        async with self._connect() as db:
+            await db.executemany(
+                """INSERT INTO observations
+                       (id, company_id, prospect_id, signal_code, collector,
+                        value_num, value_text, confidence, evidence_url,
+                        observed_at, run_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           COALESCE(?, CURRENT_TIMESTAMP), ?)""",
+                payload,
+            )
+            await db.commit()
+        return len(payload)
+
+    async def get_observations(
+        self,
+        company_id: str = "",
+        signal_code: str = "",
+        latest_only: bool = False,
+        limit: int = 500,
+    ) -> list[dict]:
+        where, params = [], []
+        if company_id:
+            where.append("company_id = ?")
+            params.append(company_id)
+        if signal_code:
+            where.append("signal_code = ?")
+            params.append(signal_code)
+        sql = "SELECT * FROM observations"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        if latest_only:
+            # Newest observation per (company, signal) — the current view of
+            # the world, with history still on disk underneath.
+            sql = (
+                "SELECT * FROM (" + sql + " ORDER BY observed_at DESC) "
+                "GROUP BY company_id, signal_code"
+            )
+        else:
+            sql += " ORDER BY observed_at DESC"
+        sql += " LIMIT ?"
+        params.append(int(limit))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def signal_counts(self) -> list[dict]:
+        """How many entities carry each signal — the cohort sizes."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT o.signal_code,
+                          COALESCE(sc.label, o.signal_code) AS label,
+                          sc.status AS status,
+                          COUNT(DISTINCT o.company_id) AS companies,
+                          COUNT(*) AS observations
+                   FROM observations o
+                   LEFT JOIN signal_codes sc ON sc.code = o.signal_code
+                   GROUP BY o.signal_code
+                   ORDER BY companies DESC"""
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def cohort(
+        self,
+        require: list[str],
+        exclude: list[str] | None = None,
+        min_confidence: float = 0.0,
+        limit: int = 500,
+    ) -> list[str]:
+        """Company IDs carrying ALL required signals and none excluded.
+
+        Set intersection happens in SQL — doing it in application code over a
+        capped SELECT silently returns the wrong cohort.
+        """
+        if not require:
+            return []
+        req_ph = ",".join("?" for _ in require)
+        sql = (
+            "SELECT company_id FROM observations "
+            f"WHERE signal_code IN ({req_ph}) AND company_id != '' "
+            "AND confidence >= ? "
+            "GROUP BY company_id HAVING COUNT(DISTINCT signal_code) = ?"
+        )
+        params: list = [*require, float(min_confidence), len(set(require))]
+        if exclude:
+            exc_ph = ",".join("?" for _ in exclude)
+            sql += (
+                " AND company_id NOT IN ("
+                f"SELECT company_id FROM observations WHERE signal_code IN ({exc_ph})"
+                ")"
+            )
+            params.extend(exclude)
+        sql += " LIMIT ?"
+        params.append(int(limit))
+        async with self._connect() as db:
+            async with db.execute(sql, params) as cursor:
+                return [row[0] for row in await cursor.fetchall()]
+
+    # ── Run log (what ran, when, what it produced and cost) ──
+
+    async def start_run(
+        self, stage: str, provider: str = "", params: dict | None = None
+    ) -> str:
+        run_id = _new_id()
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO runs (id, stage, provider, params_json, status) "
+                "VALUES (?, ?, ?, ?, 'running')",
+                (run_id, stage, provider, json.dumps(params or {})),
+            )
+            await db.commit()
+        return run_id
+
+    async def finish_run(
+        self,
+        run_id: str,
+        status: str = "completed",
+        records: int = 0,
+        cost_usd: float = 0.0,
+        error: str = "",
+    ):
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE runs SET status = ?, records = ?, cost_usd = ?, "
+                "error = ?, ended_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, int(records), float(cost_usd), error[:500], run_id),
+            )
+            await db.commit()
+
+    async def sweep_stale_runs(self, older_than_hours: int = 6) -> int:
+        """A killed collector can't close its own run — never trust it to."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE runs SET status = 'stale', ended_at = CURRENT_TIMESTAMP "
+                "WHERE status = 'running' "
+                "AND started_at < datetime('now', ?)",
+                (f"-{int(older_than_hours)} hours",),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def get_runs(self, limit: int = 25) -> list[dict]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (int(limit),)
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
 
     # ── Settings (operational flags: kill switch, counters) ──
 
