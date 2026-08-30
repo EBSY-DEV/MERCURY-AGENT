@@ -252,8 +252,16 @@ def load_env() -> EnvConfig:
 
 
 def _find_config_file() -> str:
-    """Search for harvey.yaml in common locations."""
+    """Search for Harvey's config.
+
+    ``harvey.local.yaml`` wins when present. It is gitignored, so a fork can
+    carry a real product configuration (trained on an actual company) while
+    the tracked ``harvey.yaml`` stays an untrained template — nobody
+    publishes their positioning, pricing, and prospect targeting by accident.
+    """
     candidates = [
+        Path.cwd() / "harvey.local.yaml",
+        PROJECT_ROOT / "harvey.local.yaml",
         Path.cwd() / "harvey.yaml",
         Path.cwd().parent / "harvey.yaml",
         PROJECT_ROOT / "harvey.yaml",

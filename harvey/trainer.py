@@ -318,7 +318,7 @@ class Trainer:
     async def train(
         self,
         url: str,
-        output_path: str = "harvey.yaml",
+        output_path: str = "harvey.local.yaml",
         max_pages: int = 100,
     ):
         """Train Harvey on a product website.
@@ -742,7 +742,7 @@ What prospects do instead of buying a solution like ours:
         }
 
 
-async def run_training(url: str, output: str = "harvey.yaml", max_pages: int = 100):
+async def run_training(url: str, output: str = "harvey.local.yaml", max_pages: int = 100):
     """Entry point for training."""
     trainer = Trainer()
     await trainer.train(url, output, max_pages=max_pages)
