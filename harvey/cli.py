@@ -320,6 +320,69 @@ def cmd_outbox(args):
     asyncio.run(_outbox())
 
 
+def cmd_signals(args):
+    """Review the signal vocabulary — Harvey proposes, you confirm.
+
+    Nothing is collected until a signal is confirmed, so a fresh install
+    prospects against nothing until someone makes these decisions.
+    """
+    from harvey.state import StateManager
+    from harvey.signals import seed_signal_catalog
+
+    async def _signals():
+        state = StateManager()
+        await state.init_db()
+        await seed_signal_catalog(state)
+
+        codes = [a.strip().upper() for a in (args.confirm or args.reject or "").split(",")
+                 if a.strip()]
+        if codes:
+            status = "confirmed" if args.confirm else "rejected"
+            if codes == ["ALL"]:
+                codes = [c["code"] for c in await state.get_signal_codes()]
+            elif codes == ["FREE"]:
+                # Only signals whose cost note STARTS with free/included. A
+                # substring match would sweep in "1 credit (free tiers
+                # available)", which is not free.
+                codes = [c["code"] for c in await state.get_signal_codes()
+                         if (c["cost_note"] or "").lower().startswith(("free", "included"))]
+            changed = sum(
+                [1 for c in codes if await state.set_signal_status(c, status)]
+            )
+            print(f"\n  {changed} signal(s) {status}.\n")
+            return
+
+        rows = await state.get_signal_codes()
+        counts = {c["signal_code"]: c for c in await state.signal_counts()}
+        by_status = {"confirmed": 0, "proposed": 0, "rejected": 0}
+        for r in rows:
+            by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+
+        print(f"\n  Signals — {by_status['confirmed']} confirmed, "
+              f"{by_status['proposed']} awaiting you, {by_status['rejected']} off")
+        print("  " + "=" * 66)
+        mark = {"confirmed": "[on] ", "proposed": "[ ? ]", "rejected": "[off]"}
+        current = None
+        for r in rows:
+            if r["category"] != current:
+                current = r["category"]
+                print(f"\n  {current.upper()}")
+            seen = counts.get(r["code"], {}).get("companies", 0)
+            seen_txt = f"  ({seen} companies)" if seen else ""
+            print(f"    {mark.get(r['status'], '     ')} {r['code']:<22} "
+                  f"{r['label']}{seen_txt}")
+            print(f"          {r['cost_note']}")
+
+        if by_status["proposed"]:
+            print("\n  Confirm with: harvey signals --confirm CODE[,CODE...]")
+            print("  Everything free: harvey signals --confirm free")
+            print("  Details and descriptions: harvey dashboard → Signals\n")
+        else:
+            print("")
+
+    asyncio.run(_signals())
+
+
 def cmd_sending(args):
     """Pause/resume the sending kill switch."""
     from harvey.state import StateManager
@@ -413,6 +476,14 @@ def main():
     sub.set_defaults(func=cmd_outbox)
 
     # harvey sending pause|resume|status
+    sub = subparsers.add_parser(
+        "signals", help="Review/confirm which signals Harvey prospects against")
+    sub.add_argument("--confirm", metavar="CODES", default="",
+                     help="Comma-separated codes to confirm ('all' or 'free' accepted)")
+    sub.add_argument("--reject", metavar="CODES", default="",
+                     help="Comma-separated codes to turn off")
+    sub.set_defaults(func=cmd_signals)
+
     sub = subparsers.add_parser("sending", help="Kill switch: pause/resume sending")
     sub.add_argument("sending_action", nargs="?", default="status",
                      choices=["pause", "resume", "status"])

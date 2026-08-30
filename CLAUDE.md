@@ -46,7 +46,9 @@ People will ask "how does this work?" — explain it simply:
 
 - **"What does it cost?"** → Just your Claude Max subscription (which you already have). The only paid integration is Instantly for sending emails (their cheapest plan works). Everything else — prospecting, email writing, reply handling — is included.
 
-- **"What's the dashboard?"** → Run `harvey dashboard` to see a local web UI at localhost:5555. It shows your pipeline, campaigns, prospects, conversations, and lets you control Harvey from the browser.
+- **"What's the dashboard?"** → Run `harvey dashboard` to see a local web UI at localhost:5555. It opens on **Today** — anything waiting on a decision, then the pipeline. Tabs for Signals, Companies, Contacts, Campaigns, Outbox, Conversations, Activity, Usage, Settings.
+
+- **"What are signals?"** → Signals are the facts Harvey collects about a business: who its current agency is, whether it's running ads, whether it has online booking, how it ranks. **Harvey proposes; you confirm.** Nothing is collected until the user says yes on the Signals tab (or `harvey signals --confirm ...`). That keeps spend intentional and makes every prospect list explainable — a cohort is a query over signals a human chose, not a black box.
 
 ---
 
@@ -135,7 +137,29 @@ Ask the user these questions and build `harvey.yaml` and `skills/product_knowled
   - How long is the call? (default: 15 minutes)
   - Who takes the meeting?
 
-### Step 4: Behavior Settings
+### Step 4: Confirm Signals
+
+Harvey ships a catalog of ~19 signals it knows how to collect, all **proposed** and
+none active. Nothing is prospected against until the user confirms them.
+
+Send them to `harvey dashboard` → **Signals**, where each one shows a
+plain-language description, what it costs, and how many companies already carry
+it. Or from the terminal:
+
+```bash
+harvey signals                      # review the catalog
+harvey signals --confirm free       # turn on everything that costs nothing
+harvey signals --confirm SERP_RANK  # the one paid discovery signal
+```
+
+Most signals are free (they read pages a business already publishes). Only
+`SERP_RANK` and `EMAIL_STATUS` consume credits — the cost note on each row says so.
+
+Once signals are confirmed, the **cohort builder** at the bottom of the Signals
+tab turns them into a target list: pick what a good prospect must have (and what
+disqualifies them) and it counts the matches live.
+
+### Step 5: Behavior Settings
 
 These go in `harvey.yaml` under `usage:`. Use sensible defaults unless they want to customize:
 - `max_daily_claude_percent`: 80 (how much of daily Claude quota to use)
@@ -143,7 +167,7 @@ These go in `harvey.yaml` under `usage:`. Use sensible defaults unless they want
 - `quiet_hours`: 22:00-07:00 in their timezone
 - `max_daily_sends`: 50 (email send limit)
 
-### Step 5: Start Harvey
+### Step 6: Start Harvey
 
 ```bash
 source .venv/bin/activate && harvey run
@@ -178,6 +202,8 @@ Users will come back with questions and tasks. Common ones:
 - **State** (`state.py`): SQLite at `data/harvey.db` with tables for companies, prospects, campaigns, conversations, actions, usage
 - **Usage tracking** (`usage.py`, `integrations/quota.py`): per-call attribution (agent/task/model/tokens) for Harvey's OWN Claude calls only — it never scans your other Claude Code sessions — plus a live subscription-quota gauge read the same way Claude Code's `/usage` does. The budget check throttles Harvey against real quota utilization so it always leaves headroom for your own interactive Claude use (`usage.max_daily_claude_percent`). Dashboard has a Usage tab; CLI has `harvey usage`.
 - **Skills** (`skills/`): Markdown knowledge files injected into agent prompts
+- **Signals** (`signals.py`, `state.py`): every fact Harvey learns is an OBSERVATION — a row in `observations`, never a column. A new signal needs no migration, re-observing over time is a free time series, and confidence + provenance travel with the fact. The vocabulary in `signal_codes` is governed (a trigger rejects any code not in it) and gated: only `status = 'confirmed'` signals are collected, and only a human sets that. `state.cohort(require, exclude)` does the set intersection in SQL.
+- **Dashboard** (`dashboard.py` + `harvey/web/`): FastAPI JSON API plus plain HTML/CSS/JS served from disk — no build step. Edit `harvey/web/app.css` or `app.js` and reload the page.
 
 ### Sub-Agents
 - **Scout**: Python does all web searching (DuckDuckGo → Bing → Google → Serper API) and email resolution (pattern-first: cache → scraped mailto → Hunter domain search → default, then verify one candidate via Reoon/ZeroBounce/Hunter/SMTP; catch-alls flagged `risky`). Claude only scores/personalizes found data. Scout also collects **buying signals**: tech stack detected on each company's site (HubSpot, Shopify, Intercom, ~35 tools — zero extra requests) and hiring signals from careers pages. With `pip install python-jobspy` (optional), a job-board strategy discovers companies actively hiring for roles in `icp.hiring_signals` (falls back to `icp.titles`) — the strongest in-market signal. Signals land in prospects' personalization notes and boost their score.
@@ -206,6 +232,7 @@ harvey export --all          # Full raw list, no filters
 harvey gmail auth            # One-time Gmail OAuth (when provider: gmail)
 harvey gmail test            # Verify the Gmail connection
 harvey outbox                # Review queued emails; --approve <id> / --approve-all / --reject <id>
+harvey signals               # The signal vocabulary; --confirm / --reject CODES (or 'free' / 'all')
 harvey sending pause|resume  # Kill switch for all outbound
 ```
 
