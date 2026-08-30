@@ -86,15 +86,19 @@ REOON_API_KEY=              # 600 free/mo — best free tier
 ZEROBOUNCE_API_KEY=         # 100 free/mo — best for M365/Workspace catch-alls
 HUNTER_API_KEY=             # 50 free/mo + pattern lookup
 
+# --- Discovery (optional — the free OpenStreetMap source needs no key) ---
+DATAFORSEO_LOGIN=  DATAFORSEO_PASSWORD=   # cheapest local-business + SERP data
+DATAFORSEO_SANDBOX=                       # any value routes to the free sandbox
+
 # --- Optional ---
 LINKEDIN_EMAIL=  LINKEDIN_PASSWORD=   # LinkedIn prospecting
 CLOUDFLARE_ACCOUNT_ID=  CLOUDFLARE_API_TOKEN=   # deep JS crawling for training
-SERPER_API_KEY=            # reliable web search ($5/mo at serper.dev)
+SERPER_API_KEY=            # web search + discovery (2,500 free, then a $50 prepaid pack)
 ```
 
 **Recommended provider — Gmail:** for <50 cold emails/day, a real Google Workspace mailbox on a *dedicated secondary domain* (never the main one) is the most deliverable, cheapest (~$7/mo) option. Set `channels.email.provider: gmail` in harvey.yaml, put the OAuth client id/secret in `.env`, then run `harvey gmail auth` (one-time browser login). SMTP works with any mailbox (AgentMail, Fastmail). Instantly still works as a legacy option.
 
-**Email verification matters:** Harvey learns each company's email *pattern* and verifies ONE candidate rather than guessing (raw SMTP probing no longer works against Google Workspace / Microsoft 365). Without a verifier key, found emails are marked `guess` and are **never sent**.
+**Email verification matters:** Harvey learns each company's email *pattern* and verifies ONE candidate rather than guessing (raw SMTP probing is not viable from a locally-running agent — outbound port 25 is usually blocked, and Google Workspace / Microsoft 365 accept everything from an unknown IP). Without a verifier key, found emails are marked `guess` and are **never sent**.
 
 **Approval by default:** with a native provider, every outgoing email waits in the **Outbox** for your approval (dashboard Outbox tab, or `harvey outbox`). Once you trust the output, set `channels.email.require_approval: false` in harvey.yaml for full autopilot.
 
@@ -159,7 +163,37 @@ Once signals are confirmed, the **cohort builder** at the bottom of the Signals
 tab turns them into a target list: pick what a good prospect must have (and what
 disqualifies them) and it counts the matches live.
 
-### Step 5: Behavior Settings
+### Step 5: Find Businesses
+
+Discovery is the only stage that spends money, so it always estimates first.
+
+```bash
+harvey discover --providers                        # the menu, with real prices
+harvey discover --estimate                         # projected spend, then exits
+harvey discover                                    # free OpenStreetMap source
+harvey discover --provider dataforseo_listings --max-spend 2.00
+```
+
+The dashboard's **Discover** tab is the same thing with the tradeoffs laid out
+side by side: what each source does, what it costs, its free tier, and which
+`.env` keys it needs. Nothing is called until the user presses Run.
+
+| Source | Cost | Free tier | Best for |
+|---|---|---|---|
+| **OpenStreetMap** (default) | free | unlimited | Trying the whole pipeline with no account. Thin coverage — under 2,000 roofers in the entire US — so it's a trial source, not a complete list. |
+| **DataForSEO Business Listings** | $0.372/1k businesses | $1 credit | Local trades, clinics, contractors. Phone + domain + rating + whether the listing is claimed, and it can filter for businesses with **no website at all**. |
+| **DataForSEO SERP** | $0.0018 a search at depth 30 | $1 credit + free sandbox | Rank as the buying signal. Positions 11-30 are the sweet spot. |
+| **Serper** | ~$0.30-$1.00/1k | 2,500 free, no card | The easiest paid one to try. |
+
+Cities are geocoded automatically (cached forever, one lookup per city), or set
+`icp.geo_coordinates` in harvey.yaml to control the radius:
+`"Denver, CO": "39.7392,-104.9903,50"`.
+
+**Depth 20-30, not 100.** Google removed 100-results-per-page in September 2025,
+so depth 100 is now billed as ten pages at nearly every provider. Below rank 30
+it is mostly directories anyway.
+
+### Step 6: Behavior Settings
 
 These go in `harvey.yaml` under `usage:`. Use sensible defaults unless they want to customize:
 - `max_daily_claude_percent`: 80 (how much of daily Claude quota to use)
@@ -167,7 +201,7 @@ These go in `harvey.yaml` under `usage:`. Use sensible defaults unless they want
 - `quiet_hours`: 22:00-07:00 in their timezone
 - `max_daily_sends`: 50 (email send limit)
 
-### Step 6: Start Harvey
+### Step 7: Start Harvey
 
 ```bash
 source .venv/bin/activate && harvey run
@@ -204,6 +238,7 @@ Users will come back with questions and tasks. Common ones:
 - **Skills** (`skills/`): Markdown knowledge files injected into agent prompts
 - **Signals** (`signals.py`, `state.py`): every fact Harvey learns is an OBSERVATION — a row in `observations`, never a column. A new signal needs no migration, re-observing over time is a free time series, and confidence + provenance travel with the fact. The vocabulary in `signal_codes` is governed (a trigger rejects any code not in it) and gated: only `status = 'confirmed'` signals are collected, and only a human sets that. `state.cohort(require, exclude)` does the set intersection in SQL.
 - **Dashboard** (`dashboard.py` + `harvey/web/`): FastAPI JSON API plus plain HTML/CSS/JS served from disk — no build step. Edit `harvey/web/app.css` or `app.js` and reload the page.
+- **DISCOVER** (`collectors/discover.py`): the only stage that spends money, so cost discipline lives in the collector, not the database — every run estimates first, checks a spend cap between batches, reads a kill switch, and flushes observations per batch. Providers are adapters behind one interface (`DiscoveryProvider`); adding one is a small class. Junk filtering matches *patterns*, not a literal blocklist. Entity resolution is the normalised domain, falling back to the provider's `external_id` for businesses with no website.
 
 ### Sub-Agents
 - **Scout**: Python does all web searching (DuckDuckGo → Bing → Google → Serper API) and email resolution (pattern-first: cache → scraped mailto → Hunter domain search → default, then verify one candidate via Reoon/ZeroBounce/Hunter/SMTP; catch-alls flagged `risky`). Claude only scores/personalizes found data. Scout also collects **buying signals**: tech stack detected on each company's site (HubSpot, Shopify, Intercom, ~35 tools — zero extra requests) and hiring signals from careers pages. With `pip install python-jobspy` (optional), a job-board strategy discovers companies actively hiring for roles in `icp.hiring_signals` (falls back to `icp.titles`) — the strongest in-market signal. Signals land in prospects' personalization notes and boost their score.
@@ -233,6 +268,7 @@ harvey gmail auth            # One-time Gmail OAuth (when provider: gmail)
 harvey gmail test            # Verify the Gmail connection
 harvey outbox                # Review queued emails; --approve <id> / --approve-all / --reject <id>
 harvey signals               # The signal vocabulary; --confirm / --reject CODES (or 'free' / 'all')
+harvey discover              # Find businesses; --providers / --estimate / --provider <key>
 harvey sending pause|resume  # Kill switch for all outbound
 ```
 

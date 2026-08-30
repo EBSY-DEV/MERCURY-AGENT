@@ -320,6 +320,79 @@ def cmd_outbox(args):
     asyncio.run(_outbox())
 
 
+def cmd_discover(args):
+    """Find businesses. The only stage that spends money, so it estimates first."""
+    from harvey.state import StateManager
+    from harvey.config import load_config
+    from harvey.collectors.discover import (
+        PROVIDERS, build_queries, provider_menu, run_discovery,
+    )
+
+    async def _discover():
+        if args.providers:
+            print("\n  Discovery providers")
+            print("  " + "=" * 68)
+            for m in provider_menu():
+                mark = "ready" if m["configured"] else "needs setup"
+                print(f"\n  {m['label']}  [{m['key']}]  ({mark})")
+                print(f"    {m['blurb']}")
+                print(f"    Cost: {m['cost_note']}")
+                print(f"    Free: {m['free_tier']}")
+                if m["env_keys"]:
+                    print(f"    Needs: {', '.join(m['env_keys'])} in .env  —  {m['signup_url']}")
+                if m["caveat"]:
+                    print(f"    Note: {m['caveat']}")
+            print("\n  Run one with: harvey discover --provider <key> --estimate\n")
+            return
+
+        if args.provider not in PROVIDERS:
+            print(f"\n  Unknown provider {args.provider!r}. "
+                  f"See: harvey discover --providers\n")
+            return
+
+        config = load_config()
+        state = StateManager()
+        await state.init_db()
+
+        # Semicolons, not commas: "Denver, CO" is one city, not two.
+        cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
+        queries = build_queries(config, cities=cities,
+                                depth=args.depth, limit=args.limit)
+
+        report = await run_discovery(state, config, args.provider, queries,
+                                     max_spend=args.max_spend, dry_run=True)
+        print(f"\n  {len(queries)} queries via {PROVIDERS[args.provider].label}")
+        for q in queries[:8]:
+            print(f"    - {q.keyword()}" + ("" if q.coordinate else
+                  "   (no coordinates — add icp.geo_coordinates for radius search)"))
+        if len(queries) > 8:
+            print(f"    ... and {len(queries) - 8} more")
+        print(f"\n  Estimated cost: ${report.estimated_cost:.4f}"
+              f"   (cap: ${args.max_spend:.2f})")
+
+        if args.estimate:
+            print("\n  Estimate only. Re-run without --estimate to collect.\n")
+            return
+
+        print("\n  Running...\n")
+        report = await run_discovery(state, config, args.provider, queries,
+                                     max_spend=args.max_spend)
+
+        r = report
+        print(f"  Found {r.found} results across {r.queries} queries")
+        print(f"    {r.new_companies} new companies, {r.known_companies} already known")
+        print(f"    {r.junk} filtered out as directories/aggregators")
+        print(f"    {r.observations} observations recorded")
+        print(f"    actual cost: ${r.actual_cost:.4f}")
+        if r.stopped:
+            print(f"\n  Stopped early: {r.stopped}")
+        for err in r.errors[:5]:
+            print(f"    ! {err}")
+        print("\n  Next: harvey dashboard → Signals → cohort builder\n")
+
+    asyncio.run(_discover())
+
+
 def cmd_signals(args):
     """Review the signal vocabulary — Harvey proposes, you confirm.
 
@@ -476,6 +549,24 @@ def main():
     sub.set_defaults(func=cmd_outbox)
 
     # harvey sending pause|resume|status
+    sub = subparsers.add_parser("discover", help="Find businesses matching your ICP")
+    sub.add_argument("--provider", default="osm",
+                     help="Discovery provider (default: osm — free, no account)")
+    sub.add_argument("--providers", action="store_true",
+                     help="List every provider with cost and setup, then exit")
+    sub.add_argument("--estimate", action="store_true",
+                     help="Print projected spend and exit without calling anything")
+    sub.add_argument("--city", default="",
+                     help='Semicolon-separated cities, e.g. "Denver, CO;Dallas, TX" '
+                          '(default: icp.geography)')
+    sub.add_argument("--depth", type=int, default=30,
+                     help="SERP depth (default: 30 — depth 100 costs 10x since Sept 2025)")
+    sub.add_argument("--limit", type=int, default=100,
+                     help="Max records per query (default: 100)")
+    sub.add_argument("--max-spend", type=float, default=1.0,
+                     help="Hard cap in dollars (default: 1.00)")
+    sub.set_defaults(func=cmd_discover)
+
     sub = subparsers.add_parser(
         "signals", help="Review/confirm which signals Harvey prospects against")
     sub.add_argument("--confirm", metavar="CODES", default="",

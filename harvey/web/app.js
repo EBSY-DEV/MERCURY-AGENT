@@ -135,6 +135,7 @@ function loadCurrentTab() {
   switch (currentTab) {
     case 'today': loadToday(); loadStats(); loadSetupStatus(); loadRuns(); break;
     case 'signals': loadSignals(); break;
+    case 'discover': loadDiscoverProviders(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
@@ -348,6 +349,165 @@ async function setSignals(codes, status) {
     showToast('Could not update that signal.', 'error');
   }
   loadSignals();
+}
+
+// ── Discover: pick a source, price it, then run it ──
+
+let _provider = null;
+let _discoverPoll = null;
+
+async function loadDiscoverProviders() {
+  const el = document.getElementById('discover-providers');
+  const data = await api('/api/discover/providers');
+  if (!data || !data.providers) { el.innerHTML = offlineState(); return; }
+
+  _provider = _provider || data.selected || data.default;
+  el.innerHTML = '<div class="prov-grid">' + data.providers.map(p => {
+    const ready = p.configured
+      ? '<span class="badge t-good">ready</span>'
+      : '<span class="badge t-waiting">needs a key</span>';
+    return '<div class="prov-card ' + (p.key === _provider ? 'selected' : '') +
+      '" onclick="pickProvider(\'' + p.key + '\')">' +
+      '<div class="prov-head"><h3>' + escHtml(p.label) + '</h3>' + ready + '</div>' +
+      '<div class="blurb">' + escHtml(p.blurb) + '</div>' +
+      '<div class="row"><span class="k">Cost</span><span class="v">' +
+        escHtml(p.cost_note) + '</span></div>' +
+      '<div class="row"><span class="k">Free</span><span class="v">' +
+        escHtml(p.free_tier) + '</span></div>' +
+      (p.needs_key
+        ? '<div class="row"><span class="k">Setup</span><span class="v">' +
+          escHtml(p.env_keys.join(', ')) + ' in .env &middot; ' +
+          '<a href="' + escHtml(p.signup_url) + '" target="_blank" rel="noopener">get a key</a>' +
+          '</span></div>'
+        : '') +
+      (p.caveat ? '<div class="caveat">' + escHtml(p.caveat) + '</div>' : '') +
+    '</div>';
+  }).join('') + '</div>';
+
+  const running = data.running;
+  document.getElementById('disc-stop').style.display = running ? '' : 'none';
+  if (running && !_discoverPoll) {
+    _discoverPoll = setInterval(loadDiscoverProviders, 4000);
+  } else if (!running && _discoverPoll) {
+    clearInterval(_discoverPoll);
+    _discoverPoll = null;
+    // A finished run leaves the button stuck on "Running…" otherwise.
+    const btn = document.getElementById('disc-run');
+    btn.disabled = true;
+    btn.textContent = 'Estimate first';
+    showToast('Discovery finished.', 'success');
+  }
+  renderDiscoverResult(data.last_report, running);
+}
+
+function pickProvider(key) {
+  _provider = key;
+  document.getElementById('disc-run').disabled = true;
+  document.getElementById('disc-run').textContent = 'Estimate first';
+  document.getElementById('discover-estimate').innerHTML = '';
+  loadDiscoverProviders();
+}
+
+function discoverBody() {
+  const raw = document.getElementById('disc-cities').value.trim();
+  return {
+    provider: _provider,
+    // Semicolons or newlines, never commas: "Denver, CO" is one city.
+    cities: raw ? raw.split(/[;\n]/).map(c => c.trim()).filter(Boolean) : [],
+    depth: Number(document.getElementById('disc-depth').value) || 30,
+    limit: Number(document.getElementById('disc-limit').value) || 100,
+    max_spend: Number(document.getElementById('disc-cap').value) || 1,
+  };
+}
+
+async function estimateDiscovery() {
+  const el = document.getElementById('discover-estimate');
+  el.innerHTML = '<p class="muted" style="font-size:13px">Pricing it…</p>';
+  const data = await api('/api/discover/estimate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(discoverBody()),
+  });
+  if (!data || data.error) {
+    el.innerHTML = '<div class="test-result error">' +
+      escHtml((data && data.error) || 'Could not estimate.') + '</div>';
+    return;
+  }
+
+  const cap = discoverBody().max_spend;
+  const over = data.estimated_cost > cap;
+  el.innerHTML = '<div class="estimate-box">' +
+    '<div class="amount ' + (data.free ? 'free' : 'paid') + '">' +
+      (data.free ? 'Free' : '$' + data.estimated_cost.toFixed(4)) + '</div>' +
+    '<div class="muted" style="font-size:13px;margin-top:2px">' +
+      data.query_count + ' quer' + (data.query_count === 1 ? 'y' : 'ies') +
+      (data.free ? '' : ' &middot; cap is $' + cap.toFixed(2)) + '</div>' +
+    (over ? '<div class="test-result error" style="margin-top:12px">' +
+      'Over your cap. Raise the cap or narrow the search.</div>' : '') +
+    '<div class="query-list">' +
+      data.queries.slice(0, 40).map(escHtml).join('<br>') +
+      (data.queries.length > 40 ? '<br>… and ' + (data.queries.length - 40) + ' more' : '') +
+    '</div></div>';
+
+  const btn = document.getElementById('disc-run');
+  btn.disabled = over;
+  btn.textContent = over ? 'Over cap'
+    : (data.free ? 'Run — free' : 'Run — spend up to $' + data.estimated_cost.toFixed(2));
+}
+
+async function runDiscovery() {
+  const btn = document.getElementById('disc-run');
+  btn.disabled = true;
+  btn.textContent = 'Running…';
+  const data = await api('/api/discover/run', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(discoverBody()),
+  });
+  if (data && data.success) {
+    showToast('Discovery started — ' + data.queries + ' queries.', 'success');
+  } else {
+    showToast((data && data.message) || 'Could not start.', 'error');
+    btn.disabled = false;
+  }
+  loadDiscoverProviders();
+}
+
+async function stopDiscovery() {
+  const data = await api('/api/discover/stop', {method: 'POST'});
+  showToast(data && data.success ? 'Stopping after the current query.'
+                                 : 'Could not stop.', data ? 'success' : 'error');
+  loadDiscoverProviders();
+}
+
+function renderDiscoverResult(report, running) {
+  const el = document.getElementById('discover-result');
+  if (running) {
+    el.innerHTML = '<div class="card"><h2>Running…</h2>' +
+      '<p class="muted" style="font-size:13px">Harvey is working through the ' +
+      'queries. Results land in Companies, and the run log is on Today.</p></div>';
+    return;
+  }
+  if (!report) { el.innerHTML = ''; return; }
+
+  const stat = (label, value, tone) =>
+    '<div class="stat-card"><div class="label">' + label + '</div>' +
+    '<div class="value"' + (tone ? ' style="color:var(--' + tone + ')"' : '') + '>' +
+    value + '</div></div>';
+
+  el.innerHTML = '<div class="subhead">Last run</div>' +
+    '<div class="stats-grid">' +
+      stat('New companies', report.new_companies || 0, 'accent') +
+      stat('Already known', report.known_companies || 0) +
+      stat('Observations', report.observations || 0) +
+      stat('Filtered as junk', report.junk || 0) +
+      stat('Actual cost', report.actual_cost ? '$' + report.actual_cost.toFixed(4) : 'free') +
+    '</div>' +
+    (report.stopped ? '<div class="test-result error" style="margin-top:14px">' +
+      'Stopped early: ' + escHtml(report.stopped) + '</div>' : '') +
+    ((report.errors || []).length
+      ? '<div class="card" style="margin-top:14px"><h2>Problems</h2>' +
+        (report.errors || []).slice(0, 8).map(e =>
+          '<div class="check-help">' + escHtml(e) + '</div>').join('') + '</div>'
+      : '');
 }
 
 // ── Cohort builder: a prospect list is a query ──
