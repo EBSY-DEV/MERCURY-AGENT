@@ -83,5 +83,6 @@ dossier and kills the human feel. Bank the others for follow-ups.
 
 Be honest about it. Fall back to a genuine problem the role or industry
 faces right now — stated as an observation, not a fake personalization.
-"Most contractors miss half their inbound calls" is a true, useful opener.
+"Most teams at your headcount still reconcile this by hand" is a true,
+useful opener.
 "I was looking at your website and love what you're doing" is not.

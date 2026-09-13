@@ -468,9 +468,10 @@ class OpenStreetMap(DiscoveryProvider):
     free_tier = "unlimited, within community rate etiquette"
     signup_url = "https://www.openstreetmap.org"
     env_keys = ()
-    caveat = ("Coverage is thin for businesses without a storefront — OSM has "
-              "under 2,000 roofers for the entire US. Great for a free trial "
-              "run or as a cross-reference; not a complete list.")
+    caveat = ("Coverage is thin for any trade without a storefront — OSM maps "
+              "premises, so it holds under 2,000 roofers for the entire US. "
+              "Great for a free trial run or as a cross-reference; not a "
+              "complete list.")
 
     # Several public Overpass instances run the same API. The main one
     # throttles readily, so try the mirrors before giving up — a free source
