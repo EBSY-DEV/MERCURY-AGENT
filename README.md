@@ -23,6 +23,12 @@ Decision: write_campaign (12 new prospects with no drafts)
 Cycle complete. Sleeping for 15 minutes.
 ```
 
+And the dashboard it keeps, at `localhost:5555` — confirming a signal, building a
+cohort out of the confirmed ones, pricing a discovery run before it spends
+anything, and approving mail one message at a time:
+
+![Harvey's dashboard: the Today queue, confirming a signal, the cohort builder counting matches live, a costed discovery estimate, and the outbox decisions desk — in light and dark](docs/dashboard.gif)
+
 ---
 
 ## Table of contents
