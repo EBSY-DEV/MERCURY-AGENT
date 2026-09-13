@@ -21,6 +21,8 @@
       <span class="status-dot stopped" id="header-dot"></span>
       <span id="header-status-text">Checking…</span>
     </div>
+    <button class="icon-btn" id="theme-btn" onclick="cycleTheme()"
+            title="Appearance: follows your system until you pick one">auto</button>
     <button class="refresh-btn" onclick="loadCurrentTab()">Refresh</button>
   </div>
 </header>
@@ -49,11 +51,27 @@
     <h2>Today</h2>
     <p>Anything waiting on you, then everything Harvey has built so far.</p>
   </div>
-  <div id="today-queue"></div>
-  <div id="today-setup"></div>
-  <div class="subhead">Pipeline</div>
-  <div class="stats-grid" id="stats-grid"></div>
-  <div id="today-runs"></div>
+  <div class="today-grid">
+    <div class="today-main">
+      <div id="today-queue"></div>
+      <div class="rail-block" style="margin-top:34px">
+        <div class="subhead">Recent activity</div>
+        <div id="today-activity"></div>
+      </div>
+    </div>
+
+    <aside class="today-rail">
+      <div class="rail-block">
+        <div class="subhead">Pipeline</div>
+        <div id="today-figures"></div>
+      </div>
+      <div class="rail-block" id="today-runs-block">
+        <div class="subhead">Collector runs</div>
+        <div id="today-runs"></div>
+      </div>
+      <div id="today-setup"></div>
+    </aside>
+  </div>
 </div>
 
 <!-- Signals: the confirmation gate -->

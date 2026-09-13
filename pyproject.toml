@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "harvey"
-version = "0.1.0"
+version = "0.2.0"
 description = "Autonomous AI sales agent. Always Be Closing."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -43,6 +43,7 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/ethanplusai/harvey"
 Issues = "https://github.com/ethanplusai/harvey/issues"
+Changelog = "https://github.com/ethanplusai/harvey/blob/main/CHANGELOG.md"
 
 [project.scripts]
 harvey = "harvey.cli:main"
@@ -50,6 +51,7 @@ harvey = "harvey.cli:main"
 [tool.setuptools.packages.find]
 include = ["harvey*"]
 
-# The dashboard's HTML/CSS/JS are real files, served from disk.
+# The dashboard's HTML/CSS/JS are real files served from disk, and its fonts
+# are vendored so a local tool renders correctly with the network off.
 [tool.setuptools.package-data]
-harvey = ["web/*"]
+harvey = ["web/*", "web/fonts/*"]

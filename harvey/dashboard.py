@@ -15,7 +15,9 @@ import aiosqlite
 import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    HTMLResponse, JSONResponse, PlainTextResponse, Response,
+)
 
 logger = logging.getLogger("harvey.dashboard")
 
@@ -1225,20 +1227,33 @@ async def get_runs_api():
 WEB_DIR = (Path(__file__).resolve().parent / "web")
 
 
-@app.get("/static/{filename}")
-async def static_file(filename: str):
-    """Serve the dashboard's CSS/JS from disk.
+TEXT_TYPES = {".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml"}
+BINARY_TYPES = {".woff2": "font/woff2", ".woff": "font/woff", ".png": "image/png"}
 
-    Read per-request rather than cached at import: editing app.css or app.js
-    and hitting reload is the whole point of having them as real files.
+
+@app.get("/static/{path:path}")
+async def static_file(path: str):
+    """Serve the dashboard's own assets from disk.
+
+    Read per-request rather than cached at import: editing app.css and hitting
+    reload is the whole point of having them as real files. Fonts are vendored
+    rather than fetched from a CDN — this is a local tool and it should work
+    with the network off.
     """
-    path = (WEB_DIR / filename).resolve()
-    if path.parent != WEB_DIR.resolve() or not path.is_file():
+    target = (WEB_DIR / path).resolve()
+    root = WEB_DIR.resolve()
+    if not target.is_file() or not target.is_relative_to(root):
         return PlainTextResponse("not found", status_code=404)
-    types = {".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml"}
+
+    if target.suffix in BINARY_TYPES:
+        return Response(
+            target.read_bytes(),
+            media_type=BINARY_TYPES[target.suffix],
+            headers={"Cache-Control": "public, max-age=604800"},
+        )
     return PlainTextResponse(
-        path.read_text(),
-        media_type=types.get(path.suffix, "text/plain"),
+        target.read_text(),
+        media_type=TEXT_TYPES.get(target.suffix, "text/plain"),
         headers={"Cache-Control": "no-store"},
     )
 

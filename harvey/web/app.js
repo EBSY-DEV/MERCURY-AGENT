@@ -4,6 +4,35 @@ let _companies = [], _prospects = [], _campaigns = [];
 let _signals = null;           // last /api/signals payload, for the cohort builder
 let _desk = { items: [], i: 0 };
 
+// ── Appearance ──
+//
+// Three states, not two: "auto" follows the OS and is the default, so the
+// dashboard matches the rest of your machine until you deliberately override
+// it. Stored per-browser; nothing is sent anywhere.
+
+const THEMES = ['auto', 'light', 'dark'];
+
+function applyTheme(mode) {
+  const root = document.documentElement;
+  if (mode === 'auto') root.removeAttribute('data-theme');
+  else root.setAttribute('data-theme', mode);
+  const btn = document.getElementById('theme-btn');
+  if (btn) btn.textContent = mode;
+}
+
+function cycleTheme() {
+  const now = localStorage.getItem('harvey-theme') || 'auto';
+  const next = THEMES[(THEMES.indexOf(now) + 1) % THEMES.length];
+  try { localStorage.setItem('harvey-theme', next); } catch { /* private mode */ }
+  applyTheme(next);
+}
+
+(function initTheme() {
+  let saved = 'auto';
+  try { saved = localStorage.getItem('harvey-theme') || 'auto'; } catch { /* ignore */ }
+  applyTheme(THEMES.includes(saved) ? saved : 'auto');
+})();
+
 // ── Utilities ──
 
 function escHtml(s) {
@@ -133,7 +162,7 @@ function showTab(id, btn) {
 
 function loadCurrentTab() {
   switch (currentTab) {
-    case 'today': loadToday(); loadStats(); loadSetupStatus(); loadRuns(); break;
+    case 'today': loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
     case 'signals': loadSignals(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
@@ -157,7 +186,7 @@ async function loadToday() {
 
   navCount('nav-today', (data.items || []).filter(i => i.tone !== 'good').length);
   navCount('nav-outbox', (data.stats || {}).outbox_pending || 0);
-  navCount('nav-signals', 0);
+  renderFigures(data.stats || {});
 
   const items = data.items || [];
   if (!items.length) {
@@ -182,6 +211,41 @@ async function loadToday() {
   ).join('') + '</div>';
 }
 
+function renderFigures(stats) {
+  const el = document.getElementById('today-figures');
+  if (!el) return;
+  const row = (label, value) =>
+    '<div class="figure"><span class="k">' + label + '</span>' +
+    '<span class="v' + (value ? '' : ' zero') + '">' + value + '</span></div>';
+
+  el.innerHTML = '<div class="figures">' +
+    row('Companies', stats.companies || 0) +
+    row('Contacts', stats.prospects || 0) +
+    row('Signals on', stats.signals_confirmed || 0) +
+    row('Not yet read', stats.unprofiled || 0) +
+    row('Awaiting approval', stats.outbox_pending || 0) +
+    row('Scheduled', stats.outbox_approved || 0) +
+    row('Live conversations', stats.open_conversations || 0) +
+  '</div>';
+}
+
+async function loadTodayActivity() {
+  const el = document.getElementById('today-activity');
+  if (!el) return;
+  const data = await api('/api/activity');
+  if (!Array.isArray(data) || !data.length) {
+    el.innerHTML = '<p class="muted" style="font-size:12.5px">' +
+      'Nothing yet. Every action Harvey takes shows up here.</p>';
+    return;
+  }
+  el.innerHTML = '<div class="activity-feed">' + data.slice(0, 12).map(a =>
+    '<div class="activity-item">' +
+      '<span class="time">' + formatDate(a.created_at) + '</span>' +
+      '<span class="agent">' + escHtml(a.agent) + '</span>' +
+      '<span class="action">' + escHtml(String(a.action_type).replace(/_/g, ' ')) + '</span>' +
+    '</div>').join('') + '</div>';
+}
+
 function navCount(id, n) {
   const el = document.getElementById(id);
   if (!el) return;
@@ -198,19 +262,27 @@ function goTab(id) {
 
 async function loadRuns() {
   const el = document.getElementById('today-runs');
+  const block = document.getElementById('today-runs-block');
   if (!el) return;
   const runs = await api('/api/runs');
-  if (!Array.isArray(runs) || !runs.length) { el.innerHTML = ''; return; }
-  el.innerHTML = '<div class="subhead">Collector runs</div>' +
-    '<div class="table-card"><table><thead><tr><th>Stage</th><th>Status</th>' +
-    '<th>Provider</th><th>Records</th><th>Cost</th><th>Started</th></tr></thead><tbody>' +
-    runs.map(r =>
-      '<tr><td>' + escHtml(r.stage) + '</td><td>' + badge(r.status) + '</td>' +
-      '<td class="muted">' + escHtml(r.provider || '—') + '</td>' +
-      '<td>' + (r.records || 0) + '</td>' +
-      '<td class="muted">' + (r.cost_usd ? '$' + Number(r.cost_usd).toFixed(4) : 'free') + '</td>' +
-      '<td class="muted">' + formatDate(r.started_at) + '</td></tr>'
-    ).join('') + '</tbody></table></div>';
+  if (!Array.isArray(runs) || !runs.length) {
+    if (block) block.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }
+  if (block) block.style.display = '';
+
+  // A rail is 300px wide — a seven-column table does not belong here.
+  el.innerHTML = '<div class="figures">' + runs.slice(0, 6).map(r =>
+    '<div class="figure" style="align-items:flex-start">' +
+      '<span class="k">' + escHtml(r.stage) +
+        '<br><span class="muted" style="font-size:11px">' +
+        formatDate(r.started_at) + '</span></span>' +
+      '<span style="text-align:right;flex:none">' + badge(r.status) +
+        '<br><span class="muted" style="font-family:var(--mono);font-size:11px">' +
+        (r.records || 0) + ' rec &middot; ' +
+        (r.cost_usd ? '$' + Number(r.cost_usd).toFixed(4) : 'free') + '</span></span>' +
+    '</div>').join('') + '</div>';
 }
 
 // ── Setup checklist (lives on Today, and disappears once it's done) ──
@@ -222,38 +294,35 @@ async function loadSetupStatus() {
   if (!data || !data.checks) { el.innerHTML = ''; return; }
 
   const pct = data.percent || 0;
-  const renderCheck = (c, optional) => {
-    const icon = c.done
-      ? '<span class="check-icon done">&#10003;</span>'
-      : '<span class="check-icon pending">&#9679;</span>';
-    return '<div class="check-item">' + icon +
+  // Finished setup disappears completely rather than greeting you forever.
+  if (pct === 100) { el.innerHTML = ''; return; }
+
+  const renderCheck = (c, optional) =>
+    '<div class="check-item">' +
+      (c.done ? '<span class="check-icon done">&#10003;</span>'
+              : '<span class="check-icon pending"></span>') +
       '<div class="check-info">' +
         '<div class="check-label ' + (c.done ? 'done' : '') + '">' + escHtml(c.label) +
-          (optional ? ' <span class="optional-tag">optional</span>' : '') + '</div>' +
+          (optional ? '<span class="optional-tag">optional</span>' : '') + '</div>' +
         (!c.done ? '<div class="check-help">' + escHtml(c.help) + '</div>' : '') +
       '</div></div>';
-  };
 
-  let checks = data.checks.filter(c => c.required).map(c => renderCheck(c, false)).join('');
+  const required = data.checks.filter(c => c.required);
   const optional = data.checks.filter(c => !c.required);
-  if (optional.length) {
-    checks += '<div class="subhead">Optional</div>';
-    checks += optional.map(c => renderCheck(c, true)).join('');
-  }
 
-  // Complete setup collapses out of the way rather than greeting you forever.
-  const open = pct < 100 ? ' open' : '';
   el.innerHTML =
-    '<details class="card"' + open + '>' +
-      '<summary style="cursor:pointer;font-size:14px;font-weight:650">Setup &mdash; ' +
-        pct + '% complete <span class="muted" style="font-weight:400">(' +
-        data.completed + ' of ' + data.total_required + ' required steps)</span></summary>' +
-      '<div style="margin-top:16px">' +
-        '<div class="progress-bar" style="margin-bottom:18px"><div class="progress-fill ' +
-          (pct === 100 ? 'green' : 'yellow') + '" style="width:' + pct + '%"></div></div>' +
-        checks +
-      '</div>' +
-    '</details>';
+    '<div class="rail-block">' +
+      '<div class="subhead">Setup &mdash; ' + pct + '%</div>' +
+      '<div class="progress-bar" style="margin-bottom:14px">' +
+        '<div class="progress-fill yellow" style="width:' + pct + '%"></div></div>' +
+      required.map(c => renderCheck(c, false)).join('') +
+      (optional.length
+        ? '<details style="margin-top:10px"><summary class="muted" ' +
+          'style="font-size:12px">' + optional.length + ' optional</summary>' +
+          '<div style="margin-top:6px">' +
+          optional.map(c => renderCheck(c, true)).join('') + '</div></details>'
+        : '') +
+    '</div>';
 }
 
 // ── Signals: Harvey proposes, you confirm ──
@@ -1241,9 +1310,9 @@ async function loadActivity() {
 // ── Init & live refresh ──
 
 loadToday();
-loadStats();
 loadSetupStatus();
 loadRuns();
+loadTodayActivity();
 loadHarveyStatus();
 
 // Agent status: quick poll
@@ -1265,7 +1334,7 @@ setInterval(async () => {
 setInterval(() => {
   if (document.hidden) return;
   switch (currentTab) {
-    case 'today': loadToday(); loadStats(); loadRuns(); break;
+    case 'today': loadToday(); loadRuns(); loadTodayActivity(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
