@@ -158,11 +158,11 @@ Pick one specific pain point and poke at it. Use a real stat if you have one, bu
 ```
 Subject: missed calls
 
-{{first_name}}, the average contractor misses over half their inbound calls. Every one of those is a job that goes to whoever picks up the phone first.
+{{first_name}}, most ops teams your size rebuild the same inventory report by hand every Monday morning. That's half a day a week nobody has.
 
-We built something that answers every call for companies like {{company}} and books the appointment automatically.
+We generate it straight out of the systems {{company}} already runs, so it's sitting there when you log in.
 
-How are you handling after-hours calls right now?
+Worth a look, or is this already handled?
 ```
 
 ### Email 3: The Breakup
@@ -207,7 +207,7 @@ A cold email gets a reply when it hits one of four triggers. Every email should 
 1. **Recognition** — you named a problem they're living with, in their own words. This is the strongest trigger. It requires real specificity: "your pricing page has four tiers but no annual option" beats "companies struggle with pricing" every time.
 2. **Curiosity gap** — you know something they'd want to know ("noticed something odd in how {{company}} shows up in search"). Only works if you actually deliver the payoff when they reply. Never manufacture a fake gap.
 3. **Easy yes** — the ask is so small that replying is cheaper than deleting ("is this on your radar at all?" beats "do you have 30 minutes Thursday?").
-4. **Status/peer proof** — a named, real peer or competitor did something relevant. Must be true and public. "Two roofing companies in Austin started doing X" only if they exist.
+4. **Status/peer proof** — a named, real peer or competitor did something relevant. Must be true and public. "Two other regional distributors moved off spreadsheets last quarter" only if they did.
 
 If the draft doesn't clearly hit one of these, it will be ignored no matter how clean the copy is. Rewrite around a trigger, not around your product.
 

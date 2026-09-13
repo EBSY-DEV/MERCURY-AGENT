@@ -180,7 +180,7 @@ side by side: what each source does, what it costs, its free tier, and which
 
 | Source | Cost | Free tier | Best for |
 |---|---|---|---|
-| **OpenStreetMap** (default) | free | unlimited | Trying the whole pipeline with no account. Thin coverage — under 2,000 roofers in the entire US — so it's a trial source, not a complete list. |
+| **OpenStreetMap** (default) | free | unlimited | Trying the whole pipeline with no account. Thin coverage for service-area trades — OSM maps premises, so it has under 2,000 roofers in the entire US. A trial source, not a complete list. |
 | **DataForSEO Business Listings** | $0.372/1k businesses | $1 credit | Local trades, clinics, contractors. Phone + domain + rating + whether the listing is claimed, and it can filter for businesses with **no website at all**. |
 | **DataForSEO SERP** | $0.0018 a search at depth 30 | $1 credit + free sandbox | Rank as the buying signal. Positions 11-30 are the sweet spot. |
 | **Serper** | ~$0.30-$1.00/1k | 2,500 free, no card | The easiest paid one to try. |

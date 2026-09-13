@@ -200,7 +200,7 @@ harvey discover               # go
 
 | Source | Cost | Free tier | Best for |
 |---|---|---|---|
-| **OpenStreetMap** *(default)* | free | unlimited, no account | Trying the whole pipeline before paying anyone. Coverage is thin for businesses without a storefront — under 2,000 roofers in the entire US — and Harvey says so in the UI rather than quietly under-delivering. |
+| **OpenStreetMap** *(default)* | free | unlimited, no account | Trying the whole pipeline before paying anyone. Coverage is thin for businesses without a storefront: OSM maps premises, so whole trades are barely present (under 2,000 roofers and under 2,300 plumbers in the entire US). Harvey says so in the UI rather than quietly under-delivering. |
 | **DataForSEO Business Listings** | $0.372 / 1,000 | $1 credit | Local trades, clinics, contractors. Phone, domain, rating, claimed status — and it can filter for businesses with **no website at all**. |
 | **DataForSEO SERP** | $0.0018 / search | $1 credit + free sandbox | Rank as the buying signal. |
 | **Serper** | ~$0.30–1.00 / 1,000 | 2,500 free, no card | The easiest paid one to try. |
@@ -326,9 +326,9 @@ When you trust it, set `channels.email.require_approval: false` for full autopil
 harvey dashboard     # http://localhost:5555
 ```
 
-Plain HTML, CSS and JavaScript served from `harvey/web/`. No build step, no framework, no bundler — edit `app.css` and reload.
+Plain HTML, CSS and JavaScript served from `harvey/web/`. No build step, no framework, no bundler — edit `app.css` and reload. Fonts are vendored, so it renders correctly with the network off.
 
-- **Today** — what needs a human, then the pipeline, then the collector run log. It opens here, not on a setup checklist, because the question you actually have is "is anything waiting on me?"
+- **Today** — an asymmetric two-column screen: anything waiting on a decision down the left with the activity feed beneath it, and a rail carrying pipeline figures, collector runs and setup. It opens here rather than on a setup checklist, because the question you actually have is "is anything waiting on me?" Setup lives in the rail and disappears entirely once it's done.
 - **Signals** — the confirmation gate and the cohort builder
 - **Discover** — the provider menu with prices side by side, an estimate, then a run
 - **Companies / Contacts** — everything found, with CSV export
@@ -336,7 +336,15 @@ Plain HTML, CSS and JavaScript served from `harvey/web/`. No build step, no fram
 - **Conversations** — every reply and how Harvey handled it
 - **Usage** — real Claude quota gauges and per-agent token counts. No dollar figures: you're on a subscription, you aren't billed per token, and pretending otherwise would be theater.
 
-One status vocabulary runs through all of it, so "waiting on you" looks identical whether it's an email, a signal, or a campaign.
+Three rules hold the interface together:
+
+**The interface carries no colour.** The chrome is warm greyscale in both modes, so the only coloured thing on screen is status — if something has a hue, it means something.
+
+**One status vocabulary.** Prospects, campaigns, conversations, the outbox, signals and email deliverability all resolve to the same five tones, so "waiting on you" looks identical wherever it appears.
+
+**Every figure is monospaced and tabular**, so columns of numbers line up and a value changing doesn't shift the layout.
+
+Appearance has three states, not two. `auto` follows your OS and is the default, so the dashboard matches the rest of your machine until you deliberately pick light or dark. Dark isn't a separate design — it's the same design re-tokenised.
 
 ---
 
@@ -503,6 +511,12 @@ tests/                   # 242 tests
 **Next:** people enrichment from public registries · consent-gated voice callbacks · calendar integration for auto-booking · scheduled re-observation so signal *changes* trigger outreach · multi-product support
 
 > **On voice:** a fully autonomous AI cold dialer is not on this roadmap, and won't be. Under FCC 24-17 an AI-generated voice is an "artificial voice" under the TCPA, and 47 CFR 64.1200(a)(1) has no B2B exemption — penalties run $500–1,500 per call, uncapped, and some states ban it outright. Voice here will be **consent-gated**: inbound and opt-in-triggered callbacks only.
+
+---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md). Current release: **0.2.0**.
 
 ---
 
