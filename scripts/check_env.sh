@@ -14,9 +14,32 @@ echo
 echo " Cloud state:"
 have HARVEY_STATE_REPO
 echo
-echo " Mail provider (gmail):"
-have GMAIL_CLIENT_ID
-have GMAIL_CLIENT_SECRET
+# Read the provider actually configured rather than assuming one -- a
+# checklist that reports on the wrong provider is worse than no checklist.
+PROVIDER="$(grep -A6 '^ *email:' harvey.local.yaml harvey.yaml 2>/dev/null \
+    | grep -m1 'provider:' | sed 's/.*provider: *//; s/["'"'"']//g; s/ *#.*//' | tr -d '\r')"
+PROVIDER="${PROVIDER:-unknown}"
+echo " Mail provider (configured: $PROVIDER):"
+case "$PROVIDER" in
+    gmail)
+        have GMAIL_CLIENT_ID
+        have GMAIL_CLIENT_SECRET
+        echo "      also run 'harvey gmail auth' once, locally"
+        ;;
+    smtp)
+        have SMTP_HOST
+        have SMTP_USERNAME
+        have SMTP_PASSWORD
+        have IMAP_HOST
+        ;;
+    instantly)
+        have INSTANTLY_API_KEY
+        ;;
+    *)
+        echo "  [ ] channels.email.provider is not gmail, smtp or instantly"
+        ;;
+esac
+echo "      verify with: harvey mail test"
 echo
 echo " Email verification -- without ANY of these every address stays"
 echo " 'guess' and Harvey never sends a single email:"
@@ -42,7 +65,13 @@ have CLOUDFLARE_API_TOKEN
 have LINKEDIN_EMAIL
 have LINKEDIN_PASSWORD
 echo
-echo "NOT NEEDED (provider is gmail, not instantly)"
-echo
-[ -n "${INSTANTLY_API_KEY:-}" ] && echo "  INSTANTLY_API_KEY is set but unused" || echo "  INSTANTLY_API_KEY unset - correct"
-echo
+if [ "$PROVIDER" != "instantly" ]; then
+    echo "NOT NEEDED (provider is $PROVIDER, not instantly)"
+    echo
+    if [ -n "${INSTANTLY_API_KEY:-}" ]; then
+        echo "  INSTANTLY_API_KEY is set but unused"
+    else
+        echo "  INSTANTLY_API_KEY unset - correct"
+    fi
+    echo
+fi

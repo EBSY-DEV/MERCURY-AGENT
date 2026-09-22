@@ -118,17 +118,41 @@ Only set `require_approval: false` once you have read enough of Harvey's output
 to trust it unattended. A scheduled job sending cold email with nobody watching
 puts your sending domain's reputation on the line every hour.
 
-## Choosing a provider for a headless deployment
+## Choosing a provider: check the egress first
 
-SMTP+IMAP is the simpler of the two here: pure environment variables, no OAuth
-and no browser step, and it works with any mailbox host. `IMAP_USERNAME` and
-`IMAP_PASSWORD` fall back to their SMTP equivalents, so a single mailbox needs
-only `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD` and `IMAP_HOST`. Port 587
-uses STARTTLS and 465 uses implicit TLS, picked automatically from the port.
+**A scheduled cloud container may only be allowed to talk HTTPS.** Measured on
+the Anthropic cloud environment:
 
-Whichever you choose, what actually governs whether mail arrives is the sending
-domain, not the provider: a dedicated domain, correct SPF/DKIM/DMARC, verified
-addresses, and a slow warmup. Run `harvey mail test` before trusting either.
+| Port | Purpose | Result |
+|---|---|---|
+| 443 | HTTPS | open |
+| 587 | SMTP submission | blocked |
+| 465 | SMTP implicit TLS | blocked |
+| 993 | IMAP over TLS | blocked |
+| 25 | SMTP relay | blocked |
+
+That decides the provider, and it is the opposite of the answer you get by
+reasoning about convenience alone:
+
+- **`gmail` works.** It is the Gmail REST API over HTTPS
+  (`gmail.googleapis.com`), so it goes through the same egress as everything
+  else. The OAuth browser step is a one-time annoyance run locally; the token
+  then lives in the state repo and refreshes itself.
+- **`smtp` cannot send or read mail from such a container.** It needs raw TCP
+  on 587/465 to send and 993 to poll replies. `harvey mail test` reports this
+  as a connection timeout, not an auth error.
+
+SMTP remains the better choice when Harvey runs somewhere with open mail ports
+— a laptop, a VPS, a Docker host. It is simpler: pure environment variables, no
+OAuth, `IMAP_USERNAME`/`IMAP_PASSWORD` falling back to their SMTP equivalents,
+and STARTTLS or implicit TLS picked automatically from the port.
+
+Run `harvey mail test` on the machine that will actually do the sending, before
+trusting either. A timeout there means ports, not credentials.
+
+Whichever you choose, what governs whether mail *arrives* is the sending domain,
+not the provider: a dedicated domain, correct SPF/DKIM/DMARC, verified
+addresses, and a slow warmup.
 
 ## Gmail in a headless container
 
