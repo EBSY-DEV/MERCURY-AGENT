@@ -100,17 +100,19 @@ than the rest.
 ## Approval still applies
 
 With `channels.email.require_approval: true` (the default) a scheduled run
-drafts and queues, but nothing leaves the building. Review the outbox by
-cloning the state repo locally and pointing the dashboard at it:
+drafts and queues, but nothing leaves the building. Review it from your own machine:
 
 ```bash
-git clone https://github.com/<you>/harvey-state.git
-ln -s ../harvey-state/data data
-harvey dashboard        # localhost:5555 → Outbox
-harvey outbox --approve-all
+HARVEY_STATE_REPO=https://github.com/<you>/harvey-state.git scripts/local_dashboard.sh
 ```
 
-Approvals commit back to the state repo and the next cloud firing sends them.
+That pulls the state repo, points the dashboard at it (localhost:5555 → Outbox),
+and pushes your approvals back when you stop it, so the next cloud firing sends
+what you approved. `harvey outbox --approve-all` does the same from the terminal.
+
+The dashboard is a local web UI. It cannot be reached from the scheduled cloud
+container, which has no exposed ports and is destroyed after each run — the
+state repo is what carries decisions between the two.
 
 Only set `require_approval: false` once you have read enough of Harvey's output
 to trust it unattended. A scheduled job sending cold email with nobody watching
