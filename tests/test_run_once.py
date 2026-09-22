@@ -237,3 +237,47 @@ def test_an_unusable_inherited_value_is_overwritten(monkeypatch, inherited):
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setenv("IS_SANDBOX", inherited)
     assert B._cli_env()["IS_SANDBOX"] == "1"
+
+
+# --- the offer actually reaching the reply agent -----------------------------
+
+def _handler_with_offer(**offer_kwargs):
+    from types import SimpleNamespace
+    from harvey.agents.handler import Handler
+
+    h = Handler.__new__(Handler)          # no I/O: only _offer_brief is under test
+    defaults = dict(
+        primary="", entry="", goal="", booking_method="",
+        booking_url="", meeting_duration="", meeting_owner="",
+    )
+    defaults.update(offer_kwargs)
+    h.config = SimpleNamespace(product=SimpleNamespace(offer=SimpleNamespace(**defaults)))
+    return h
+
+
+def test_a_calendar_link_reaches_the_prompt():
+    """offer_strategy.md tells the agent to use booking_url; something must supply it."""
+    brief = _handler_with_offer(
+        goal="book_call",
+        booking_method="calendar_link",
+        booking_url="https://cal.com/someone/intro",
+        meeting_owner="Someone Real",
+    )._offer_brief()
+    assert "https://cal.com/someone/intro" in brief
+    assert "Someone Real" in brief
+
+
+def test_suggest_times_never_promises_a_link():
+    brief = _handler_with_offer(goal="book_call", booking_method="suggest_times")._offer_brief()
+    assert "http" not in brief
+    assert "do not send a link" in brief
+
+
+def test_calendar_link_method_without_a_url_promises_nothing():
+    """Half-configured is the dangerous case: don't tell it to send a link it lacks."""
+    brief = _handler_with_offer(goal="book_call", booking_method="calendar_link")._offer_brief()
+    assert "Booking link" not in brief
+
+
+def test_an_unconfigured_offer_adds_no_section():
+    assert _handler_with_offer()._offer_brief() == ""
