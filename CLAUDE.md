@@ -283,6 +283,7 @@ harvey export                # Deliverable prospects → sequencer-ready CSV (pr
 harvey export --all          # Full raw list, no filters
 harvey gmail auth            # One-time Gmail OAuth (when provider: gmail)
 harvey gmail test            # Verify the Gmail connection
+harvey mail test             # Verify whichever provider is configured (gmail or smtp)
 harvey outbox                # Review queued emails; --approve <id> / --approve-all / --reject <id>
 harvey signals               # The signal vocabulary; --confirm / --reject CODES (or 'free' / 'all')
 harvey discover              # Find businesses; --providers / --estimate / --provider <key>
