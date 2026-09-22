@@ -6,6 +6,10 @@
 data/
 *.db
 
+# Private state checkout created by scripts/cloud_run.sh (see docs/cloud.md).
+# Holds the pipeline database and the trained config — never tracked here.
+.harvey-state/
+
 # Python
 __pycache__/
 *.pyc
