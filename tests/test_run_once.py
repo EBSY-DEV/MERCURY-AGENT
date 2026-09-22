@@ -227,7 +227,13 @@ def test_unprivileged_user_is_left_alone(monkeypatch):
     assert "IS_SANDBOX" not in B._cli_env()
 
 
-def test_an_explicit_is_sandbox_setting_is_never_overridden(monkeypatch):
+@pytest.mark.parametrize("inherited", ["yes", "true", "0", ""])
+def test_an_unusable_inherited_value_is_overwritten(monkeypatch, inherited):
+    """Hosts export IS_SANDBOX=yes; the CLI only accepts "1".
+
+    Inheriting the host's spelling looks right and fails every Claude call,
+    which is exactly how this was found.
+    """
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    monkeypatch.setenv("IS_SANDBOX", "0")
-    assert B._cli_env()["IS_SANDBOX"] == "0"
+    monkeypatch.setenv("IS_SANDBOX", inherited)
+    assert B._cli_env()["IS_SANDBOX"] == "1"
