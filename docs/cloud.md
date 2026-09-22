@@ -86,7 +86,7 @@ Harvey reads `os.environ` directly, so a cloud deployment needs no `.env` file
 | `SERPER_API_KEY` | **Strongly recommended.** Google rate-limits datacenter IPs on the first request and DuckDuckGo serves a challenge, so free search is close to useless from a cloud container. Bing alone is thin. |
 | `REOON_API_KEY` / `ZEROBOUNCE_API_KEY` / `HUNTER_API_KEY` | Email verification. Without one, every address stays `guess` and is never sent. |
 | `DATAFORSEO_LOGIN` / `DATAFORSEO_PASSWORD` | Paid discovery. `DATAFORSEO_SANDBOX=1` routes to the free sandbox. |
-| Mail provider | `GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET`, or the `SMTP_*`/`IMAP_*` set. |
+| Mail provider | `GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET`, or the `SMTP_*`/`IMAP_*` set. Verify either with `harvey mail test`. |
 
 ### d. Run it
 
@@ -117,6 +117,18 @@ state repo is what carries decisions between the two.
 Only set `require_approval: false` once you have read enough of Harvey's output
 to trust it unattended. A scheduled job sending cold email with nobody watching
 puts your sending domain's reputation on the line every hour.
+
+## Choosing a provider for a headless deployment
+
+SMTP+IMAP is the simpler of the two here: pure environment variables, no OAuth
+and no browser step, and it works with any mailbox host. `IMAP_USERNAME` and
+`IMAP_PASSWORD` fall back to their SMTP equivalents, so a single mailbox needs
+only `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD` and `IMAP_HOST`. Port 587
+uses STARTTLS and 465 uses implicit TLS, picked automatically from the port.
+
+Whichever you choose, what actually governs whether mail arrives is the sending
+domain, not the provider: a dedicated domain, correct SPF/DKIM/DMARC, verified
+addresses, and a slow warmup. Run `harvey mail test` before trusting either.
 
 ## Gmail in a headless container
 
