@@ -535,6 +535,40 @@ Respond with ONLY the category label, nothing else."""
 
         return current_stage
 
+    def _offer_brief(self) -> str:
+        """The configured offer, rendered for a prompt.
+
+        Returns "" when nothing is configured, so an untrained deployment
+        carries on without an offer section rather than emitting empty
+        labels the model would feel obliged to fill in.
+        """
+        offer = self.config.product.offer
+        lines = []
+        if offer.primary:
+            lines.append(f"- What we sell: {offer.primary}")
+        if offer.entry:
+            lines.append(f"- Low-commitment first step: {offer.entry}")
+        if offer.goal:
+            lines.append(f"- Goal of this conversation: {offer.goal}")
+        if offer.meeting_duration:
+            lines.append(f"- Meeting length: {offer.meeting_duration}")
+        if offer.meeting_owner:
+            lines.append(f"- Who takes the meeting: {offer.meeting_owner}")
+
+        if offer.booking_method == "calendar_link" and offer.booking_url:
+            lines.append(
+                f"- Booking link: {offer.booking_url} -- share it exactly as "
+                f"written once they show interest. Never invent a link."
+            )
+        elif offer.booking_method == "suggest_times":
+            lines.append("- Booking: suggest two or three concrete times, do not send a link")
+        elif offer.booking_method == "ask_preference":
+            lines.append("- Booking: ask which times suit them, do not send a link")
+
+        if not lines:
+            return ""
+        return "\n\nTHE OFFER:\n" + "\n".join(lines)
+
     async def _generate_response(
         self, intent: str, reply_text: str, prospect, convo: Conversation
     ) -> str:
@@ -562,6 +596,12 @@ Product: {self.config.product.name} — {self.config.product.description}"""
         # Inject objection handling + sales methodology skills
         if self.skills:
             prompt += "\n\n" + self.skills
+
+        # The offer is configuration, not knowledge, so it never arrives via
+        # skills. Without it the reply agent knows to propose a call but not
+        # what to propose or where to send them -- offer_strategy.md tells it
+        # to use the booking_url, and nothing ever supplied one.
+        prompt += self._offer_brief()
 
         prompt += f"""
 
