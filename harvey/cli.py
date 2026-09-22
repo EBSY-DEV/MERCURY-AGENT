@@ -125,7 +125,14 @@ def cmd_setup(args):
 
 
 def cmd_run(args):
-    """Start Harvey's heartbeat loop."""
+    """Start Harvey's heartbeat loop, or run a single cycle."""
+    if getattr(args, "once", False):
+        from harvey.main import run_once_main
+
+        raise SystemExit(
+            run_once_main(ignore_quiet_hours=getattr(args, "ignore_quiet_hours", False))
+        )
+
     from harvey.main import main
 
     main()
@@ -563,6 +570,16 @@ def main():
 
     # harvey run
     sub = subparsers.add_parser("run", help="Start Harvey's heartbeat loop")
+    sub.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single cycle and exit (for cron/scheduled runs)",
+    )
+    sub.add_argument(
+        "--ignore-quiet-hours",
+        action="store_true",
+        help="With --once: run even during quiet hours",
+    )
     sub.set_defaults(func=cmd_run)
 
     # harvey train <url>

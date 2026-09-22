@@ -212,6 +212,22 @@ Or open the dashboard:
 harvey dashboard
 ```
 
+### Step 8 (optional): Run it on a schedule instead
+
+`harvey run` is a daemon — it wants a machine that stays up. To run Harvey on a
+schedule in an ephemeral container (a cron job, a CI runner, a Claude Code
+Routine) two things change:
+
+- **`harvey run --once`** does a single cycle and exits, letting the scheduler
+  own the cadence. Quiet hours still apply, and it never opens the setup wizard.
+- **State needs somewhere to live.** `data/harvey.db` is the whole pipeline, and
+  a fresh container has none. `scripts/cloud_run.sh` restores it from a *private*
+  state repo, runs one cycle, and pushes it back.
+
+Prospect data must never go in this public repository. See `docs/cloud.md` for
+the full setup — state repo layout, environment variables, reviewing the outbox
+remotely, and why a `SERPER_API_KEY` is close to mandatory from a datacenter IP.
+
 ---
 
 ## After Setup — Ongoing Help
@@ -257,6 +273,7 @@ handle_replies > send_campaigns > write_campaigns > prospect > idle (run analyst
 ```bash
 source .venv/bin/activate    # Always activate venv first
 harvey run                   # Start the heartbeat loop
+harvey run --once            # One cycle, then exit (cron / scheduled cloud runs)
 harvey dashboard             # Web UI at http://localhost:5555
 harvey setup                 # Re-run setup wizard
 harvey train <url>           # Train on a product website
