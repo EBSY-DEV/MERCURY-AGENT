@@ -185,6 +185,8 @@ class Writer:
             except Exception:
                 company = None
         if company:
+            if company.location:
+                facts.append(f"- Location: {company.location}")
             if company.description:
                 facts.append(f"- What the company says about itself: {company.description}")
             if company.tech_stack:

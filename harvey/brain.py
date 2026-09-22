@@ -40,10 +40,15 @@ def _cli_env() -> dict:
     there -- but hosted runners and scheduled cloud containers are root, and
     there the container *is* the sandbox. Without this, Harvey's brain fails
     on every call in exactly the environments it is left alone to run in.
+
+    The value has to be exactly "1". Some hosts already export a friendlier
+    spelling (IS_SANDBOX=yes), which the CLI does not accept -- so overwrite
+    rather than defaulting, or Harvey inherits a value that reads as correct
+    and fails every call anyway.
     """
     env = os.environ.copy()
     if getattr(os, "geteuid", None) and os.geteuid() == 0:
-        env.setdefault("IS_SANDBOX", "1")
+        env["IS_SANDBOX"] = "1"
     return env
 
 
