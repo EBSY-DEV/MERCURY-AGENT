@@ -658,8 +658,10 @@ async def get_outbox_api():
         await state.init_db()
         return {
             "paused": await state.get_setting("sending_paused"),
-            "pending": await state.get_outbox(status="pending_review", limit=100),
-            "approved": await state.get_outbox(status="approved", limit=50),
+            "pending": await _with_from_mailbox(
+                state, await state.get_outbox(status="pending_review", limit=100)),
+            "approved": await _with_from_mailbox(
+                state, await state.get_outbox(status="approved", limit=50)),
             "sent": (await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
                 "ORDER BY sent_at DESC LIMIT 25")),
@@ -667,6 +669,47 @@ async def get_outbox_api():
                 "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
                 "ORDER BY updated_at DESC LIMIT 25")),
         }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def _with_from_mailbox(state, rows: list[dict]) -> list[dict]:
+    """Add ``from_mailbox``: the address a queued email will go out from.
+    Follow-ups inherit their opener's mailbox; a new thread shows '' (the
+    sender picks one when it goes out); '' on a sent row of an old thread
+    means it predates mailbox tracking."""
+    for r in rows:
+        fm = r.get("mailbox") or ""
+        if not fm and r.get("kind") == "sequence" and int(r.get("step") or 1) > 1:
+            prev = await state.get_previous_outbox_step(
+                r.get("campaign_id") or "", r.get("prospect_id") or "", int(r["step"]))
+            fm = (prev or {}).get("mailbox") or ""
+        r["from_mailbox"] = fm
+    return rows
+
+
+@app.get("/api/mailboxes")
+async def get_mailboxes():
+    """Sending capacity per mailbox: today's cap, warm-up stage, sends in the
+    rolling 24 hours. Presence flags only; no secret leaves the box."""
+    try:
+        from harvey.config import load_config
+        from harvey.integrations.mailboxes import mailbox_report
+
+        config = load_config()
+        state = _state()
+        await state.init_db()
+        env_vars = _read_env_file()
+
+        def has_secret(name: str) -> bool:
+            return bool((env_vars.get(name) or os.getenv(name) or "").strip())
+
+        return mailbox_report(
+            config,
+            await state.count_outbox_sent_today_by_mailbox(),
+            has_secret,
+            smtp_username=env_vars.get("SMTP_USERNAME") or os.getenv("SMTP_USERNAME", ""),
+        )
     except Exception as e:
         return {"error": str(e)}
 

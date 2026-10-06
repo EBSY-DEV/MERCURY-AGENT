@@ -362,3 +362,54 @@ async def test_handler_reads_every_inbox_and_answers_from_the_receiving_one(stat
                if r["kind"] == "reply"]
     assert len(replies) == 1
     assert replies[0]["mailbox"] == "b@y.co"
+
+
+# ── dashboard report ──
+
+def test_mailbox_report_shows_caps_stages_and_missing_passwords():
+    from harvey.integrations.mailboxes import mailbox_report
+
+    today = date(2026, 10, 7)
+    cfg = make_config(auto_approve_followups=True, max_daily_sends=100, mailboxes=[
+        MailboxConfig(email="old@main.co", daily_cap=30, warmup_start=date(2026, 9, 16)),
+        MailboxConfig(email="new@x.co", daily_cap=30, warmup_start=today,
+                      password_env="MAILBOX_PASSWORD"),
+        MailboxConfig(email="later@y.co", daily_cap=30, warmup_start=date(2026, 10, 9),
+                      password_env="MAILBOX_PASSWORD"),
+        MailboxConfig(email="warm@z.co", daily_cap=20, password_env="MAILBOX_NOPE"),
+    ])
+    rep = mailbox_report(cfg, {"": 4, "old@main.co": 3, "new@x.co": 1},
+                         lambda name: name != "MAILBOX_NOPE",
+                         smtp_username="old@main.co", day=today)
+    rows = {r["email"]: r for r in rep["mailboxes"]}
+
+    # 3 weeks in: 5 + 3 * 5 = 20; full 30/day after ceil(25 / 5) = 5 weeks.
+    assert rows["old@main.co"]["cap_today"] == 20 and rows["old@main.co"]["sent_24h"] == 7
+    assert rows["old@main.co"]["stage"] == "warming"
+    assert rows["old@main.co"]["full_on"] == "2026-10-21"
+    assert rows["new@x.co"]["cap_today"] == 5 and rows["new@x.co"]["remaining"] == 4
+    assert rows["later@y.co"]["stage"] == "scheduled" and rows["later@y.co"]["cap_today"] == 0
+    assert rows["warm@z.co"]["configured"] is False and rows["warm@z.co"]["stage"] == "warm"
+    assert rep["capacity_today"] == 25          # the unconfigured mailbox doesn't count
+    assert rep["sent_24h"] == 8 and rep["auto_approve_followups"] is True
+
+
+def test_mailbox_report_without_rotation_is_one_mailbox():
+    from harvey.integrations.mailboxes import mailbox_report
+
+    rep = mailbox_report(make_config(max_daily_sends=15), {"": 6}, lambda n: True)
+    assert rep["rotation"] is False
+    assert [(r["email"], r["cap_today"], r["sent_24h"]) for r in rep["mailboxes"]] == [
+        ("carlos@main.co", 15, 6)]
+
+
+@pytest.mark.asyncio
+async def test_outbox_api_shows_the_mailbox_a_follow_up_inherits(state, monkeypatch):
+    from harvey import dashboard
+
+    pid = await seed_prospect(state)
+    s1 = await queue(state, pid, "jane@acme.com", step=1)
+    await state.update_outbox_item(s1, status="sent", sent_at=_now_iso(), mailbox="b@y.co")
+    await queue(state, pid, "jane@acme.com", step=2)
+    rows = await dashboard._with_from_mailbox(state, await state.get_outbox(status="approved"))
+    assert [r["from_mailbox"] for r in rows] == ["b@y.co"]
