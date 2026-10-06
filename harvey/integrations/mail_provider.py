@@ -42,6 +42,9 @@ class InboundMessage:
     date: str = ""
     is_bounce: bool = False
     headers: dict = field(default_factory=dict)
+    # The mailbox this arrived in (set by the handler when several are
+    # polled); Harvey's answer goes out from the same address.
+    mailbox: str = ""
 
 
 BOUNCE_SENDERS = ("mailer-daemon", "postmaster", "mail delivery subsystem")

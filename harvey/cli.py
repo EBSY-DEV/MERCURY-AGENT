@@ -318,21 +318,29 @@ def cmd_mail(args):
     class and both providers implement it.
     """
     from harvey.config import load_config, load_env
-    from harvey.integrations.mail_provider import get_mail_provider
+    from harvey.integrations.mailboxes import MailboxPool, local_today
 
     config = load_config()
     env = load_env()
-    provider = get_mail_provider(config, env)
-    if provider is None:
+    pool = MailboxPool.from_config(config, env)
+    if pool is None:
         name = config.channels.email.provider or "(unset)"
         print(f"\n  ✗ No native mail provider for '{name}'.")
         print("    Set channels.email.provider to 'gmail' or 'smtp'.\n")
         sys.exit(1)
 
     async def _test():
-        ok, detail = await provider.test_connection()
-        print(f"\n  {'✓' if ok else '✗'} {detail}\n")
-        sys.exit(0 if ok else 1)
+        today = local_today(config)
+        all_ok = True
+        print()
+        for mb in pool.mailboxes:
+            ok, detail = await mb.provider.test_connection()
+            all_ok = all_ok and ok
+            cap = pool.cap_on(mb, today)
+            label = f"{mb.email}  (cap today: {cap})  " if len(pool.mailboxes) > 1 else ""
+            print(f"  {'✓' if ok else '✗'} {label}{detail}")
+        print()
+        sys.exit(0 if all_ok else 1)
 
     asyncio.run(_test())
 
