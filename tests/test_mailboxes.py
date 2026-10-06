@@ -138,18 +138,36 @@ def test_smtp_provider_sends_as_its_mailbox():
     assert not missing.is_configured()
 
 
-def test_pool_from_config_marks_the_smtp_login_as_legacy():
+def test_pool_from_config_keeps_disabled_mailboxes_for_their_threads():
     env = EnvConfig(smtp_host="h", smtp_username="old@main.co", smtp_password="p",
                     mailbox_secrets={"MAILBOX_PASSWORD": "pw"})
     cfg = make_config(mailboxes=[
         MailboxConfig(email="new@ebsyhq.com", password_env="MAILBOX_PASSWORD"),
         MailboxConfig(email="old@main.co"),
-        MailboxConfig(email="off@x.co", enabled=False),
+        MailboxConfig(email="off@x.co", enabled=False, password_env="MAILBOX_PASSWORD"),
     ])
+    cfg.persona.email = "nobody@else.co"
     pool = MailboxPool.from_config(cfg, env)
-    assert [mb.email for mb in pool.mailboxes] == ["new@ebsyhq.com", "old@main.co"]
-    assert pool.legacy.email == "old@main.co"
+    assert [mb.email for mb in pool.mailboxes] == ["new@ebsyhq.com", "old@main.co", "off@x.co"]
+    assert [mb.accepts_new for mb in pool.mailboxes] == [True, True, False]
+    assert pool.legacy.email == "old@main.co"          # SMTP login, persona not listed
     assert pool.resolve("") is pool.legacy
+
+
+def test_legacy_mailbox_is_the_old_from_address_first():
+    # Old mail went out From persona.email, so that mailbox owns '' rows
+    # even when the SMTP login is a different listed mailbox.
+    env = EnvConfig(smtp_host="h", smtp_username="login@main.co", smtp_password="p")
+    cfg = make_config(mailboxes=[MailboxConfig(email="login@main.co"),
+                                 MailboxConfig(email="carlos@main.co")])
+    assert MailboxPool.from_config(cfg, env).legacy.email == "carlos@main.co"
+
+
+def test_secret_only_hands_out_mailbox_passwords():
+    env = EnvConfig(tavily_api_key="tvly-secret", smtp_password="s",
+                    mailbox_secrets={"MAILBOX_X": "x"})
+    assert env.secret("TAVILY_API_KEY") == ""
+    assert env.secret("SMTP_PASSWORD") == "s" and env.secret("MAILBOX_X") == "x"
 
 
 # ── sending ──
@@ -230,17 +248,138 @@ async def test_pre_tracking_threads_continue_from_the_legacy_mailbox(state):
 
 
 @pytest.mark.asyncio
-async def test_thread_of_a_removed_mailbox_moves_to_another(state):
+async def test_thread_of_a_removed_mailbox_is_cancelled_not_rerouted(state):
+    # Nobody reads the removed inbox: continuing from another address would
+    # keep mailing someone whose reply or opt-out went unseen.
     pool = make_pool(("a@x.co", 5, None))
     sender = make_sender(state, pool)
     pid = await seed_prospect(state)
     s1 = await queue(state, pid, "jane@acme.com", step=1)
     await state.update_outbox_item(s1, status="sent", sent_at=_now_iso(), mailbox="gone@z.co")
-    await queue(state, pid, "jane@acme.com", step=2)
+    s2 = await queue(state, pid, "jane@acme.com", step=2)
 
     await sender._drain_due()
 
-    assert len(pool.primary.provider.sent) == 1
+    assert pool.primary.provider.sent == []
+    assert (await state.get_outbox_item(s2))["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_disabled_mailbox_finishes_its_threads_but_starts_none(state):
+    pool = make_pool(("a@x.co", 5, None), ("off@y.co", 5, None))
+    pool.mailboxes[1].accepts_new = False
+    sender = make_sender(state, pool)
+    pid = await seed_prospect(state)
+    s1 = await queue(state, pid, "jane@acme.com", step=1)
+    await state.update_outbox_item(s1, status="sent", sent_at=_now_iso(), mailbox="off@y.co")
+    await queue(state, pid, "jane@acme.com", step=2)
+    for i in range(3):
+        p = await seed_prospect(state, email=f"new{i}@acme.com")
+        await queue(state, p, f"new{i}@acme.com", campaign=f"n{i}")
+
+    await sender._drain_due()
+
+    assert [m["to"] for m in pool.mailboxes[1].provider.sent] == ["jane@acme.com"]
+    assert len(pool.mailboxes[0].provider.sent) == 3
+
+
+@pytest.mark.asyncio
+async def test_follow_up_without_credentials_is_held(state):
+    class NoCreds(FakeProvider):
+        def is_configured(self):
+            return False
+    pool = MailboxPool([Mailbox(email="a@x.co", provider=FakeProvider(), daily_cap=5),
+                        Mailbox(email="b@y.co", provider=NoCreds(), daily_cap=5)])
+    sender = make_sender(state, pool)
+    pid = await seed_prospect(state)
+    s1 = await queue(state, pid, "jane@acme.com", step=1)
+    await state.update_outbox_item(s1, status="sent", sent_at=_now_iso(), mailbox="b@y.co")
+    s2 = await queue(state, pid, "jane@acme.com", step=2)
+
+    await sender._drain_due()
+
+    assert pool.mailboxes[0].provider.sent == []
+    assert (await state.get_outbox_item(s2))["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_legacy_sends_count_against_the_legacy_mailbox(state):
+    pool = make_pool(("old@main.co", 3, None), ("new@x.co", 3, None))
+    sender = make_sender(state, pool)
+    for i in range(3):   # three pre-tracking sends today, mailbox ''
+        p = await seed_prospect(state, email=f"old{i}@acme.com")
+        oid = await queue(state, p, f"old{i}@acme.com", campaign=f"o{i}")
+        await state.update_outbox_item(oid, status="sent", sent_at=_now_iso())
+    for i in range(4):
+        p = await seed_prospect(state, email=f"n{i}@acme.com")
+        await queue(state, p, f"n{i}@acme.com", campaign=f"n{i}")
+
+    await sender._drain_due()
+
+    assert pool.mailboxes[0].provider.sent == []          # already at its 3
+    assert len(pool.mailboxes[1].provider.sent) == 3
+
+
+@pytest.mark.asyncio
+async def test_capped_follow_ups_do_not_starve_other_mailboxes(state):
+    # Many old follow-ups pinned to a capped mailbox sit ahead of newer
+    # openers; the free mailbox must still send.
+    pool = make_pool(("old@main.co", 1, None), ("new@x.co", 3, None))
+    sender = make_sender(state, pool, spread_sends=True)
+    sender._spread = lambda left: 1
+    old = (datetime.now(timezone.utc) - timedelta(days=5)).replace(tzinfo=None).isoformat()
+    for i in range(40):
+        p = await seed_prospect(state, email=f"t{i}@acme.com")
+        s1 = await queue(state, p, f"t{i}@acme.com", campaign=f"t{i}")
+        await state.update_outbox_item(s1, status="sent", sent_at=old, mailbox="old@main.co")
+        s2 = await queue(state, p, f"t{i}@acme.com", step=2, campaign=f"t{i}")
+        await state.update_outbox_item(s2, send_at=old)
+    p = await seed_prospect(state, email="fresh@acme.com")
+    await queue(state, p, "fresh@acme.com", campaign="fresh")
+
+    await sender._drain_due()          # old@main.co takes its 1; budget 1 spent
+    await sender._drain_due()          # old is capped now: the opener must go
+
+    assert [m["to"] for m in pool.mailboxes[1].provider.sent] == ["fresh@acme.com"]
+
+
+@pytest.mark.asyncio
+async def test_follow_up_waits_its_delay_after_the_opener_really_went_out(state):
+    from harvey.models.campaign import Campaign, EmailStep
+
+    camp = Campaign(id="", name="c", sequence=[
+        EmailStep(step=1, subject="s1", body="b1", delay_days=0),
+        EmailStep(step=2, subject="s2", body="b2", delay_days=3)])
+    cid = await state.add_campaign(camp)
+    pid = await seed_prospect(state)
+    s1 = await queue(state, pid, "jane@acme.com", step=1, campaign=cid)
+    await state.update_outbox_item(s1, status="sent", sent_at=_now_iso(), mailbox="a@x.co")
+    s2 = await queue(state, pid, "jane@acme.com", step=2, campaign=cid)  # staged long ago
+
+    pool = make_pool(("a@x.co", 5, None))
+    sender = make_sender(state, pool)
+    await sender._drain_due()
+
+    assert pool.primary.provider.sent == []
+    row = await state.get_outbox_item(s2)
+    assert row["status"] == "approved"
+    resched = datetime.fromisoformat(row["send_at"])
+    assert timedelta(days=2, hours=23) < resched - datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+@pytest.mark.asyncio
+async def test_a_reply_may_pass_its_mailboxs_warmup_cap(state):
+    pool = make_pool(("a@x.co", 1, None))
+    sender = make_sender(state, pool)
+    p = await seed_prospect(state, email="n@acme.com")
+    oid = await queue(state, p, "n@acme.com", campaign="n")
+    await state.update_outbox_item(oid, status="sent", sent_at=_now_iso(), mailbox="a@x.co")
+    rp = await seed_prospect(state, email="replier@acme.com", status="replied")
+    await queue(state, rp, "replier@acme.com", kind="reply", mailbox="a@x.co")
+
+    await sender._drain_due()
+
+    assert [m["to"] for m in pool.primary.provider.sent] == ["replier@acme.com"]
 
 
 @pytest.mark.asyncio
@@ -366,10 +505,16 @@ async def test_handler_reads_every_inbox_and_answers_from_the_receiving_one(stat
 
 # ── dashboard report ──
 
-def test_mailbox_report_shows_caps_stages_and_missing_passwords():
+def _report_pool(env, cfg):
+    return MailboxPool.from_config(cfg, env)
+
+
+def test_mailbox_report_matches_what_the_sender_enforces():
     from harvey.integrations.mailboxes import mailbox_report
 
     today = date(2026, 10, 7)
+    env = EnvConfig(smtp_host="mail.x", smtp_username="old@main.co", smtp_password="p",
+                    mailbox_secrets={"MAILBOX_PASSWORD": "pw"})
     cfg = make_config(auto_approve_followups=True, max_daily_sends=100, mailboxes=[
         MailboxConfig(email="old@main.co", daily_cap=30, warmup_start=date(2026, 9, 16)),
         MailboxConfig(email="new@x.co", daily_cap=30, warmup_start=today,
@@ -377,30 +522,70 @@ def test_mailbox_report_shows_caps_stages_and_missing_passwords():
         MailboxConfig(email="later@y.co", daily_cap=30, warmup_start=date(2026, 10, 9),
                       password_env="MAILBOX_PASSWORD"),
         MailboxConfig(email="warm@z.co", daily_cap=20, password_env="MAILBOX_NOPE"),
+        MailboxConfig(email="flat@q.co", daily_cap=30, warmup_start=today,
+                      password_env="MAILBOX_PASSWORD", enabled=False),
     ])
-    rep = mailbox_report(cfg, {"": 4, "old@main.co": 3, "new@x.co": 1},
-                         lambda name: name != "MAILBOX_NOPE",
-                         smtp_username="old@main.co", day=today)
+    cfg.persona.email = "old@main.co"
+    pool = _report_pool(env, cfg)
+    sent = {"": 4, "old@main.co": 3, "new@x.co": 1, "gone@r.co": 2}
+    rep = mailbox_report(cfg, pool, sent, day=today)
     rows = {r["email"]: r for r in rep["mailboxes"]}
 
     # 3 weeks in: 5 + 3 * 5 = 20; full 30/day after ceil(25 / 5) = 5 weeks.
     assert rows["old@main.co"]["cap_today"] == 20 and rows["old@main.co"]["sent_24h"] == 7
-    assert rows["old@main.co"]["stage"] == "warming"
+    assert rows["old@main.co"]["stage"] == "warming" and rows["old@main.co"]["legacy"]
     assert rows["old@main.co"]["full_on"] == "2026-10-21"
-    assert rows["new@x.co"]["cap_today"] == 5 and rows["new@x.co"]["remaining"] == 4
     assert rows["later@y.co"]["stage"] == "scheduled" and rows["later@y.co"]["cap_today"] == 0
-    assert rows["warm@z.co"]["configured"] is False and rows["warm@z.co"]["stage"] == "warm"
-    assert rep["capacity_today"] == 25          # the unconfigured mailbox doesn't count
-    assert rep["sent_24h"] == 8 and rep["auto_approve_followups"] is True
+    assert rows["warm@z.co"]["configured"] is False and rows["warm@z.co"]["remaining"] == 0
+    assert rows["flat@q.co"]["accepts_new"] is False
+    assert rows[""]["stage"] == "removed" and rows[""]["sent_24h"] == 2
+    # Same numbers as the pool the sender uses.
+    remaining = pool.remaining(sent, today)
+    for email, left in remaining.items():
+        assert rows[email]["remaining"] == left
+    assert rep["capacity_today"] == pool.capacity_on(today) == 20 + 5 + 0 + 5
+    assert rep["legacy_email"] == "old@main.co" and rep["capped_by_global"] is False
+    assert rep["sent_24h"] == 10 and rep["auto_approve_followups"] is True
+
+
+def test_mailbox_report_stage_for_a_ramp_that_never_finishes():
+    from harvey.integrations.mailboxes import mailbox_report
+
+    today = date(2026, 10, 7)
+    env = EnvConfig(smtp_host="h", mailbox_secrets={"MAILBOX_P": "x"})
+    cfg = make_config(warmup_weekly_increase=0, mailboxes=[
+        MailboxConfig(email="a@x.co", daily_cap=30, warmup_start=today, password_env="MAILBOX_P")])
+    row = mailbox_report(cfg, _report_pool(env, cfg), {}, day=today)["mailboxes"][0]
+    assert (row["stage"], row["cap_today"], row["full_on"]) == ("fixed", 5, None)
 
 
 def test_mailbox_report_without_rotation_is_one_mailbox():
     from harvey.integrations.mailboxes import mailbox_report
 
-    rep = mailbox_report(make_config(max_daily_sends=15), {"": 6}, lambda n: True)
+    cfg = make_config(max_daily_sends=15)
+    pool = MailboxPool.single(FakeProvider(), 15, "carlos@main.co")
+    rep = mailbox_report(cfg, pool, {"": 6})
     assert rep["rotation"] is False
     assert [(r["email"], r["cap_today"], r["sent_24h"]) for r in rep["mailboxes"]] == [
         ("carlos@main.co", 15, 6)]
+    assert mailbox_report(cfg, None, {})["mailboxes"] == []     # instantly
+
+
+def test_planned_capacity_skips_mailboxes_without_a_password():
+    today = date(2026, 10, 7)
+    cfg = make_config(mailboxes=[MailboxConfig(email="a@x.co", daily_cap=10),
+                                 MailboxConfig(email="b@y.co", daily_cap=10,
+                                               password_env="MAILBOX_NOPE")])
+    assert planned_daily_capacity(cfg, today, has_secret=lambda n: n != "MAILBOX_NOPE") == 10
+
+
+def test_has_credentials_ignores_an_empty_mailbox_secrets_dict(monkeypatch):
+    from harvey import main as M
+
+    monkeypatch.setattr(M, "load_env", lambda: EnvConfig())
+    assert M._has_credentials() is False
+    monkeypatch.setattr(M, "load_env", lambda: EnvConfig(mailbox_secrets={"MAILBOX_P": "x"}))
+    assert M._has_credentials() is True
 
 
 @pytest.mark.asyncio
@@ -413,3 +598,123 @@ async def test_outbox_api_shows_the_mailbox_a_follow_up_inherits(state, monkeypa
     await queue(state, pid, "jane@acme.com", step=2)
     rows = await dashboard._with_from_mailbox(state, await state.get_outbox(status="approved"))
     assert [r["from_mailbox"] for r in rows] == ["b@y.co"]
+
+
+@pytest.mark.asyncio
+async def test_from_mailbox_resolves_legacy_threads_and_waiting_chains(state):
+    from harvey import dashboard
+
+    # Old thread: opener sent before tracking -> follow-up goes from legacy.
+    p1 = await seed_prospect(state, email="old@acme.com")
+    o1 = await queue(state, p1, "old@acme.com", step=1, campaign="c1")
+    await state.update_outbox_item(o1, status="sent", sent_at=_now_iso())
+    await queue(state, p1, "old@acme.com", step=2, campaign="c1")
+    # Step 3 whose step 2 is approved but unsent: inherits step 1's mailbox.
+    p2 = await seed_prospect(state, email="chain@acme.com")
+    o2 = await queue(state, p2, "chain@acme.com", step=1, campaign="c2")
+    await state.update_outbox_item(o2, status="sent", sent_at=_now_iso(), mailbox="b@y.co")
+    await queue(state, p2, "chain@acme.com", step=2, campaign="c2")
+    await queue(state, p2, "chain@acme.com", step=3, campaign="c2")
+    # New thread, opener not sent: rotates.
+    p3 = await seed_prospect(state, email="new@acme.com")
+    await queue(state, p3, "new@acme.com", step=1, campaign="c3")
+
+    rows = await dashboard._with_from_mailbox(
+        state, await state.get_outbox(status="approved"), legacy_email="legacy@main.co")
+    got = {(r["to_email"], r["step"]): r["from_mailbox"] for r in rows}
+    assert got[("old@acme.com", 2)] == "legacy@main.co"
+    assert got[("chain@acme.com", 2)] == "b@y.co"
+    assert got[("chain@acme.com", 3)] == "b@y.co"
+    assert got[("new@acme.com", 1)] == ""
+    sent = await dashboard._with_from_mailbox(
+        state, await state.get_outbox(status="sent"), legacy_email="legacy@main.co")
+    assert {r["to_email"]: r["from_mailbox"] for r in sent}["old@acme.com"] == "legacy@main.co"
+
+
+def test_mailboxes_endpoint_reports_presence_only(state, monkeypatch):
+    from fastapi.testclient import TestClient
+    from harvey import dashboard
+
+    env = EnvConfig(smtp_host="mail.x", smtp_username="old@main.co",
+                    smtp_password="TOPSECRET-1", mailbox_secrets={"MAILBOX_PASSWORD": "TOPSECRET-2"})
+    cfg = make_config(mailboxes=[
+        MailboxConfig(email="old@main.co"),
+        MailboxConfig(email="new@x.co", password_env="MAILBOX_PASSWORD"),
+        MailboxConfig(email="nopw@y.co", password_env="MAILBOX_MISSING"),
+    ])
+    cfg.persona.email = "old@main.co"
+    monkeypatch.setattr(dashboard, "_mail_context",
+                        lambda: (cfg, MailboxPool.from_config(cfg, env)))
+    monkeypatch.setattr(dashboard, "_state", lambda: state)
+
+    r = TestClient(dashboard.app).get("/api/mailboxes")
+    body = r.text
+    assert r.status_code == 200 and "TOPSECRET" not in body
+    data = r.json()
+    assert [m["configured"] for m in data["mailboxes"]] == [True, True, False]
+    assert data["legacy_email"] == "old@main.co"
+
+
+def test_mailboxes_endpoint_explains_a_broken_config(monkeypatch):
+    from fastapi.testclient import TestClient
+    from harvey import dashboard
+
+    def boom():
+        raise ValueError("channels.email.mailboxes.0.email: secret-looking input")
+    monkeypatch.setattr(dashboard, "_mail_context", boom)
+    data = TestClient(dashboard.app).get("/api/mailboxes").json()
+    assert "error" in data and "ValueError" in data["error"]
+    assert "secret-looking" not in data["error"]       # no config values echoed
+
+
+@pytest.mark.asyncio
+async def test_approving_an_opener_promotes_its_follow_ups_at_once(state, monkeypatch):
+    from fastapi.testclient import TestClient
+    from harvey import dashboard
+
+    pid = await seed_prospect(state)
+    s1 = await queue(state, pid, "jane@acme.com", step=1, status="pending_review")
+    s2 = await queue(state, pid, "jane@acme.com", step=2, status="pending_review")
+    s3 = await queue(state, pid, "jane@acme.com", step=3, status="pending_review")
+    cfg = make_config(auto_approve_followups=True)
+    monkeypatch.setattr(dashboard, "_state", lambda: state)
+    monkeypatch.setattr("harvey.config.load_config", lambda *a, **k: cfg)
+
+    data = TestClient(dashboard.app).post(f"/api/outbox/{s1}/approve").json()
+
+    assert data == {"success": True, "followups_approved": 2}
+    for i in (s2, s3):
+        assert (await state.get_outbox_item(i))["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_reply_from_a_mailbox_without_credentials_is_held(state):
+    # Replies skip the warm-up cap, so only the credential check stops one
+    # from going to an SMTP server with no password.
+    class NoCreds(FakeProvider):
+        def is_configured(self):
+            return False
+    nocreds = NoCreds()
+    pool = MailboxPool([Mailbox(email="a@x.co", provider=FakeProvider(), daily_cap=5),
+                        Mailbox(email="b@y.co", provider=nocreds, daily_cap=5)])
+    sender = make_sender(state, pool)
+    rp = await seed_prospect(state, email="replier@acme.com", status="replied")
+    rid = await queue(state, rp, "replier@acme.com", kind="reply", mailbox="b@y.co")
+
+    await sender._drain_due()
+
+    assert nocreds.sent == [] and pool.mailboxes[0].provider.sent == []
+    assert (await state.get_outbox_item(rid))["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_from_mailbox_flags_threads_of_removed_mailboxes(state):
+    from harvey import dashboard
+
+    pid = await seed_prospect(state)
+    s1 = await queue(state, pid, "jane@acme.com", step=1)
+    await state.update_outbox_item(s1, status="sent", sent_at=_now_iso(), mailbox="gone@z.co")
+    await queue(state, pid, "jane@acme.com", step=2)
+    rows = await dashboard._with_from_mailbox(
+        state, await state.get_outbox(status="approved"), "a@x.co", known={"a@x.co"})
+    assert rows[0]["from_mailbox"] == "gone@z.co" and rows[0]["from_removed"] is True

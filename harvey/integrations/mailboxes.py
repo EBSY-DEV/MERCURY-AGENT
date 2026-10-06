@@ -11,6 +11,11 @@ and Harvey's replies go out from the same address. Otherwise a prospect would
 get "Re:" mail from a stranger, and their answers would land in an inbox the
 conversation never touched.
 
+A mailbox with ``enabled: false`` takes no new threads, but its inbox is
+still read and its threads still finish from it. A mailbox removed from the
+config is gone: its pending follow-ups are cancelled by the sender rather
+than re-routed, because nobody reads its inbox any more.
+
 Without ``channels.email.mailboxes`` the pool wraps the single configured
 provider (gmail, or the SMTP_* mailbox), so every deployment runs the same
 code path.
@@ -19,6 +24,7 @@ code path.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -33,6 +39,8 @@ class Mailbox:
     provider: MailProvider
     daily_cap: int
     warmup_start: date | None = None
+    # False: finishes its threads and is still polled, but starts no new one.
+    accepts_new: bool = True
     # Owns outbox rows recorded before mailbox tracking existed (mailbox = '').
     legacy: bool = False
 
@@ -68,10 +76,34 @@ def warmup_cap(daily_cap: int, warmup_start: date | None, day: date,
     return max(0, min(int(daily_cap), ramp))
 
 
-def planned_daily_capacity(config, day: date | None = None) -> int:
-    """Sends per day the configuration allows, without touching credentials:
-    max_daily_sends, further limited by the mailboxes' caps when rotating.
-    Used for planning (how much to draft), not for the send decision."""
+def full_volume_on(daily_cap: int, warmup_start: date | None,
+                   initial: int, weekly_increase: int) -> date | None:
+    """First day a warming mailbox reaches daily_cap; None if it never
+    ramps (already warm, or a zero weekly increase)."""
+    if warmup_start is None or daily_cap <= initial:
+        return None
+    if weekly_increase <= 0:
+        return None
+    weeks = -(-(int(daily_cap) - int(initial)) // int(weekly_increase))  # ceil
+    return warmup_start + timedelta(days=7 * weeks)
+
+
+def rotation_configured(config) -> bool:
+    """True when the SMTP provider has a mailboxes list to rotate over."""
+    email_cfg = config.channels.email
+    provider_name = (getattr(email_cfg, "provider", "") or "").strip().lower()
+    return provider_name == "smtp" and bool(getattr(email_cfg, "mailboxes", None))
+
+
+def _env_has(name: str) -> bool:
+    return bool((os.getenv(name or "") or "").strip())
+
+
+def planned_daily_capacity(config, day: date | None = None, has_secret=_env_has) -> int:
+    """Sends per day the configuration allows, without opening a connection:
+    max_daily_sends, further limited by the caps of the mailboxes that have
+    a password. Used for planning (how much to draft, whether the cap is
+    reached), not for the send decision itself."""
     email_cfg = config.channels.email
     max_daily = int(getattr(email_cfg, "max_daily_sends", 0) or 0)
     if not rotation_configured(config):
@@ -81,7 +113,7 @@ def planned_daily_capacity(config, day: date | None = None) -> int:
     weekly = getattr(email_cfg, "warmup_weekly_increase", 5)
     total = sum(
         warmup_cap(m.daily_cap, m.warmup_start, day, initial, weekly)
-        for m in email_cfg.mailboxes if getattr(m, "enabled", True)
+        for m in email_cfg.mailboxes if has_secret(m.password_env)
     )
     return min(max_daily, total)
 
@@ -116,31 +148,41 @@ class MailboxPool:
         email_cfg = config.channels.email
         provider_name = (getattr(email_cfg, "provider", "") or "").strip().lower()
         max_daily = int(getattr(email_cfg, "max_daily_sends", 0) or 0)
-        configured = [m for m in (getattr(email_cfg, "mailboxes", None) or [])
-                      if getattr(m, "enabled", True)]
+        listed = list(getattr(email_cfg, "mailboxes", None) or [])
 
-        if provider_name == "smtp" and configured:
+        if listed and provider_name != "smtp":
+            logger.warning(
+                f"Mailboxes: channels.email.mailboxes is only used with the smtp "
+                f"provider; ignoring it for '{provider_name}'."
+            )
+
+        if provider_name == "smtp" and listed:
             from harvey.integrations.smtp_mail import SmtpImapProvider
 
-            legacy_login = (getattr(env, "smtp_username", "") or "").strip().lower()
-            persona_email = (getattr(config.persona, "email", "") or "").strip().lower()
             mailboxes = [
                 Mailbox(
                     email=m.email,
                     provider=SmtpImapProvider(config, env, mailbox=m),
                     daily_cap=m.daily_cap,
                     warmup_start=m.warmup_start,
+                    accepts_new=bool(getattr(m, "enabled", True)),
                 )
-                for m in configured
+                for m in listed
             ]
             # Rows sent before this feature carry no mailbox. They went out
-            # through SMTP_USERNAME, so that mailbox owns them (persona.email
-            # as a fallback, else the first listed).
-            for key in (legacy_login, persona_email):
-                owner = next((mb for mb in mailboxes if key and mb.email == key), None)
-                if owner:
-                    owner.legacy = True
-                    break
+            # From persona.email (or the SMTP login when that was empty).
+            persona_email = (getattr(config.persona, "email", "") or "").strip().lower()
+            login = (getattr(env, "smtp_username", "") or "").strip().lower()
+            owner = next((mb for key in (persona_email, login) for mb in mailboxes
+                          if key and mb.email == key), None)
+            if owner:
+                owner.legacy = True
+            else:
+                logger.warning(
+                    f"Mailboxes: neither persona.email ({persona_email or 'empty'}) nor "
+                    f"SMTP_USERNAME is in channels.email.mailboxes; threads started "
+                    f"before rotation continue from {mailboxes[0].email}."
+                )
             return cls(
                 mailboxes,
                 warmup_initial_cap=getattr(email_cfg, "warmup_initial_cap", 5),
@@ -164,13 +206,14 @@ class MailboxPool:
 
     def resolve(self, email: str | None) -> Mailbox | None:
         """The mailbox a stored outbox value refers to. '' means "sent before
-        mailbox tracking", i.e. the legacy mailbox."""
+        mailbox tracking", i.e. the legacy mailbox. None: not in the pool."""
         key = (email or "").strip().lower()
         if not key:
             return self.legacy
         return next((mb for mb in self.mailboxes if mb.email == key), None)
 
     def configured(self) -> list[Mailbox]:
+        """Mailboxes with credentials: these are polled and may send."""
         return [mb for mb in self.mailboxes if mb.provider.is_configured()]
 
     def domains(self) -> set[str]:
@@ -210,25 +253,18 @@ class MailboxPool:
         """Mailbox for a new thread: fewest sends this cycle, then the largest
         share of its daily cap still unused, then list order. A warming
         mailbox (cap 5) and a warm one (cap 30) both drain at their own pace
-        instead of the warm one doing all the work."""
+        instead of the warm one doing all the work. Disabled mailboxes take
+        no new threads."""
         best, best_key = None, None
         for idx, mb in enumerate(self.configured()):
             left = remaining.get(mb.email, 0)
-            if left <= 0:
+            if left <= 0 or not mb.accepts_new:
                 continue
             cap = self.cap_on(mb, day) or 1
             key = (sent_this_cycle.get(mb.email, 0), -(left / cap), idx)
             if best_key is None or key < best_key:
                 best, best_key = mb, key
         return best
-
-
-def rotation_configured(config) -> bool:
-    """True when the SMTP provider has a mailboxes list to rotate over."""
-    email_cfg = config.channels.email
-    provider_name = (getattr(email_cfg, "provider", "") or "").strip().lower()
-    mailboxes = getattr(email_cfg, "mailboxes", None) or []
-    return provider_name == "smtp" and any(getattr(m, "enabled", True) for m in mailboxes)
 
 
 def build_rotation_pool(config, env) -> MailboxPool | None:
@@ -244,73 +280,79 @@ def build_rotation_pool(config, env) -> MailboxPool | None:
         return None
 
 
-def mailbox_report(config, sent_by_mailbox: dict[str, int], has_secret,
-                   smtp_username: str = "", day: date | None = None) -> dict:
-    """What the dashboard shows about sending capacity. No network, no
-    secrets: ``has_secret(name)`` only says whether an env var is set.
-
-    Each row: email, name, daily_cap, cap_today, sent_24h, remaining,
-    warmup_start, full_on (first day at daily_cap), stage, configured.
+def mailbox_report(config, pool: MailboxPool | None, sent_by_mailbox: dict[str, int],
+                   day: date | None = None) -> dict:
+    """What the dashboard shows about sending capacity, computed with the
+    same pool and the same rules the sender enforces. No network, no
+    secrets: "configured" is the provider's own credential check.
     """
     email_cfg = config.channels.email
     day = day or local_today(config)
     max_daily = int(getattr(email_cfg, "max_daily_sends", 0) or 0)
-    initial = int(getattr(email_cfg, "warmup_initial_cap", 5) or 0)
-    weekly = int(getattr(email_cfg, "warmup_weekly_increase", 5) or 0)
-    total_sent = sum(sent_by_mailbox.values())
-    rows: list[dict] = []
-
-    if rotation_configured(config):
-        listed = [m for m in email_cfg.mailboxes if getattr(m, "enabled", True)]
-        login = (smtp_username or "").strip().lower()
-        persona_email = (getattr(config.persona, "email", "") or "").strip().lower()
-        legacy = next((m.email for key in (login, persona_email) for m in listed
-                       if key and m.email == key), listed[0].email)
-        for m in listed:
-            cap = warmup_cap(m.daily_cap, m.warmup_start, day, initial, weekly)
-            sent = int(sent_by_mailbox.get(m.email, 0))
-            if m.email == legacy:
-                sent += int(sent_by_mailbox.get("", 0))
-            full_on = None
-            if m.warmup_start is not None and weekly > 0 and m.daily_cap > initial:
-                weeks = -(-(m.daily_cap - initial) // weekly)  # ceil
-                full_on = (m.warmup_start + timedelta(days=7 * weeks)).isoformat()
-            if m.warmup_start is not None and day < m.warmup_start:
-                stage = "scheduled"
-            elif cap < m.daily_cap:
-                stage = "warming"
-            else:
-                stage = "warm"
-            rows.append({
-                "email": m.email,
-                "name": m.name or getattr(config.persona, "name", ""),
-                "daily_cap": m.daily_cap,
-                "cap_today": cap,
-                "sent_24h": sent,
-                "remaining": max(0, cap - sent),
-                "warmup_start": m.warmup_start.isoformat() if m.warmup_start else None,
-                "full_on": full_on if stage != "warm" else None,
-                "stage": stage,
-                "configured": bool(has_secret(m.password_env)),
-            })
-    else:
-        email = (getattr(config.persona, "email", "") or smtp_username or "").lower()
-        rows.append({
-            "email": email, "name": getattr(config.persona, "name", ""),
-            "daily_cap": max_daily, "cap_today": max_daily, "sent_24h": total_sent,
-            "remaining": max(0, max_daily - total_sent), "warmup_start": None,
-            "full_on": None, "stage": "warm", "configured": None,
-        })
-
-    capacity = sum(r["cap_today"] for r in rows if r["configured"] is not False)
-    return {
+    total_sent = sum(int(v) for v in sent_by_mailbox.values())
+    base = {
         "rotation": rotation_configured(config),
         "provider": getattr(email_cfg, "provider", ""),
-        "mailboxes": rows,
-        "capacity_today": min(max_daily, capacity),
         "max_daily_sends": max_daily,
         "sent_24h": total_sent,
         "require_approval": bool(getattr(email_cfg, "require_approval", True)),
         "auto_approve_followups": bool(getattr(email_cfg, "auto_approve_followups", False)),
         "spread_sends": bool(getattr(email_cfg, "spread_sends", False)),
+    }
+    if pool is None:  # instantly: the outbox numbers mean nothing here
+        return {**base, "mailboxes": [], "legacy_email": "", "capacity_today": 0,
+                "capped_by_global": False}
+
+    global_left = max(0, max_daily - total_sent)
+    rows: list[dict] = []
+    known: set[str] = set()
+    for mb in pool.mailboxes:
+        configured = mb.provider.is_configured()
+        cap = pool.cap_on(mb, day)
+        sent = pool.used(mb, sent_by_mailbox)
+        known.add(mb.email)
+        if mb.legacy:
+            known.add("")
+        full_on = full_volume_on(mb.daily_cap, mb.warmup_start,
+                                 pool.warmup_initial_cap, pool.warmup_weekly_increase)
+        if mb.warmup_start is not None and day < mb.warmup_start:
+            stage = "scheduled"
+        elif cap < mb.daily_cap:
+            stage = "warming" if full_on else "fixed"
+        else:
+            stage = "warm"
+        from_name = getattr(mb.provider, "from_name", None)
+        rows.append({
+            "email": mb.email,
+            "name": (from_name if isinstance(from_name, str) else "")
+                    or getattr(config.persona, "name", ""),
+            "daily_cap": mb.daily_cap,
+            "cap_today": cap,
+            "sent_24h": sent,
+            # What the sender would really still send from it today.
+            "remaining": min(max(0, cap - sent), global_left) if configured else 0,
+            "warmup_start": mb.warmup_start.isoformat() if mb.warmup_start else None,
+            "full_on": full_on.isoformat() if (full_on and stage != "warm") else None,
+            "stage": stage,
+            "accepts_new": mb.accepts_new,
+            "configured": configured,
+            "legacy": mb.legacy,
+        })
+
+    # Sends from mailboxes no longer in the config still count globally.
+    other = sum(int(v) for k, v in sent_by_mailbox.items() if k not in known)
+    if other:
+        rows.append({
+            "email": "", "name": "removed mailboxes", "daily_cap": 0, "cap_today": 0,
+            "sent_24h": other, "remaining": 0, "warmup_start": None, "full_on": None,
+            "stage": "removed", "accepts_new": False, "configured": None, "legacy": False,
+        })
+
+    mailbox_capacity = pool.capacity_on(day)
+    return {
+        **base,
+        "mailboxes": rows,
+        "legacy_email": pool.legacy.email,
+        "capacity_today": min(max_daily, mailbox_capacity),
+        "capped_by_global": max_daily < mailbox_capacity,
     }

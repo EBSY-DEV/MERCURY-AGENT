@@ -550,8 +550,13 @@ def _has_credentials() -> bool:
     except Exception:
         return False
     # Ports carry non-empty defaults, so they say nothing about setup.
+    def _present(v) -> bool:
+        if isinstance(v, dict):  # mailbox_secrets: "{}" is not a credential
+            return any(str(x).strip() for x in v.values())
+        return bool(str(v).strip())
+
     return any(
-        str(v).strip()
+        _present(v)
         for k, v in values.items()
         if k not in ("smtp_port", "imap_port")
     )

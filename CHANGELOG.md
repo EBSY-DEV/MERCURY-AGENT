@@ -5,6 +5,35 @@ Notable changes to Harvey. Dates are release dates; the format follows
 follow [semver](https://semver.org/), with the caveat that Harvey is pre-1.0 and
 minor versions can still change behaviour.
 
+## [Unreleased]
+
+### Added
+
+- **Mailbox rotation.** `channels.email.mailboxes` lists several SMTP
+  mailboxes, each with its own daily cap and an optional warm-up ramp
+  (`warmup_start`, `warmup_initial_cap`, `warmup_weekly_increase`).
+  `max_daily_sends` still caps the total. A thread keeps its mailbox: the
+  first email rotates, follow-ups go out from the same address, and replies
+  from the inbox they answer. Every inbox is polled, and one unreachable
+  inbox no longer hides the others. `enabled: false` stops new threads but
+  keeps reading the inbox. A mailbox removed from the config has its
+  remaining follow-ups cancelled, not re-routed.
+- **`auto_approve_followups`.** Approving a first email approves its
+  follow-ups, in the dashboard immediately and in the agent loop each cycle.
+- **`spread_sends`.** Paces the day's remaining sends over the cycles left
+  before quiet hours.
+- **Dashboard.** A Sending mailboxes card on the Outbox (sends in the last 24
+  hours against today's cap, warm-up stage, missing passwords), and the From
+  address on every queued and sent email. `harvey mail` tests every mailbox.
+
+### Fixed
+
+- A follow-up waits its delay after the previous email actually went out,
+  not after the day the sequence was staged. Approving an old opener no
+  longer sends its follow-ups right behind it.
+- Replies are sent before follow-ups and first emails, and are not held by a
+  mailbox's warm-up cap.
+
 ## [0.2.0] — 2026-09-13
 
 The release that made Harvey worth running. The previous version could write

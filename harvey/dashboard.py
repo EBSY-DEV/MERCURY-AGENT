@@ -656,15 +656,21 @@ async def get_outbox_api():
     try:
         state = _state()
         await state.init_db()
+        try:
+            _cfg, pool = _mail_context()
+            legacy = pool.legacy.email if pool else ""
+            known = {mb.email for mb in pool.mailboxes} if pool else None
+        except Exception:
+            legacy, known = "", None
         return {
             "paused": await state.get_setting("sending_paused"),
             "pending": await _with_from_mailbox(
-                state, await state.get_outbox(status="pending_review", limit=100)),
+                state, await state.get_outbox(status="pending_review", limit=100), legacy, known),
             "approved": await _with_from_mailbox(
-                state, await state.get_outbox(status="approved", limit=50)),
-            "sent": (await query_db(
+                state, await state.get_outbox(status="approved", limit=50), legacy, known),
+            "sent": await _with_from_mailbox(state, await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
-                "ORDER BY sent_at DESC LIMIT 25")),
+                "ORDER BY sent_at DESC LIMIT 25"), legacy),
             "failed": (await query_db(
                 "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
                 "ORDER BY updated_at DESC LIMIT 25")),
@@ -673,45 +679,80 @@ async def get_outbox_api():
         return {"error": str(e)}
 
 
-async def _with_from_mailbox(state, rows: list[dict]) -> list[dict]:
-    """Add ``from_mailbox``: the address a queued email will go out from.
-    Follow-ups inherit their opener's mailbox; a new thread shows '' (the
-    sender picks one when it goes out); '' on a sent row of an old thread
-    means it predates mailbox tracking."""
+def _mail_context():
+    """(config, pool) built exactly as the sender builds them. Re-reads .env
+    so a password added by hand shows up without restarting the dashboard."""
+    from harvey.config import load_config, load_env
+    from harvey.integrations.mailboxes import MailboxPool
+
+    if ENV_FILE.exists():
+        load_dotenv(str(ENV_FILE), override=True)
+    config = load_config()
+    return config, MailboxPool.from_config(config, load_env())
+
+
+async def _with_from_mailbox(state, rows: list[dict], legacy_email: str = "",
+                             known: set[str] | None = None) -> list[dict]:
+    """Add ``from_mailbox``: the address an email goes (or went) out from,
+    resolved the way the sender resolves it. A follow-up inherits its
+    opener's mailbox, '' on an old thread means the legacy mailbox, and a
+    new thread whose opener has not gone out yet stays '' (it rotates)."""
+    need = [r.get("campaign_id") or "" for r in rows
+            if not r.get("mailbox") and r.get("kind") == "sequence"
+            and int(r.get("step") or 1) > 1]
+    threads = await state.get_thread_mailboxes(need)
     for r in rows:
         fm = r.get("mailbox") or ""
-        if not fm and r.get("kind") == "sequence" and int(r.get("step") or 1) > 1:
-            prev = await state.get_previous_outbox_step(
-                r.get("campaign_id") or "", r.get("prospect_id") or "", int(r["step"]))
-            fm = (prev or {}).get("mailbox") or ""
+        if not fm:
+            if r.get("status") == "sent" or r.get("kind") == "reply":
+                fm = legacy_email
+            elif r.get("kind") == "sequence" and int(r.get("step") or 1) > 1:
+                key = (r.get("campaign_id") or "", r.get("prospect_id") or "")
+                if key in threads:
+                    fm = threads[key] or legacy_email
         r["from_mailbox"] = fm
+        # Queued mail pinned to a mailbox no longer configured is cancelled
+        # by the sender instead of going out; say so before it happens.
+        r["from_removed"] = bool(fm and known is not None and fm not in known
+                                 and r.get("status") != "sent")
     return rows
+
+
+async def _promote_followups_if_enabled(state) -> int:
+    """auto_approve_followups: promote right away on approval, so the
+    follow-ups leave the review desk instead of waiting for the next cycle."""
+    try:
+        from harvey.config import load_config
+
+        if not getattr(load_config().channels.email, "auto_approve_followups", False):
+            return 0
+    except Exception:
+        return 0
+    total = 0
+    for _ in range(10):
+        n = await state.approve_ready_followups()
+        if not n:
+            break
+        total += n
+    return total
 
 
 @app.get("/api/mailboxes")
 async def get_mailboxes():
-    """Sending capacity per mailbox: today's cap, warm-up stage, sends in the
-    rolling 24 hours. Presence flags only; no secret leaves the box."""
+    """Sending capacity per mailbox, computed with the sender's own pool and
+    rules: today's cap, warm-up stage, sends in the rolling 24 hours.
+    Presence flags only; no secret leaves the box."""
     try:
-        from harvey.config import load_config
         from harvey.integrations.mailboxes import mailbox_report
 
-        config = load_config()
+        config, pool = _mail_context()
         state = _state()
         await state.init_db()
-        env_vars = _read_env_file()
-
-        def has_secret(name: str) -> bool:
-            return bool((env_vars.get(name) or os.getenv(name) or "").strip())
-
-        return mailbox_report(
-            config,
-            await state.count_outbox_sent_today_by_mailbox(),
-            has_secret,
-            smtp_username=env_vars.get("SMTP_USERNAME") or os.getenv("SMTP_USERNAME", ""),
-        )
+        return mailbox_report(config, pool, await state.count_outbox_sent_today_by_mailbox())
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"/api/mailboxes: {e}")
+        return {"error": f"Could not read the mail configuration: {type(e).__name__}. "
+                         "Check harvey.local.yaml (channels.email) and the dashboard log."}
 
 
 @app.post("/api/outbox/approve-all")
@@ -720,6 +761,7 @@ async def outbox_approve_all():
         state = _state()
         await state.init_db()
         n = await state.approve_outbox()
+        await _promote_followups_if_enabled(state)
         return {"success": True, "approved": n}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -731,7 +773,8 @@ async def outbox_approve(item_id: str):
         state = _state()
         await state.init_db()
         n = await state.approve_outbox(item_id)
-        return {"success": bool(n)}
+        followups = await _promote_followups_if_enabled(state) if n else 0
+        return {"success": bool(n), "followups_approved": followups}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
