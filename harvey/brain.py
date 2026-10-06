@@ -137,6 +137,12 @@ class Brain:
                         f"Claude exited with code {process.returncode}: {error[:300]}"
                     )
                     last_error = error
+                    if process.returncode in (-15, 143):
+                        # SIGTERM: Harvey itself is being restarted or shut
+                        # down. Retrying would only stack a second child
+                        # behind systemd's SIGKILL.
+                        logger.warning("Claude call interrupted by shutdown; not retrying.")
+                        return ""
                     if any(p in error.lower() for p in _NON_RETRYABLE_PATTERNS):
                         logger.error(
                             "Non-retryable Claude error (auth). "

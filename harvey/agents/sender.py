@@ -33,6 +33,24 @@ SEND_JITTER_SECONDS = (4, 15)
 # Prospect pipeline statuses that mean "stop emailing this person".
 STOP_STATUSES = {"replied", "opted_out", "lost", "meeting", "closed"}
 
+
+def _smtp_error_is_transient(err: str) -> bool:
+    """Connection trouble and 4xx deferrals deserve a retry; 5xx verdicts do not."""
+    e = (err or "").lower()
+    if any(m in e for m in ("timed out", "timeout", "connect", "disconnected",
+                            "connection", "temporarily", "try again", "greylist",
+                            "too many", "rate limit", "throttl")):
+        return True
+    import re
+    m = re.search(r"\b([245]\d\d)\b", e)
+    return bool(m) and m.group(1).startswith("4")
+
+
+def _retry_attempt(prev_error: str) -> int:
+    import re
+    m = re.match(r"retry (\d)/3", prev_error or "")
+    return int(m.group(1)) + 1 if m else 1
+
 KILL_SWITCH_KEY = "sending_paused"
 BOUNCE_COUNT_KEY = "bounce_count"
 
@@ -345,6 +363,24 @@ class Sender:
             text = text.replace("{{ " + key + " }}", value or "")
         return text.strip()
 
+    # Stopword counts decide the footer language; drafts are ES or EN.
+    _ES_MARKERS = (" el ", " la ", " de ", " que ", " para ", " los ", " las ",
+                   " una ", " con ", " por ", " tu ", " su ", " está ", " cómo ")
+    _EN_MARKERS = (" the ", " and ", " you ", " your ", " with ", " for ",
+                   " that ", " on ", " is ", " are ", " to ", " of ")
+
+    def _with_legal_footer(self, body: str) -> str:
+        """Append company + postal address + opt-out line (CAN-SPAM) in the
+        language of the email. Kept out of the draft so the writer never
+        rewrites or drops it."""
+        c = self.config.compliance
+        padded = f" {body.lower()} "
+        es = sum(padded.count(m) for m in self._ES_MARKERS)
+        en = sum(padded.count(m) for m in self._EN_MARKERS)
+        opt_out = c.opt_out_line_es if es > en else c.opt_out_line_en
+        company = self.config.persona.company
+        return f"{body.rstrip()}\n\n{company} · {c.postal_address.strip()}\n{opt_out}"
+
     async def _stage_campaign_native(self, campaign):
         """Render + schedule a draft campaign's emails into the outbox."""
         if not self._validate_sequence(campaign):
@@ -426,6 +462,16 @@ class Sender:
             )
             return
 
+        compliance = getattr(self.config, "compliance", None)
+        if compliance is None or not compliance.postal_address.strip():
+            logger.error(
+                "Sender: compliance hold — compliance.postal_address is empty in "
+                "harvey.local.yaml. CAN-SPAM requires a physical postal address and "
+                "an opt-out line in every commercial email; the outbox is holding "
+                "until it is set."
+            )
+            return
+
         max_daily = self.config.channels.email.max_daily_sends
         sent_today = await self.state.count_outbox_sent_today()
         budget = min(MAX_SENDS_PER_CYCLE, max_daily - sent_today)
@@ -439,6 +485,12 @@ class Sender:
         )
         if not due:
             return
+        # A started conversation outranks a new first touch: follow-ups carry
+        # 55-65% of replies and lose their "3 days later" meaning when they
+        # wait. Ordered by send_at alone, a backlog of older first emails
+        # starved every step 2 (19 due follow-ups sat unsent for two days).
+        due.sort(key=lambda i: (0 if int(i.get("step") or 1) > 1 else 1,
+                                i.get("send_at") or ""))
 
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
         sent = 0
@@ -461,6 +513,32 @@ class Sender:
                 )
                 continue
 
+            # Sequence order: step N never leaves before step N-1 was sent.
+            # If the earlier step is dead (rejected, cancelled, failed) this
+            # one dies with it, so it cannot sit 'approved' forever and crowd
+            # the due queue. If the earlier step is merely not sent yet, hold.
+            if item["kind"] == "sequence" and item["step"] > 1:
+                prev = await self.state.get_previous_outbox_step(
+                    item["campaign_id"], item["prospect_id"], item["step"]
+                )
+                prev_status = prev["status"] if prev else "missing"
+                if prev_status in ("rejected", "cancelled", "failed"):
+                    await self.state.update_outbox_item(
+                        item["id"], status="cancelled",
+                        error=f"previous step is '{prev_status}'",
+                    )
+                    logger.info(
+                        f"Sender: cancelled step {item['step']} to {item['to_email']}: "
+                        f"previous step is '{prev_status}'."
+                    )
+                    continue
+                if prev_status != "sent":
+                    logger.info(
+                        f"Sender: holding step {item['step']} to {item['to_email']}: "
+                        f"previous step is '{prev_status}', not sent."
+                    )
+                    continue
+
             gate = pre_send_check(
                 item["to_email"], item["subject"], item["body"],
                 prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
@@ -476,21 +554,46 @@ class Sender:
                 )
                 continue
 
+            body_out = item["body"]
+            if item["kind"] != "reply":
+                body_out = self._with_legal_footer(body_out)
             result = await self.provider.send_email(
-                item["to_email"], item["subject"], item["body"],
+                item["to_email"], item["subject"], body_out,
                 thread_ref=item.get("thread_ref", ""),
                 in_reply_to=item.get("in_reply_to", ""),
             )
             if not result.ok:
-                await self.state.update_outbox_item(
-                    item["id"], status="failed", error=result.error[:300]
-                )
+                err = result.error or ""
+                attempt = _retry_attempt(item.get("error") or "")
+                if attempt <= 3 and _smtp_error_is_transient(err):
+                    # A connection hiccup or a 4xx deferral is not a verdict
+                    # on the address: keep the row approved and try later.
+                    retry_at = datetime.fromtimestamp(
+                        datetime.now(timezone.utc).timestamp() + 1800 * attempt,
+                        tz=timezone.utc,
+                    ).replace(tzinfo=None).isoformat()
+                    await self.state.update_outbox_item(
+                        item["id"], send_at=retry_at,
+                        error=f"retry {attempt}/3: {err[:250]}",
+                    )
+                    logger.warning(
+                        f"Sender: transient SMTP error to {item['to_email']} "
+                        f"(attempt {attempt}/3), retrying at {retry_at[:16]}: {err[:120]}"
+                    )
+                else:
+                    await self.state.update_outbox_item(
+                        item["id"], status="failed", error=err[:300]
+                    )
+                    logger.error(
+                        f"Sender: giving up on {item['to_email']} "
+                        f"(prospect {item['prospect_id']}): {err[:160]}"
+                    )
                 continue
 
             sent += 1
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             await self.state.update_outbox_item(
-                item["id"], status="sent", sent_at=now_iso,
+                item["id"], status="sent", sent_at=now_iso, body=body_out,
                 message_id=result.message_id, thread_ref=result.thread_ref,
             )
             if prospect.status in ("new", "queued"):

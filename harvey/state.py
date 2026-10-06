@@ -860,6 +860,51 @@ class StateManager:
             await db.commit()
             return cursor.rowcount
 
+    async def get_previous_outbox_step(
+        self, campaign_id: str, prospect_id: str, step: int
+    ) -> dict | None:
+        """Nearest earlier sequence step for the same (campaign, prospect),
+        or None when there is none. The sender holds step N until this row
+        is actually 'sent': a follow-up must never precede its opener."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE campaign_id = ? AND prospect_id = ? "
+                "AND kind = 'sequence' AND step < ? "
+                "ORDER BY step DESC LIMIT 1",
+                (campaign_id, prospect_id, int(step)),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def reject_outbox_item(self, item_id: str) -> int:
+        """Reject one queued item. For a sequence step, every LATER step of
+        the same (campaign, prospect) that is still queued is rejected too:
+        'closing the loop' on an email that never went out is nonsense.
+        Returns the number of rows rejected."""
+        item = await self.get_outbox_item(item_id)
+        if not item:
+            return 0
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'rejected', updated_at = ? "
+                "WHERE id = ? AND status IN ('pending_review', 'approved')",
+                (now, item_id),
+            )
+            n = cursor.rowcount
+            if item["kind"] == "sequence" and item["campaign_id"]:
+                cursor = await db.execute(
+                    "UPDATE outbox SET status = 'rejected', error = ?, updated_at = ? "
+                    "WHERE campaign_id = ? AND prospect_id = ? AND kind = 'sequence' "
+                    "AND step > ? AND status IN ('pending_review', 'approved')",
+                    (f"step {item['step']} rejected", now,
+                     item["campaign_id"], item["prospect_id"], int(item["step"])),
+                )
+                n += cursor.rowcount
+            await db.commit()
+            return n
+
     async def cancel_pending_outbox_for_prospect(
         self, prospect_id: str, reason: str = "stop_on_reply"
     ) -> int:
@@ -883,8 +928,11 @@ class StateManager:
     async def count_outbox_sent_today(self) -> int:
         async with self._connect() as db:
             async with db.execute(
+                # A rolling 24-hour window: a calendar day in UTC let the cap
+                # reset at 20:00 Santo Domingo, i.e. ten sends per local day.
                 "SELECT COUNT(*) FROM outbox WHERE status = 'sent' "
-                "AND date(sent_at) = date('now')"
+                "AND replace(sent_at, 'T', ' ') >= "
+                "strftime('%Y-%m-%d %H:%M:%S', 'now', '-24 hours')"
             ) as cursor:
                 return (await cursor.fetchone())[0]
 
