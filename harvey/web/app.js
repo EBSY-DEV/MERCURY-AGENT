@@ -701,6 +701,13 @@ async function loadSettings() {
   savedPh('reoon-key', data.reoon_api_key_set, '600 free/mo — reoon.com/email-verifier');
   savedPh('zerobounce-key', data.zerobounce_api_key_set, '100 free/mo — best for M365/Workspace catch-alls');
   savedPh('hunter-key', data.hunter_api_key_set, '50 free/mo + email-pattern lookup');
+  savedPh('serper-key', data.serper_api_key_set, '2500 free credits - serper.dev');
+  savedPh('tavily-key', data.tavily_api_key_set, 'fallback search - tavily.com');
+  savedPh('semrush-key', data.semrush_api_key_set, 'qualifies domains by real traffic - semrush.com');
+  savedPh('treg-token', data.treg_token_set, 'one prepaid balance for email verification & enrichment - treg.to');
+  savedPh('dfs-pass', data.dataforseo_password_set, 'from dataforseo.com API access');
+  const dfsl = document.getElementById('dfs-login');
+  if (dfsl) dfsl.value = data.dataforseo_login || '';
   savedPh('linkedin-password', data.linkedin_password_set, 'Enter password');
   savedPh('cf-api-token', data.cloudflare_api_token_set, 'Your Cloudflare API Token');
 
@@ -714,6 +721,11 @@ async function loadSettings() {
   tag('reoon-status', data.reoon_api_key_set, 'set');
   tag('zerobounce-status', data.zerobounce_api_key_set, 'set');
   tag('hunter-status', data.hunter_api_key_set, 'set');
+  tag('serper-status', data.serper_api_key_set, 'set');
+  tag('tavily-status', data.tavily_api_key_set, 'set');
+  tag('semrush-status', data.semrush_api_key_set, 'set');
+  tag('treg-status', data.treg_token_set, 'set');
+  tag('dfs-status', data.dataforseo_password_set, 'set');
 }
 
 function saveGmail() {
@@ -744,6 +756,24 @@ function saveVerifiers() {
   if (h) payload.HUNTER_API_KEY = h;
   if (!Object.keys(payload).length) { showToast('Enter at least one key first.', 'error'); return; }
   saveEnv(payload, 'Verification keys saved.').then(loadSettings);
+}
+
+function saveSerper() {
+  const payload = {};
+  const s = document.getElementById('serper-key').value;
+  const t = document.getElementById('tavily-key').value;
+  const m = document.getElementById('semrush-key').value;
+  if (s) payload.SERPER_API_KEY = s;
+  if (t) payload.TAVILY_API_KEY = t;
+  if (m) payload.SEMRUSH_API_KEY = m;
+  const tg = document.getElementById('treg-token');
+  if (tg && tg.value) payload.TREG_TOKEN = tg.value.trim();
+  const dl = document.getElementById('dfs-login');
+  const dp = document.getElementById('dfs-pass');
+  if (dl && dl.value) payload.DATAFORSEO_LOGIN = dl.value.trim();
+  if (dp && dp.value) payload.DATAFORSEO_PASSWORD = dp.value;
+  if (!Object.keys(payload).length) { showToast('Enter at least one key first.', 'error'); return; }
+  saveEnv(payload, 'Search keys saved.').then(loadSettings);
 }
 
 async function saveEnv(payload, okMsg) {
@@ -1084,9 +1114,17 @@ function renderDesk(items, i) {
       '<div class="to-line">To <b>' + escHtml(cur.to_email) + '</b> &middot; step ' +
         cur.step + ' (' + escHtml(cur.kind) + ') &middot; sends ' +
         formatDate(cur.send_at) + '</div>' +
-      '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
-      '<div class="body">' + escHtml(cur.body) + '</div>' +
+      '<input class="desk-subject" id="desk-subject" value="' + escAttr(cur.subject || '') +
+        '" placeholder="subject">' +
+      '<textarea class="desk-body" id="desk-body" rows="12">' + escHtml(cur.body) + '</textarea>' +
+      '<div class="desk-regen">' +
+        '<input id="desk-instruction" placeholder="Optional instruction for a rewrite: ' +
+          'más corto, más cálido, menciona la constructora…">' +
+        '<button class="btn btn-secondary btn-sm" id="desk-regen-btn" onclick="outboxRegenerate(\'' +
+          cur.id + '\')">Regenerate</button>' +
+      '</div>' +
       '<div class="desk-actions">' +
+        '<button class="btn btn-secondary" onclick="outboxSave(\'' + cur.id + '\')">Save edits</button>' +
         '<button class="btn btn-primary" onclick="outboxAct(\'' + cur.id + '\',\'approve\')">' +
           'Approve <kbd>A</kbd></button>' +
         '<button class="btn btn-secondary" onclick="outboxAct(\'' + cur.id + '\',\'reject\')">' +
@@ -1116,7 +1154,56 @@ document.addEventListener('keydown', e => {
   else if (k === 'r' && cur) { e.preventDefault(); outboxAct(cur.id, 'reject'); }
 });
 
+function escAttr(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+function deskEdits(id) {
+  const it = _desk.items.find(x => x.id === id);
+  const s = document.getElementById('desk-subject');
+  const b = document.getElementById('desk-body');
+  if (!it || !s || !b) return null;
+  const subject = s.value.trim(), body = b.value.trim();
+  if (subject === (it.subject || '') && body === (it.body || '')) return null;
+  return {it, subject, body};
+}
+
+async function outboxSave(id) {
+  const e = deskEdits(id);
+  if (!e) { showToast('Nothing changed.', 'success'); return true; }
+  if (!e.subject || !e.body) { showToast('Subject and body cannot be empty.', 'error'); return false; }
+  const data = await api('/api/outbox/' + encodeURIComponent(id), {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({subject: e.subject, body: e.body}),
+  });
+  if (data && data.success) { e.it.subject = e.subject; e.it.body = e.body; showToast('Saved.', 'success'); return true; }
+  showToast('Save failed.', 'error');
+  return false;
+}
+
+async function outboxRegenerate(id) {
+  const instruction = (document.getElementById('desk-instruction') || {}).value || '';
+  const btn = document.getElementById('desk-regen-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Writing…'; }
+  showToast('Regenerating — this takes up to a minute.', 'success');
+  const data = await api('/api/outbox/' + encodeURIComponent(id) + '/regenerate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({instruction: instruction.trim()}),
+  });
+  if (data && data.success) {
+    const it = _desk.items.find(x => x.id === id);
+    if (it) { it.subject = data.subject; it.body = data.body; }
+    document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i);
+    showToast('New draft ready.', 'success');
+  } else {
+    if (btn) { btn.disabled = false; btn.textContent = 'Regenerate'; }
+    showToast('Regenerate failed' + (data && data.message ? ': ' + data.message : '.'), 'error');
+  }
+}
+
 async function outboxAct(id, action) {
+  // Approving sends what is on screen, so unsaved edits go first.
+  if (action === 'approve' && deskEdits(id) && !(await outboxSave(id))) return;
   const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
   if (data && data.success) showToast(action === 'approve' ? 'Approved — will send on schedule.' : 'Rejected.', 'success');
   else showToast('Action failed.', 'error');

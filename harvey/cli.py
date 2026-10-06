@@ -354,8 +354,9 @@ def cmd_outbox(args):
             print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
             return
         if args.reject:
-            await state.update_outbox_item(args.reject, status="rejected")
-            print("\n  Rejected.\n")
+            n = await state.reject_outbox_item(args.reject)
+            print(f"\n  Rejected {n} email(s), later steps of the same sequence included.\n"
+                  if n else "\n  No queued item with that id.\n")
             return
 
         paused = await state.get_setting("sending_paused")
