@@ -181,7 +181,14 @@ async def decide_next_action(
     # Drafting costs Claude calls, and with a 5/day cap a draft written today
     # goes out in two weeks, by which time the facts and the copy rules have
     # moved on. Stop drafting once the queue already holds a week of sends.
-    max_daily = max(int(getattr(config.channels.email, "max_daily_sends", 5) or 1), 1)
+    # With mailbox rotation the real ceiling is the mailboxes' (warming) caps.
+    try:
+        from harvey.integrations.mailboxes import planned_daily_capacity
+
+        daily_capacity = planned_daily_capacity(config)
+    except Exception:  # pragma: no cover - never block a cycle on this
+        daily_capacity = int(getattr(config.channels.email, "max_daily_sends", 5) or 0)
+    max_daily = max(int(daily_capacity or 1), 1)
     queued_first = 0
     if writable_prospects:
         try:
@@ -234,7 +241,7 @@ async def decide_next_action(
     # drains the moment the cap frees up.
     if deployable:
         try:
-            if await state.count_outbox_sent_today() >= config.channels.email.max_daily_sends:
+            if await state.count_outbox_sent_today() >= daily_capacity:
                 deployable = 0
         except Exception:  # pragma: no cover - never block a cycle on this
             pass
@@ -331,8 +338,8 @@ async def run_cycle(rt: Runtime) -> str:
     through them; a scheduled one-shot run is paced by whatever scheduler
     woke it and only needs to report the skip.
 
-    Returns the action taken, or ``budget_exhausted`` when Harvey declined
-    to spend any more of today's Claude quota.
+    Returns the action taken, or ``over_budget`` when today's Claude quota
+    is spent: model work is skipped, the zero-Claude ride-alongs still run.
     """
     config = rt.config
     max_calls = max(int(200 * (config.usage.max_daily_claude_percent / 100)), 1)
@@ -543,8 +550,13 @@ def _has_credentials() -> bool:
     except Exception:
         return False
     # Ports carry non-empty defaults, so they say nothing about setup.
+    def _present(v) -> bool:
+        if isinstance(v, dict):  # mailbox_secrets: "{}" is not a credential
+            return any(str(x).strip() for x in v.values())
+        return bool(str(v).strip())
+
     return any(
-        str(v).strip()
+        _present(v)
         for k, v in values.items()
         if k not in ("smtp_port", "imap_port")
     )

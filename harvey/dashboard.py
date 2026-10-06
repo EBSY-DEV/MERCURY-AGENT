@@ -656,13 +656,21 @@ async def get_outbox_api():
     try:
         state = _state()
         await state.init_db()
+        try:
+            _cfg, pool = _mail_context()
+            legacy = pool.legacy.email if pool else ""
+            known = {mb.email for mb in pool.mailboxes} if pool else None
+        except Exception:
+            legacy, known = "", None
         return {
             "paused": await state.get_setting("sending_paused"),
-            "pending": await state.get_outbox(status="pending_review", limit=100),
-            "approved": await state.get_outbox(status="approved", limit=50),
-            "sent": (await query_db(
+            "pending": await _with_from_mailbox(
+                state, await state.get_outbox(status="pending_review", limit=100), legacy, known),
+            "approved": await _with_from_mailbox(
+                state, await state.get_outbox(status="approved", limit=50), legacy, known),
+            "sent": await _with_from_mailbox(state, await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
-                "ORDER BY sent_at DESC LIMIT 25")),
+                "ORDER BY sent_at DESC LIMIT 25"), legacy),
             "failed": (await query_db(
                 "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
                 "ORDER BY updated_at DESC LIMIT 25")),
@@ -671,12 +679,97 @@ async def get_outbox_api():
         return {"error": str(e)}
 
 
+def _mail_context():
+    """(config, pool) built exactly as the sender builds them. Re-reads .env
+    on each call, so a password added by hand shows up without a restart."""
+    from harvey.config import load_config, load_env
+    from harvey.integrations.mailboxes import MailboxPool
+
+    from dotenv import dotenv_values
+
+    # Read .env over a copy of the environment; never mutate os.environ
+    # here (the agent the dashboard starts inherits it).
+    values = dict(os.environ)
+    if ENV_FILE.exists():
+        values.update({k: v for k, v in dotenv_values(str(ENV_FILE)).items() if v is not None})
+    config = load_config()
+    return config, MailboxPool.from_config(config, load_env(values))
+
+
+async def _with_from_mailbox(state, rows: list[dict], legacy_email: str = "",
+                             known: set[str] | None = None) -> list[dict]:
+    """Add ``from_mailbox``: the address an email goes (or went) out from,
+    resolved the way the sender resolves it. A follow-up inherits its
+    opener's mailbox, '' on an old thread means the legacy mailbox, and a
+    new thread whose opener has not gone out yet stays '' (it rotates)."""
+    need = [r.get("campaign_id") or "" for r in rows
+            if not r.get("mailbox") and r.get("kind") == "sequence"
+            and int(r.get("step") or 1) > 1]
+    threads = await state.get_thread_mailboxes(need)
+    for r in rows:
+        fm = r.get("mailbox") or ""
+        if not fm:
+            if r.get("status") == "sent" or r.get("kind") == "reply":
+                fm = legacy_email
+            elif r.get("kind") == "sequence" and int(r.get("step") or 1) > 1:
+                key = (r.get("campaign_id") or "", r.get("prospect_id") or "")
+                if key in threads:
+                    fm = threads[key] or legacy_email
+        r["from_mailbox"] = fm
+        # Queued mail pinned to a mailbox no longer configured is held by
+        # the sender (never re-routed); say so in the UI.
+        r["from_removed"] = bool(fm and known is not None and fm not in known
+                                 and r.get("status") != "sent")
+    return rows
+
+
+async def _promote_followups_if_enabled(state, item: dict | None = None) -> int:
+    """auto_approve_followups: promote right away on approval, so the
+    follow-ups leave the review desk instead of waiting for the next cycle."""
+    try:
+        from harvey.config import load_config
+
+        if not getattr(load_config().channels.email, "auto_approve_followups", False):
+            return 0
+    except Exception:
+        return 0
+    thread = {}
+    if item and item.get("campaign_id"):
+        thread = {"campaign_id": item["campaign_id"], "prospect_id": item.get("prospect_id") or ""}
+    total = 0
+    for _ in range(10):
+        n = await state.approve_ready_followups(**thread)
+        if not n:
+            break
+        total += n
+    return total
+
+
+@app.get("/api/mailboxes")
+async def get_mailboxes():
+    """Sending capacity per mailbox, computed with the sender's own pool and
+    rules: today's cap, warm-up stage, sends in the rolling 24 hours.
+    Presence flags only; no secret leaves the box."""
+    try:
+        from harvey.integrations.mailboxes import mailbox_report
+
+        config, pool = _mail_context()
+        state = _state()
+        await state.init_db()
+        return mailbox_report(config, pool, await state.count_outbox_sent_today_by_mailbox())
+    except Exception as e:
+        logger.error(f"/api/mailboxes: {e}")
+        return {"error": f"Could not read the mail configuration: {type(e).__name__}. "
+                         "Check harvey.local.yaml (channels.email) and the dashboard log."}
+
+
 @app.post("/api/outbox/approve-all")
 async def outbox_approve_all():
     try:
         state = _state()
         await state.init_db()
         n = await state.approve_outbox()
+        await _promote_followups_if_enabled(state)
         return {"success": True, "approved": n}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -688,7 +781,11 @@ async def outbox_approve(item_id: str):
         state = _state()
         await state.init_db()
         n = await state.approve_outbox(item_id)
-        return {"success": bool(n)}
+        followups = 0
+        if n:
+            followups = await _promote_followups_if_enabled(
+                state, await state.get_outbox_item(item_id))
+        return {"success": bool(n), "followups_approved": followups}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
