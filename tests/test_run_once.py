@@ -22,7 +22,10 @@ def _config(percent=80, interval=15):
             max_daily_claude_percent=percent,
             heartbeat_interval_minutes=interval,
             quiet_hours=SimpleNamespace(start="22:00", end="07:00", timezone="UTC"),
-        )
+        ),
+        channels=SimpleNamespace(
+            email=SimpleNamespace(provider="smtp", max_daily_sends=50, send_to_risky=False),
+        ),
     )
 
 
@@ -45,6 +48,10 @@ class _State:
     async def log_action(self, action_type, agent):
         self.logged.append(action_type)
 
+    async def get_setting(self, key):
+        # No discovery provider chosen, no kill switch engaged.
+        return None
+
 
 class _Agent:
     def __init__(self, name, ran, boom=False, is_native=False):
@@ -57,6 +64,10 @@ class _Agent:
         self.ran.append(self.name)
         if self.boom:
             raise RuntimeError(f"{self.name} exploded")
+
+    async def _prospects_from_known_companies(self):
+        # The scout's inbox-sweep ride-along (run every cycle); a no-op here.
+        return 0
 
 
 def _runtime(state, brain=None, ran=None, native=False):
@@ -77,14 +88,15 @@ def _runtime(state, brain=None, ran=None, native=False):
 # --- run_cycle -------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_over_budget_short_circuits_before_any_agent_runs():
+async def test_over_budget_skips_model_work_but_keeps_the_cycle():
+    # A spent Claude quota stops the agents that spend it (scout scoring,
+    # writer), not the zero-Claude ride-alongs such as the outbox drain.
     ran = []
     state = _State(prospects={"new": 0})
     rt = _runtime(state, brain=_Brain(within_budget=False), ran=ran)
 
-    assert await M.run_cycle(rt) == "budget_exhausted"
-    assert ran == []
-    assert state.logged == []
+    assert await M.run_cycle(rt) == "over_budget"
+    assert "scout" not in ran and "writer" not in ran
 
 
 @pytest.mark.asyncio

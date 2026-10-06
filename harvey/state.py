@@ -374,6 +374,13 @@ MIGRATIONS: list[str] = [
     CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_external
         ON companies(external_id) WHERE external_id != '';
     """,
+    # ── v9: mailbox rotation ──
+    """
+    -- The address an outbox row goes out from. Set when step 1 is sent (or
+    -- when a reply is queued, from the inbox it answers) and inherited by
+    -- the rest of the thread. '' = sent before mailbox tracking existed.
+    ALTER TABLE outbox ADD COLUMN mailbox TEXT DEFAULT '';
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -773,6 +780,7 @@ class StateManager:
         provider: str = "",
         thread_ref: str = "",
         in_reply_to: str = "",
+        mailbox: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard."""
@@ -782,12 +790,13 @@ class StateManager:
                 """INSERT OR IGNORE INTO outbox
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
-                    thread_ref, in_reply_to)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    thread_ref, in_reply_to, mailbox)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
                     status, send_at, provider, thread_ref, in_reply_to,
+                    _norm(mailbox),
                 ),
             )
             await db.commit()
@@ -827,7 +836,7 @@ class StateManager:
 
     _OUTBOX_COLUMNS = frozenset({
         "status", "error", "message_id", "thread_ref", "sent_at",
-        "subject", "body", "send_at", "provider",
+        "subject", "body", "send_at", "provider", "mailbox",
     })
 
     async def update_outbox_item(self, item_id: str, **kwargs):
@@ -859,6 +868,69 @@ class StateManager:
                 )
             await db.commit()
             return cursor.rowcount
+
+    async def approve_ready_followups(self, campaign_id: str | None = None,
+                                      prospect_id: str | None = None) -> int:
+        """Approve pending follow-ups (sequence steps 2+) whose previous step
+        is already approved or sent: the reviewer signed off on the opener,
+        so the sequence it belongs to may run. A follow-up of a still-pending
+        or rejected opener stays put. One step per pass, so a 3-step chain
+        whose opener was approved is fully promoted within two cycles."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """UPDATE outbox SET status = 'approved', updated_at = ?
+                   WHERE status = 'pending_review' AND kind = 'sequence'
+                     AND step > 1 AND campaign_id != ''
+                     AND (
+                       SELECT prev.status FROM outbox AS prev
+                       WHERE prev.campaign_id = outbox.campaign_id
+                         AND prev.prospect_id = outbox.prospect_id
+                         AND prev.kind = 'sequence' AND prev.step < outbox.step
+                       ORDER BY prev.step DESC LIMIT 1
+                     ) IN ('approved', 'sent')"""
+                + (" AND campaign_id = ? AND prospect_id = ?" if campaign_id else ""),
+                (_utcnow().isoformat(),) + ((campaign_id, prospect_id or "") if campaign_id else ()),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def get_sequence_delay_days(self, campaign_id: str, step: int) -> int | None:
+        """delay_days of ``step`` in a campaign's sequence (days after the
+        previous step), or None when the campaign or step is unknown."""
+        if not campaign_id:
+            return None
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT sequence_json FROM campaigns WHERE id = ?", (campaign_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return None
+        for s in Campaign.sequence_from_json(row[0]):
+            if int(s.step) == int(step):
+                return max(0, int(s.delay_days))
+        return None
+
+    async def get_thread_mailboxes(self, campaign_ids: list[str]) -> dict[tuple[str, str], str]:
+        """(campaign_id, prospect_id) -> mailbox of the thread's sent opener
+        ('' = sent before mailbox tracking). One query for a whole page."""
+        ids = sorted({c for c in campaign_ids if c})
+        if not ids:
+            return {}
+        out: dict[tuple[str, str], str] = {}
+        async with self._connect() as db:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                marks = ", ".join("?" for _ in chunk)
+                async with db.execute(
+                    "SELECT campaign_id, prospect_id, COALESCE(mailbox, '') FROM outbox "
+                    "WHERE kind = 'sequence' AND step = 1 AND status = 'sent' "
+                    f"AND campaign_id IN ({marks})",
+                    chunk,
+                ) as cursor:
+                    for c, p, m in await cursor.fetchall():
+                        out[(c, p)] = m
+        return out
 
     async def get_previous_outbox_step(
         self, campaign_id: str, prospect_id: str, step: int
@@ -935,6 +1007,18 @@ class StateManager:
                 "strftime('%Y-%m-%d %H:%M:%S', 'now', '-24 hours')"
             ) as cursor:
                 return (await cursor.fetchone())[0]
+
+    async def count_outbox_sent_today_by_mailbox(self) -> dict[str, int]:
+        """Same rolling 24-hour window as count_outbox_sent_today, split by
+        the mailbox each email went out from ('' = before tracking)."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COALESCE(mailbox, ''), COUNT(*) FROM outbox "
+                "WHERE status = 'sent' AND replace(sent_at, 'T', ' ') >= "
+                "strftime('%Y-%m-%d %H:%M:%S', 'now', '-24 hours') "
+                "GROUP BY COALESCE(mailbox, '')"
+            ) as cursor:
+                return {row[0]: row[1] for row in await cursor.fetchall()}
 
     async def find_outbox_by_message_id(self, message_id: str) -> dict | None:
         if not message_id:

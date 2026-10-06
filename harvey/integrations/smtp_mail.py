@@ -19,7 +19,7 @@ import email.policy
 import imaplib
 import logging
 from email.message import EmailMessage
-from email.utils import make_msgid, parseaddr
+from email.utils import formataddr, make_msgid, parseaddr
 
 import aiosmtplib
 
@@ -75,7 +75,9 @@ class SmtpImapProvider(MailProvider):
     name = "smtp"
     LOOKBACK_DAYS = 3
 
-    def __init__(self, config, env):
+    def __init__(self, config, env, mailbox=None):
+        """``mailbox`` (a MailboxConfig) sends as that address with its own
+        login; without it this is the single SMTP_* mailbox from .env."""
         self.config = config
         self.smtp_host = getattr(env, "smtp_host", "")
         self.smtp_port = int(getattr(env, "smtp_port", 587) or 587)
@@ -85,9 +87,28 @@ class SmtpImapProvider(MailProvider):
         self.imap_port = int(getattr(env, "imap_port", 993) or 993)
         self.imap_user = getattr(env, "imap_username", "") or self.smtp_user
         self.imap_pass = getattr(env, "imap_password", "") or self.smtp_pass
+        # The address mail goes out as. None = persona.email (legacy).
+        self.from_email: str | None = None
+        self.from_name: str | None = None
+        if mailbox is not None:
+            secret = env.secret(mailbox.password_env) if hasattr(env, "secret") else ""
+            self.smtp_host = mailbox.smtp_host or self.smtp_host
+            self.smtp_port = int(mailbox.smtp_port or self.smtp_port)
+            self.smtp_user = mailbox.username or mailbox.email
+            self.smtp_pass = secret
+            self.imap_host = mailbox.imap_host or getattr(env, "imap_host", "") or self.smtp_host
+            self.imap_port = int(mailbox.imap_port or self.imap_port)
+            self.imap_user = self.smtp_user
+            self.imap_pass = secret
+            self.from_email = mailbox.email
+            self.from_name = mailbox.name or None
 
     def is_configured(self) -> bool:
         return bool(self.smtp_host and self.smtp_user and self.smtp_pass)
+
+    @property
+    def sender_address(self) -> str:
+        return self.from_email or self.config.persona.email or self.smtp_user
 
     async def send_email(
         self,
@@ -98,18 +119,20 @@ class SmtpImapProvider(MailProvider):
         in_reply_to: str = "",
     ) -> SendResult:
         persona = self.config.persona
+        # From must be the mailbox we authenticate as: SPF/DKIM align on its
+        # domain, and replies have to land in the inbox we poll.
+        sender_addr = self.sender_address
         msg = EmailMessage()
         msg["To"] = to_email
-        msg["From"] = f"{persona.name} <{persona.email or self.smtp_user}>"
+        msg["From"] = formataddr((self.from_name or persona.name, sender_addr))
         msg["Subject"] = subject
-        message_id = make_msgid(domain=(persona.email or self.smtp_user).split("@")[-1])
+        message_id = make_msgid(domain=sender_addr.split("@")[-1])
         msg["Message-ID"] = message_id
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
             msg["References"] = in_reply_to
         # RFC 2369 opt-out header in mailto form. RFC 8058 one-click needs an
         # HTTPS endpoint we do not run, so List-Unsubscribe-Post is omitted.
-        sender_addr = persona.email or self.smtp_user
         msg["List-Unsubscribe"] = f"<mailto:{sender_addr}?subject=unsubscribe>"
         msg.set_content(body)
 
@@ -218,6 +241,9 @@ class SmtpImapProvider(MailProvider):
 
     async def test_connection(self) -> tuple[bool, str]:
         if not self.is_configured():
+            if self.from_email:
+                return False, (f"{self.from_email}: SMTP_HOST or its password env var "
+                               "is missing from .env")
             return False, "SMTP_HOST / SMTP_USERNAME / SMTP_PASSWORD missing from .env"
         # SMTP handshake
         try:
@@ -249,3 +275,6 @@ class SmtpImapProvider(MailProvider):
         except Exception as e:
             return False, f"SMTP OK but IMAP login failed: {str(e)[:200]}"
         return True, f"SMTP + IMAP connected as {self.smtp_user}"
+
+    def __repr__(self) -> str:  # never include the password
+        return f"SmtpImapProvider({self.smtp_user!r} @ {self.smtp_host}:{self.smtp_port})"
