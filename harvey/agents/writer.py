@@ -23,7 +23,7 @@ logger = logging.getLogger("harvey.writer")
 
 # Native mode: one Claude call per prospect for email 1, so batches stay
 # small — the rest of the 'new' pool is picked up on later cycles.
-NATIVE_BATCH_CAP = 8
+NATIVE_BATCH_CAP = 20
 LEGACY_BATCH_CAP = 50
 
 
@@ -37,6 +37,9 @@ class Writer:
     ):
         self.brain = brain
         self.state = state
+        # Loaded here too so drafts requested outside run() (the review
+        # desk's regenerate, one-off scripts) get the product knowledge.
+        self.skills = self.brain.load_skills_for_agent("writer")
         self.config = config
         self.env = env
 
@@ -60,7 +63,9 @@ class Writer:
         # Only write for prospects we can actually deliver to. Guessed and
         # invalid addresses are skipped so we don't spend Claude calls (or
         # sending reputation) on mail that will bounce.
-        deliverable = {"verified", "risky"}
+        deliverable = {"verified"}
+        if getattr(self.config.channels.email, "send_to_risky", False):
+            deliverable.add("risky")
         prospects_with_email = [
             p for p in new_prospects
             if p.email and (p.email_status or "guess") in deliverable
@@ -168,7 +173,7 @@ class Writer:
                 f"({'awaiting approval' if require_approval else 'approved'})."
             )
 
-    async def _write_personal_email(self, prospect) -> dict | None:
+    async def _write_personal_email(self, prospect, instruction: str = "") -> dict | None:
         """One grounded draft for one person. Facts in, one email out."""
         facts = [
             f"- Name: {prospect.full_name()}",
@@ -185,6 +190,8 @@ class Writer:
             except Exception:
                 company = None
         if company:
+            if company.location:
+                facts.append(f"- Location: {company.location}")
             if company.description:
                 facts.append(f"- What the company says about itself: {company.description}")
             if company.tech_stack:
@@ -195,6 +202,32 @@ class Writer:
                 )
         if prospect.personalization_notes:
             facts.append(f"- Research notes: {prospect.personalization_notes}")
+        lang_line = await self._market_lang([prospect])
+        # Half of the first 24 subjects sent were a variant of "quote form":
+        # the model converges on the strongest fact. Show it what is already
+        # in the queue so each email finds its own angle and words.
+        recent_line = ""
+        try:
+            import aiosqlite
+
+            async with aiosqlite.connect(self.state.db_path) as db:
+                async with db.execute(
+                    "SELECT subject FROM outbox WHERE step = 1 "
+                    "AND status IN ('approved', 'pending_review', 'sent') "
+                    "ORDER BY created_at DESC LIMIT 25"
+                ) as cursor:
+                    recent = [r[0] for r in await cursor.fetchall() if r[0]]
+            if recent:
+                recent_line = (
+                    "\n- Subjects already in the queue (do not reuse or paraphrase any, "
+                    "and vary the opening angle too): " + "; ".join(sorted(set(recent))[:25])
+                )
+        except Exception:
+            recent_line = ""
+        instruction_line = (
+            f"\n- The reviewer asked for this change; it is binding: {instruction.strip()}"
+            if instruction and instruction.strip() else ""
+        )
 
         prompt = self.brain.load_prompt(
             "writer",
@@ -221,11 +254,12 @@ or anything else:
 {chr(10).join(facts)}
 
 Requirements:
-- Under 75 words. One specific observation from the FACTS above, one
+- 50-90 words. One specific observation from the FACTS above, one
   question. No pitch, no product name.
 - Write the actual text (no merge variables — you know their name/company).
-- Subject: lowercase, 2-5 words.
-- Follow every STRICT EMAIL RULE above.
+- Subject: lowercase, 2-4 words, reads like an internal note.
+- Language and register: {lang_line}
+- Follow every STRICT EMAIL RULE and the EVIDENCE-BACKED RULES above.{instruction_line}{recent_line}
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
@@ -241,8 +275,127 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             return None
         return {"subject": subject[:120], "body": body[:2000]}
 
+    async def regenerate_email(self, item: dict, prospect, instruction: str = "") -> dict | None:
+        """Rewrite one outbox draft from the review desk.
+
+        Step 1 is drafted again from the facts; a follow-up is rewritten in
+        the context of the first email of its thread. The reviewer's
+        instruction ("más corto", "menciona la constructora") is binding.
+        """
+        step = int(item.get("step") or 1)
+        if step == 1:
+            return await self._write_personal_email(prospect, instruction=instruction)
+
+        first = ""
+        try:
+            import aiosqlite
+
+            async with aiosqlite.connect(self.state.db_path) as db:
+                async with db.execute(
+                    "SELECT body FROM outbox WHERE campaign_id = ? AND prospect_id = ? "
+                    "AND step = 1 ORDER BY created_at DESC LIMIT 1",
+                    (item.get("campaign_id"), item.get("prospect_id")),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    first = row[0] if row else ""
+        except Exception:
+            first = ""
+
+        lang_line = await self._market_lang([prospect])
+        instruction_line = (
+            f"\n- The reviewer asked for this change; it is binding: {instruction.strip()}"
+            if instruction and instruction.strip() else ""
+        )
+        role = (
+            "a FOLLOW-UP sent 3 days after the first email: 60-110 words, at least "
+            "four sentences, stands on its own, a different angle with one concrete "
+            "proof point from the product knowledge, and an interest-based question"
+            if step == 2 else
+            "the BREAK-UP email, the last one: 30-50 words, gives permission to say "
+            "no, leaves the door open, no guilt"
+        )
+        prompt = self.brain.load_prompt(
+            "writer",
+            product_name=self.config.product.name,
+            product_description=self.config.product.description,
+            product_benefits="\n".join(f"- {b}" for b in self.config.product.key_benefits),
+            product_pricing=self.config.product.pricing,
+            persona_name=self.config.persona.name,
+            persona_company=self.config.persona.company,
+            persona_role=self.config.persona.role,
+            persona_tone=self.config.persona.tone,
+        ) or ""
+        if self.skills:
+            prompt += "\n\n" + self.skills
+        prompt += f"""
+
+Rewrite ONE email for this person: {prospect.full_name()}, {prospect.title} at {prospect.company}.
+It is {role}.
+
+The first email of the thread was:
+\"\"\"
+{first or "(not available)"}
+\"\"\"
+
+Requirements:
+- Write the actual text (no merge variables).
+- Subject: lowercase, 2-4 words, like an internal note.
+- Language and register: {lang_line}
+- Follow every STRICT EMAIL RULE and the EVIDENCE-BACKED RULES above.{instruction_line}
+
+Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
+        result = await self.brain.think_json(
+            prompt, session_id="harvey-writer",
+            agent="writer", task="regenerate_email",
+        )
+        if not isinstance(result, dict):
+            return None
+        subject = str(result.get("subject") or "").strip()
+        body = str(result.get("body") or "").strip()
+        if not subject or not body:
+            return None
+        return {"subject": subject[:120], "body": body[:2000]}
+
+    async def _market_lang(self, prospects: list) -> str:
+        """The language line for a batch, decided from the prospects' market.
+
+        Matched against icp.markets by company location (or a .do domain),
+        never left to the model: half the Dominican follow-ups came out in
+        English when the sequence prompt did not say which language to use.
+        """
+        votes: dict[str, int] = {}
+        markets = getattr(self.config.icp, "markets", None) or []
+        for prospect in prospects[:8]:
+            company = None
+            if getattr(prospect, "company_id", ""):
+                try:
+                    company = await self.state.get_company(prospect.company_id)
+                except Exception:
+                    company = None
+            loc = ((getattr(company, "location", "") or "") + " "
+                   + (getattr(company, "domain", "") or "")).lower()
+            lang = ""
+            for market in markets:
+                if any(place.lower() in loc for place in market.places):
+                    lang = market.lang
+                    break
+            if not lang and (loc.rstrip().endswith(".do") or ".com.do" in loc
+                             or "domin" in loc):
+                lang = "es"
+            if lang:
+                votes[lang] = votes.get(lang, 0) + 1
+        lang = max(votes, key=votes.get) if votes else "en"
+        if lang == "es":
+            return ("Spanish, for prospects in the Dominican Republic. The whole "
+                    "sequence follows DOMINICAN REGISTER above — emails 2 and 3 "
+                    "too. No English anywhere, not even a subject line.")
+        return ("English, for prospects in the United States. Never mention the "
+                "Dominican Republic or a Dominican client; say \"a local business "
+                "like yours\".")
+
     async def _write_sequence(self, prospects: list) -> list[EmailStep]:
         """Ask the brain to write a 3-email sequence."""
+        lang_line = await self._market_lang(prospects)
         # Build context about the prospects
         prospect_summary = "\n".join(
             f"- {p.full_name()}, {p.title} at {p.company}"
@@ -281,14 +434,20 @@ Write a 3-email cold outreach sequence for prospects like these:
 {prospect_summary}
 
 Requirements:
-- Email 1: Personalized cold observation + one question. Under 75 words. No pitch.
-- Email 2: Follow-up 3 days later. Different angle, one concrete proof point. Under 75 words.
-- Email 3: Break-up email 4 days after that. Under 40 words. Gracious, not guilt-tripping.
+- Email 1: Personalized cold observation + one question. 50-90 words. No pitch.
+- Email 2: Follow-up 3 days later. It must stand on its own (the reader does
+  not remember email 1): 60-110 words, at least four sentences, a different
+  angle, one concrete proof point from the product knowledge, and an
+  interest-based question ("¿le interesa que le cuente cómo…?" / "worth
+  hearing how…?"), never "thoughts?".
+- Email 3: Break-up 4 days after that. 30-50 words. Gives permission to say
+  no and leaves the door open; no guilt ("I never heard back" is banned).
 - Use {{{{first_name}}}}, {{{{company}}}}, {{{{title}}}} as merge variables — every email
   must use at least one, and email 1 must reference something specific to
   these prospects' industry or role (use the notes above).
 - Never be pushy or salesy. Be consultative and value-driven.
-- Subject lines: lowercase, 2-5 words.
+- Subject lines: lowercase, 2-4 words, like an internal note; no salesy words.
+- Language and register: {lang_line}
 - Follow every rule in the STRICT EMAIL RULES above. No exceptions.
 
 Return ONLY a JSON array (no markdown fences, no commentary):

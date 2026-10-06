@@ -294,7 +294,110 @@ async def verify_reoon(email: str, api_key: str) -> Optional[dict]:
         return None
     status = str(data.get("status") or "").lower()
     is_catch_all = bool(data.get("is_catch_all") or status == "catch_all")
-    return {"status": status, "catch_all": is_catch_all}
+    # Power mode answers with 'safe' and 'role_account', neither of which is a
+    # documented v1 status. The booleans are the authoritative verdict, so keep
+    # them: dropping them silently downgraded deliverable inboxes to a guess,
+    # and a guess is never sent.
+    return {
+        "status": status,
+        "catch_all": is_catch_all,
+        "safe_to_send": data.get("is_safe_to_send"),
+        "deliverable": data.get("is_deliverable"),
+    }
+
+
+async def reoon_balance(api_key: str) -> Optional[int]:
+    """Credits left (daily + instant), or None when the account cannot be read.
+
+    Every verification costs one credit; at zero, Reoon stops answering and
+    every new prospect would silently become an unsendable 'guess'.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+            resp = await client.get(
+                "https://emailverifier.reoon.com/api/v1/check-account-balance/",
+                params={"key": api_key},
+            )
+    except httpx.HTTPError as e:
+        logger.debug(f"Reoon balance check failed: {e}")
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("status") != "success":
+        return None
+    try:
+        return int(data.get("remaining_daily_credits") or 0) + \
+            int(data.get("remaining_instant_credits") or 0)
+    except (TypeError, ValueError):
+        return None
+
+
+class VerifierExhausted(RuntimeError):
+    """The verifier answered 402/429: no balance or daily cap hit. Callers
+    must stop the batch rather than turn every address into a 'guess'."""
+
+
+async def verify_treg(email: str, token: str) -> Optional[dict]:
+    """treg.to routed verification (own keys first, then cheapest provider).
+
+    One prepaid balance instead of per-provider credits: ~$0.0015 per
+    address. Response: {output: {valid, status}, raw: {...}, _treg: {...}}.
+    Raises VerifierExhausted on 402 (balance) / 429 (agent daily cap).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(75.0)) as client:
+            resp = await client.post(
+                "https://treg.to/call/treg.people.email.verify",
+                json={"email": email},
+                headers={"X-Treg-Token": token,
+                         "X-Treg-Route-Max-Cost": "0.02",
+                         "Idempotency-Key": f"verify:{email.lower()}"},
+            )
+    except httpx.HTTPError as e:
+        logger.debug(f"treg verify failed for {email}: {e}")
+        return None
+    if resp.status_code in (402, 429):
+        raise VerifierExhausted(f"treg HTTP {resp.status_code}: {resp.text[:120]}")
+    if resp.status_code != 200:
+        logger.debug(f"treg verify for {email}: HTTP {resp.status_code} {resp.text[:120]}")
+        return None
+    try:
+        data = resp.json() or {}
+    except ValueError:
+        return None
+    out = data.get("output") or {}
+    raw = data.get("raw") or {}
+    status = str(out.get("status") or raw.get("validity") or raw.get("status") or "").lower()
+    catch_all = status in ("catch_all", "catch-all", "accept_all", "accept-all") or bool(raw.get("catch_all"))
+    valid = out.get("valid")
+    return {
+        "status": "catch_all" if catch_all else status,
+        "catch_all": catch_all,
+        "safe_to_send": True if (valid is True and not catch_all) else None,
+        "deliverable": (True if valid is True else False if status in ("invalid", "undeliverable", "disabled") else None),
+    }
+
+
+async def hunter_verifications_left(api_key: str) -> Optional[int]:
+    """Monthly verification credits left on the Hunter plan, or None."""
+    try:
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+            resp = await client.get("https://api.hunter.io/v2/account",
+                                    params={"api_key": api_key})
+    except httpx.HTTPError as e:
+        logger.debug(f"Hunter account check failed: {e}")
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        left = resp.json()["data"]["requests"]["verifications"]["remaining"]
+        return int(left)
+    except (ValueError, KeyError, TypeError):
+        return None
 
 
 async def verify_zerobounce(email: str, api_key: str) -> Optional[dict]:
@@ -322,16 +425,26 @@ async def verify_zerobounce(email: str, api_key: str) -> Optional[dict]:
 
 
 async def verify_hunter(email: str, api_key: str) -> Optional[dict]:
-    try:
-        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
-            resp = await client.get(
-                "https://api.hunter.io/v2/email-verifier",
-                params={"email": email, "api_key": api_key},
-            )
-    except httpx.HTTPError as e:
-        logger.debug(f"Hunter verify failed for {email}: {e}")
-        return None
-    if resp.status_code != 200:
+    """Hunter answers 202 while a fresh SMTP check is still running (the
+    credit is charged on the first call, retries are free), so wait for it:
+    treating 202 as a miss turned every first-time address into a 'guess'."""
+    resp = None
+    for attempt in range(4):
+        if attempt:
+            await asyncio.sleep(6)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(45.0)) as client:
+                resp = await client.get(
+                    "https://api.hunter.io/v2/email-verifier",
+                    params={"email": email, "api_key": api_key},
+                )
+        except httpx.HTTPError as e:
+            logger.debug(f"Hunter verify failed for {email}: {e}")
+            return None
+        if resp.status_code != 202:
+            break
+    if resp is None or resp.status_code != 200:
+        logger.debug(f"Hunter verify for {email}: HTTP {getattr(resp, 'status_code', '?')}")
         return None
     try:
         data = (resp.json() or {}).get("data") or {}
@@ -394,7 +507,14 @@ def _status_from_verdict(verdict: dict) -> Optional[str]:
     if verdict.get("catch_all"):
         return "risky"
     status = verdict.get("status", "")
-    if status in ("valid", "deliverable"):
+    # An explicit provider verdict outranks the status string: 'safe' and
+    # 'role_account' are both deliverable, and a role inbox is often the only
+    # address a small local business publishes.
+    if verdict.get("safe_to_send") is True and verdict.get("deliverable") is True:
+        return "verified"
+    if verdict.get("deliverable") is False:
+        return "invalid"
+    if status in ("valid", "deliverable", "safe", "role_account"):
         return "verified"
     if status in ("invalid", "undeliverable", "disabled"):
         return "invalid"

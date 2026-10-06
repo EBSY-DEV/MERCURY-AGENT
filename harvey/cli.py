@@ -125,7 +125,14 @@ def cmd_setup(args):
 
 
 def cmd_run(args):
-    """Start Harvey's heartbeat loop."""
+    """Start Harvey's heartbeat loop, or run a single cycle."""
+    if getattr(args, "once", False):
+        from harvey.main import run_once_main
+
+        raise SystemExit(
+            run_once_main(ignore_quiet_hours=getattr(args, "ignore_quiet_hours", False))
+        )
+
     from harvey.main import main
 
     main()
@@ -302,6 +309,34 @@ def cmd_gmail(args):
         asyncio.run(_test())
 
 
+def cmd_mail(args):
+    """Test whichever mail provider is configured.
+
+    `harvey gmail test` only ever builds a GmailProvider, so an SMTP
+    deployment had no way to check its credentials before trusting the
+    pipeline with them -- even though test_connection() is on the base
+    class and both providers implement it.
+    """
+    from harvey.config import load_config, load_env
+    from harvey.integrations.mail_provider import get_mail_provider
+
+    config = load_config()
+    env = load_env()
+    provider = get_mail_provider(config, env)
+    if provider is None:
+        name = config.channels.email.provider or "(unset)"
+        print(f"\n  ✗ No native mail provider for '{name}'.")
+        print("    Set channels.email.provider to 'gmail' or 'smtp'.\n")
+        sys.exit(1)
+
+    async def _test():
+        ok, detail = await provider.test_connection()
+        print(f"\n  {'✓' if ok else '✗'} {detail}\n")
+        sys.exit(0 if ok else 1)
+
+    asyncio.run(_test())
+
+
 def cmd_outbox(args):
     """Review and approve queued outgoing emails."""
     from harvey.state import StateManager
@@ -319,8 +354,9 @@ def cmd_outbox(args):
             print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
             return
         if args.reject:
-            await state.update_outbox_item(args.reject, status="rejected")
-            print("\n  Rejected.\n")
+            n = await state.reject_outbox_item(args.reject)
+            print(f"\n  Rejected {n} email(s), later steps of the same sequence included.\n"
+                  if n else "\n  No queued item with that id.\n")
             return
 
         paused = await state.get_setting("sending_paused")
@@ -563,6 +599,16 @@ def main():
 
     # harvey run
     sub = subparsers.add_parser("run", help="Start Harvey's heartbeat loop")
+    sub.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single cycle and exit (for cron/scheduled runs)",
+    )
+    sub.add_argument(
+        "--ignore-quiet-hours",
+        action="store_true",
+        help="With --once: run even during quiet hours",
+    )
     sub.set_defaults(func=cmd_run)
 
     # harvey train <url>
@@ -608,6 +654,12 @@ def main():
     sub.set_defaults(func=cmd_gmail)
 
     # harvey outbox
+    sub = subparsers.add_parser("mail", help="Test the configured mail provider")
+    sub.add_argument(
+        "mail_action", choices=["test"], help="test: verify send/receive credentials"
+    )
+    sub.set_defaults(func=cmd_mail)
+
     sub = subparsers.add_parser("outbox", help="Review/approve queued emails")
     sub.add_argument("--approve", metavar="ID", default="", help="Approve one item")
     sub.add_argument("--approve-all", action="store_true", help="Approve all pending")

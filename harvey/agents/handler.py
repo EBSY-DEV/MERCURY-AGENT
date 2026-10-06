@@ -8,6 +8,7 @@ sending domain while nobody's watching.
 """
 
 import logging
+import re
 from datetime import datetime, timezone
 
 from harvey.brain import Brain
@@ -58,6 +59,71 @@ OPT_OUT_PATTERNS = (
     "delete my info",
     "delete my data",
 )
+
+# Spanish opt-outs. Word-boundary regexes so "baja" never fires on
+# "trabaja", "rebaja" or "está de baja" (on leave).
+OPT_OUT_REGEXES = tuple(re.compile(p) for p in (
+    r"\b(dar|darme|darnos|dame|deme|denme|dénme|solicito la|solicito|quiero darme) (de )?baja\b",
+    r"\bdesuscrib",
+    r"\bcancel(a|e|en|ar) (la |mi )?suscripción\b",
+    r"\bno (me|nos) (escrib(a|as|an)|contact(e|es|en)|env[ií](e|es|en)|mand(e|es|en))\b",
+    r"\bno (me|nos) vuelv\w* a (escribir|contactar|enviar|mandar|molestar)\b",
+    r"\bno (quiero|queremos|deseo|deseamos) (recibir|seguir recibiendo)\b",
+    r"\bdej(a|e|en|ad|ar) de (escribir|enviar|mandar|contactar)",
+    r"\b(elim[ií]n|qu[ií]t|borr|sa[cq]u)\w* ?(me |nos )?de (la |su |tu |esta |sus )?lista\b",
+    r"\bborr\w* (mis|nuestros) datos\b",
+))
+# A reply that is nothing but the opt-out word we asked for.
+OPT_OUT_EXACT = {"baja", "stop", "unsubscribe", "remove", "opt out", "no mas", "no más"}
+
+# Everything from the first of these markers on is quoted text (our own
+# email, or a forwarded thread), never the prospect's words. Our own footer
+# contains the very words we ask people to reply with, so this cut is what
+# keeps a normal reply from being read as an opt-out.
+_QUOTE_MARKERS = (
+    re.compile(r"^\s*>", re.M),
+    re.compile(r"^\s*On .{0,200}?wrote:\s*$", re.M | re.S),
+    re.compile(r"^\s*El .{0,200}?escribió:\s*$", re.M | re.S),
+    re.compile(r"^\s*-{2,}\s*(Original Message|Mensaje original|Forwarded message|Mensaje reenviado)", re.M | re.I),
+    re.compile(r"^\s*(From|De):\s.+\n\s*(Sent|Enviado el|Date|Fecha):\s", re.M | re.I),
+)
+
+
+def strip_quoted(text: str, extra_markers: tuple[str, ...] = ()) -> str:
+    """Return only the prospect's own words from an inbound reply."""
+    cut = len(text)
+    for rx in _QUOTE_MARKERS:
+        m = rx.search(text)
+        if m and m.start() < cut:
+            cut = m.start()
+    lowered = text.lower()
+    for marker in extra_markers:
+        marker = (marker or "").strip().lower()
+        if not marker:
+            continue
+        i = lowered.find(marker)
+        if i != -1 and i < cut:
+            cut = i
+    return text[:cut].strip()
+
+AUTO_REPLY_SUBJECTS = (
+    "out of office", "out-of-office", "automatic reply", "auto-reply", "autoreply",
+    "fuera de la oficina", "respuesta automática", "respuesta automatica",
+)
+
+
+def _is_auto_reply(msg) -> bool:
+    """Vacation and out-of-office responders, detected from headers first."""
+    h = {k.lower(): (v or "").lower() for k, v in (getattr(msg, "headers", None) or {}).items()}
+    if h.get("auto-submitted", "no") not in ("", "no"):
+        return True
+    if h.get("precedence") in ("bulk", "auto_reply", "junk"):
+        return True
+    if "x-autoreply" in h or "x-autorespond" in h:
+        return True
+    subject = (getattr(msg, "subject", "") or "").lower()
+    return any(m in subject for m in AUTO_REPLY_SUBJECTS)
+
 
 # Phrases that mean a human must take over. Never auto-reply to these.
 ESCALATION_PATTERNS = (
@@ -191,8 +257,35 @@ class Handler:
             logger.warning(f"Handler: No prospect found for {lead_email}")
             return
 
-        # Update prospect status + stop-on-reply: a human answered, so every
-        # queued sequence email for them is now wrong to send.
+        # 1. Classify intent. Hard keyword checks run FIRST and override
+        # the LLM — opt-outs and legal threats must never be missed.
+        compliance = getattr(self.config, "compliance", None)
+        own_words = strip_quoted(
+            reply_text,
+            (compliance.opt_out_line_en, compliance.opt_out_line_es) if compliance else (),
+        )
+        text_lower = own_words.lower()
+        first_line = re.sub(r"[^\w ]", " ", text_lower.split("\n", 1)[0]).strip()
+        if (
+            any(p in text_lower for p in OPT_OUT_PATTERNS)
+            or any(rx.search(text_lower) for rx in OPT_OUT_REGEXES)
+            or first_line in OPT_OUT_EXACT
+        ):
+            intent = "unsubscribe"
+        elif any(p in text_lower for p in ESCALATION_PATTERNS):
+            intent = "escalate"
+        else:
+            intent = await self._classify_intent(reply_text, prospect)
+        logger.info(f"Handler: Intent for {lead_email}: {intent}")
+
+        if intent == "ooo":
+            # Not a human answer: keep the sequence going, open nothing.
+            logger.info(f"Handler: out-of-office from {lead_email}; sequence continues.")
+            return
+
+        # A human answered, so every queued sequence email for them is now
+        # wrong to send. This used to run before classification, so an
+        # auto-responder cancelled the whole sequence.
         await self.state.update_prospect_status(prospect.id, "replied")
         try:
             cancelled = await self.state.cancel_pending_outbox_for_prospect(prospect.id)
@@ -203,17 +296,6 @@ class Handler:
                 )
         except Exception as e:
             logger.debug(f"Handler: outbox cancel failed: {e}")
-
-        # 1. Classify intent. Hard keyword checks run FIRST and override
-        # the LLM — opt-outs and legal threats must never be missed.
-        text_lower = reply_text.lower()
-        if any(p in text_lower for p in OPT_OUT_PATTERNS):
-            intent = "unsubscribe"
-        elif any(p in text_lower for p in ESCALATION_PATTERNS):
-            intent = "escalate"
-        else:
-            intent = await self._classify_intent(reply_text, prospect)
-        logger.info(f"Handler: Intent for {lead_email}: {intent}")
 
         # 2. Get or create conversation
         existing_convos = await self.state.get_conversations_by_status("open")
@@ -350,6 +432,10 @@ class Handler:
             try:
                 if msg.is_bounce:
                     await self._handle_bounce(msg)
+                elif _is_auto_reply(msg):
+                    # Not a human answer: the sequence keeps going and no
+                    # Claude call is spent classifying it.
+                    logger.info(f"Handler: auto-reply from {msg.from_email} ignored; sequence continues.")
                 elif msg.body.strip():
                     await self._process_reply(
                         msg.from_email,
@@ -374,10 +460,28 @@ class Handler:
 
     async def _handle_bounce(self, msg):
         """A bounce is a data bug AND a reputation threat. Fix both."""
+        headers = getattr(msg, "headers", None) or {}
         outbox_item = await self.state.find_outbox_by_message_id(msg.in_reply_to)
+        if not outbox_item and headers.get("original_message_id"):
+            outbox_item = await self.state.find_outbox_by_message_id(
+                headers["original_message_id"])
         prospect = None
         if outbox_item:
             prospect = await self.state.get_prospect(outbox_item["prospect_id"])
+        if prospect is None and headers.get("bounced_recipient"):
+            prospect = await self.state.get_prospect_by_email(headers["bounced_recipient"])
+        if prospect is None:
+            # Last resort: any address in the DSN text that we have written to.
+            own = (self.config.persona.email or "").split("@")[-1].lower()
+            for cand in set(re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", msg.body or "")):
+                cand = cand.lower().rstrip(".")
+                if own and cand.endswith("@" + own):
+                    continue
+                if cand.split("@")[0] in ("mailer-daemon", "postmaster"):
+                    continue
+                prospect = await self.state.get_prospect_by_email(cand)
+                if prospect is not None:
+                    break
 
         if prospect:
             await self.state.update_prospect_email(
@@ -535,6 +639,40 @@ Respond with ONLY the category label, nothing else."""
 
         return current_stage
 
+    def _offer_brief(self) -> str:
+        """The configured offer, rendered for a prompt.
+
+        Returns "" when nothing is configured, so an untrained deployment
+        carries on without an offer section rather than emitting empty
+        labels the model would feel obliged to fill in.
+        """
+        offer = self.config.product.offer
+        lines = []
+        if offer.primary:
+            lines.append(f"- What we sell: {offer.primary}")
+        if offer.entry:
+            lines.append(f"- Low-commitment first step: {offer.entry}")
+        if offer.goal:
+            lines.append(f"- Goal of this conversation: {offer.goal}")
+        if offer.meeting_duration:
+            lines.append(f"- Meeting length: {offer.meeting_duration}")
+        if offer.meeting_owner:
+            lines.append(f"- Who takes the meeting: {offer.meeting_owner}")
+
+        if offer.booking_method == "calendar_link" and offer.booking_url:
+            lines.append(
+                f"- Booking link: {offer.booking_url} -- share it exactly as "
+                f"written once they show interest. Never invent a link."
+            )
+        elif offer.booking_method == "suggest_times":
+            lines.append("- Booking: suggest two or three concrete times, do not send a link")
+        elif offer.booking_method == "ask_preference":
+            lines.append("- Booking: ask which times suit them, do not send a link")
+
+        if not lines:
+            return ""
+        return "\n\nTHE OFFER:\n" + "\n".join(lines)
+
     async def _generate_response(
         self, intent: str, reply_text: str, prospect, convo: Conversation
     ) -> str:
@@ -562,6 +700,12 @@ Product: {self.config.product.name} — {self.config.product.description}"""
         # Inject objection handling + sales methodology skills
         if self.skills:
             prompt += "\n\n" + self.skills
+
+        # The offer is configuration, not knowledge, so it never arrives via
+        # skills. Without it the reply agent knows to propose a call but not
+        # what to propose or where to send them -- offer_strategy.md tells it
+        # to use the booking_url, and nothing ever supplied one.
+        prompt += self._offer_brief()
 
         prompt += f"""
 

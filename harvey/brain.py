@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import uuid
 from pathlib import Path
@@ -28,6 +29,27 @@ _NON_RETRYABLE_PATTERNS = (
     "invalid api key",
     "unauthorized",
 )
+
+
+def _cli_env() -> dict:
+    """Environment for the Claude CLI subprocess.
+
+    The CLI refuses ``--dangerously-skip-permissions`` when it is running as
+    root, unless IS_SANDBOX says the process is already confined. Harvey's
+    own container image runs as an unprivileged user, so this never fires
+    there -- but hosted runners and scheduled cloud containers are root, and
+    there the container *is* the sandbox. Without this, Harvey's brain fails
+    on every call in exactly the environments it is left alone to run in.
+
+    The value has to be exactly "1". Some hosts already export a friendlier
+    spelling (IS_SANDBOX=yes), which the CLI does not accept -- so overwrite
+    rather than defaulting, or Harvey inherits a value that reads as correct
+    and fails every call anyway.
+    """
+    env = os.environ.copy()
+    if getattr(os, "geteuid", None) and os.geteuid() == 0:
+        env["IS_SANDBOX"] = "1"
+    return env
 
 
 class Brain:
@@ -88,6 +110,7 @@ class Brain:
             try:
                 process = await asyncio.create_subprocess_exec(
                     *cmd,
+                    env=_cli_env(),
                     # DEVNULL: the CLI reads inherited stdin as prompt input,
                     # stealing the terminal (and any piped answers) from Harvey.
                     stdin=asyncio.subprocess.DEVNULL,
@@ -114,6 +137,12 @@ class Brain:
                         f"Claude exited with code {process.returncode}: {error[:300]}"
                     )
                     last_error = error
+                    if process.returncode in (-15, 143):
+                        # SIGTERM: Harvey itself is being restarted or shut
+                        # down. Retrying would only stack a second child
+                        # behind systemd's SIGKILL.
+                        logger.warning("Claude call interrupted by shutdown; not retrying.")
+                        return ""
                     if any(p in error.lower() for p in _NON_RETRYABLE_PATTERNS):
                         logger.error(
                             "Non-retryable Claude error (auth). "

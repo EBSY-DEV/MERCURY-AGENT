@@ -33,8 +33,47 @@ from harvey.integrations.mail_provider import (
 logger = logging.getLogger("harvey.smtp")
 
 
+def _bounce_details(msg) -> dict:
+    """Pull the failed recipient and the original Message-ID out of a DSN.
+
+    Gmail puts the original Message-ID in In-Reply-To; most other servers
+    only carry it inside the message/delivery-status and message/rfc822
+    parts, so without this walk their bounces could never be matched and
+    a dead address kept receiving steps 2 and 3.
+    """
+    out: dict = {}
+    try:
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            payload = part.get_payload()
+            if ctype == "message/delivery-status" and isinstance(payload, list):
+                for sub in payload:
+                    for key in ("Final-Recipient", "Original-Recipient"):
+                        val = str(sub.get(key, "") or "").strip()
+                        if val and "bounced_recipient" not in out:
+                            out["bounced_recipient"] = val.split(";")[-1].strip().lower()
+            elif ctype in ("message/rfc822", "text/rfc822-headers"):
+                inner = None
+                if isinstance(payload, list) and payload:
+                    inner = payload[0]
+                elif isinstance(payload, (str, bytes)):
+                    text = payload if isinstance(payload, str) else payload.decode("utf-8", "replace")
+                    inner = email.message_from_string(text, policy=email.policy.default)
+                if inner is not None:
+                    mid = str(inner.get("Message-ID", "") or "").strip()
+                    if mid and "original_message_id" not in out:
+                        out["original_message_id"] = mid
+                    to = parseaddr(str(inner.get("To", "") or ""))[1].lower()
+                    if to and "bounced_recipient" not in out:
+                        out["bounced_recipient"] = to
+    except Exception:
+        pass
+    return out
+
+
 class SmtpImapProvider(MailProvider):
     name = "smtp"
+    LOOKBACK_DAYS = 3
 
     def __init__(self, config, env):
         self.config = config
@@ -68,6 +107,10 @@ class SmtpImapProvider(MailProvider):
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
             msg["References"] = in_reply_to
+        # RFC 2369 opt-out header in mailto form. RFC 8058 one-click needs an
+        # HTTPS endpoint we do not run, so List-Unsubscribe-Post is omitted.
+        sender_addr = persona.email or self.smtp_user
+        msg["List-Unsubscribe"] = f"<mailto:{sender_addr}?subject=unsubscribe>"
         msg.set_content(body)
 
         try:
@@ -100,12 +143,22 @@ class SmtpImapProvider(MailProvider):
         try:
             conn.login(self.imap_user, self.imap_pass)
             conn.select("INBOX")
-            status, data = conn.search(None, "UNSEEN")
+            # A date window instead of the Seen flag: a reply the operator
+            # opened in webmail, or one in a batch that aborted, is not
+            # UNSEEN any more and was lost for good. PEEK leaves flags
+            # untouched; processed_replies is the dedup.
+            from datetime import datetime, timedelta
+            since = (datetime.utcnow() - timedelta(days=self.LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+            status, data = conn.search(None, "SINCE", since)
             if status != "OK":
                 return []
             ids = data[0].split()[-limit:]
             for msg_id in ids:
-                status, parts = conn.fetch(msg_id, "(RFC822)")
+                try:
+                    status, parts = conn.fetch(msg_id, "(BODY.PEEK[])")
+                except Exception as e:
+                    logger.warning(f"IMAP fetch of {msg_id!r} failed: {e}")
+                    continue
                 if status != "OK" or not parts or not isinstance(parts[0], tuple):
                     continue
                 parsed = self._parse_rfc822(parts[0][1])
@@ -141,6 +194,15 @@ class SmtpImapProvider(MailProvider):
             pass
 
         message_id = str(msg.get("Message-ID", "")).strip()
+        headers = {
+            k: str(msg.get(k, "")).strip()
+            for k in ("Auto-Submitted", "Precedence", "X-Autoreply",
+                      "X-Autorespond", "Return-Path")
+            if msg.get(k)
+        }
+        bounce = looks_like_bounce(from_email, subject)
+        if bounce:
+            headers.update(_bounce_details(msg))
         return InboundMessage(
             provider_id=message_id or f"{from_email}:{subject}",
             from_email=from_email,
@@ -150,7 +212,8 @@ class SmtpImapProvider(MailProvider):
             in_reply_to=str(msg.get("In-Reply-To", "")).strip(),
             thread_ref=str(msg.get("In-Reply-To", "")).strip(),
             date=str(msg.get("Date", "")),
-            is_bounce=looks_like_bounce(from_email, subject),
+            is_bounce=bounce,
+            headers=headers,
         )
 
     async def test_connection(self) -> tuple[bool, str]:

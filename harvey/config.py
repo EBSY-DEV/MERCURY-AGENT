@@ -51,6 +51,19 @@ class ProductConfig(BaseModel):
     offer: OfferConfig = OfferConfig()
 
 
+class MarketConfig(BaseModel):
+    """One market for discovery: its own places, terms and language.
+
+    "ferretería" is searched in Santo Domingo and "plumber" in Tampa, instead
+    of every term in every city. `industries`/`geography` still describe the
+    ICP for scoring and writing.
+    """
+    name: str
+    places: list[str]
+    terms: list[str]
+    lang: str = "en"
+
+
 class ICPConfig(BaseModel):
     industries: list[str]
     company_size: str
@@ -65,6 +78,8 @@ class ICPConfig(BaseModel):
     #   "Denver, CO": "39.7392,-104.9903,50"
     # Without one, listings providers can only match on the business name.
     geo_coordinates: dict[str, str] = {}
+    # Market-aware discovery (see MarketConfig). Empty → industries x geography.
+    markets: list[MarketConfig] = []
 
 
 class EmailChannelConfig(BaseModel):
@@ -152,12 +167,27 @@ class UsageConfig(BaseModel):
         return v
 
 
+class ComplianceConfig(BaseModel):
+    """Legal footer the sender appends to every outbound sequence email.
+
+    CAN-SPAM (US) requires a valid physical postal address and a clear opt-out
+    mechanism in every commercial email. The sender holds the outbox while
+    postal_address is empty. The opt-out lines are also the quote markers the
+    handler uses to cut our own text out of inbound replies, so keep them
+    distinctive.
+    """
+    postal_address: str = ""
+    opt_out_line_en: str = 'Not relevant? Reply "unsubscribe" and you won\'t hear from me again.'
+    opt_out_line_es: str = '¿No es para ti? Responde "baja" y no te escribo más.'
+
+
 class HarveyConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
     icp: ICPConfig
     channels: ChannelsConfig = ChannelsConfig()
     usage: UsageConfig = UsageConfig()
+    compliance: ComplianceConfig = ComplianceConfig()
 
 
 class EnvConfig(BaseModel):
@@ -170,6 +200,9 @@ class EnvConfig(BaseModel):
     linkedin_password: str = ""
     hunter_api_key: str = ""
     serper_api_key: str = ""
+    tavily_api_key: str = ""
+    treg_token: str = ""          # treg.to: one prepaid balance for verification/enrichment
+    semrush_api_key: str = ""
     reoon_api_key: str = ""
     zerobounce_api_key: str = ""
     # Native mail providers (channels.email.provider: gmail | smtp)
@@ -247,6 +280,9 @@ def load_env() -> EnvConfig:
         linkedin_password=os.getenv("LINKEDIN_PASSWORD", "").strip(),
         hunter_api_key=os.getenv("HUNTER_API_KEY", "").strip(),
         serper_api_key=os.getenv("SERPER_API_KEY", "").strip(),
+        tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip(),
+        treg_token=os.getenv("TREG_TOKEN", "").strip(),
+        semrush_api_key=os.getenv("SEMRUSH_API_KEY", "").strip(),
         reoon_api_key=os.getenv("REOON_API_KEY", "").strip(),
         zerobounce_api_key=os.getenv("ZEROBOUNCE_API_KEY", "").strip(),
         gmail_client_id=os.getenv("GMAIL_CLIENT_ID", "").strip(),
