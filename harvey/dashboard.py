@@ -10,6 +10,7 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
+import pathlib
 
 import aiosqlite
 import yaml
@@ -164,9 +165,14 @@ async def get_setup_status():
 
     # 5. Config valid
     config_valid = False
-    if CONFIG_FILE.exists():
+    try:
+        from harvey.config import _find_config_file
+        _cfg_path = pathlib.Path(_find_config_file())
+    except Exception:
+        _cfg_path = CONFIG_FILE
+    if _cfg_path.exists():
         try:
-            with open(CONFIG_FILE) as f:
+            with open(_cfg_path) as f:
                 cfg = yaml.safe_load(f)
             company = cfg.get("persona", {}).get("company", "")
             product = cfg.get("product", {}).get("name", "")
@@ -224,9 +230,19 @@ async def get_setup_status():
 
 
 def _current_provider() -> str:
-    """Read channels.email.provider from harvey.yaml (best-effort)."""
+    """Read channels.email.provider from the ACTIVE config (best-effort).
+
+    Resolve it the way the rest of Harvey does: harvey.local.yaml wins when
+    present. Reading the tracked template instead reports the wrong provider
+    and declares a configured deployment unconfigured.
+    """
     try:
-        with open(CONFIG_FILE) as f:
+        try:
+            from harvey.config import _find_config_file
+            cfg_path = _find_config_file()
+        except Exception:
+            cfg_path = CONFIG_FILE
+        with open(cfg_path) as f:
             cfg = yaml.safe_load(f) or {}
         return ((cfg.get("channels") or {}).get("email") or {}).get("provider", "instantly")
     except Exception:
@@ -244,6 +260,8 @@ async def get_settings():
         "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
         "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
         "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY",
+        "SERPER_API_KEY", "TAVILY_API_KEY", "SEMRUSH_API_KEY",
+        "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD", "TREG_TOKEN",
     ]
     for key in all_keys:
         if key not in env_vars:
@@ -276,6 +294,12 @@ async def get_settings():
         "reoon_api_key_set": is_set("REOON_API_KEY"),
         "zerobounce_api_key_set": is_set("ZEROBOUNCE_API_KEY"),
         "hunter_api_key_set": is_set("HUNTER_API_KEY"),
+        "serper_api_key_set": is_set("SERPER_API_KEY"),
+        "tavily_api_key_set": is_set("TAVILY_API_KEY"),
+        "semrush_api_key_set": is_set("SEMRUSH_API_KEY"),
+        "treg_token_set": is_set("TREG_TOKEN"),
+        "dataforseo_login": env_vars.get("DATAFORSEO_LOGIN", ""),
+        "dataforseo_password_set": is_set("DATAFORSEO_PASSWORD"),
     }
 
 
@@ -295,7 +319,9 @@ async def save_env_settings(request: Request):
                      "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
                      "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
                      "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
-                     "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY"]:
+                     "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY",
+                     "SERPER_API_KEY", "TAVILY_API_KEY", "SEMRUSH_API_KEY",
+                     "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD", "TREG_TOKEN"]:
             if key in data and data[key] is not None:
                 # Strip newlines so a crafted value can't inject extra .env entries
                 updates[key] = str(data[key]).replace("\n", " ").replace("\r", " ").strip()
@@ -672,8 +698,68 @@ async def outbox_reject(item_id: str):
     try:
         state = _state()
         await state.init_db()
-        await state.update_outbox_item(item_id, status="rejected")
+        n = await state.reject_outbox_item(item_id)
+        return {"success": True, "rejected": n}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.put("/api/outbox/{item_id}")
+async def outbox_edit(item_id: str, request: Request):
+    """The reviewer edits a draft in place. Approved mail stays approved."""
+    try:
+        body = await request.json()
+        subject = str(body.get("subject") or "").strip()[:200]
+        text = str(body.get("body") or "").strip()[:4000]
+        if not subject or not text:
+            return JSONResponse({"success": False, "message": "subject and body are required"},
+                                status_code=400)
+        state = _state()
+        await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if not item or item.get("status") not in ("pending_review", "approved"):
+            return JSONResponse({"success": False,
+                                 "message": "only pending or approved drafts can be edited"},
+                                status_code=409)
+        await state.update_outbox_item(item_id, subject=subject, body=text)
         return {"success": True}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/outbox/{item_id}/regenerate")
+async def outbox_regenerate(item_id: str, request: Request):
+    """Ask the Writer for a new draft of this email, optionally with an instruction."""
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        instruction = str((body or {}).get("instruction") or "").strip()[:500]
+        state = _state()
+        await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if not item or item.get("status") not in ("pending_review", "approved"):
+            return JSONResponse({"success": False,
+                                 "message": "only pending or approved drafts can be regenerated"},
+                                status_code=409)
+        prospect = await state.get_prospect(item["prospect_id"])
+        if not prospect:
+            return JSONResponse({"success": False, "message": "prospect not found"}, status_code=404)
+        from harvey.agents.writer import Writer
+        from harvey.brain import Brain
+        from harvey.config import load_config, load_env
+
+        writer = Writer(Brain(state), state, load_config(), load_env())
+        draft = await writer.regenerate_email(item, prospect, instruction)
+        if not draft:
+            return JSONResponse({"success": False, "message": "the writer returned nothing; try again"},
+                                status_code=502)
+        # A regenerated draft is unread: back to the review queue.
+        await state.update_outbox_item(
+            item_id, subject=draft["subject"], body=draft["body"], status="pending_review",
+        )
+        return {"success": True, "subject": draft["subject"], "body": draft["body"]}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
