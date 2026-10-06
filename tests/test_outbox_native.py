@@ -78,6 +78,12 @@ class Cfg:
         class linkedin:
             enabled = False
 
+    class compliance:
+        # The sender holds the outbox without a postal address (CAN-SPAM).
+        postal_address = "1 Main St, Springfield"
+        opt_out_line_en = 'Reply "unsubscribe" to opt out.'
+        opt_out_line_es = 'Responde "baja" para no recibir más.'
+
 
 class Env:
     instantly_api_key = ""

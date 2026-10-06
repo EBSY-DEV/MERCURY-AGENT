@@ -15,6 +15,11 @@ from harvey.brain import Brain
 from harvey.config import HarveyConfig, EnvConfig
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from harvey.integrations.mailboxes import (
+    MailboxPool,
+    build_rotation_pool,
+    rotation_configured,
+)
 from harvey.models.conversation import Conversation, Message
 from harvey.state import StateManager
 
@@ -156,8 +161,24 @@ class Handler:
         self.state = state
         self.config = config
         self.instantly = InstantlyClient(env.instantly_api_key)
-        self.provider = get_mail_provider(config, env)
+        # Every configured mailbox is polled; see Sender for the pool.
+        self.mailboxes: MailboxPool | None = build_rotation_pool(config, env)
+        self.provider = (
+            self.mailboxes.primary.provider if self.mailboxes
+            else get_mail_provider(config, env)
+        )
         self.skills = ""
+
+    def _pool(self) -> MailboxPool | None:
+        if self.mailboxes is not None:
+            return self.mailboxes
+        if rotation_configured(self.config) or self.provider is None:
+            return None
+        return MailboxPool.single(
+            self.provider,
+            getattr(self.config.channels.email, "max_daily_sends", 0) or 0,
+            getattr(self.config.persona, "email", "") or "",
+        )
 
     @property
     def is_native(self) -> bool:
@@ -411,18 +432,33 @@ class Handler:
     # ── Native provider path (Gmail / SMTP) ──
 
     async def _run_native(self):
-        """Poll the mailbox, split bounces from human replies, handle both."""
-        if not self.provider.is_configured():
+        """Poll every mailbox, split bounces from human replies, handle both."""
+        pool = self._pool()
+        if pool is None:
+            logger.error("Handler: no mailbox could be built; not reading replies.")
+            return
+        mailboxes = pool.configured()
+        if not mailboxes:
             logger.debug(
-                f"Handler: provider '{self.provider.name}' not configured yet."
+                f"Handler: provider '{self.provider.name if self.provider else '?'}' "
+                "not configured yet."
             )
             return
 
-        try:
-            inbound = await self.provider.get_replies()
-        except Exception as e:
-            logger.error(f"Handler: fetching replies failed: {e}")
-            return
+        # One unreachable inbox must not hide the replies sitting in the rest.
+        inbound = []
+        for mailbox in mailboxes:
+            try:
+                fetched = await mailbox.provider.get_replies()
+            except Exception as e:
+                logger.error(
+                    f"Handler: fetching replies from "
+                    f"{mailbox.email or mailbox.provider.name} failed: {e}"
+                )
+                continue
+            for msg in fetched:
+                msg.mailbox = mailbox.email
+            inbound.extend(fetched)
 
         handled = 0
         for msg in inbound:
@@ -445,6 +481,7 @@ class Handler:
                             "thread_ref": msg.thread_ref,
                             "message_id": msg.message_id,
                             "subject": msg.subject,
+                            "mailbox": getattr(msg, "mailbox", ""),
                         },
                     )
                 handled += 1
@@ -472,10 +509,14 @@ class Handler:
             prospect = await self.state.get_prospect_by_email(headers["bounced_recipient"])
         if prospect is None:
             # Last resort: any address in the DSN text that we have written to.
-            own = (self.config.persona.email or "").split("@")[-1].lower()
+            own = {(self.config.persona.email or "").split("@")[-1].lower()}
+            pool = self._pool()
+            if pool is not None:
+                own |= pool.domains()
+            own.discard("")
             for cand in set(re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", msg.body or "")):
                 cand = cand.lower().rstrip(".")
-                if own and cand.endswith("@" + own):
+                if cand.split("@")[-1] in own:
                     continue
                 if cand.split("@")[0] in ("mailer-daemon", "postmaster"):
                     continue
@@ -545,6 +586,8 @@ class Handler:
             provider=self.provider.name if self.provider else "",
             thread_ref=reply_meta.get("thread_ref", ""),
             in_reply_to=reply_meta.get("message_id", ""),
+            # Answer from the inbox the message arrived in.
+            mailbox=reply_meta.get("mailbox", ""),
         )
         if item_id:
             mode = "queued for your approval" if require_approval else "queued to send"
