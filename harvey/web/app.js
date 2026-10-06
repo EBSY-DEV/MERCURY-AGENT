@@ -1048,7 +1048,11 @@ async function loadOutbox() {
   const [data, mbox] = await Promise.all([api('/api/outbox'), api('/api/mailboxes')]);
   _mailboxes = mbox && !mbox.error ? mbox : null;
   const mboxEl = document.getElementById('outbox-mailboxes');
-  if (mboxEl) mboxEl.innerHTML = renderMailboxes(_mailboxes);
+  if (mboxEl) mboxEl.innerHTML = mbox && mbox.error
+    ? '<div class="card" style="border-color:var(--red);margin-bottom:16px">' +
+        '<h2 style="color:var(--red)">&#9888; Mailbox settings unreadable</h2>' +
+        '<p style="color:var(--text-2);font-size:13px">' + escHtml(mbox.error) + '</p></div>'
+    : renderMailboxes(_mailboxes);
   const banner = document.getElementById('outbox-banner');
   const desk = document.getElementById('outbox-desk');
   const list = document.getElementById('outbox-list');
@@ -1103,7 +1107,7 @@ async function loadOutbox() {
     ]) +
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
-      ['From', r => r.mailbox || '—', true],
+      ['From', r => r.from_mailbox || r.mailbox || '—', true],
       ['Sent', r => formatDate(r.sent_at), true],
     ]) +
     table('Didn\'t send', data.failed, [
@@ -1220,11 +1224,11 @@ async function outboxAct(id, action) {
   // Approving sends what is on screen, so unsaved edits go first.
   if (action === 'approve' && deskEdits(id) && !(await outboxSave(id))) return;
   const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
-  const it = _desk.items.find(x => x.id === id);
-  const withFollowups = action === 'approve' && it && autoFollowups(it);
+  const fu = data && data.followups_approved;
   if (data && data.success) showToast(action === 'approve'
-      ? (withFollowups ? 'Approved, with its follow-ups — they send on schedule.'
-                       : 'Approved — will send on schedule.')
+      ? (fu ? 'Approved, with ' + fu + ' follow-up' + (fu === 1 ? '' : 's') +
+              ' — they send on schedule.'
+            : 'Approved — will send on schedule.')
       : 'Rejected.', 'success');
   else showToast('Action failed.', 'error');
   loadOutbox();
@@ -1247,9 +1251,12 @@ async function sendingToggle(action) {
 // ── Sending mailboxes ──
 
 function fromLabel(r) {
+  if (r.from_mailbox && r.from_removed) return r.from_mailbox + ' (removed: will be cancelled)';
   if (r.from_mailbox) return r.from_mailbox;
   if (r.mailbox) return r.mailbox;
-  return _mailboxes && _mailboxes.rotation ? 'next free mailbox' : (_mailboxes && _mailboxes.mailboxes[0] ? _mailboxes.mailboxes[0].email || '—' : '—');
+  if (_mailboxes && _mailboxes.rotation) return 'next free mailbox';
+  const first = _mailboxes && _mailboxes.mailboxes[0];
+  return (first && first.email) || '—';
 }
 
 function autoFollowups(it) {
@@ -1263,13 +1270,24 @@ function followupNote(it) {
 }
 
 function mailboxStage(m) {
+  if (m.stage === 'removed')
+    return '<span class="badge t-idle">removed</span> <span class="muted" style="font-size:12px">' +
+      'still counts toward max_daily_sends</span>';
   if (m.configured === false) return '<span class="badge t-bad">no password</span>';
+  let h;
   if (m.stage === 'scheduled')
-    return '<span class="badge t-idle">starts ' + escHtml(formatDay(m.warmup_start)) + '</span>';
-  if (m.stage === 'warming')
-    return '<span class="badge t-active">warming</span> <span class="muted" style="font-size:12px">' +
+    h = '<span class="badge t-idle">starts ' + escHtml(formatDay(m.warmup_start)) + '</span>';
+  else if (m.stage === 'warming')
+    h = '<span class="badge t-active">warming</span> <span class="muted" style="font-size:12px">' +
       escHtml(m.daily_cap + '/day from ' + formatDay(m.full_on)) + '</span>';
-  return '<span class="badge t-good">warm</span>';
+  else if (m.stage === 'fixed')
+    h = '<span class="badge t-note">fixed</span> <span class="muted" style="font-size:12px">' +
+      escHtml(m.cap_today + '/day, no weekly ramp') + '</span>';
+  else
+    h = '<span class="badge t-good">warm</span>';
+  if (m.accepts_new === false)
+    h += ' <span class="badge t-idle" title="Finishes its threads and is still read; starts no new ones">no new threads</span>';
+  return h;
 }
 
 function formatDay(iso) {
@@ -1285,13 +1303,13 @@ function renderMailboxes(mb, compact) {
     ? 'you approve first emails; follow-ups ride along' : 'every email needs your approval');
   else flags.push('autopilot: no approval step');
   if (mb.spread_sends) flags.push('paced through the day');
-  const capNote = mb.capacity_today < mb.mailboxes.reduce((n, m) => n + m.cap_today, 0)
+  const capNote = mb.capped_by_global
     ? ' (capped by max_daily_sends ' + mb.max_daily_sends + ')' : '';
 
   let rows = '';
   for (const m of mb.mailboxes) {
     const pct = m.cap_today ? Math.min(100, Math.round(100 * m.sent_24h / m.cap_today)) : 0;
-    rows += '<tr><td><b>' + escHtml(m.email || '(default mailbox)') + '</b>' +
+    rows += '<tr><td><b>' + escHtml(m.email || (m.stage === 'removed' ? 'other' : '(default mailbox)')) + '</b>' +
         (m.name ? '<div class="muted" style="font-size:12px">' + escHtml(m.name) + '</div>' : '') + '</td>' +
       '<td style="min-width:140px"><div class="progress-label"><span class="pct">' +
         m.sent_24h + ' / ' + m.cap_today + '</span><span class="text">' + m.remaining + ' left</span></div>' +

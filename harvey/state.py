@@ -892,6 +892,44 @@ class StateManager:
             await db.commit()
             return cursor.rowcount
 
+    async def get_sequence_delay_days(self, campaign_id: str, step: int) -> int | None:
+        """delay_days of ``step`` in a campaign's sequence (days after the
+        previous step), or None when the campaign or step is unknown."""
+        if not campaign_id:
+            return None
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT sequence_json FROM campaigns WHERE id = ?", (campaign_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return None
+        for s in Campaign.sequence_from_json(row[0]):
+            if int(s.step) == int(step):
+                return max(0, int(s.delay_days))
+        return None
+
+    async def get_thread_mailboxes(self, campaign_ids: list[str]) -> dict[tuple[str, str], str]:
+        """(campaign_id, prospect_id) -> mailbox of the thread's sent opener
+        ('' = sent before mailbox tracking). One query for a whole page."""
+        ids = sorted({c for c in campaign_ids if c})
+        if not ids:
+            return {}
+        out: dict[tuple[str, str], str] = {}
+        async with self._connect() as db:
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                marks = ", ".join("?" for _ in chunk)
+                async with db.execute(
+                    "SELECT campaign_id, prospect_id, COALESCE(mailbox, '') FROM outbox "
+                    "WHERE kind = 'sequence' AND step = 1 AND status = 'sent' "
+                    f"AND campaign_id IN ({marks})",
+                    chunk,
+                ) as cursor:
+                    for c, p, m in await cursor.fetchall():
+                        out[(c, p)] = m
+        return out
+
     async def get_previous_outbox_step(
         self, campaign_id: str, prospect_id: str, step: int
     ) -> dict | None:

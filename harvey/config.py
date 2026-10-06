@@ -110,6 +110,10 @@ class MailboxConfig(BaseModel):
     # empty for a mailbox that is already warm. A date in the future means
     # "not yet": the mailbox sends nothing until then.
     warmup_start: _date | None = None
+    # false = start no NEW threads here. Its inbox is still read and its
+    # existing threads still finish from it, so replies and opt-outs are
+    # never missed. Remove the entry only once its threads are done: the
+    # follow-ups of a mailbox that is gone are cancelled, not re-routed.
     enabled: bool = True
 
     @field_validator("email")
@@ -297,15 +301,19 @@ class EnvConfig(BaseModel):
     # can name any of them without a field per mailbox.
     mailbox_secrets: dict[str, str] = {}
 
+    # Env vars a mailbox may take its password from besides MAILBOX_*. An
+    # allowlist, so a typo such as password_env: TAVILY_API_KEY cannot hand
+    # an API key to an SMTP server.
+    _MAILBOX_PASSWORD_FIELDS = ("SMTP_PASSWORD", "IMAP_PASSWORD")
+
     def secret(self, name: str) -> str:
-        """Value of the env var ``name``: a MAILBOX_* entry or a known field."""
+        """A mailbox password: a MAILBOX_* variable, SMTP_PASSWORD or IMAP_PASSWORD."""
         name = (name or "").strip()
-        if not name:
-            return ""
-        if name in self.mailbox_secrets:
-            return self.mailbox_secrets[name]
-        value = getattr(self, name.lower(), "")
-        return value if isinstance(value, str) else ""
+        if name.startswith("MAILBOX_"):
+            return self.mailbox_secrets.get(name, "")
+        if name in self._MAILBOX_PASSWORD_FIELDS:
+            return getattr(self, name.lower(), "") or ""
+        return ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
