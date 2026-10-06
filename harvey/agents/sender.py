@@ -592,6 +592,8 @@ class Sender:
             if sent >= budget:
                 break
             if item["kind"] != "reply" and cold_sent >= cold_budget:
+                if cold_budget == 0 and not sent:
+                    logger.info("Sender: mailbox caps reached for today; only replies may go.")
                 break  # replies sort first, so nothing sendable is left
 
             prospect = await self.state.get_prospect(item["prospect_id"])
@@ -648,18 +650,8 @@ class Sender:
                     )
                     continue
 
-            mailbox, verdict = self._mailbox_for(item, prev, pool, remaining,
-                                                 sent_this_cycle, today)
-            if verdict == "cancel":
-                await self.state.update_outbox_item(
-                    item["id"], status="cancelled",
-                    error="its mailbox was removed from channels.email.mailboxes",
-                )
-                logger.warning(
-                    f"Sender: cancelled {item['kind']} to {item['to_email']}: the thread's "
-                    "mailbox is no longer configured and its inbox is not read."
-                )
-                continue
+            mailbox, _verdict = self._mailbox_for(item, prev, pool, remaining,
+                                                  sent_this_cycle, today)
             if mailbox is None:
                 continue
 
@@ -765,15 +757,13 @@ class Sender:
                         f"({sent_today + sent}/{capacity} today).")
 
     def _mailbox_for(self, item, prev, pool, remaining, sent_this_cycle, today):
-        """(mailbox, verdict): verdict is "send", "hold" (try a later cycle)
-        or "cancel".
+        """(mailbox, verdict): verdict is "send" or "hold" (try a later cycle).
 
         A thread keeps its mailbox: a reply answers from the inbox the message
         arrived in, and a follow-up comes from the address its opener used.
         Only a new thread (step 1) rotates, and only onto mailboxes that take
         new threads. A thread whose mailbox was removed from the config is
-        cancelled: its inbox is no longer read, so a reply or an opt-out sent
-        there would go unseen while the sequence carried on from elsewhere.
+        held, never moved to another address.
         """
         pinned_value = None
         if item.get("mailbox"):
@@ -789,7 +779,15 @@ class Sender:
 
         mailbox = pool.resolve(pinned_value)
         if mailbox is None:
-            return None, "cancel"
+            # Never re-route: the old inbox is not read, so a reply or an
+            # opt-out sent there would go unseen. Holding is reversible (put
+            # the mailbox back, or reject the email in the dashboard).
+            logger.warning(
+                f"Sender: holding {item['kind']} to {item['to_email']}: its thread's "
+                f"mailbox {pinned_value} is not in channels.email.mailboxes. Add it "
+                "back (enabled: false is enough) or reject the email."
+            )
+            return None, "hold"
         if not mailbox.provider.is_configured():
             logger.warning(
                 f"Sender: holding email to {item['to_email']}: its thread's mailbox "
@@ -819,16 +817,11 @@ class Sender:
         delay = await self.state.get_sequence_delay_days(item.get("campaign_id") or "",
                                                          int(item["step"]))
         if delay is None:
-            # No campaign row: fall back to the staged gap between the steps.
-            try:
-                gap = (datetime.fromisoformat(str(item["send_at"]).replace(" ", "T"))
-                       - datetime.fromisoformat(str(prev["send_at"]).replace(" ", "T")))
-            except (KeyError, TypeError, ValueError):
-                return None
-            delta = max(gap, timedelta(0))
-        else:
-            delta = timedelta(days=delay)
-        return (prev_sent + delta).isoformat()
+            # No campaign row to read the delay from. send_at values get
+            # rewritten (retries, this rescheduling), so a gap derived from
+            # them drifts; keep the staged send_at instead.
+            return None
+        return (prev_sent + timedelta(days=delay)).isoformat()
 
     def _spread(self, left_today: int) -> int:
         usage = getattr(self.config, "usage", None)

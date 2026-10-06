@@ -869,7 +869,8 @@ class StateManager:
             await db.commit()
             return cursor.rowcount
 
-    async def approve_ready_followups(self) -> int:
+    async def approve_ready_followups(self, campaign_id: str | None = None,
+                                      prospect_id: str | None = None) -> int:
         """Approve pending follow-ups (sequence steps 2+) whose previous step
         is already approved or sent: the reviewer signed off on the opener,
         so the sequence it belongs to may run. A follow-up of a still-pending
@@ -886,8 +887,9 @@ class StateManager:
                          AND prev.prospect_id = outbox.prospect_id
                          AND prev.kind = 'sequence' AND prev.step < outbox.step
                        ORDER BY prev.step DESC LIMIT 1
-                     ) IN ('approved', 'sent')""",
-                (_utcnow().isoformat(),),
+                     ) IN ('approved', 'sent')"""
+                + (" AND campaign_id = ? AND prospect_id = ?" if campaign_id else ""),
+                (_utcnow().isoformat(),) + ((campaign_id, prospect_id or "") if campaign_id else ()),
             )
             await db.commit()
             return cursor.rowcount

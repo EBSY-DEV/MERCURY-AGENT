@@ -16,8 +16,8 @@ minor versions can still change behaviour.
   first email rotates, follow-ups go out from the same address, and replies
   from the inbox they answer. Every inbox is polled, and one unreachable
   inbox no longer hides the others. `enabled: false` stops new threads but
-  keeps reading the inbox. A mailbox removed from the config has its
-  remaining follow-ups cancelled, not re-routed.
+  keeps reading the inbox. Mail of a thread whose mailbox was removed from
+  the config is held, never re-routed to another address.
 - **`auto_approve_followups`.** Approving a first email approves its
   follow-ups, in the dashboard immediately and in the agent loop each cycle.
 - **`spread_sends`.** Paces the day's remaining sends over the cycles left

@@ -99,11 +99,12 @@ def test_warmup_cap_ramps_weekly_and_stops_at_the_daily_cap():
 
 def test_planned_capacity_is_the_smaller_of_global_and_mailbox_caps():
     today = date(2026, 10, 7)
+    env = EnvConfig(smtp_host="h", smtp_password="p")
     mbs = [MailboxConfig(email="a@x.co", daily_cap=30, warmup_start=today),
            MailboxConfig(email="b@y.co", daily_cap=30)]
-    assert planned_daily_capacity(make_config(mailboxes=mbs, max_daily_sends=100), today) == 35
-    assert planned_daily_capacity(make_config(mailboxes=mbs, max_daily_sends=20), today) == 20
-    assert planned_daily_capacity(make_config(max_daily_sends=15), today) == 15
+    assert planned_daily_capacity(make_config(mailboxes=mbs, max_daily_sends=100), today, env) == 35
+    assert planned_daily_capacity(make_config(mailboxes=mbs, max_daily_sends=20), today, env) == 20
+    assert planned_daily_capacity(make_config(max_daily_sends=15), today, env) == 15
 
 
 def test_mailbox_config_normalises_and_rejects_duplicates():
@@ -248,9 +249,10 @@ async def test_pre_tracking_threads_continue_from_the_legacy_mailbox(state):
 
 
 @pytest.mark.asyncio
-async def test_thread_of_a_removed_mailbox_is_cancelled_not_rerouted(state):
+async def test_thread_of_a_removed_mailbox_is_held_not_rerouted(state):
     # Nobody reads the removed inbox: continuing from another address would
-    # keep mailing someone whose reply or opt-out went unseen.
+    # keep mailing someone whose reply or opt-out went unseen. Held, not
+    # cancelled, so a config typo is reversible.
     pool = make_pool(("a@x.co", 5, None))
     sender = make_sender(state, pool)
     pid = await seed_prospect(state)
@@ -261,7 +263,21 @@ async def test_thread_of_a_removed_mailbox_is_cancelled_not_rerouted(state):
     await sender._drain_due()
 
     assert pool.primary.provider.sent == []
-    assert (await state.get_outbox_item(s2))["status"] == "cancelled"
+    assert (await state.get_outbox_item(s2))["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_single_mailbox_continues_threads_whatever_address_they_recorded(state):
+    # Without a rotation list there is one inbox; a changed persona.email
+    # must not strand the threads it already started.
+    pool = MailboxPool.single(FakeProvider(), 10, "new@main.co")
+    sender = make_sender(state, pool)
+    pid = await seed_prospect(state)
+    s1 = await queue(state, pid, "jane@acme.com", step=1)
+    await state.update_outbox_item(s1, status="sent", sent_at=_now_iso(), mailbox="old@main.co")
+    await queue(state, pid, "jane@acme.com", step=2)
+    await sender._drain_due()
+    assert len(pool.primary.provider.sent) == 1
 
 
 @pytest.mark.asyncio
@@ -571,12 +587,37 @@ def test_mailbox_report_without_rotation_is_one_mailbox():
     assert mailbox_report(cfg, None, {})["mailboxes"] == []     # instantly
 
 
-def test_planned_capacity_skips_mailboxes_without_a_password():
+def test_planned_capacity_counts_only_usable_mailboxes_for_new_threads():
     today = date(2026, 10, 7)
-    cfg = make_config(mailboxes=[MailboxConfig(email="a@x.co", daily_cap=10),
-                                 MailboxConfig(email="b@y.co", daily_cap=10,
-                                               password_env="MAILBOX_NOPE")])
-    assert planned_daily_capacity(cfg, today, has_secret=lambda n: n != "MAILBOX_NOPE") == 10
+    env = EnvConfig(smtp_host="h", smtp_password="p")
+    cfg = make_config(mailboxes=[
+        MailboxConfig(email="a@x.co", daily_cap=10),
+        MailboxConfig(email="b@y.co", daily_cap=10, password_env="MAILBOX_NOPE"),
+        MailboxConfig(email="c@z.co", daily_cap=10, enabled=False),
+    ])
+    assert planned_daily_capacity(cfg, today, env) == 10
+
+
+def test_load_env_from_a_mapping_leaves_os_environ_alone(monkeypatch):
+    from harvey.config import load_env
+
+    monkeypatch.delenv("MAILBOX_ONLY_IN_FILE", raising=False)
+    env = load_env({"SMTP_HOST": "h", "MAILBOX_ONLY_IN_FILE": "x"})
+    assert env.smtp_host == "h" and env.secret("MAILBOX_ONLY_IN_FILE") == "x"
+    assert "MAILBOX_ONLY_IN_FILE" not in os.environ
+
+
+@pytest.mark.asyncio
+async def test_promotion_can_be_limited_to_one_thread(state):
+    a = await seed_prospect(state, email="a@acme.com")
+    b = await seed_prospect(state, email="b@acme.com")
+    await queue(state, a, "a@acme.com", step=1, campaign="ca")
+    a2 = await queue(state, a, "a@acme.com", step=2, status="pending_review", campaign="ca")
+    await queue(state, b, "b@acme.com", step=1, campaign="cb")
+    b2 = await queue(state, b, "b@acme.com", step=2, status="pending_review", campaign="cb")
+    assert await state.approve_ready_followups(campaign_id="ca", prospect_id=a) == 1
+    assert (await state.get_outbox_item(a2))["status"] == "approved"
+    assert (await state.get_outbox_item(b2))["status"] == "pending_review"
 
 
 def test_has_credentials_ignores_an_empty_mailbox_secrets_dict(monkeypatch):
