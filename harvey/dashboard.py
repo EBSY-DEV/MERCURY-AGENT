@@ -681,14 +681,19 @@ async def get_outbox_api():
 
 def _mail_context():
     """(config, pool) built exactly as the sender builds them. Re-reads .env
-    so a password added by hand shows up without restarting the dashboard."""
+    on each call, so a password added by hand shows up without a restart."""
     from harvey.config import load_config, load_env
     from harvey.integrations.mailboxes import MailboxPool
 
+    from dotenv import dotenv_values
+
+    # Read .env over a copy of the environment; never mutate os.environ
+    # here (the agent the dashboard starts inherits it).
+    values = dict(os.environ)
     if ENV_FILE.exists():
-        load_dotenv(str(ENV_FILE), override=True)
+        values.update({k: v for k, v in dotenv_values(str(ENV_FILE)).items() if v is not None})
     config = load_config()
-    return config, MailboxPool.from_config(config, load_env())
+    return config, MailboxPool.from_config(config, load_env(values))
 
 
 async def _with_from_mailbox(state, rows: list[dict], legacy_email: str = "",
@@ -711,14 +716,14 @@ async def _with_from_mailbox(state, rows: list[dict], legacy_email: str = "",
                 if key in threads:
                     fm = threads[key] or legacy_email
         r["from_mailbox"] = fm
-        # Queued mail pinned to a mailbox no longer configured is cancelled
-        # by the sender instead of going out; say so before it happens.
+        # Queued mail pinned to a mailbox no longer configured is held by
+        # the sender (never re-routed); say so in the UI.
         r["from_removed"] = bool(fm and known is not None and fm not in known
                                  and r.get("status") != "sent")
     return rows
 
 
-async def _promote_followups_if_enabled(state) -> int:
+async def _promote_followups_if_enabled(state, item: dict | None = None) -> int:
     """auto_approve_followups: promote right away on approval, so the
     follow-ups leave the review desk instead of waiting for the next cycle."""
     try:
@@ -728,9 +733,12 @@ async def _promote_followups_if_enabled(state) -> int:
             return 0
     except Exception:
         return 0
+    thread = {}
+    if item and item.get("campaign_id"):
+        thread = {"campaign_id": item["campaign_id"], "prospect_id": item.get("prospect_id") or ""}
     total = 0
     for _ in range(10):
-        n = await state.approve_ready_followups()
+        n = await state.approve_ready_followups(**thread)
         if not n:
             break
         total += n
@@ -773,7 +781,10 @@ async def outbox_approve(item_id: str):
         state = _state()
         await state.init_db()
         n = await state.approve_outbox(item_id)
-        followups = await _promote_followups_if_enabled(state) if n else 0
+        followups = 0
+        if n:
+            followups = await _promote_followups_if_enabled(
+                state, await state.get_outbox_item(item_id))
         return {"success": bool(n), "followups_approved": followups}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)

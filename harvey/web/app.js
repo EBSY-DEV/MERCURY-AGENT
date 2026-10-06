@@ -1251,7 +1251,7 @@ async function sendingToggle(action) {
 // ── Sending mailboxes ──
 
 function fromLabel(r) {
-  if (r.from_mailbox && r.from_removed) return r.from_mailbox + ' (removed: will be cancelled)';
+  if (r.from_mailbox && r.from_removed) return r.from_mailbox + ' (removed: held until you add it back)';
   if (r.from_mailbox) return r.from_mailbox;
   if (r.mailbox) return r.mailbox;
   if (_mailboxes && _mailboxes.rotation) return 'next free mailbox';

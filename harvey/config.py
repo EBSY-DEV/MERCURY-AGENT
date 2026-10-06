@@ -112,8 +112,8 @@ class MailboxConfig(BaseModel):
     warmup_start: _date | None = None
     # false = start no NEW threads here. Its inbox is still read and its
     # existing threads still finish from it, so replies and opt-outs are
-    # never missed. Remove the entry only once its threads are done: the
-    # follow-ups of a mailbox that is gone are cancelled, not re-routed.
+    # never missed. Remove the entry only once its threads are done: mail of
+    # a thread whose mailbox is gone is held, never re-routed.
     enabled: bool = True
 
     @field_validator("email")
@@ -366,35 +366,39 @@ def load_config(config_path: str | None = None) -> HarveyConfig:
         raise
 
 
-def load_env() -> EnvConfig:
-    """Load environment variables from .env file."""
-    load_dotenv()
+def load_env(values=None) -> EnvConfig:
+    """Load credentials: .env merged into the process environment, or the
+    mapping ``values`` (read as-is, without touching os.environ)."""
+    if values is None:
+        load_dotenv()
+        values = os.environ
+    getenv = lambda key, default="": (values.get(key) or default)  # noqa: E731
     env = EnvConfig(
-        instantly_api_key=os.getenv("INSTANTLY_API_KEY", "").strip(),
-        dataforseo_login=os.getenv("DATAFORSEO_LOGIN", "").strip(),
-        dataforseo_password=os.getenv("DATAFORSEO_PASSWORD", "").strip(),
-        dataforseo_sandbox=os.getenv("DATAFORSEO_SANDBOX", "").strip(),
-        linkedin_email=os.getenv("LINKEDIN_EMAIL", "").strip(),
-        linkedin_password=os.getenv("LINKEDIN_PASSWORD", "").strip(),
-        hunter_api_key=os.getenv("HUNTER_API_KEY", "").strip(),
-        serper_api_key=os.getenv("SERPER_API_KEY", "").strip(),
-        tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip(),
-        treg_token=os.getenv("TREG_TOKEN", "").strip(),
-        semrush_api_key=os.getenv("SEMRUSH_API_KEY", "").strip(),
-        reoon_api_key=os.getenv("REOON_API_KEY", "").strip(),
-        zerobounce_api_key=os.getenv("ZEROBOUNCE_API_KEY", "").strip(),
-        gmail_client_id=os.getenv("GMAIL_CLIENT_ID", "").strip(),
-        gmail_client_secret=os.getenv("GMAIL_CLIENT_SECRET", "").strip(),
-        smtp_host=os.getenv("SMTP_HOST", "").strip(),
-        smtp_port=int(os.getenv("SMTP_PORT", "587").strip() or 587),
-        smtp_username=os.getenv("SMTP_USERNAME", "").strip(),
-        smtp_password=os.getenv("SMTP_PASSWORD", "").strip(),
-        imap_host=os.getenv("IMAP_HOST", "").strip(),
-        imap_port=int(os.getenv("IMAP_PORT", "993").strip() or 993),
-        imap_username=os.getenv("IMAP_USERNAME", "").strip(),
-        imap_password=os.getenv("IMAP_PASSWORD", "").strip(),
+        instantly_api_key=getenv("INSTANTLY_API_KEY", "").strip(),
+        dataforseo_login=getenv("DATAFORSEO_LOGIN", "").strip(),
+        dataforseo_password=getenv("DATAFORSEO_PASSWORD", "").strip(),
+        dataforseo_sandbox=getenv("DATAFORSEO_SANDBOX", "").strip(),
+        linkedin_email=getenv("LINKEDIN_EMAIL", "").strip(),
+        linkedin_password=getenv("LINKEDIN_PASSWORD", "").strip(),
+        hunter_api_key=getenv("HUNTER_API_KEY", "").strip(),
+        serper_api_key=getenv("SERPER_API_KEY", "").strip(),
+        tavily_api_key=getenv("TAVILY_API_KEY", "").strip(),
+        treg_token=getenv("TREG_TOKEN", "").strip(),
+        semrush_api_key=getenv("SEMRUSH_API_KEY", "").strip(),
+        reoon_api_key=getenv("REOON_API_KEY", "").strip(),
+        zerobounce_api_key=getenv("ZEROBOUNCE_API_KEY", "").strip(),
+        gmail_client_id=getenv("GMAIL_CLIENT_ID", "").strip(),
+        gmail_client_secret=getenv("GMAIL_CLIENT_SECRET", "").strip(),
+        smtp_host=getenv("SMTP_HOST", "").strip(),
+        smtp_port=int(getenv("SMTP_PORT", "587").strip() or 587),
+        smtp_username=getenv("SMTP_USERNAME", "").strip(),
+        smtp_password=getenv("SMTP_PASSWORD", "").strip(),
+        imap_host=getenv("IMAP_HOST", "").strip(),
+        imap_port=int(getenv("IMAP_PORT", "993").strip() or 993),
+        imap_username=getenv("IMAP_USERNAME", "").strip(),
+        imap_password=getenv("IMAP_PASSWORD", "").strip(),
         mailbox_secrets={
-            k: v.strip() for k, v in os.environ.items() if k.startswith("MAILBOX_")
+            k: v.strip() for k, v in values.items() if k.startswith("MAILBOX_")
         },
     )
     return env

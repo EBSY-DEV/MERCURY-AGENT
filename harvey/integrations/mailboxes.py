@@ -12,9 +12,9 @@ get "Re:" mail from a stranger, and their answers would land in an inbox the
 conversation never touched.
 
 A mailbox with ``enabled: false`` takes no new threads, but its inbox is
-still read and its threads still finish from it. A mailbox removed from the
-config is gone: its pending follow-ups are cancelled by the sender rather
-than re-routed, because nobody reads its inbox any more.
+still read and its threads still finish from it. Mail of a thread whose
+mailbox was removed from the config is held by the sender, never re-routed:
+nobody reads that inbox any more, so a reply or opt-out there would be lost.
 
 Without ``channels.email.mailboxes`` the pool wraps the single configured
 provider (gmail, or the SMTP_* mailbox), so every deployment runs the same
@@ -24,7 +24,6 @@ code path.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -95,26 +94,22 @@ def rotation_configured(config) -> bool:
     return provider_name == "smtp" and bool(getattr(email_cfg, "mailboxes", None))
 
 
-def _env_has(name: str) -> bool:
-    return bool((os.getenv(name or "") or "").strip())
-
-
-def planned_daily_capacity(config, day: date | None = None, has_secret=_env_has) -> int:
-    """Sends per day the configuration allows, without opening a connection:
-    max_daily_sends, further limited by the caps of the mailboxes that have
-    a password. Used for planning (how much to draft, whether the cap is
-    reached), not for the send decision itself."""
+def planned_daily_capacity(config, day: date | None = None, env=None) -> int:
+    """New threads per day the configuration allows, without opening a
+    connection: max_daily_sends, further limited by the caps of mailboxes
+    that have credentials and take new threads. Used for planning (how much
+    to draft, whether the cap is reached), not for the send decision."""
     email_cfg = config.channels.email
     max_daily = int(getattr(email_cfg, "max_daily_sends", 0) or 0)
     if not rotation_configured(config):
         return max_daily
+    if env is None:
+        from harvey.config import load_env
+
+        env = load_env()
+    pool = MailboxPool.from_config(config, env)
     day = day or local_today(config)
-    initial = getattr(email_cfg, "warmup_initial_cap", 5)
-    weekly = getattr(email_cfg, "warmup_weekly_increase", 5)
-    total = sum(
-        warmup_cap(m.daily_cap, m.warmup_start, day, initial, weekly)
-        for m in email_cfg.mailboxes if has_secret(m.password_env)
-    )
+    total = sum(pool.cap_on(mb, day) for mb in pool.configured() if mb.accepts_new)
     return min(max_daily, total)
 
 
@@ -132,14 +127,19 @@ class MailboxPool:
         self.warmup_weekly_increase = max(0, int(warmup_weekly_increase))
         if not any(mb.legacy for mb in mailboxes):
             mailboxes[0].legacy = True
+        # One mailbox without a rotation list: whatever address a row
+        # recorded, it went out through (and is answered in) this inbox.
+        self.single_inbox = False
 
     # ── construction ──
 
     @classmethod
     def single(cls, provider: MailProvider, daily_cap: int, email: str = "") -> "MailboxPool":
         """The pre-pool behaviour: one mailbox, capped by max_daily_sends."""
-        return cls([Mailbox(email=(email or "").strip().lower(), provider=provider,
+        pool = cls([Mailbox(email=(email or "").strip().lower(), provider=provider,
                             daily_cap=max(0, int(daily_cap)), legacy=True)])
+        pool.single_inbox = True
+        return pool
 
     @classmethod
     def from_config(cls, config, env) -> "MailboxPool | None":
@@ -208,7 +208,7 @@ class MailboxPool:
         """The mailbox a stored outbox value refers to. '' means "sent before
         mailbox tracking", i.e. the legacy mailbox. None: not in the pool."""
         key = (email or "").strip().lower()
-        if not key:
+        if not key or self.single_inbox:
             return self.legacy
         return next((mb for mb in self.mailboxes if mb.email == key), None)
 
@@ -226,6 +226,8 @@ class MailboxPool:
                           self.warmup_initial_cap, self.warmup_weekly_increase)
 
     def used(self, mb: Mailbox, sent_by_mailbox: dict[str, int]) -> int:
+        if self.single_inbox:
+            return sum(int(v) for v in sent_by_mailbox.values())
         n = int(sent_by_mailbox.get(mb.email, 0))
         if mb.legacy and mb.email:
             n += int(sent_by_mailbox.get("", 0))
