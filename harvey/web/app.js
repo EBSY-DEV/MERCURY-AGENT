@@ -697,6 +697,10 @@ async function loadSettings() {
 
   savedPh('gmail-secret', data.gmail_client_secret_set, 'Enter client secret');
   savedPh('smtp-pass', data.smtp_password_set, 'Enter password / app password');
+  api('/api/mailboxes').then(mb => {
+    const el = document.getElementById('settings-mailboxes');
+    if (el) el.innerHTML = mb && !mb.error && mb.rotation ? renderMailboxes(mb, true) : '';
+  });
   savedPh('instantly-key', data.instantly_api_key_set, 'Enter your Instantly API key');
   savedPh('reoon-key', data.reoon_api_key_set, '600 free/mo — reoon.com/email-verifier');
   savedPh('zerobounce-key', data.zerobounce_api_key_set, '100 free/mo — best for M365/Workspace catch-alls');
@@ -1037,8 +1041,14 @@ async function loadUsage() {
 // the approval ladder exists to prevent. One email fills the pane; the rest
 // wait in the rail.
 
+// Sending capacity, shared by the Outbox card, the desk and Settings.
+let _mailboxes = null;
+
 async function loadOutbox() {
-  const data = await api('/api/outbox');
+  const [data, mbox] = await Promise.all([api('/api/outbox'), api('/api/mailboxes')]);
+  _mailboxes = mbox && !mbox.error ? mbox : null;
+  const mboxEl = document.getElementById('outbox-mailboxes');
+  if (mboxEl) mboxEl.innerHTML = renderMailboxes(_mailboxes);
   const banner = document.getElementById('outbox-banner');
   const desk = document.getElementById('outbox-desk');
   const list = document.getElementById('outbox-list');
@@ -1088,10 +1098,12 @@ async function loadOutbox() {
   list.innerHTML =
     table('Approved &amp; scheduled', data.approved, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
+      ['From', r => fromLabel(r), true],
       ['Sends', r => formatDate(r.send_at), true],
     ]) +
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
+      ['From', r => r.mailbox || '—', true],
       ['Sent', r => formatDate(r.sent_at), true],
     ]) +
     table('Didn\'t send', data.failed, [
@@ -1113,7 +1125,10 @@ function renderDesk(items, i) {
     '<div class="desk-pane">' +
       '<div class="to-line">To <b>' + escHtml(cur.to_email) + '</b> &middot; step ' +
         cur.step + ' (' + escHtml(cur.kind) + ') &middot; sends ' +
-        formatDate(cur.send_at) + '</div>' +
+        formatDate(cur.send_at) +
+        (_mailboxes && _mailboxes.rotation
+          ? ' &middot; from <b>' + escHtml(fromLabel(cur)) + '</b>' : '') +
+        followupNote(cur) + '</div>' +
       '<input class="desk-subject" id="desk-subject" value="' + escAttr(cur.subject || '') +
         '" placeholder="subject">' +
       '<textarea class="desk-body" id="desk-body" rows="12">' + escHtml(cur.body) + '</textarea>' +
@@ -1205,7 +1220,12 @@ async function outboxAct(id, action) {
   // Approving sends what is on screen, so unsaved edits go first.
   if (action === 'approve' && deskEdits(id) && !(await outboxSave(id))) return;
   const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
-  if (data && data.success) showToast(action === 'approve' ? 'Approved — will send on schedule.' : 'Rejected.', 'success');
+  const it = _desk.items.find(x => x.id === id);
+  const withFollowups = action === 'approve' && it && autoFollowups(it);
+  if (data && data.success) showToast(action === 'approve'
+      ? (withFollowups ? 'Approved, with its follow-ups — they send on schedule.'
+                       : 'Approved — will send on schedule.')
+      : 'Rejected.', 'success');
   else showToast('Action failed.', 'error');
   loadOutbox();
 }
@@ -1222,6 +1242,75 @@ async function sendingToggle(action) {
   if (data && data.success) showToast(action === 'pause' ? 'Sending paused.' : 'Sending resumed.', 'success');
   else showToast('Failed.', 'error');
   loadOutbox();
+}
+
+// ── Sending mailboxes ──
+
+function fromLabel(r) {
+  if (r.from_mailbox) return r.from_mailbox;
+  if (r.mailbox) return r.mailbox;
+  return _mailboxes && _mailboxes.rotation ? 'next free mailbox' : (_mailboxes && _mailboxes.mailboxes[0] ? _mailboxes.mailboxes[0].email || '—' : '—');
+}
+
+function autoFollowups(it) {
+  return !!(_mailboxes && _mailboxes.auto_approve_followups &&
+            it.kind === 'sequence' && Number(it.step) === 1);
+}
+
+function followupNote(it) {
+  return autoFollowups(it)
+    ? ' &middot; <span class="muted">approving also approves its follow-ups</span>' : '';
+}
+
+function mailboxStage(m) {
+  if (m.configured === false) return '<span class="badge t-bad">no password</span>';
+  if (m.stage === 'scheduled')
+    return '<span class="badge t-idle">starts ' + escHtml(formatDay(m.warmup_start)) + '</span>';
+  if (m.stage === 'warming')
+    return '<span class="badge t-active">warming</span> <span class="muted" style="font-size:12px">' +
+      escHtml(m.daily_cap + '/day from ' + formatDay(m.full_on)) + '</span>';
+  return '<span class="badge t-good">warm</span>';
+}
+
+function formatDay(iso) {
+  if (!iso) return '';
+  const d = new Date(iso + 'T12:00:00');
+  return isNaN(d) ? iso : d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+}
+
+function renderMailboxes(mb, compact) {
+  if (!mb || !mb.mailboxes || !mb.mailboxes.length) return '';
+  const flags = [];
+  if (mb.require_approval) flags.push(mb.auto_approve_followups
+    ? 'you approve first emails; follow-ups ride along' : 'every email needs your approval');
+  else flags.push('autopilot: no approval step');
+  if (mb.spread_sends) flags.push('paced through the day');
+  const capNote = mb.capacity_today < mb.mailboxes.reduce((n, m) => n + m.cap_today, 0)
+    ? ' (capped by max_daily_sends ' + mb.max_daily_sends + ')' : '';
+
+  let rows = '';
+  for (const m of mb.mailboxes) {
+    const pct = m.cap_today ? Math.min(100, Math.round(100 * m.sent_24h / m.cap_today)) : 0;
+    rows += '<tr><td><b>' + escHtml(m.email || '(default mailbox)') + '</b>' +
+        (m.name ? '<div class="muted" style="font-size:12px">' + escHtml(m.name) + '</div>' : '') + '</td>' +
+      '<td style="min-width:140px"><div class="progress-label"><span class="pct">' +
+        m.sent_24h + ' / ' + m.cap_today + '</span><span class="text">' + m.remaining + ' left</span></div>' +
+        '<div class="progress-bar"><div class="progress-fill" style="width:' + pct +
+        '%;background:var(--s-active)"></div></div></td>' +
+      '<td>' + mailboxStage(m) + '</td></tr>';
+  }
+  const head = compact ? '<div style="font-weight:650;margin-bottom:6px">Rotation</div>'
+                       : '<h2>Sending mailboxes</h2>';
+  return '<div class="' + (compact ? '' : 'card') + '">' + head +
+    '<p class="muted" style="font-size:13px;margin:2px 0 10px">' +
+      mb.sent_24h + ' of ' + mb.capacity_today + ' sent in the last 24 hours' + escHtml(capNote) +
+      ' &middot; ' + flags.map(escHtml).join(' &middot; ') + '</p>' +
+    '<div class="table-card"><table><thead><tr><th>Mailbox</th><th>Last 24h</th><th>Stage</th></tr></thead><tbody>' +
+    rows + '</tbody></table></div>' +
+    (compact && mb.rotation
+      ? '<p class="lede" style="margin-top:8px">Mailboxes are listed under <span style="font-family:var(--mono);font-size:12px">channels.email.mailboxes</span> in harvey.local.yaml; passwords live in .env.</p>'
+      : '') +
+    '</div>';
 }
 
 async function loadCompanies() {

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from harvey.integrations.mail_provider import MailProvider, get_mail_provider
 
@@ -242,3 +242,75 @@ def build_rotation_pool(config, env) -> MailboxPool | None:
     except Exception as e:  # pragma: no cover - defensive
         logger.error(f"Mailboxes: could not build the mailbox pool: {e}")
         return None
+
+
+def mailbox_report(config, sent_by_mailbox: dict[str, int], has_secret,
+                   smtp_username: str = "", day: date | None = None) -> dict:
+    """What the dashboard shows about sending capacity. No network, no
+    secrets: ``has_secret(name)`` only says whether an env var is set.
+
+    Each row: email, name, daily_cap, cap_today, sent_24h, remaining,
+    warmup_start, full_on (first day at daily_cap), stage, configured.
+    """
+    email_cfg = config.channels.email
+    day = day or local_today(config)
+    max_daily = int(getattr(email_cfg, "max_daily_sends", 0) or 0)
+    initial = int(getattr(email_cfg, "warmup_initial_cap", 5) or 0)
+    weekly = int(getattr(email_cfg, "warmup_weekly_increase", 5) or 0)
+    total_sent = sum(sent_by_mailbox.values())
+    rows: list[dict] = []
+
+    if rotation_configured(config):
+        listed = [m for m in email_cfg.mailboxes if getattr(m, "enabled", True)]
+        login = (smtp_username or "").strip().lower()
+        persona_email = (getattr(config.persona, "email", "") or "").strip().lower()
+        legacy = next((m.email for key in (login, persona_email) for m in listed
+                       if key and m.email == key), listed[0].email)
+        for m in listed:
+            cap = warmup_cap(m.daily_cap, m.warmup_start, day, initial, weekly)
+            sent = int(sent_by_mailbox.get(m.email, 0))
+            if m.email == legacy:
+                sent += int(sent_by_mailbox.get("", 0))
+            full_on = None
+            if m.warmup_start is not None and weekly > 0 and m.daily_cap > initial:
+                weeks = -(-(m.daily_cap - initial) // weekly)  # ceil
+                full_on = (m.warmup_start + timedelta(days=7 * weeks)).isoformat()
+            if m.warmup_start is not None and day < m.warmup_start:
+                stage = "scheduled"
+            elif cap < m.daily_cap:
+                stage = "warming"
+            else:
+                stage = "warm"
+            rows.append({
+                "email": m.email,
+                "name": m.name or getattr(config.persona, "name", ""),
+                "daily_cap": m.daily_cap,
+                "cap_today": cap,
+                "sent_24h": sent,
+                "remaining": max(0, cap - sent),
+                "warmup_start": m.warmup_start.isoformat() if m.warmup_start else None,
+                "full_on": full_on if stage != "warm" else None,
+                "stage": stage,
+                "configured": bool(has_secret(m.password_env)),
+            })
+    else:
+        email = (getattr(config.persona, "email", "") or smtp_username or "").lower()
+        rows.append({
+            "email": email, "name": getattr(config.persona, "name", ""),
+            "daily_cap": max_daily, "cap_today": max_daily, "sent_24h": total_sent,
+            "remaining": max(0, max_daily - total_sent), "warmup_start": None,
+            "full_on": None, "stage": "warm", "configured": None,
+        })
+
+    capacity = sum(r["cap_today"] for r in rows if r["configured"] is not False)
+    return {
+        "rotation": rotation_configured(config),
+        "provider": getattr(email_cfg, "provider", ""),
+        "mailboxes": rows,
+        "capacity_today": min(max_daily, capacity),
+        "max_daily_sends": max_daily,
+        "sent_24h": total_sent,
+        "require_approval": bool(getattr(email_cfg, "require_approval", True)),
+        "auto_approve_followups": bool(getattr(email_cfg, "auto_approve_followups", False)),
+        "spread_sends": bool(getattr(email_cfg, "spread_sends", False)),
+    }
