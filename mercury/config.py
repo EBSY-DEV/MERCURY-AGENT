@@ -137,6 +137,63 @@ class MailboxConfig(BaseModel):
         return v
 
 
+class PlacementSeedConfig(BaseModel):
+    """A seed inbox you own that the placement test sends to and reads.
+
+    Mercury reads it over IMAP to see which folder each test email landed
+    in. ``provider`` (gmail, outlook, yahoo, other) and ``imap_host`` are
+    guessed from the address when left empty; set ``provider: gmail`` for a
+    Google Workspace seed on its own domain so Primary and Promotions are
+    told apart. The password (an app password) is read from the env var in
+    ``password_env``, which must start with PLACEMENT_ or MAILBOX_. Leave it
+    empty to read the seed yourself and record the folder with
+    ``mercury mail placement mark``.
+    """
+    email: str
+    provider: str = ""
+    password_env: str = ""
+    username: str = ""
+    imap_host: str = ""
+    imap_port: int = 993
+
+    @field_validator("email")
+    @classmethod
+    def _seed_email(cls, v: str) -> str:
+        return _address(v)
+
+
+def _address(v: str) -> str:
+    v = (v or "").strip().lower()
+    if "@" not in v or v.startswith("@") or v.endswith("@"):
+        raise ValueError(f"'{v}' is not an email address")
+    return v
+
+
+class PlacementControlConfig(BaseModel):
+    """A known-good personal mailbox (usually a personal Gmail) that sends
+    the same text as the control. Its SMTP password comes from the env var
+    in ``password_env`` (PLACEMENT_* or MAILBOX_*)."""
+    email: str
+    name: str = ""
+    password_env: str = ""
+    username: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+
+    @field_validator("email")
+    @classmethod
+    def _control_email(cls, v: str) -> str:
+        return _address(v)
+
+
+class PlacementConfig(BaseModel):
+    """The inbox placement test (``mercury mail placement``)."""
+    seeds: list[PlacementSeedConfig] = []
+    control: PlacementControlConfig | None = None
+    # How long to keep looking for the test emails in the seed inboxes.
+    wait_seconds: int = 180
+
+
 class EmailChannelConfig(BaseModel):
     enabled: bool = True
     # "instantly" (legacy), "gmail" (Gmail/Workspace via API — recommended),
@@ -182,6 +239,8 @@ class EmailChannelConfig(BaseModel):
     # after the return date they gave. 0 resumes the morning they are back.
     # A date you set by hand on the Outbox tab is used as is.
     ooo_resume_buffer_days: int = 0
+    # Seed inboxes and a control sender for `mercury mail placement`.
+    placement: PlacementConfig = PlacementConfig()
 
     @field_validator("max_daily_sends")
     @classmethod
@@ -394,6 +453,9 @@ class EnvConfig(BaseModel):
     # Every MAILBOX_* variable, so channels.email.mailboxes[].password_env
     # can name any of them without a field per mailbox.
     mailbox_secrets: dict[str, str] = {}
+    # Every PLACEMENT_* variable: app passwords of the placement test's seed
+    # inboxes and control sender (channels.email.placement).
+    placement_secrets: dict[str, str] = {}
 
     # Env vars a mailbox may take its password from besides MAILBOX_*. An
     # allowlist, so a typo such as password_env: TAVILY_API_KEY cannot hand
@@ -401,10 +463,13 @@ class EnvConfig(BaseModel):
     _MAILBOX_PASSWORD_FIELDS = ("SMTP_PASSWORD", "IMAP_PASSWORD")
 
     def secret(self, name: str) -> str:
-        """A mailbox password: a MAILBOX_* variable, SMTP_PASSWORD or IMAP_PASSWORD."""
+        """A mailbox password: a MAILBOX_* or PLACEMENT_* variable,
+        SMTP_PASSWORD or IMAP_PASSWORD."""
         name = (name or "").strip()
         if name.startswith("MAILBOX_"):
             return self.mailbox_secrets.get(name, "")
+        if name.startswith("PLACEMENT_"):
+            return self.placement_secrets.get(name, "")
         if name in self._MAILBOX_PASSWORD_FIELDS:
             return getattr(self, name.lower(), "") or ""
         return ""
@@ -493,6 +558,9 @@ def load_env(values=None) -> EnvConfig:
         imap_password=getenv("IMAP_PASSWORD", ""),
         mailbox_secrets={
             k: v for k, v in values.items() if k.startswith("MAILBOX_")
+        },
+        placement_secrets={
+            k: v for k, v in values.items() if k.startswith("PLACEMENT_")
         },
     )
     return env

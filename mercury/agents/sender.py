@@ -100,6 +100,26 @@ SENDABLE_STATUSES = {"new", "queued"}
 SENDABLE_EMAIL_STATUSES = {"verified"}
 SENDABLE_EMAIL_STATUSES_WITH_RISKY = {"verified", "risky"}
 
+# Stopword counts decide the footer language; drafts are ES or EN.
+_ES_MARKERS = (" el ", " la ", " de ", " que ", " para ", " los ", " las ",
+               " una ", " con ", " por ", " tu ", " su ", " está ", " cómo ")
+_EN_MARKERS = (" the ", " and ", " you ", " your ", " with ", " for ",
+               " that ", " on ", " is ", " are ", " to ", " of ")
+
+
+def with_legal_footer(config, body: str) -> str:
+    """Append company + postal address + opt-out line (CAN-SPAM) in the
+    language of the email. Kept out of the draft so the writer never
+    rewrites or drops it. The placement test sends the same footer, so it
+    tests the email prospects actually get."""
+    c = config.compliance
+    padded = f" {body.lower()} "
+    es = sum(padded.count(m) for m in _ES_MARKERS)
+    en = sum(padded.count(m) for m in _EN_MARKERS)
+    opt_out = c.opt_out_line_es if es > en else c.opt_out_line_en
+    company = config.persona.company
+    return f"{body.rstrip()}\n\n{company} · {c.postal_address.strip()}\n{opt_out}"
+
 
 class Sender:
     def __init__(
@@ -470,23 +490,8 @@ class Sender:
             text = text.replace("{{ " + key + " }}", value or "")
         return text.strip()
 
-    # Stopword counts decide the footer language; drafts are ES or EN.
-    _ES_MARKERS = (" el ", " la ", " de ", " que ", " para ", " los ", " las ",
-                   " una ", " con ", " por ", " tu ", " su ", " está ", " cómo ")
-    _EN_MARKERS = (" the ", " and ", " you ", " your ", " with ", " for ",
-                   " that ", " on ", " is ", " are ", " to ", " of ")
-
     def _with_legal_footer(self, body: str) -> str:
-        """Append company + postal address + opt-out line (CAN-SPAM) in the
-        language of the email. Kept out of the draft so the writer never
-        rewrites or drops it."""
-        c = self.config.compliance
-        padded = f" {body.lower()} "
-        es = sum(padded.count(m) for m in self._ES_MARKERS)
-        en = sum(padded.count(m) for m in self._EN_MARKERS)
-        opt_out = c.opt_out_line_es if es > en else c.opt_out_line_en
-        company = self.config.persona.company
-        return f"{body.rstrip()}\n\n{company} · {c.postal_address.strip()}\n{opt_out}"
+        return with_legal_footer(self.config, body)
 
     async def _stage_campaign_native(self, campaign):
         """Render + schedule a draft campaign's emails into the outbox."""

@@ -82,6 +82,19 @@ minor versions can still change behaviour.
   `demos.retire_after_days` after the last email to a contact who never
   replied. Campaigns and outbox rows gain an `offer_key` for the offer router
   (#57) to fill.
+
+- **Deliverability health and a placement test** (#53). `mercury health`, a
+  Deliverability card on Today and a verdict per domain on the Mailboxes tab
+  show each sending domain's sends, replies and bounces over 7, 14 and 30 days,
+  its sending age, and a verdict: too young (under 30 days), not enough data
+  (under 200 sends for the reply rate, 50 for bounces), keep (1% replies after
+  200) or cancel candidate (0 replies on 150+, under 1% after 200, or a burned
+  bounce code once bounces are classified). `mercury mail placement` sends the
+  real email 1 from every mailbox, plus a control sender, to seed inboxes you
+  own, reads where each copy landed over IMAP and says whether it is the domain
+  or the copy. It never touches the outbox or a daily cap. Results go in a new
+  `placement_tests` table (created on first use) and show next to the DNS
+  checklist. Configure under `channels.email.placement`.
 - **CSV contact import** (#3). Dashboard (Contacts → Import CSV), `mercury import`
   share one service. It has a read-only preview
   with per-row outcomes (new, needs enrichment, duplicate, invalid), column
