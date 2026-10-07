@@ -67,10 +67,19 @@ channels:
     #    password_env: "MAILBOX_YOU_PASSWORD"
     #    daily_cap: 30
     #    warmup_start: "2026-10-07"
+    # Warm-up health gate (per mailbox, last 7 days): over 5% bounces after
+    # 20 sends pauses that mailbox until you resume it on the Warm-up tab;
+    # 3-5% holds it at yesterday's cap.
   linkedin:
     enabled: true
     max_daily_connections: 20
     max_daily_messages: 10
+
+# CAN-SPAM: every commercial email carries a postal address and an opt-out
+# line. The native sender holds the outbox until postal_address is set.
+compliance:
+  postal_address: ""
+  # opt_out_line_en / opt_out_line_es override the default opt-out sentences.
 
 usage:
   max_daily_claude_percent: 80

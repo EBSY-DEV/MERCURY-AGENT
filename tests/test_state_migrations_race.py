@@ -57,7 +57,7 @@ def test_migration_order_mailbox_v9_then_warmup_v10():
 
 @pytest.mark.asyncio
 async def test_production_v9_db_upgrades_to_v10(tmp_path):
-    db = str(tmp_path / "harvey-prod.db")
+    db = str(tmp_path / "prod.db")
     _apply(db, MIGRATIONS[:9])
     conn = sqlite3.connect(db)
     conn.execute("INSERT INTO outbox (id, prospect_id, to_email, subject, body, mailbox) "
