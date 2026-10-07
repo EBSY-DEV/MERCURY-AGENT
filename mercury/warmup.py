@@ -453,6 +453,18 @@ async def overview(state, config, pool: MailboxPool | None,
             "notes": row.get("notes") or "",
         })
 
+    # Last stored DNS check per sending domain, so the Mailboxes table can show
+    # every domain's records without running a live lookup for each one.
+    domains: dict[str, dict | None] = {}
+    for mb in pool.mailboxes:
+        if mb.domain and mb.domain not in domains:
+            stored = await load_dns_result(state, mb.domain)
+            domains[mb.domain] = {
+                "checks": [{"key": c.get("key"), "status": c.get("status")} for c in stored.get("checks", [])],
+                "checked_at": stored.get("checked_at"),
+                "all_pass": dns_all_pass(stored),
+            } if stored else None
+
     removed = next((r for r in report["mailboxes"] if r["stage"] == "removed"), None)
     return {
         **{k: v for k, v in report.items() if k != "mailboxes"},
@@ -462,6 +474,7 @@ async def overview(state, config, pool: MailboxPool | None,
         "warmup_weekly_increase": inc,
         "removed_sent_24h": removed["sent_24h"] if removed else 0,
         "inboxes": inboxes,
+        "domains": domains,
         "config_hint": CONFIG_HINT,
     }
 

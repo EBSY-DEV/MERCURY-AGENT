@@ -166,7 +166,7 @@ const TAB_META = {
   today: ['Today', 'squares-four'], signals: ['Signals', 'funnel'], discover: ['Discover', 'compass'],
   companies: ['Companies', 'buildings'], prospects: ['Contacts', 'address-book'],
   pipeline: ['Pipeline', 'kanban'], calendar: ['Calendar', 'calendar-blank'],
-  campaigns: ['Campaigns', 'megaphone'], outbox: ['Outbox', 'tray'], warmup: ['Warm-up', 'fire'],
+  campaigns: ['Campaigns', 'megaphone'], outbox: ['Outbox', 'tray'], mailboxes: ['Mailboxes', 'envelope-simple'],
   personas: ['Voice & Personas', 'sparkle'],
   conversations: ['Conversations', 'chat-circle-text'], activity: ['Activity', 'pulse'],
   usage: ['Usage', 'gauge'], settings: ['Settings', 'gear-six'], controls: ['Controls', 'power'],
@@ -201,7 +201,7 @@ function loadCurrentTab() {
   switch (currentTab) {
     case 'today': loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); loadTrend(); loadHeatmap(); break;
     case 'help': break;
-    case 'warmup': loadWarmup(); break;
+    case 'mailboxes': loadMailboxes(); break;
     case 'signals': loadSignals(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
@@ -970,7 +970,7 @@ async function saveInbox(event) {
     ? 'Inbox saved. Stop and start Mercury in Controls to apply the changes to the running agent.'
     : 'Inbox saved. Changes apply on your next Mercury run; restart it if you run it outside this dashboard.';
   await loadSettings();
-  _wu.key = null;
+  _mb.key = '';
   showToast('Inbox saved.', 'success');
 }
 
@@ -1572,11 +1572,11 @@ function renderMailboxes(mb, compact) {
   if (compact) {
     return '<div class="mb-compact"><div class="mb-compact-head"><b>Rotation</b><span class="muted">' + summary + '</span></div>' +
       table + '<p class="lede mb-hint">Manage addresses, passwords, and sending limits under Sending inboxes below. ' +
-      '<button class="link-btn" onclick="goTab(\'warmup\')">Warm-up' + icon('arrow-right') + '</button></p></div>';
+      '<button class="link-btn" onclick="goTab(\'mailboxes\')">Mailboxes' + icon('arrow-right') + '</button></p></div>';
   }
   return '<section class="panel"><div class="panel-head"><div><h3>Sending mailboxes</h3><p>' + summary +
       ' &middot; ' + flags.map(escHtml).join(' &middot; ') + '</p></div>' +
-      '<button class="link-btn" onclick="goTab(\'warmup\')">Warm-up' + icon('arrow-right') + '</button></div>' +
+      '<button class="link-btn" onclick="goTab(\'mailboxes\')">Mailboxes' + icon('arrow-right') + '</button></div>' +
     '<div class="panel-body">' + table + '</div></section>';
 }
 
@@ -1867,6 +1867,8 @@ function openDrawer(kicker, title, subHtml, bodyHtml) {
   document.getElementById('drawer-kicker').textContent = kicker || '';
   document.getElementById('drawer-title').textContent = title || '';
   document.getElementById('drawer-sub').innerHTML = subHtml || '';
+  const actions = document.getElementById('drawer-actions');
+  if (actions) actions.innerHTML = '';
   const body = document.getElementById('drawer-body');
   body.innerHTML = bodyHtml || '';
   body.scrollTop = 0;
@@ -1874,7 +1876,7 @@ function openDrawer(kicker, title, subHtml, bodyHtml) {
   d.classList.add('open');
   d.setAttribute('aria-hidden', 'false');
   document.getElementById('drawer-scrim').classList.add('open');
-  const close = d.querySelector('.drawer-head .btn-square');
+  const close = d.querySelector('.drawer-head > .btn-square');
   if (close) close.focus({preventScroll: true});
 }
 
@@ -1885,6 +1887,7 @@ function closeDrawer() {
   d.setAttribute('aria-hidden', 'true');
   document.getElementById('drawer-scrim').classList.remove('open');
   _drawerCtx = null;
+  if (_mb.view) { _mb.view = null; document.querySelectorAll('#mb-table .mb-row.sel').forEach(r => r.classList.remove('sel')); }
   if (_drawerPrevFocus && document.contains(_drawerPrevFocus)) _drawerPrevFocus.focus({preventScroll: true});
   _drawerPrevFocus = null;
 }
@@ -2869,7 +2872,7 @@ function renderRates() {
     card('Positive replies', t.positive_rate, fmtN(t.positive) + ' interested of ' + fmtN(sent) + ' sent',
       rateDelta(t.positive_rate, p.positive_rate, p.sent, true, days), 'conversations') +
     card('Bounce rate', t.bounce_rate, fmtN(t.bounces) + ' bounce' + (Number(t.bounces) === 1 ? '' : 's') + ' of ' + fmtN(sent) + ' sent',
-      rateDelta(t.bounce_rate, p.bounce_rate, p.sent, false, days), 'warmup', bounceTone);
+      rateDelta(t.bounce_rate, p.bounce_rate, p.sent, false, days), 'mailboxes', bounceTone);
   el.hidden = false;
 }
 
@@ -2960,248 +2963,493 @@ function renderTrend() {
     : 'Nothing sent in the last ' + (d.days || n) + ' days';
 }
 
-// ── Warm-up: a new inbox earns its volume ──
+// ── Mailboxes: every inbox Mercury sends from ──
 //
 // Which inboxes exist, their daily caps and their ramp (warmup_start, then
 // +warmup_weekly_increase every week) come from mercury.yaml →
-// channels.email.mailboxes. The sender enforces those caps, lowered by the
-// health gate (bounces) or a manual pause from this tab. This tab shows where
-// each inbox is on its ramp, the setup checklist for each week, and the DNS
-// records that decide whether mail lands in the inbox at all.
+// channels.email.mailboxes, edited here through /api/settings/mailboxes. The
+// sender enforces those caps, lowered by the health gate (bounces) or a
+// manual pause. The tab is a table of every inbox, grouped by sending domain
+// so DNS (a domain setting) shows once, with a drawer per inbox (ramp,
+// health, checklist, notes, settings) and per domain (DNS records).
 
-let _wu = { data: null, key: '', sel: null, open: {}, dns: {}, dnsLoading: {}, seq: 0, hint: false };
-
-const WU_STATUS = {
-  scheduled: ['Scheduled', 'idle'],
-  warming:   ['Warming up', 'active'],
-  fixed:     ['Capped', 'active'],
-  warm:      ['Fully warmed', 'good'],
-  paused:    ['Paused', 'waiting'],
+let _mb = {
+  data: null, key: '', seq: 0, q: '', filter: 'all', open: {}, dns: {}, dnsLoading: {},
+  view: null, settings: null, test: {},
 };
-const wuKey = b => (b.status === 'paused' ? 'paused' : (b.stage || 'warm'));
-const wuMeta = b => WU_STATUS[wuKey(b)] || [String(wuKey(b)), 'idle'];
-const wuEnc = email => encodeURIComponent(email);
-const wuDomain = email => String(email || '').split('@')[1] || '';
 
-function wuInbox() {
-  const list = (_wu.data && _wu.data.inboxes) || [];
-  return list.find(b => b.email === _wu.sel) || null;
+const MB_FILTERS = [['all', 'All'], ['needs', 'Needs you'], ['warming', 'Warming'], ['soon', 'Starting soon'], ['warm', 'Warm']];
+const mbEnc = email => encodeURIComponent(email);
+const mbDomainOf = email => String(email || '').split('@')[1] || '';
+const mbList = () => (_mb.data && _mb.data.inboxes) || [];
+const mbFind = email => mbList().find(b => b.email === email) || null;
+const mbDns = domain => ((_mb.data && _mb.data.domains) || {})[domain] || null;
+// A record that is missing or wrong needs the user; a lookup that couldn't run (network) doesn't.
+const mbDnsFails = domain => { const d = mbDns(domain); return !!d && (d.checks || []).some(c => c.status === 'fail'); };
+const mbArg = s => escHtml(JSON.stringify(String(s)));   // safe inline-handler string argument
+
+// Stage, as a status word + tone. Paused and held override the ramp stage.
+function mbStage(b) {
+  const gate = (b.health || {}).gate || 'ok';
+  if (b.status === 'paused') return { key: 'paused', label: 'Paused', tone: 'bad' };
+  if (gate === 'hold') return { key: 'hold', label: 'On hold', tone: 'waiting' };
+  if (b.accepts_new === false) return { key: 'replies', label: 'Replies only', tone: 'idle' };
+  if (b.stage === 'scheduled') return { key: 'soon', label: 'Starts ' + shortDay(b.start_date), tone: 'idle' };
+  if (b.stage === 'warming' || b.stage === 'fixed') return { key: 'warming', label: 'Warming', tone: 'active' };
+  return { key: 'warm', label: 'Warm', tone: 'good' };
 }
 
-function wuBusy() {
+function mbOpenTasks(b) {
+  if (!b.start_date) return [];   // added already warm: Mercury never ramped it, so no catch-up list
+  const cur = b.current_week === null || b.current_week === undefined ? 0 : b.current_week;
+  return (b.weeks || []).filter(w => w.week <= cur)
+    .flatMap(w => (w.tasks || []).filter(t => !t.done && t.key !== 'dns').map(t => ({ ...t, week: w.week, cur: w.week === cur })));
+}
+
+// What the inbox needs next, worst first: [text, tone] where tone '' is muted.
+function mbNext(b) {
+  const st = mbStage(b);
+  if (st.key === 'paused') return ['Resume once bounces are fixed', 'bad'];
+  if (b.configured === false) return ['Add the inbox password', 'bad'];
+  if (st.key === 'hold') return ['Bounces over 3%', 'waiting'];
+  if (mbDnsFails(b.domain)) return ['Waiting on domain DNS', ''];
+  if (st.key === 'soon') return ['Starts ' + shortDay(b.start_date), ''];
+  const open = mbOpenTasks(b);
+  if (open.length) return ['Checklist: ' + open.length + ' open', ''];
+  return ['Nothing to do', ''];
+}
+
+function mbNeeds(b) {
+  const st = mbStage(b);
+  return st.key === 'paused' || st.key === 'hold' || b.configured === false || mbDnsFails(b.domain);
+}
+
+function mbInFilter(b, k) {
+  const st = mbStage(b).key;
+  switch (k) {
+    case 'needs': return mbNeeds(b);
+    case 'warming': return st === 'warming' || (st === 'hold' && b.stage === 'warming');
+    case 'soon': return st === 'soon';
+    case 'warm': return st === 'warm';
+    default: return true;
+  }
+}
+
+function mbMatches(b) {
+  const q = _mb.q.trim().toLowerCase();
+  if (q && !(b.email + ' ' + (b.name || '')).toLowerCase().includes(q)) return false;
+  return mbInFilter(b, _mb.filter);
+}
+
+function mbBusy() {
   const a = document.activeElement;
-  return modalOpen() || !!(a && a.closest && a.closest('#warmup') && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+  return modalOpen() || !!(a && a.closest && a.closest('#drawer, #mailboxes') && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.id !== 'mb-search');
 }
 
-async function loadWarmup(quiet) {
-  const body = document.getElementById('wu-body');
-  const seq = ++_wu.seq;
+async function loadMailboxes(quiet) {
+  const body = document.getElementById('mb-body');
+  const seq = ++_mb.seq;
   const res = await getJSON('/api/warmup');
-  if (seq !== _wu.seq) return;
+  if (seq !== _mb.seq) return;
   if (!res.ok || !res.data || !Array.isArray(res.data.inboxes)) {
-    if (quiet && _wu.data) return;
-    _wu.data = null; _wu.key = '';
-    document.getElementById('wu-switch').innerHTML = '';
-    body.innerHTML = unavailableState(res, 'fire', 'Warm-up');
+    if (quiet && _mb.data) return;
+    _mb.data = null; _mb.key = '';
+    body.innerHTML = unavailableState(res, 'envelope-simple', 'Mailboxes');
     return;
   }
   const key = JSON.stringify(res.data);
-  if (quiet && key === _wu.key) return;
-  _wu.data = res.data; _wu.key = key;
-  const list = res.data.inboxes;
-  if (!list.some(b => b.email === _wu.sel)) {
-    // Open on what needs attention: a paused inbox, then one mid-ramp.
-    const pick = list.find(b => b.status === 'paused') || list.find(b => b.stage === 'warming') ||
-      list.find(b => b.primary) || list[0];
-    _wu.sel = pick ? pick.email : null;
-  }
-  wuNavFlag();
-  renderWarmup();
+  if (quiet && key === _mb.key) return;
+  _mb.data = res.data; _mb.key = key;
+  mbNavFlag();
+  renderMailboxes();
+  if (quiet) mbRefreshDrawer();
 }
 
-function wuNavFlag() {
-  const el = document.getElementById('nav-warmup');
+function mbNavFlag() {
+  const el = document.getElementById('nav-mailboxes');
   if (!el) return;
-  const list = (_wu.data && _wu.data.inboxes) || [];
+  const list = mbList();
   const worst = list.some(b => b.status === 'paused') ? 'bad'
-    : list.some(b => b.health && b.health.gate === 'hold') ? 'wait' : '';
+    : list.some(b => mbNeeds(b)) ? 'wait' : '';
   el.hidden = !worst;
   el.className = 'nav-flag ' + worst;
-  el.title = worst === 'bad' ? 'An inbox is paused' : worst === 'wait' ? 'A ramp is on hold' : '';
+  el.title = worst === 'bad' ? 'An inbox is paused' : worst === 'wait' ? 'A mailbox needs you' : '';
 }
 
-function wuSelect(i) {
-  const x = ((_wu.data && _wu.data.inboxes) || [])[i];
-  if (!x) return;
-  _wu.sel = x.email;
-  renderWarmup();
+function mbConfigHint() {
+  return '<div class="wu-config"><p>' + icon('info') + '<span>Mailboxes live in <span class="mono">mercury.yaml</span> &rarr; ' +
+    '<span class="mono">channels.email.mailboxes</span>. Add one here or edit the file; Mercury picks changes up on its next run.</span></p></div>';
 }
 
-function wuConfigHint(open) {
-  const hint = (_wu.data && _wu.data.config_hint) || '';
-  return '<div class="wu-config">' +
-    '<p>' + icon('info') + '<span>Add inboxes, update passwords, and change caps or start dates in ' +
-      '<button class="link-btn" onclick="goTab(\'settings\')">Settings</button>. Restart a running Mercury agent after saving changes.</span></p>' +
-    (hint ? '<details' + (open ? ' open' : '') + ' ontoggle="_wu.hint = this.open"><summary>Config snippet</summary>' +
-      '<div class="wu-snippet"><pre>' + escHtml(hint) + '</pre>' +
-      '<button class="btn-square xs ghost" title="Copy snippet" aria-label="Copy config snippet" data-copy="' + escHtml(hint) +
-        '" onclick="wuCopy(this)">' + icon('copy') + '</button></div></details>' : '') +
-    '</div>';
-}
-
-function renderWarmup() {
-  const body = document.getElementById('wu-body');
-  const sw = document.getElementById('wu-switch');
-  const list = (_wu.data && _wu.data.inboxes) || [];
+function renderMailboxes() {
+  const body = document.getElementById('mb-body');
+  const list = mbList();
   if (!list.length) {
-    sw.innerHTML = '';
-    const note = _wu.data && _wu.data.note;
+    const note = _mb.data && _mb.data.note;
     body.innerHTML = '<section class="panel">' + emptyState('envelope-simple',
-        note ? 'Nothing to warm up here' : 'No sending inbox configured',
-        note ? escHtml(note) : 'Configure the mailbox Mercury sends from and it shows up here with its ramp, ' +
+        note ? 'Nothing to manage here' : 'No sending inbox yet',
+        note ? escHtml(note) : 'Add the inbox Mercury sends from. It shows up here with its warm-up ramp, ' +
           'bounce monitoring and a setup checklist.') +
-      '<div class="panel-foot">' + wuConfigHint(true) + '</div></section>';
+      (note ? '' : '<div class="panel-body mb-empty-act"><button class="btn btn-primary" onclick="mbOpenSettings(null)">' +
+        icon('plus') + 'Add inbox</button></div>') +
+      '<div class="panel-foot">' + mbConfigHint() + '</div></section>';
     return;
   }
-  const b = wuInbox();
-
-  sw.innerHTML = list.length > 1
-    ? '<div class="toolbar wu-switch"><div class="segmented wu-seg" role="tablist" aria-label="Inbox">' + list.map((x, i) => {
-        const m = wuMeta(x);
-        return '<button role="tab" aria-selected="' + (x.email === _wu.sel) + '" class="' + (x.email === _wu.sel ? 'on' : '') +
-          '" onclick="wuSelect(' + i + ')" title="' + escHtml(m[0]) + '">' +
-          '<span class="wu-seg-ic t-' + m[1] + '">' + icon(TONE_ICON[m[1]]) + '</span>' +
-          '<span class="mono">' + escHtml(x.email) + '</span>' +
-          (x.primary ? '<span class="wu-seg-tag">primary</span>' : '') + '</button>';
-      }).join('') +
-      '</div>' + wuRotationNote() + '</div>'
-    : '<div class="toolbar wu-switch"><span class="wu-one">' + icon('envelope-simple') +
-        '<span class="mono">' + escHtml(b.email || 'your sending inbox') + '</span>' +
-        '<span class="toolbar-note">' + (_wu.data.rotation ? 'the only mailbox in the rotation' : 'the inbox Mercury sends from') + '</span></span>' +
-        wuRotationNote() + '</div>';
-
-  body.innerHTML =
-    '<div class="kpis" id="wu-hero">' + wuHero(b) + '</div>' +
-    '<div class="grid-2-1">' +
-      '<div class="stack">' +
-        '<section class="panel" id="wu-ramp-panel">' + wuRampPanel(b) + '</section>' +
-        '<section class="panel" id="wu-plan-panel"></section>' +
+  if (!document.getElementById('mb-table')) {
+    body.innerHTML = '<div class="kpis kpis-3" id="mb-summary"></div>' +
+      '<div class="toolbar mb-toolbar">' +
+        '<label class="search-field">' + icon('magnifying-glass') +
+          '<input type="search" id="mb-search" placeholder="Search ' + list.length + ' inboxes" autocomplete="off" ' +
+          'aria-label="Search inboxes" oninput="mbSearch(this.value)"></label>' +
+        '<div class="segmented" id="mb-filters" role="tablist" aria-label="Filter inboxes"></div>' +
+        '<button class="btn btn-primary btn-sm mb-add" onclick="mbOpenSettings(null)">' + icon('plus') + 'Add inbox</button>' +
       '</div>' +
-      '<div class="stack">' +
-        '<section class="panel" id="wu-dns-panel"></section>' +
-        '<section class="panel" id="wu-notes-panel">' + wuNotesPanel(b) + '</section>' +
-        '<section class="panel">' + wuRulesPanel(b) + '</section>' +
-      '</div>' +
+      '<div class="table-card mb-table" id="mb-table"></div>';
+  }
+  const search = document.getElementById('mb-search');
+  if (search) search.placeholder = 'Search ' + list.length + ' inbox' + (list.length === 1 ? '' : 'es');
+  document.getElementById('mb-summary').innerHTML = mbSummary();
+  document.getElementById('mb-filters').innerHTML = MB_FILTERS.map(([k, label]) => {
+    const n = list.filter(b => mbInFilter(b, k)).length;
+    return '<button role="tab" aria-selected="' + (_mb.filter === k) + '" class="' + (_mb.filter === k ? 'on' : '') +
+      '" onclick="mbSetFilter(\'' + k + '\')">' + label + '<span class="mb-count' + (k === 'needs' && n ? ' bad' : '') + '">' + n + '</span></button>';
+  }).join('');
+  renderMbTable();
+}
+
+function mbSearch(v) { _mb.q = v || ''; renderMbTable(); }
+function mbSetFilter(k) { _mb.filter = k; renderMailboxes(); }
+
+function mbSummary() {
+  const d = _mb.data || {};
+  const list = mbList();
+  const kpi = (label, value, foot, extra) =>
+    '<div class="kpi static"><span class="kpi-label">' + label + '</span>' + value + (extra || '') +
+    '<span class="kpi-foot">' + foot + '</span></div>';
+
+  const sent = Number(d.sent_24h || 0), cap = Number(d.capacity_today || 0);
+  const pct = cap ? Math.min(100, sent / cap * 100) : 0;
+  const sending = kpi('Sending today',
+    '<span class="kpi-value tight' + (sent ? '' : ' zero') + '">' + fmtN(sent) + '<small>/ ' + fmtN(cap) + ' allowed</small></span>',
+    cap ? (Math.max(0, cap - sent) ? '<b>' + fmtN(Math.max(0, cap - sent)) + '</b> more allowed in the last 24 h' : 'Today\'s capacity is used up')
+      + (d.capped_by_global ? ' &middot; overall limit ' + fmtN(d.max_daily_sends) : '')
+      : 'No cold email allowed today',
+    '<span class="kpi-bar' + (cap && sent >= cap ? ' full' : '') + '"><span style="width:' + pct.toFixed(1) + '%"></span></span>');
+
+  const groups = [['warm', 'warm', 'mb-s-good'], ['warming', 'warming', 'mb-s-active'], ['soon', 'starting soon', 'mb-s-idle'],
+    ['hold', 'on hold', 'mb-s-wait'], ['paused', 'paused', 'mb-s-bad'], ['replies', 'replies only', 'mb-s-idle']];
+  const counts = {};
+  list.forEach(b => { const k = mbStage(b).key; counts[k] = (counts[k] || 0) + 1; });
+  const stack = '<span class="mb-stack" aria-hidden="true">' + groups.filter(g => counts[g[0]]).map(g =>
+    '<span class="' + g[2] + '" style="flex:' + counts[g[0]] + '"></span>').join('') + '</span>';
+  const inboxes = kpi('Inboxes',
+    '<span class="kpi-value tight">' + fmtN(list.length) + '<small>across ' + fmtN(new Set(list.map(b => b.domain)).size) + ' domain' +
+      (new Set(list.map(b => b.domain)).size === 1 ? '' : 's') + '</small></span>',
+    groups.filter(g => counts[g[0]]).map(g => '<b>' + counts[g[0]] + '</b> ' + g[1]).join(' &middot; '), stack);
+
+  const issues = [];
+  const failing = [...new Set(list.filter(b => mbDnsFails(b.domain)).map(b => b.domain))];
+  failing.forEach(dm => issues.push(['bad', dm + ' fails DNS checks']));
+  list.filter(b => b.status === 'paused').forEach(b => issues.push(['bad', b.email + ' is paused']));
+  const held = list.filter(b => mbStage(b).key === 'hold').length;
+  if (held) issues.push(['waiting', held + ' ramp' + (held === 1 ? '' : 's') + ' on hold from bounces']);
+  const noPw = list.filter(b => b.configured === false).length;
+  if (noPw) issues.push(['bad', noPw + ' inbox' + (noPw === 1 ? '' : 'es') + ' missing a password']);
+  const needs = kpi('Needs you',
+    '<span class="kpi-value tight' + (issues.length ? '' : ' zero') + '">' + issues.length + '<small>' + (issues.length === 1 ? 'item' : 'items') + '</small></span>',
+    issues.length ? '<span class="mb-issues">' + issues.slice(0, 3).map(i => toneBadge(i[0], i[1])).join('') +
+      (issues.length > 3 ? '<span class="muted">and ' + (issues.length - 3) + ' more</span>' : '') + '</span>'
+      : toneBadge('good', 'Nothing needs you'));
+  return sending + inboxes + needs;
+}
+
+function mbMini(parts, total) {
+  return '<span class="mb-mini" aria-hidden="true">' + parts.filter(p => p[0] > 0).map(p =>
+    '<span class="' + p[1] + '" style="width:' + Math.min(100, p[0] / (total || 1) * 100).toFixed(1) + '%"></span>').join('') + '</span>';
+}
+
+function mbDnsMini(domain) {
+  const d = mbDns(domain);
+  if (!d) return '<span class="mb-dns muted">DNS not checked</span>';
+  const keys = ['mx', 'spf', 'dkim', 'dmarc'];
+  const st = Object.fromEntries((d.checks || []).map(c => [c.key, c.status]));
+  const pass = keys.filter(k => st[k] === 'pass').length;
+  return '<span class="mb-dns" title="MX, SPF, DKIM, DMARC">' + keys.map(k =>
+    '<span class="mb-dns-b s-' + escHtml(st[k] || 'unknown') + '"></span>').join('') +
+    '<span class="mb-dns-l">' + (d.all_pass ? 'DNS ok' : (mbDnsFails(domain) || (d.checks || []).some(c => c.status === 'warn')) ? pass + '/4 DNS' : 'DNS unclear') + '</span></span>';
+}
+
+function renderMbTable() {
+  const el = document.getElementById('mb-table');
+  if (!el) return;
+  const list = mbList();
+  const shown = list.filter(mbMatches);
+  if (!shown.length) {
+    el.innerHTML = '<div class="panel-body">' + emptyState('magnifying-glass', 'No inboxes match',
+      'Try a different search or filter.') + '</div>';
+    return;
+  }
+  const byDomain = {};
+  shown.forEach(b => (byDomain[b.domain || mbDomainOf(b.email)] ||= []).push(b));
+  const domainNeeds = dm => (byDomain[dm] || []).some(mbNeeds) || mbDnsFails(dm);
+  const domains = Object.keys(byDomain).sort((a, b) => (domainNeeds(b) - domainNeeds(a)) || a.localeCompare(b));
+  const filtering = !!_mb.q.trim() || _mb.filter !== 'all';
+  const autoOpen = list.length <= 12;
+
+  const rows = domains.map(dm => {
+    const boxes = byDomain[dm];
+    const all = list.filter(b => b.domain === dm);
+    const open = filtering || (_mb.open[dm] !== undefined ? _mb.open[dm] : (autoOpen || domainNeeds(dm)));
+    const sent = all.reduce((s, b) => s + Number(b.sent_today || 0), 0);
+    const cap = all.reduce((s, b) => s + Number(b.today_cap || 0), 0);
+    const flags = [];
+    if (mbDnsFails(dm)) flags.push(toneBadge('bad', 'Fix DNS'));
+    const paused = all.filter(b => b.status === 'paused').length;
+    if (paused) flags.push(toneBadge('bad', paused + ' paused'));
+    const held = all.filter(b => mbStage(b).key === 'hold').length;
+    if (held) flags.push(toneBadge('waiting', held + ' on hold'));
+    const head = '<tr class="mb-group"><td colspan="7"><div class="mb-group-in">' +
+      '<button class="mb-caret" aria-expanded="' + open + '" aria-label="' + (open ? 'Collapse ' : 'Expand ') + escHtml(dm) +
+        '" onclick="mbToggleDomain(' + mbArg(dm) + ')">' + icon(open ? 'caret-down' : 'caret-right') + '</button>' +
+      '<button class="mb-domain mono" onclick="mbOpenDomain(' + mbArg(dm) + ')">' + escHtml(dm) + '</button>' +
+      '<span class="mb-group-meta">' + all.length + ' inbox' + (all.length === 1 ? '' : 'es') + ' &middot; <span class="mono">' + fmtN(sent) + '/' + fmtN(cap) + '</span> today</span>' +
+      mbDnsMini(dm) + flags.join('') +
+      '<button class="link-btn mb-group-open" onclick="mbOpenDomain(' + mbArg(dm) + ')">Domain' + icon('arrow-right') + '</button>' +
+    '</div></td></tr>';
+    if (!open) return head;
+    return head + boxes.map(b => {
+      const st = mbStage(b);
+      const [next, nextTone] = mbNext(b);
+      const target = Number(b.target_daily || 0), tcap = Number(b.today_cap || 0), sentB = Number(b.sent_today || 0);
+      const ramp = st.key === 'soon' ? mbMini([], 1) + '<span class="mb-cell-n">not started</span>'
+        : b.ramp_days ? mbMini([[Math.min(b.day || 0, b.ramp_days), b.stage === 'warm' ? 'mb-s-good' : 'mb-s-active']], b.ramp_days) +
+            '<span class="mb-cell-n">Day ' + fmtN(Math.min(b.day || 0, b.ramp_days)) + '/' + fmtN(b.ramp_days) + '</span>'
+        : mbMini([[1, 'mb-s-good']], 1) + '<span class="mb-cell-n">Full</span>';
+      const today = tcap
+        ? mbMini([[sentB, 'mb-s-sent'], [Math.max(0, tcap - sentB), 'mb-s-left']], target || tcap) + '<span class="mb-cell-n">' + fmtN(sentB) + '/' + fmtN(tcap) + '</span>'
+        : mbMini([], 1) + '<span class="mb-cell-n muted">none</span>';
+      const h = b.health || {};
+      const br = h.bounce_rate;
+      const brCls = br === null || br === undefined ? ' muted' : br >= 0.05 ? ' is-bad' : br >= 0.03 ? ' is-wait' : '';
+      return '<tr class="mb-row' + (_mb.view && _mb.view.email === b.email ? ' sel' : '') + '" tabindex="0" ' +
+        'onclick="mbOpenInbox(' + mbArg(b.email) + ')" onkeydown="if(event.key===\'Enter\'){event.preventDefault();mbOpenInbox(' + mbArg(b.email) + ')}">' +
+        '<td class="mb-c-inbox"><span class="mono">' + escHtml(b.email) + '</span></td>' +
+        '<td>' + toneBadge(st.tone, st.label) + '</td>' +
+        '<td><span class="mb-cell">' + ramp + '</span></td>' +
+        '<td><span class="mb-cell">' + today + '</span></td>' +
+        '<td class="num' + brCls + '">' + fmtPct(br) + '</td>' +
+        '<td class="num' + (h.reply_rate === null || h.reply_rate === undefined ? ' muted' : '') + '">' + fmtPct(h.reply_rate) + '</td>' +
+        '<td class="mb-c-next' + (nextTone === 'bad' ? ' is-bad' : nextTone === 'waiting' ? ' is-wait' : '') + '">' + escHtml(next) + '</td>' +
+      '</tr>';
+    }).join('');
+  }).join('');
+
+  el.innerHTML = '<table><thead><tr><th>Inbox</th><th>Stage</th><th>Ramp</th><th>Today</th>' +
+    '<th class="num">Bounces 7d</th><th class="num">Replies 7d</th><th>Next</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    '<div class="panel-foot mb-foot"><span>Domains that need you come first' + (autoOpen ? '.' : '; the rest stay folded.') + '</span>' +
+    '<span class="muted">' + fmtN(shown.length) + ' of ' + fmtN(list.length) + ' shown</span></div>';
+}
+
+function mbToggleDomain(dm) {
+  const el = document.querySelector('#mb-table');
+  const list = mbList();
+  const cur = _mb.open[dm] !== undefined ? _mb.open[dm]
+    : (list.length <= 12 || list.some(b => b.domain === dm && mbNeeds(b)) || mbDnsFails(dm));
+  _mb.open[dm] = !cur;
+  if (el) renderMbTable();
+}
+
+// ── Inbox drawer ──
+
+function mbDrawerActions(html) {
+  const el = document.getElementById('drawer-actions');
+  if (el) el.innerHTML = html || '';
+}
+
+function mbOpenInbox(email, mode) {
+  const b = mbFind(email);
+  if (!b) return;
+  _mb.view = { kind: 'inbox', email, mode: mode || 'overview' };
+  if (_mb.view.mode === 'settings') { mbOpenSettings(email); return; }
+  const st = mbStage(b);
+  const peers = mbList().filter(x => x.domain === b.domain);
+  const idx = peers.findIndex(x => x.email === email);
+  const sub = toneBadge(st.tone, st.label) +
+    (b.ramp_days && b.day ? '<span class="mb-sub-t">Day ' + fmtN(Math.min(b.day, b.ramp_days)) + ' of ' + fmtN(b.ramp_days) + '</span>'
+      : st.key === 'soon' ? '<span class="mb-sub-t">Ramp starts ' + escHtml(shortDay(b.start_date)) + '</span>' : '');
+  openDrawer(escHtml(b.domain) + (peers.length > 1 ? ' · ' + (idx + 1) + ' of ' + peers.length : ''), b.email, sub, mbInboxBody(b));
+  const nav = peers.length > 1
+    ? '<button class="btn-square xs" title="Previous inbox" aria-label="Previous inbox" onclick="mbStep(-1)">' + icon('caret-up') + '</button>' +
+      '<button class="btn-square xs" title="Next inbox" aria-label="Next inbox" onclick="mbStep(1)">' + icon('caret-down') + '</button>' : '';
+  mbDrawerActions(nav +
+    (b.status === 'paused'
+      ? '<button class="btn btn-primary btn-sm" onclick="mbAction(\'resume\')">' + icon('play') + 'Resume</button>'
+      : '<button class="btn btn-secondary btn-sm" onclick="mbAction(\'pause\')">' + icon('pause') + 'Pause</button>') +
+    '<button class="btn-square" title="Inbox settings" aria-label="Inbox settings" onclick="mbOpenSettings(' + mbArg(b.email) + ')">' + icon('gear-six') + '</button>');
+  const wrap = document.getElementById('mb-ramp');
+  if (wrap) { mbDrawRamp(); observeWidth(wrap, mbDrawRamp); }
+  document.querySelectorAll('#mb-table .mb-row').forEach(r => r.classList.toggle('sel', r.textContent.startsWith(b.email)));
+}
+
+function mbStep(dir) {
+  const b = _mb.view && mbFind(_mb.view.email);
+  if (!b) return;
+  const peers = mbList().filter(x => x.domain === b.domain);
+  const i = peers.findIndex(x => x.email === b.email);
+  const next = peers[(i + dir + peers.length) % peers.length];
+  if (next) mbOpenInbox(next.email);
+}
+
+function mbRefreshDrawer() {
+  if (!drawerOpen() || !_mb.view || mbBusy()) return;
+  if (_mb.view.kind === 'inbox' && _mb.view.mode === 'overview') mbOpenInbox(_mb.view.email);
+  else if (_mb.view.kind === 'domain') mbOpenDomain(_mb.view.domain);
+}
+
+function mbInboxBody(b) {
+  const st = mbStage(b);
+  const h = b.health || {};
+  const target = Number(b.target_daily || 0), cap = Number(b.today_cap || 0), sent = Number(b.sent_today || 0);
+  const left = Math.max(0, Number(b.remaining || 0));
+  const headline = st.key === 'paused' ? 'Paused. No cold email goes out until you resume.'
+    : st.key === 'soon' ? 'The ramp starts ' + escHtml(longDay(b.start_date)) + '.'
+    : b.configured === false ? 'Add the password before this inbox can send.'
+    : st.key === 'replies' ? 'Replies only. No new outreach from this inbox.'
+    : !cap ? 'No cold email allowed today.'
+    : left ? 'Can send ' + fmtN(left) + ' more today.' : 'Today\'s cap is used up.';
+  const locked = Math.max(0, target - cap);
+  let html = '<div class="drawer-section mb-today"><p class="mb-headline">' + headline + '</p>' +
+    (target ? '<div class="mb-dist" aria-hidden="true">' +
+      (sent ? '<span class="mb-s-sent" style="flex:' + sent + '"></span>' : '') +
+      (Math.max(0, cap - sent) ? '<span class="mb-s-left" style="flex:' + Math.max(0, cap - sent) + '"></span>' : '') +
+      (locked ? '<span class="mb-s-lock" style="flex:' + locked + '"></span>' : '') + '</div>' +
+      '<div class="mb-legend"><span><i class="mb-s-sent"></i>' + fmtN(sent) + ' sent</span>' +
+        '<span><i class="mb-s-left"></i>' + fmtN(Math.max(0, cap - sent)) + ' left today</span>' +
+        (locked ? '<span><i class="mb-s-lock"></i>' + fmtN(locked) + ' unlock as it warms</span>' : '') + '</div>' : '') +
     '</div>';
 
-  renderWuPlan();
-  renderWuDns();
-  renderWuRamp();
-  observeWidth(document.getElementById('wu-ramp'), renderWuRamp);
-  if (b.domain && !_wu.dns[b.domain]) loadWuDns(false);
-}
-
-function wuRotationNote() {
-  const d = _wu.data || {};
-  if (!d.max_daily_sends) return '';
-  return '<span class="toolbar-note wu-total"><b>' + fmtN(d.sent_24h || 0) + '</b> sent in 24 h &middot; ' +
-    'capacity today <b>' + fmtN(d.capacity_today || 0) + '</b>' +
-    (d.capped_by_global ? ' (max_daily_sends ' + fmtN(d.max_daily_sends) + ')' : '') + '</span>';
-}
-
-function wuHero(b) {
-  const key = wuKey(b);
-  const m = wuMeta(b);
-  const h = b.health || {};
-  const gate = h.gate || 'ok';
-  const cap = Number(b.today_cap || 0), target = Number(b.target_daily || 0);
-  const kpi = (label, value, foot, extra, cls) =>
-    '<div class="kpi static' + (cls ? ' ' + cls : '') + '"><span class="kpi-label">' + label + '</span>' +
-      value + (extra || '') + '<span class="kpi-foot">' + foot + '</span></div>';
-
-  // Today's cap — what the sender enforces right now
-  const capFoot = key === 'paused' ? 'Paused &middot; no cold email until you resume'
-    : key === 'scheduled' ? 'Ramp starts ' + escHtml(shortDay(b.start_date))
-    : gate === 'hold' && Number(b.base_cap || 0) > cap ? 'Held at yesterday\'s cap'
-    : key === 'warm' ? 'Full volume'
-    : b.ramp_days ? '<b>Day ' + fmtN(b.day) + '</b> of ' + fmtN(b.ramp_days) + ' &middot; full ' + escHtml(shortDay(b.full_on))
-    : '<b>Day ' + fmtN(b.day) + '</b> &middot; below the daily cap';
-  const capVal = '<span class="kpi-value' + (cap ? '' : ' zero') + '">' + fmtN(cap) +
-    '<small>/ ' + fmtN(target) + ' daily cap</small></span>';
-
-  // Sent in the rolling 24 hours (the window the cap is enforced over)
-  const sent = Number(b.sent_today || 0);
-  const pct = cap ? Math.min(100, sent / cap * 100) : 0;
-  const left = Number(b.remaining || 0);
-  const sentFoot = key === 'paused' ? 'Replies to people who wrote back still go out'
-    : !b.configured ? toneBadge('bad', 'No password in .env')
-    : !cap ? 'No cold email allowed today'
-    : left ? '<b>' + fmtN(left) + '</b> more allowed now'
-    : 'Cap reached &middot; the rest wait';
-  const sentVal = '<span class="kpi-value tight' + (sent ? '' : ' zero') + '">' + fmtN(sent) +
-    (cap ? '<small>/ ' + fmtN(cap) + '</small>' : '') + '</span>';
-  const bar = '<span class="kpi-bar' + (cap && sent >= cap ? ' full' : '') + '"><span style="width:' + pct.toFixed(1) + '%"></span></span>';
-
-  // Bounce rate (7d) + gate
-  const gateFoot = key === 'paused' && gate !== 'ok' ? toneBadge('bad', 'Bounces over 5%')
-    : gate === 'pause' ? toneBadge('bad', 'Bounces over 5%')
-    : gate === 'hold' ? toneBadge('waiting', 'Ramp on hold')
-    : toneBadge('good', h.sent_7d ? 'Healthy' : 'Healthy · nothing sent yet');
-  const bVal = '<span class="kpi-value' + (h.bounce_rate === null || h.bounce_rate === undefined ? ' zero' : '') +
-    (gate === 'pause' ? ' is-bad' : gate === 'hold' ? ' is-wait' : '') + '">' + fmtPct(h.bounce_rate) +
-    '<small>' + fmtN(h.sent_7d) + ' sent in 7 days</small></span>';
-
-  // Status + the one action this tab owns: pause / resume
-  const act = (a, label, cls, ic) => '<button class="btn ' + cls + ' btn-sm" onclick="wuAction(\'' + a + '\')">' +
-    (ic ? icon(ic) : '') + label + '</button>';
-  const actions = !b.email ? ''
-    : key === 'paused' ? act('resume', 'Resume', 'btn-primary', 'play')
-    : act('pause', 'Pause', 'btn-secondary', 'pause');
-  const stVal = '<span class="kpi-value wu-status t-' + m[1] + '">' + icon(TONE_ICON[m[1]]) + escHtml(m[0]) + '</span>';
-  const subs = [];
-  if (b.start_date) subs.push((key === 'scheduled' ? 'Starts ' : 'Started ') + escHtml(shortDay(b.start_date)));
-  if (b.accepts_new === false) subs.push('no new threads');
-  const since = subs.length ? '<span class="kpi-sub">' + subs.join(' &middot; ') + '</span>' : '';
-
-  return kpi('Today\'s cap', capVal, capFoot) +
-    kpi('Sent (24 h)', sentVal, sentFoot, bar) +
-    kpi('Bounce rate (7d)', bVal, gateFoot, '', 'gate-' + gate) +
-    kpi('Status', stVal, '<span class="kpi-actions">' + actions + '</span>', since, 'wu-status-card');
-}
-
-function wuRampPanel(b) {
-  const hasPlan = (b.plan || []).length > 0;
-  const d = _wu.data || {};
-  const desc = hasPlan
-    ? 'Planned daily cap from ' + escHtml(shortDay(b.start_date)) +
-      (b.full_on ? ' to full volume on ' + escHtml(shortDay(b.full_on)) : '') + ', with what actually went out.'
-    : 'Starts at ' + fmtN(d.warmup_initial_cap) + '/day and adds ' + fmtN(d.warmup_weekly_increase) + ' every week.';
-  return '<div class="panel-head wrap"><div><h3>Ramp</h3><p>' + desc + '</p></div>' +
-      (hasPlan ? '<div class="legend static">' +
-        '<span class="legend-btn"><span class="sw sw-cap"></span>Planned cap</span>' +
+  if ((b.plan || []).length) {
+    html += '<div class="drawer-section"><div class="mb-sec-head"><h4>Ramp</h4><span class="muted">' + fmtN(cap) + '/day now' +
+      (b.full_on ? ', ' + fmtN(target) + '/day from ' + escHtml(shortDay(b.full_on)) : '') + '</span></div>' +
+      '<div class="chart-wrap ramp mb-ramp" id="mb-ramp"></div>' +
+      '<div class="legend static mb-ramp-legend"><span class="legend-btn"><span class="sw sw-cap"></span>Planned cap</span>' +
         '<span class="legend-btn"><span class="sw sw-sent-bar"></span>Sent</span>' +
-        '<span class="legend-btn"><span class="sw sw-target"></span>Daily cap</span></div>' : '') +
-    '</div>' +
-    (hasPlan
-      ? '<div class="chart-wrap ramp" id="wu-ramp"></div>'
-      : '<div class="panel-body">' + emptyState('fire', 'This inbox is already at full volume',
-          'It sends up to <b>' + fmtN(b.target_daily) + ' a day</b>. To ramp a new inbox, give it a ' +
-          '<span class="mono">warmup_start</span> date in mercury.yaml.') + '</div>') +
-    '<div class="panel-foot wu-ramp-foot">' + wuConfigHint(_wu.hint) + '</div>';
+        '<span class="legend-btn"><span class="sw sw-target"></span>Daily cap</span></div></div>';
+  } else {
+    html += '<div class="drawer-section"><h4>Ramp</h4><p class="drawer-note">Already at full volume: up to <b>' + fmtN(target) +
+      ' a day</b>. Give it a warm-up start date in settings to ramp it.</p></div>';
+  }
+
+  html += '<div class="drawer-section"><div class="mb-stats">' +
+    '<div><span>Bounces 7d</span><b class="' + (h.gate === 'pause' ? 'is-bad' : h.gate === 'hold' ? 'is-wait' : '') + '">' + fmtPct(h.bounce_rate) + '</b></div>' +
+    '<div><span>Replies 7d</span><b>' + fmtPct(h.reply_rate) + '</b></div>' +
+    '<div><span>Sent 7d</span><b>' + fmtN(h.sent_7d || 0) + '</b></div></div>' +
+    (h.gate && h.gate !== 'ok' || b.status === 'paused'
+      ? '<div class="ev-note bad">' + icon('warning-circle') + '<span>' + escHtml(b.pause_reason || h.reason || 'Paused by hand.') +
+        ' Mercury holds the ramp at 3% bounces and pauses the inbox at 5%. Replies still go out.</span></div>' : '') +
+    '</div>';
+
+  if (mbDnsFails(b.domain)) {
+    const d = mbDns(b.domain);
+    const fails = (d.checks || []).filter(c => c.status === 'fail').length;
+    html += '<div class="ev-note bad mb-dns-note">' + icon('warning-circle') + '<span><b>' + escHtml(b.domain) + ' fails ' + fails + ' DNS check' +
+      (fails === 1 ? '' : 's') + '.</b> Shared by every inbox on the domain, so fix it once for all of them.</span>' +
+      '<button class="link-btn" onclick="mbOpenDomain(' + mbArg(b.domain) + ')">Open domain' + icon('arrow-right') + '</button></div>';
+  }
+
+  const open = mbOpenTasks(b);
+  const all = (b.weeks || []).flatMap(w => w.tasks || []).filter(t => t.key !== 'dns');
+  const done = all.filter(t => t.done).length;
+  html += '<div class="drawer-section"><div class="mb-sec-head"><h4>Checklist</h4><span class="muted">' + done + ' of ' + all.length + ' done</span></div>' +
+    (open.length ? '<div class="mb-tasks">' + open.map(t => mbTask(t, t.cur ? 'this week' : (t.week ? 'week ' + t.week : 'setup'))).join('') + '</div>'
+      : '<p class="drawer-note">' + (b.start_date ? 'Nothing open for this stage of the ramp.' : 'This inbox was added already warm, so there is nothing to catch up on.') + '</p>') +
+    '<details class="mb-plan"><summary>Full plan</summary>' + (b.weeks || []).map(w =>
+      '<div class="mb-plan-week"><div class="mb-plan-h"><b>' + (w.week === 0 ? 'Setup' : 'Week ' + w.week) + ': ' + escHtml(w.title) +
+        '</b><span class="muted">' + escHtml(w.range || '') + '</span></div>' +
+      (w.tasks || []).filter(t => t.key !== 'dns').map(t => mbTask(t, '')).join('') + '</div>').join('') + '</details></div>';
+
+  html += '<div class="drawer-section"><h4><label for="mb-notes">Notes</label></h4><textarea class="form-input wu-notes" id="mb-notes" rows="3" ' +
+    'placeholder="e.g. Google Postmaster verified Oct 2; forwarding set up for replies" onblur="mbSaveNotes(this)">' +
+    escHtml(b.notes || '') + '</textarea><div class="wu-notes-hint" id="mb-notes-hint">Saves when you click away.</div></div>';
+  return html;
 }
 
-function renderWuRamp() {
-  const wrap = document.getElementById('wu-ramp');
-  const b = wuInbox();
+function mbTask(t, tag) {
+  const id = 'mbt-' + escHtml(t.key) + (tag ? '' : '-p');
+  return '<label class="wu-task' + (t.done ? ' done' : '') + '" for="' + id + '">' +
+    '<input type="checkbox" id="' + id + '" ' + (t.done ? 'checked ' : '') +
+      'onchange="mbToggleTask(\'' + escHtml(t.key) + '\', this.checked)">' +
+    '<span class="wu-task-l">' + escHtml(t.label) + '</span>' +
+    (tag ? '<span class="mb-task-tag' + (tag !== 'this week' ? ' late' : '') + '">' + escHtml(tag) + '</span>' : '') + '</label>';
+}
+
+async function mbToggleTask(key, done) {
+  const b = _mb.view && mbFind(_mb.view.email);
+  if (!b) return;
+  const task = (b.weeks || []).flatMap(w => w.tasks || []).find(t => t.key === key);
+  if (!task) return;
+  task.done = done;
+  const res = await postJSON('/api/warmup/inboxes/' + mbEnc(b.email) + '/task', { key, done });
+  if (!res.ok) {
+    task.done = !done;
+    showToast('Couldn\'t save that: ' + res.error, 'error');
+  }
+  _mb.key = JSON.stringify(_mb.data);
+  mbOpenInbox(b.email);
+  renderMbTable();
+}
+
+async function mbSaveNotes(ta) {
+  const b = _mb.view && mbFind(_mb.view.email);
+  if (!b || (b.notes || '') === ta.value) return;
+  const hint = document.getElementById('mb-notes-hint');
+  if (hint) hint.textContent = 'Saving…';
+  const res = await postJSON('/api/warmup/inboxes/' + mbEnc(b.email), { notes: ta.value });
+  if (res.ok) {
+    b.notes = ta.value;
+    _mb.key = JSON.stringify(_mb.data);
+    if (hint) hint.textContent = 'Saved.';
+  } else {
+    if (hint) hint.textContent = 'Not saved: ' + res.error;
+    showToast('Couldn\'t save notes: ' + res.error, 'error');
+  }
+}
+
+const MB_DONE = {
+  pause: 'Inbox paused. No cold email goes out from it until you resume.',
+  resume: 'Inbox resumed. The bounce window starts fresh from now.',
+};
+
+async function mbAction(action, email) {
+  const b = mbFind(email || (_mb.view && _mb.view.email));
+  if (!b) return false;
+  if (action === 'pause' && !(await confirmModal({
+    title: 'Pause ' + b.email + '?',
+    copy: 'Openers and follow-ups from this inbox wait until you resume (nothing is cancelled). Replies to people who wrote back still go out.',
+    ok: 'Pause inbox',
+  }))) return false;
+  const res = await postJSON('/api/warmup/inboxes/' + mbEnc(b.email) + '/action', { action });
+  if (res.ok) showToast(MB_DONE[action] || 'Done.', 'success');
+  else showToast('Couldn\'t ' + action + ': ' + res.error, 'error');
+  await loadMailboxes();
+  if (!email && drawerOpen() && _mb.view && _mb.view.kind === 'inbox') mbOpenInbox(b.email);
+  return res.ok;
+}
+
+// The original warm-up ramp: week bands, planned cap with sent laid over it,
+// the daily-cap line and a Today marker.
+function mbDrawRamp() {
+  const wrap = document.getElementById('mb-ramp');
+  const b = _mb.view && mbFind(_mb.view.email);
   if (!wrap || !b) return;
   const plan = b.plan || [];
   const W = wrap.clientWidth;
   if (!W || !plan.length) return;
-  const n = plan.length, H = W < 560 ? 220 : 252;
+  const n = plan.length, H = W < 560 ? 210 : 252;
   const target = Number(b.target_daily || 0);
   const max = Math.max(target, ...plan.map(p => Math.max(p.cap || 0, p.sent || 0)));
   const { top, ticks } = niceTicks(max * 1.08, 4);
-  const padL = 14 + Math.max(2, String(top).length) * 7, padR = 12, padT = 26, padB = 30;
+  const padL = 14 + Math.max(2, String(top).length) * 7, padR = 6, padT = 26, padB = 30;
   const x0 = padL, x1 = W - padR, y0 = padT, y1 = H - padB;
   const slot = (x1 - x0) / n, bw = Math.max(3, Math.min(22, slot * 0.62));
   const cx = i => x0 + slot * (i + 0.5);
@@ -3211,36 +3459,31 @@ function renderWuRamp() {
 
   let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
     'aria-label="Send ramp: planned daily cap and emails actually sent">';
-  // week bands, labelled W1, W2, ...
   for (let w = 0; w * 7 < n; w++) {
     const bx = x0 + w * 7 * slot, bwid = Math.min(7, n - w * 7) * slot;
     svg += '<rect class="rp-band' + (w % 2 ? ' alt' : '') + (w === curWeek ? ' cur' : '') + '" x="' + bx.toFixed(1) + '" y="' + (y0 - 20) +
       '" width="' + bwid.toFixed(1) + '" height="' + (y1 - y0 + 20) + '" rx="6"/>' +
-      '<text class="rp-week' + (w === curWeek ? ' cur' : '') + '" x="' + (bx + 8).toFixed(1) + '" y="' + (y0 - 6) + '">W' + (w + 1) + '</text>';
+      '<text class="rp-week' + (w === curWeek ? ' cur' : '') + '" x="' + (bx + 6).toFixed(1) + '" y="' + (y0 - 6) + '">W' + (w + 1) + '</text>';
   }
   svg += yAxis(ticks, y, x0, x1, false);
-  // planned cap (soft) with actual sent laid over it (solid)
   svg += '<g>' + plan.map((p, i) => {
-    const capH = y1 - y(p.cap || 0);
     let r = '<rect class="rp-cap' + (i === todayIdx ? ' today' : '') + (todayIdx >= 0 && i > todayIdx ? ' future' : '') +
       '" x="' + (cx(i) - bw / 2).toFixed(1) + '" y="' + y(p.cap || 0).toFixed(1) + '" width="' + bw.toFixed(1) +
-      '" height="' + Math.max(0, capH).toFixed(1) + '" rx="3"/>';
+      '" height="' + Math.max(0, y1 - y(p.cap || 0)).toFixed(1) + '" rx="2"/>';
     if (p.sent !== null && p.sent !== undefined && p.sent > 0) {
       r += '<rect class="rp-sent' + (p.sent > (p.cap || 0) ? ' over' : '') + '" x="' + (cx(i) - bw / 2).toFixed(1) + '" y="' + y(p.sent).toFixed(1) +
-        '" width="' + bw.toFixed(1) + '" height="' + (y1 - y(p.sent)).toFixed(1) + '" rx="3"/>';
+        '" width="' + bw.toFixed(1) + '" height="' + (y1 - y(p.sent)).toFixed(1) + '" rx="2"/>';
     }
     return r;
   }).join('') + '</g>';
-  // target line
   if (target) {
     svg += '<line class="rp-target" x1="' + x0 + '" x2="' + x1 + '" y1="' + y(target).toFixed(1) + '" y2="' + y(target).toFixed(1) + '"/>' +
-      '<text class="rp-target-l" x="' + (x1 - 4) + '" y="' + (y(target) - 6).toFixed(1) + '" text-anchor="end">Daily cap ' + fmtN(target) + '/day</text>';
+      '<text class="rp-target-l" x="' + (x1 - 2) + '" y="' + (y(target) - 6).toFixed(1) + '" text-anchor="end">Daily cap ' + fmtN(target) + '/day</text>';
   }
-  // x labels: the first day of each week, plus a Today marker
   const xl = [];
-  for (let i = 0; i < n; i += 7) xl.push(i);
-  if (n - 1 - xl[xl.length - 1] >= 4) xl.push(n - 1);
-  svg += '<g class="ch-x">' + xl.filter(i => todayIdx < 0 || Math.abs(i - todayIdx) * slot > 46).map(i =>
+  for (let i = 0; i < n; i += 14) xl.push(i);
+  if (n - 1 - xl[xl.length - 1] >= 6) xl.push(n - 1);
+  svg += '<g class="ch-x">' + xl.filter(i => todayIdx < 0 || Math.abs(i - todayIdx) * slot > 40).map(i =>
     '<text x="' + cx(i).toFixed(1) + '" y="' + (H - 9) + '" text-anchor="middle">' + svgEsc(shortDay(plan[i].date)) + '</text>').join('') + '</g>';
   if (todayIdx >= 0) {
     svg += '<line class="rp-today" x1="' + cx(todayIdx).toFixed(1) + '" x2="' + cx(todayIdx).toFixed(1) + '" y1="' + y0 + '" y2="' + (y1 + 4) + '"/>' +
@@ -3248,8 +3491,7 @@ function renderWuRamp() {
   }
   svg += '<line class="ch-base" x1="' + x0 + '" x2="' + x1 + '" y1="' + y1 + '" y2="' + y1 + '"/><g class="ch-hover"></g></svg>';
   wrap.innerHTML = svg;
-  chartIntro(wrap, (b.email || '') + '|' + (b.plan || []).map(p => p.cap + ':' + (p.sent ?? '')).join(','));
-
+  chartIntro(wrap, (b.email || '') + '|' + plan.map(p => p.cap + ':' + (p.sent ?? '')).join(','));
   chartHover(wrap, {
     xs: plan.map((_, i) => cx(i)), x0, x1, y0: y0 - 20, y1, band: slot * 0.92,
     html: i => {
@@ -3257,88 +3499,164 @@ function renderWuRamp() {
       const when = i === todayIdx ? 'Today' : (todayIdx >= 0 && i > todayIdx) ? 'Planned' : '';
       return '<div class="tip-date">Day ' + p.day + ' &middot; ' + svgEsc(longDay(p.date)) + '</div>' +
         '<div class="tip-row"><span class="sw sw-cap"></span>Cap<b>' + fmtN(p.cap) + '</b></div>' +
-        '<div class="tip-row"><span class="sw sw-sent-bar"></span>Sent<b>' + (p.sent === null || p.sent === undefined ? '—' : fmtN(p.sent)) + '</b></div>' +
+        '<div class="tip-row"><span class="sw sw-sent-bar"></span>Sent<b>' + (p.sent === null || p.sent === undefined ? '–' : fmtN(p.sent)) + '</b></div>' +
         (when ? '<div class="tip-row sub">' + when + '</div>' : '');
     },
   });
 }
 
-function renderWuPlan() {
-  const el = document.getElementById('wu-plan-panel');
-  const b = wuInbox();
-  if (!el || !b) return;
-  const weeks = b.weeks || [];
-  const cur = b.current_week === null || b.current_week === undefined ? 0 : b.current_week;
-  const open = _wu.open[b.email] || (_wu.open[b.email] = new Set([cur]));
-  const allTasks = weeks.flatMap(w => w.tasks || []);
-  const doneAll = allTasks.filter(t => t.done).length;
+// ── Inbox settings (in the drawer) ──
 
-  el.innerHTML = '<div class="panel-head"><div><h3>Plan</h3><p>What to do each week so the ramp lands in the inbox, not spam.</p></div>' +
-      (allTasks.length ? '<span class="toolbar-note"><b>' + doneAll + '</b> of ' + allTasks.length + ' done</span>' : '') + '</div>' +
-    (weeks.length ? '<div class="wu-weeks">' + weeks.map(w => {
-      const tasks = w.tasks || [];
-      const done = tasks.filter(t => t.done).length;
-      const isCur = w.week === cur, isPast = w.week < cur, isOpen = open.has(w.week);
-      const state = isCur ? '<span class="wu-now">This week</span>'
-        : (tasks.length && done === tasks.length) ? '<span class="wu-count good">' + icon('check-circle') + 'Done</span>'
-        : isPast ? '<span class="wu-count">' + done + '/' + tasks.length + ' done</span>'
-        : '<span class="wu-count">' + tasks.length + ' task' + (tasks.length === 1 ? '' : 's') + '</span>';
-      return '<div class="wu-week' + (isCur ? ' cur' : '') + (isPast ? ' past' : '') + (isOpen ? ' open' : '') + '">' +
-        '<button class="wu-week-head" aria-expanded="' + isOpen + '" onclick="wuToggleWeek(' + w.week + ')">' +
-          '<span class="wu-week-n">' + (w.week === 0 ? 'Prep' : 'W' + w.week) + '</span>' +
-          '<span class="wu-week-t"><b>' + escHtml(w.title) + '</b><small>' + escHtml(w.range || '') + '</small></span>' +
-          state + icon('caret-down', 'wu-caret') +
-        '</button>' +
-        (isOpen ? '<div class="wu-tasks">' + tasks.map(t => wuTask(b, t)).join('') + '</div>' : '') +
-      '</div>';
-    }).join('') + '</div>'
-    : '<div class="panel-body"><p class="muted" style="font-size:13px">No checklist for this inbox.</p></div>');
+async function mbLoadSettings() {
+  const data = await api('/api/settings/mailboxes');
+  _mb.settings = data && !data.error ? data : null;
+  return _mb.settings;
 }
 
-function wuTask(b, t) {
-  if (t.key === 'dns') {
-    return '<div class="wu-task auto' + (t.done ? ' done' : '') + '">' +
-      '<span class="wu-auto-ic' + (t.done ? ' ok' : '') + '">' + icon(t.done ? 'check-circle' : 'circle-dashed') + '</span>' +
-      '<span class="wu-task-l">' + escHtml(t.label) + '</span>' +
-      '<span class="wu-auto-tag">auto</span>' +
-      '<button class="link-btn" onclick="wuScrollDns()">See DNS' + icon('arrow-right') + '</button></div>';
-  }
-  const id = 'wut-' + escHtml(t.key);
-  return '<label class="wu-task' + (t.done ? ' done' : '') + '" for="' + id + '">' +
-    '<input type="checkbox" id="' + id + '" ' + (t.done ? 'checked ' : '') +
-      'onchange="wuToggleTask(\'' + escHtml(t.key) + '\', this.checked)">' +
-    '<span class="wu-task-l">' + escHtml(t.label) + '</span></label>';
-}
-
-function wuToggleWeek(w) {
-  const b = wuInbox();
-  if (!b) return;
-  const s = _wu.open[b.email] || (_wu.open[b.email] = new Set());
-  if (s.has(w)) s.delete(w); else s.add(w);
-  renderWuPlan();
-}
-
-async function wuToggleTask(key, done) {
-  const b = wuInbox();
-  if (!b) return;
-  const task = (b.weeks || []).flatMap(w => w.tasks || []).find(t => t.key === key);
-  if (!task) return;
-  task.done = done;                                   // optimistic
-  renderWuPlan();
-  const res = await postJSON('/api/warmup/inboxes/' + wuEnc(b.email) + '/task', { key, done });
-  if (!res.ok) {
-    task.done = !done;
-    renderWuPlan();
-    showToast('Couldn\'t save that: ' + res.error, 'error');
+async function mbOpenSettings(email) {
+  const s = await mbLoadSettings();
+  const adding = !email;
+  const live = email ? mbFind(email) : null;
+  const b = s && email ? (s.inboxes || []).find(x => x.email === email) : null;
+  _mb.view = { kind: 'inbox', email: email || null, mode: 'settings' };
+  if (!s || (email && !b)) {
+    openDrawer(email ? 'Inbox settings' : 'New inbox', email || 'Add inbox', '',
+      '<div class="ev-note bad">' + icon('warning-circle') + '<span>Couldn\'t load inbox settings. Check the configuration and try again.</span></div>');
+    mbDrawerActions(email ? '<button class="btn btn-secondary btn-sm" onclick="mbOpenInbox(' + mbArg(email) + ')">' + icon('caret-left') + 'Back</button>' : '');
     return;
   }
-  _wu.key = JSON.stringify(_wu.data);                 // keep the quiet refresh from flickering
+  const defaults = s.defaults || {};
+  const v = (k, d = '') => (b && b[k] !== undefined && b[k] !== null ? b[k] : d);
+  const input = (id, label, type, value, extra = '', hint = '') => '<div class="form-group"><label class="form-label" for="mbs-' + id + '">' + label +
+    '</label><input class="form-input" id="mbs-' + id + '" type="' + type + '" value="' + escHtml(value) + '" ' + extra + '>' +
+    (hint ? '<p class="mb-hint">' + hint + '</p>' : '') + '</div>';
+  const status = live && live.status === 'paused' ? 'paused' : (b && b.enabled === false ? 'replies' : 'sending');
+  const smtpHost = v('smtp_host') || defaults.smtp_host || '';
+  const imapHost = v('imap_host') || defaults.imap_host || '';
+  const ready = b && b.password_set && b.configured;
+  const conn = b ? (ready ? toneBadge('good', 'Ready') : !b.password_set ? toneBadge('waiting', 'Password needed') : toneBadge('waiting', 'Server needed')) : '';
+  const t = email && _mb.test[email];
+
+  const html = '<form id="mbs-form" class="mb-settings" onsubmit="mbSaveSettings(event)" autocomplete="off">' +
+    (adding ? '' : '<div class="drawer-section"><h4>Status</h4>' +
+      '<div class="segmented mb-status" role="radiogroup" aria-label="Inbox status">' +
+      [['sending', 'Sending', 'arrow-circle-right'], ['replies', 'Replies only', 'arrow-bend-up-left'], ['paused', 'Paused', 'pause-circle']].map(([k, l, ic]) =>
+        '<button type="button" role="radio" aria-checked="' + (status === k) + '" class="' + (status === k ? 'on' : '') + '" data-status="' + k + '" ' +
+        'onclick="mbPickStatus(this)">' + icon(ic) + l + '</button>').join('') + '</div>' +
+      '<p class="mb-hint">Replies only and Paused both keep answering people who wrote back. Follow-ups wait; nothing is cancelled.</p></div>') +
+    '<div class="drawer-section"><h4>Sender</h4><div class="form-row">' +
+      input('email', 'Email address', 'email', v('email', ''), 'required' + (adding ? '' : ' readonly'),
+        adding ? '' : 'Can\'t change: existing threads use it.') +
+      input('name', 'Sender name', 'text', v('name', ''), 'placeholder="Uses your default sender name"') + '</div></div>' +
+    '<div class="drawer-section"><h4>Connection</h4>' +
+      (b ? facts([
+        ['Provider', '<span class="mb-prov"><span>' + (s.provider === 'smtp' ? 'SMTP + IMAP' : escHtml(s.provider)) + '</span>' + conn + '</span>'],
+        ['Sends via', smtpHost ? '<span class="mono">' + escHtml(smtpHost) + ':' + escHtml(v('smtp_port') || defaults.smtp_port || 587) + '</span>' : '<span class="muted">Not set</span>'],
+        ['Reads replies', imapHost ? '<span class="mono">' + escHtml(imapHost) + ':' + escHtml(v('imap_port') || defaults.imap_port || 993) + '</span>' : '<span class="muted">Not set</span>'],
+      ]) : '') +
+      input('password', b && b.password_set ? 'Change password' : 'Password or app password', 'password', '',
+        'autocomplete="new-password" placeholder="' + (b && b.password_set ? 'Saved. Leave blank to keep it.' : 'Can be added later') + '"',
+        'For Google Workspace, create an app password under Security, 2-Step Verification.') +
+      (b ? '<div class="mb-test"><button type="button" class="btn btn-secondary btn-sm" id="mbs-test" onclick="mbTestInbox()">' +
+        icon('lightning') + 'Test connection</button><span class="mb-hint" id="mbs-test-msg">' + escHtml(t || '') + '</span></div>' : '') +
+      '<details class="inbox-servers mb-servers"' + (!defaults.smtp_host || (b && !b.configured) ? ' open' : '') + '><summary>Server settings</summary>' +
+        '<p class="mb-hint">Blank fields use the shared SMTP and IMAP settings.</p>' +
+        '<div class="form-row">' + input('smtp-host', 'SMTP host', 'text', v('smtp_host'), 'placeholder="' + escHtml(defaults.smtp_host || 'smtp.example.com') + '"') +
+          input('smtp-port', 'SMTP port', 'number', v('smtp_port') || '', 'min="1" max="65535" placeholder="' + (defaults.smtp_port || 587) + '"') + '</div>' +
+        '<div class="form-row">' + input('imap-host', 'IMAP host', 'text', v('imap_host'), 'placeholder="' + escHtml(defaults.imap_host || 'imap.example.com') + '"') +
+          input('imap-port', 'IMAP port', 'number', v('imap_port') || '', 'min="1" max="65535" placeholder="' + (defaults.imap_port || 993) + '"') + '</div>' +
+        '<div class="form-row">' + input('username', 'SMTP login', 'text', v('username'), 'placeholder="Defaults to the inbox email"') +
+          input('imap-username', 'IMAP login', 'text', v('imap_username'), 'placeholder="Defaults to the SMTP login"') + '</div>' +
+      '</details></div>' +
+    '<div class="drawer-section"><h4>Sending</h4><div class="form-row">' +
+      input('cap', 'Daily limit at full volume', 'number', v('daily_cap', 30), 'required min="0" step="1"',
+        'All inboxes share the overall limit of ' + fmtN(s.max_daily_sends) + ' a day.') +
+      input('start', 'Warm-up start date', 'date', b ? (b.warmup_start || '') : s.today, '',
+        'Clear the date only if this inbox is already warmed up.') + '</div></div>' +
+    (s.provider !== 'smtp' ? '<label class="inbox-checkbox"><input type="checkbox" id="mbs-activate" required>Switch email sending from ' +
+      escHtml(s.provider) + ' to SMTP + IMAP</label>' : '') +
+    '<p class="form-error" id="mbs-error" role="alert" hidden></p>' +
+    '<div class="drawer-actions mb-settings-foot"><button type="submit" class="btn btn-primary btn-sm" id="mbs-save">' +
+      (adding ? 'Add inbox' : 'Save changes') + '</button>' +
+      '<button type="button" class="btn btn-secondary btn-sm" onclick="' + (adding ? 'closeDrawer()' : 'mbOpenInbox(' + mbArg(email) + ')') + '">Cancel</button>' +
+      '<span class="mb-hint">Applies on Mercury\'s next run.</span></div>' +
+  '</form>';
+  openDrawer(adding ? 'New inbox' : 'Inbox settings', adding ? 'Add inbox' : email, '', html);
+  mbDrawerActions(adding ? '' : '<button class="btn btn-secondary btn-sm" onclick="mbOpenInbox(' + mbArg(email) + ')">' + icon('caret-left') + 'Back</button>');
+  const first = document.getElementById(adding ? 'mbs-email' : 'mbs-name');
+  if (first) first.focus({ preventScroll: true });
 }
 
-function wuScrollDns() {
-  const el = document.getElementById('wu-dns-panel');
-  if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 1200); }
+function mbPickStatus(btn) {
+  btn.parentElement.querySelectorAll('button').forEach(x => {
+    const on = x === btn;
+    x.classList.toggle('on', on);
+    x.setAttribute('aria-checked', on);
+  });
 }
+
+async function mbSaveSettings(event) {
+  event.preventDefault();
+  const button = document.getElementById('mbs-save');
+  if (!button || button.disabled) return;
+  const email = _mb.view && _mb.view.email;
+  const val = id => { const el = document.getElementById('mbs-' + id); return el ? el.value : ''; };
+  const picked = document.querySelector('#mbs-form .mb-status button.on');
+  const status = picked ? picked.dataset.status : 'sending';
+  const data = {
+    email: val('email').trim(), name: val('name').trim(), password: val('password'),
+    daily_cap: Number(val('cap')), warmup_start: val('start') || null,
+    smtp_host: val('smtp-host').trim(), smtp_port: Number(val('smtp-port')) || 0,
+    imap_host: val('imap-host').trim(), imap_port: Number(val('imap-port')) || 0,
+    username: val('username').trim(), imap_username: val('imap-username').trim(),
+    enabled: status !== 'replies',
+  };
+  const activate = document.getElementById('mbs-activate');
+  if (activate) data.activate_smtp = activate.checked;
+  const err = document.getElementById('mbs-error');
+  button.disabled = true;
+  const result = await getJSON('/api/settings/mailboxes' + (email ? '/' + mbEnc(email) : ''), {
+    method: email ? 'PATCH' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+  });
+  button.disabled = false;
+  if (!result.ok || !result.data || !result.data.success) {
+    err.hidden = false;
+    err.textContent = (result.data && result.data.message) || 'Could not save. Try again.';
+    return;
+  }
+  const target = email || data.email.toLowerCase();
+  const live = mbFind(target);
+  const wasPaused = !!live && live.status === 'paused';
+  if (email && status === 'paused' && !wasPaused) await postJSON('/api/warmup/inboxes/' + mbEnc(target) + '/action', { action: 'pause' });
+  if (email && status !== 'paused' && wasPaused) await postJSON('/api/warmup/inboxes/' + mbEnc(target) + '/action', { action: 'resume' });
+  showToast(result.data.restart_required
+    ? 'Inbox saved. Stop and start Mercury in Controls to apply it to the running agent.'
+    : 'Inbox saved. It applies on Mercury\'s next run.', 'success');
+  _mb.key = '';
+  await loadMailboxes();
+  if (mbFind(target)) mbOpenInbox(target); else closeDrawer();
+}
+
+async function mbTestInbox() {
+  const email = _mb.view && _mb.view.email;
+  const btn = document.getElementById('mbs-test');
+  const msg = document.getElementById('mbs-test-msg');
+  if (!email || !btn) return;
+  btn.disabled = true;
+  if (msg) msg.textContent = 'Testing…';
+  const res = await getJSON('/api/settings/mailboxes/' + mbEnc(email) + '/test', { method: 'POST' });
+  btn.disabled = false;
+  const text = (res.data && res.data.message) || 'Could not test the connection. Try again.';
+  _mb.test[email] = text;
+  if (msg) msg.textContent = text;
+}
+
+// ── Domain drawer: DNS once per domain, and its inboxes ──
+
+const DNS_ICON = {
+  pass: ['check-circle', 'Pass'], warn: ['warning', 'Needs attention'],
+  fail: ['x-circle', 'Missing'], unknown: ['question', 'Couldn\'t check'],
+};
 
 function agoShort(d) {
   if (!d) return '';
@@ -3349,69 +3667,88 @@ function agoShort(d) {
   return relWhen(d);
 }
 
-const DNS_ICON = {
-  pass: ['check-circle', 'Pass'], warn: ['warning', 'Needs attention'],
-  fail: ['x-circle', 'Missing'], unknown: ['question', 'Couldn\'t check'],
-};
-
-async function loadWuDns(force) {
-  const b = wuInbox();
-  if (!b) return;
-  const domain = wuDomain(b.email);
-  if (_wu.dnsLoading[domain]) return;
-  _wu.dnsLoading[domain] = true;
-  if (force) renderWuDns();
-  const res = await getJSON('/api/warmup/dns' + (domain ? '?domain=' + encodeURIComponent(domain) : ''));
-  _wu.dnsLoading[domain] = false;
-  _wu.dns[domain] = res.ok && res.data && Array.isArray(res.data.checks) ? res.data : { error: res };
-  if (wuInbox() && wuDomain(wuInbox().email) === domain) renderWuDns();
+function mbOpenDomain(domain) {
+  _mb.view = { kind: 'domain', domain };
+  const boxes = mbList().filter(b => b.domain === domain);
+  openDrawer('Domain', domain, mbDomainSub(domain),
+    '<div class="drawer-section"><div class="mb-sec-head"><h4>DNS records</h4>' +
+      '<button class="link-btn" id="mb-dns-recheck" onclick="mbLoadDns(' + mbArg(domain) + ', true)">' + icon('arrow-clockwise') + 'Re-check</button></div>' +
+      '<p class="drawer-note">Add these at your domain registrar. One fix covers every inbox on ' + escHtml(domain) + '.</p>' +
+      '<div class="mb-dns-list" id="mb-dns-list"><div class="loading-note">Checking DNS…</div></div></div>' +
+    '<div class="drawer-section"><div class="mb-sec-head"><h4>Inboxes on this domain</h4><span class="muted mono">' +
+      fmtN(boxes.reduce((s, b) => s + Number(b.sent_today || 0), 0)) + '/' + fmtN(boxes.reduce((s, b) => s + Number(b.today_cap || 0), 0)) + ' today</span></div>' +
+      '<div class="ev-list">' + boxes.map(b => {
+        const st = mbStage(b);
+        return '<button class="ev-row" onclick="mbOpenInbox(' + mbArg(b.email) + ')"><span class="ev-kind">' + icon('envelope-simple') + '</span>' +
+          '<span class="ev-main"><b class="mono">' + escHtml(b.email) + '</b><small>' + escHtml(mbNext(b)[0]) + '</small></span>' +
+          '<span class="ev-side">' + toneBadge(st.tone, st.label) + '<small class="mono">' + fmtN(b.sent_today || 0) + '/' + fmtN(b.today_cap || 0) + ' today</small></span></button>';
+      }).join('') + '</div></div>');
+  mbDrawerActions('');
+  if (_mb.dns[domain]) mbRenderDns(domain);
+  mbLoadDns(domain, false);
 }
 
-function renderWuDns() {
-  const el = document.getElementById('wu-dns-panel');
-  const b = wuInbox();
-  if (!el || !b) return;
-  const domain = wuDomain(b.email);
-  const d = _wu.dns[domain];
-  const loading = _wu.dnsLoading[domain];
-  const head = '<div class="panel-head"><div><h3>Domain authentication</h3><p>The DNS records that tell inboxes <span class="mono">' +
-    escHtml(domain || 'your domain') + '</span> is really you.</p></div></div>';
-  let bodyHtml;
-  if (!d) {
-    bodyHtml = '<div class="panel-body"><div class="loading-note">Checking DNS…</div></div>';
-  } else if (d.error) {
-    bodyHtml = '<div class="panel-body"><div class="chart-note inline">' + icon('info') + '<span>' +
-      (d.error.status === 404 ? 'DNS checks aren\'t available on this server yet.' : 'Couldn\'t run the DNS check right now.') +
-      '</span></div></div>';
-  } else {
-    const pass = d.checks.filter(c => c.status === 'pass').length;
-    bodyHtml = '<div class="dns-list">' + d.checks.map(c => {
-      const m = DNS_ICON[c.status] || DNS_ICON.unknown;
-      return '<div class="dns-row s-' + escHtml(c.status) + '">' +
-        '<span class="dns-ic">' + icon(m[0]) + '</span>' +
-        '<div class="dns-main">' +
-          '<div class="dns-top"><b>' + escHtml(c.label || String(c.key).toUpperCase()) + '</b><span class="dns-st">' + m[1] + '</span></div>' +
-          (c.detail ? '<div class="dns-detail">' + escHtml(c.detail) + '</div>' : '') +
-          (c.record ? '<div class="dns-rec"><code title="' + escHtml(c.record) + '">' + escHtml(c.record) + '</code>' +
-            '<button class="btn-square xs ghost" title="Copy record" aria-label="Copy ' + escHtml(c.label || c.key) + ' record" ' +
-            'data-copy="' + escHtml(c.record) + '" onclick="wuCopy(this)">' + icon('copy') + '</button></div>' : '') +
-        '</div></div>';
-    }).join('') + '</div>';
-    bodyHtml += '<div class="panel-foot"><span class="dns-sum"><span>' + (pass === d.checks.length
-        ? toneBadge('good', 'All ' + pass + ' records pass')
-        : '<b class="mono">' + pass + '/' + d.checks.length + '</b> passing') + '</span>' +
-      (d.checked_at ? '<small class="dns-checked">Checked ' + escHtml(agoShort(parseUTC(d.checked_at))) + '</small>' : '') + '</span>' +
-      '<button class="btn btn-secondary btn-sm" onclick="loadWuDns(true)"' + (loading ? ' disabled' : '') + '>' +
-        icon('arrow-clockwise') + (loading ? 'Checking…' : 'Re-check') + '</button></div>';
-  }
-  if (d && d.error) {
-    bodyHtml += '<div class="panel-foot"><span class="muted">' + escHtml(domain) + '</span><button class="btn btn-secondary btn-sm" onclick="loadWuDns(true)"' +
-      (loading ? ' disabled' : '') + '>' + icon('arrow-clockwise') + (loading ? 'Checking…' : 'Re-check') + '</button></div>';
-  }
-  el.innerHTML = head + bodyHtml;
+function mbDomainSub(domain) {
+  const d = mbDns(domain);
+  const n = mbList().filter(b => b.domain === domain).length;
+  const pass = d ? (d.checks || []).filter(c => c.status === 'pass').length : 0;
+  return (!d ? toneBadge('idle', 'Not checked yet')
+    : d.all_pass ? toneBadge('good', 'All DNS records pass')
+    : mbDnsFails(domain) ? toneBadge('bad', pass + ' of 4 records pass')
+    : toneBadge('waiting', pass + ' of 4 pass, the rest couldn\'t be checked')) +
+    '<span class="mb-sub-t">' + n + ' inbox' + (n === 1 ? '' : 'es') + '</span>';
 }
 
-async function wuCopy(btn) {
+async function mbLoadDns(domain, force) {
+  if (_mb.dnsLoading[domain]) return;
+  _mb.dnsLoading[domain] = true;
+  const btn = document.getElementById('mb-dns-recheck');
+  if (btn && force) btn.disabled = true;
+  if (!force && _mb.dns[domain] && !_mb.dns[domain].error) { _mb.dnsLoading[domain] = false; return; }
+  const res = await getJSON('/api/warmup/dns?domain=' + encodeURIComponent(domain));
+  _mb.dnsLoading[domain] = false;
+  if (btn) btn.disabled = false;
+  _mb.dns[domain] = res.ok && res.data && Array.isArray(res.data.checks) ? res.data : { error: res };
+  if (!_mb.dns[domain].error && _mb.data) {
+    const checks = _mb.dns[domain].checks;
+    (_mb.data.domains ||= {})[domain] = {
+      checks: checks.map(c => ({ key: c.key, status: c.status })), checked_at: _mb.dns[domain].checked_at,
+      all_pass: ['mx', 'spf', 'dkim', 'dmarc'].every(k => (checks.find(c => c.key === k) || {}).status === 'pass'),
+    };
+    renderMailboxes();
+    mbNavFlag();
+  }
+  if (_mb.view && _mb.view.kind === 'domain' && _mb.view.domain === domain) {
+    mbRenderDns(domain);
+    document.getElementById('drawer-sub').innerHTML = mbDomainSub(domain);
+  }
+}
+
+function mbRenderDns(domain) {
+  const el = document.getElementById('mb-dns-list');
+  const d = _mb.dns[domain];
+  if (!el || !d) return;
+  if (d.error) {
+    el.innerHTML = '<div class="chart-note inline">' + icon('info') + '<span>' +
+      (d.error.status === 404 ? 'DNS checks aren\'t available on this server yet.' : 'Couldn\'t run the DNS check right now.') + '</span></div>';
+    return;
+  }
+  el.innerHTML = d.checks.map(c => {
+    const m = DNS_ICON[c.status] || DNS_ICON.unknown;
+    return '<div class="dns-row s-' + escHtml(c.status) + '">' +
+      '<span class="dns-ic">' + icon(m[0]) + '</span>' +
+      '<div class="dns-main">' +
+        '<div class="dns-top"><b>' + escHtml(c.label || String(c.key).toUpperCase()) + '</b><span class="dns-st">' + m[1] + '</span></div>' +
+        (c.detail ? '<div class="dns-detail">' + escHtml(c.detail) + '</div>' : '') +
+        (c.record ? '<div class="dns-rec"><code title="' + escHtml(c.record) + '">' + escHtml(c.record) + '</code>' +
+          '<button class="btn-square xs ghost" title="Copy record" aria-label="Copy ' + escHtml(c.label || c.key) + ' record" ' +
+          'data-copy="' + escHtml(c.record) + '" onclick="mbCopy(this)">' + icon('copy') + '</button></div>' : '') +
+      '</div></div>';
+  }).join('') +
+    (d.checked_at ? '<p class="dns-checked mb-dns-when">Checked ' + escHtml(agoShort(parseUTC(d.checked_at))) + '</p>' : '');
+}
+
+async function mbCopy(btn) {
   const text = btn.dataset.copy || '';
   try {
     await navigator.clipboard.writeText(text);
@@ -3423,60 +3760,6 @@ async function wuCopy(btn) {
   }
   btn.innerHTML = icon('check');
   setTimeout(() => { btn.innerHTML = icon('copy'); }, 1200);
-}
-
-function wuNotesPanel(b) {
-  return '<div class="panel-head"><div><h3>Notes</h3><p>Anything worth remembering about this inbox.</p></div></div>' +
-    '<div class="panel-body"><textarea class="form-input wu-notes" id="wu-notes" rows="4" ' +
-      'placeholder="e.g. Google Postmaster verified Oct 2; forwarding set up for replies" ' +
-      (b.email ? '' : 'disabled ') +
-      'onblur="wuSaveNotes(this)">' + escHtml(b.notes || '') + '</textarea>' +
-      '<div class="wu-notes-hint" id="wu-notes-hint">Saves when you click away.</div></div>';
-}
-
-function wuRulesPanel(b) {
-  return '<div class="panel-head"><div><h3>How the ramp protects you</h3><p>Rules Mercury enforces for every mailbox.</p></div></div>' +
-    '<div class="panel-body"><ul class="wu-rules">' +
-      '<li>' + icon('shield-check') + '<span>Never sends more cold email than today\'s cap from this inbox, no matter how much is approved.</span></li>' +
-      '<li>' + icon('pause') + '<span>Holds the ramp when bounces pass 3%, and pauses the inbox past 5% (after 20 sends in 7 days) until you resume it.</span></li>' +
-      '<li>' + icon('arrow-bend-up-left') + '<span>A paused inbox still answers people who replied; follow-ups wait, they aren\'t cancelled.</span></li>' +
-      '<li>' + icon('globe-simple') + '<span>Re-checks SPF, DKIM and DMARC so a broken record is caught before it costs you.</span></li>' +
-    '</ul></div>';
-}
-
-async function wuSaveNotes(ta) {
-  const b = wuInbox();
-  if (!b || (b.notes || '') === ta.value) return;
-  const hint = document.getElementById('wu-notes-hint');
-  if (hint) hint.textContent = 'Saving…';
-  const res = await postJSON('/api/warmup/inboxes/' + wuEnc(b.email), { notes: ta.value });
-  if (res.ok) {
-    b.notes = ta.value;
-    _wu.key = JSON.stringify(_wu.data);
-    if (hint) hint.textContent = 'Saved.';
-  } else {
-    if (hint) hint.textContent = 'Not saved: ' + res.error;
-    showToast('Couldn\'t save notes: ' + res.error, 'error');
-  }
-}
-
-const WU_DONE = {
-  pause: 'Inbox paused. No cold email goes out from it until you resume.',
-  resume: 'Inbox resumed. The bounce window starts fresh from now.',
-};
-
-async function wuAction(action) {
-  const b = wuInbox();
-  if (!b || !b.email) return;
-  if (action === 'pause' && !(await confirmModal({
-    title: 'Pause ' + b.email + '?',
-    copy: 'Openers and follow-ups from this inbox wait until you resume (nothing is cancelled). Replies to people who wrote back still go out.',
-    ok: 'Pause inbox',
-  }))) return;
-  const res = await postJSON('/api/warmup/inboxes/' + wuEnc(b.email) + '/action', { action });
-  if (res.ok) showToast(WU_DONE[action] || 'Done.', 'success');
-  else showToast('Couldn\'t ' + action + ': ' + res.error, 'error');
-  loadWarmup();
 }
 
 // ── Sending activity heatmap (GitHub-style, Monday-first, UTC days) ──
@@ -3609,7 +3892,7 @@ setInterval(() => {
   if (document.hidden) return;
   switch (currentTab) {
     case 'today': loadToday(); loadRuns(); loadTodayActivity(); loadTrend(true); loadHeatmap(true); break;
-    case 'warmup': if (!wuBusy()) loadWarmup(true); break;
+    case 'mailboxes': if (!mbBusy()) loadMailboxes(true); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;
     case 'campaigns': loadCampaigns(); break;
