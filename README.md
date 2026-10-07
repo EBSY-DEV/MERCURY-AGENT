@@ -53,7 +53,7 @@ Sales knowledge lives in `skills/` and agent prompts live in `prompts/`. Both ar
 Requirements: Python 3.11+, the Claude Code CLI logged in to a Pro or Max plan (`claude login`), and a mailbox to send from, ideally on a dedicated secondary domain.
 
 ```bash
-git clone <repo-url> mercury && cd mercury
+git clone https://github.com/EBSY-DEV/MERCURY-AGENT.git mercury-agent && cd mercury-agent
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 python -m playwright install chromium     # only needed for LinkedIn prospecting
