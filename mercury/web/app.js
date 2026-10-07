@@ -301,6 +301,7 @@ function renderFunnel(stats) {
       '<div class="funnel-bar"><span style="width:' + (v ? Math.max(2, v / max * 100) : 0) + '%"></span></div>' +
       '<div class="funnel-v' + (v ? '' : ' zero') + '">' + v.toLocaleString('en-US') + '</div>' +
     '</div>').join('') + '</div>';
+  chartIntro(el, steps.map(st => st[1]).join(','));
 }
 
 async function loadTodayActivity() {
@@ -312,12 +313,51 @@ async function loadTodayActivity() {
       '<div><b>Nothing yet.</b> Every action Mercury takes shows up here.</div></div>';
     return;
   }
-  el.innerHTML = '<div class="activity-feed">' + data.slice(0, 8).map(a =>
-    '<div class="activity-item">' +
-      '<span class="time">' + formatDate(a.created_at) + '</span>' +
-      '<span class="agent">' + escHtml(a.agent) + '</span>' +
-      '<span class="action">' + escHtml(String(a.action_type).replace(/_/g, ' ')) + '</span>' +
-    '</div>').join('') + '</div>';
+  // Agents log the same step from several places (main + scout both write
+  // "prospect" each cycle). Merge identical consecutive actions within an hour
+  // so the feed reads as events, not log lines.
+  const groups = [];
+  for (const a of data) {
+    const g = groups[groups.length - 1];
+    const t = parseUTC(a.created_at);
+    if (g && g.type === a.action_type && t && g.first && (g.first - t) < 3600e3) {
+      g.n++; g.agents.add(a.agent); g.last = t; continue;
+    }
+    groups.push({ type: a.action_type, agents: new Set([a.agent]), n: 1, first: t, last: t, at: a.created_at });
+    if (groups.length > 7) break;
+  }
+  el.innerHTML = '<div class="activity-feed">' + groups.slice(0, 7).map(g => {
+    const [ico, label] = activityLabel(g.type);
+    return '<div class="activity-item act-row">' +
+      '<span class="act-ico">' + icon(ico) + '</span>' +
+      '<span class="action">' + escHtml(label) +
+        '<span class="agent">' + escHtml([...g.agents].filter(Boolean).join(', ')) + '</span>' +
+        (g.n > 1 ? '<span class="times">&times;' + g.n + '</span>' : '') + '</span>' +
+      '<span class="time" title="' + escHtml(g.first ? fullWhen(g.first) : '') + '">' +
+        escHtml(g.first ? relWhen(g.first) : formatDate(g.at)) + '</span>' +
+    '</div>';
+  }).join('') + '</div>';
+}
+
+const ACTIVITY_LABELS = {
+  prospect: ['magnifying-glass', 'Looked for new prospects'],
+  reply_received: ['chat-circle-text', 'Reply received'],
+  bounce: ['warning-circle', 'Email bounced'],
+  email_sent: ['paper-plane-tilt', 'Email sent'],
+  pipeline_move: ['kanban', 'Moved a contact in the pipeline'],
+  outbox_reschedule: ['calendar-blank', 'Rescheduled an email'],
+  write_campaign: ['pencil-simple', 'Drafted a campaign'],
+  send_campaign: ['paper-plane-tilt', 'Sent a campaign'],
+  analyze: ['chart-line-up', 'Updated analytics'],
+  discover: ['compass', 'Discovered businesses'],
+  profile: ['buildings', 'Read company websites'],
+};
+
+function activityLabel(type) {
+  const hit = ACTIVITY_LABELS[type];
+  if (hit) return hit;
+  const t = String(type || 'activity').replace(/_/g, ' ');
+  return ['pulse', t.charAt(0).toUpperCase() + t.slice(1)];
 }
 
 function navCount(id, n) {
@@ -2594,6 +2634,18 @@ function chartHover(wrap, opts) {
 }
 
 // Redraw a chart when its container's width changes (and only then).
+// Play a chart's entrance animation only when its data changes, not on every
+// resize redraw or quiet 15-second refresh. CSS does the work under .ch-anim.
+function chartIntro(el, sig) {
+  if (!el || el.dataset.sig === sig) return;
+  el.dataset.sig = sig;
+  el.classList.remove('ch-anim');
+  void el.offsetWidth;                       // restart if it was mid-animation
+  el.classList.add('ch-anim');
+  clearTimeout(el._introT);
+  el._introT = setTimeout(() => el.classList.remove('ch-anim'), 1600);
+}
+
 function observeWidth(el, draw) {
   if (!el || el._ro || typeof ResizeObserver === 'undefined') return;
   el._lastW = el.clientWidth;
@@ -2742,10 +2794,10 @@ function renderTrend() {
       const pts = series.map((r, i) => [x(i), y(r.sent || 0)]);
       const line = smoothPath(pts);
       svg += '<path class="tr-area" d="' + line + 'L' + x(n - 1).toFixed(1) + ',' + y1 + 'L' + x(0).toFixed(1) + ',' + y1 + 'Z"/>' +
-             '<path class="tr-line tr-sent" d="' + line + '"/>';
+             '<path class="tr-line tr-sent" pathLength="1" d="' + line + '"/>';
     }
     if (show.replies) {
-      svg += '<path class="tr-line tr-replies" d="' + smoothPath(series.map((r, i) => [x(i), y(r.replies || 0)])) + '"/>';
+      svg += '<path class="tr-line tr-replies" pathLength="1" d="' + smoothPath(series.map((r, i) => [x(i), y(r.replies || 0)])) + '"/>';
     }
   }
   svg += '<line class="ch-base" x1="' + x0 + '" x2="' + x1 + '" y1="' + y1 + '" y2="' + y1 + '"/>' +
@@ -2754,6 +2806,7 @@ function renderTrend() {
   wrap.innerHTML = svg + (empty
     ? '<div class="chart-empty">' + icon('chart-line-up') + '<span>No sends yet — the trend appears after Mercury\'s first emails go out.</span></div>'
     : '');
+  chartIntro(wrap, _trend.days + '|' + JSON.stringify(d.totals || {}) + '|' + JSON.stringify(show));
 
   if (!empty) {
     chartHover(wrap, {
@@ -3065,6 +3118,7 @@ function renderWuRamp() {
   }
   svg += '<line class="ch-base" x1="' + x0 + '" x2="' + x1 + '" y1="' + y1 + '" y2="' + y1 + '"/><g class="ch-hover"></g></svg>';
   wrap.innerHTML = svg;
+  chartIntro(wrap, (b.email || '') + '|' + (b.plan || []).map(p => p.cap + ':' + (p.sent ?? '')).join(','));
 
   chartHover(wrap, {
     xs: plan.map((_, i) => cx(i)), x0, x1, y0: y0 - 20, y1, band: slot * 0.92,
@@ -3335,8 +3389,8 @@ function renderHeatmap(data) {
     }
     lastMonth = m;
   }
-  const cells = days.map(d =>
-    '<i class="hm-c l' + level(d.sent) + '" data-d="' + d.date + '" data-n="' + d.sent +
+  const cells = days.map((d, i) =>
+    '<i class="hm-c l' + level(d.sent) + '" style="--w:' + Math.floor(i / 7) + '" data-d="' + d.date + '" data-n="' + d.sent +
     '" data-r="' + (d.replies || 0) + '"></i>').join('');
 
   grid.innerHTML =
@@ -3348,6 +3402,7 @@ function renderHeatmap(data) {
 
   // Narrow screens scroll; start at the most recent week, like GitHub.
   grid.scrollLeft = grid.scrollWidth;
+  chartIntro(grid, _hmSig);
 
   const fmt = n => Number(n || 0).toLocaleString('en-US');
   document.getElementById('hm-total').innerHTML =
@@ -3390,7 +3445,8 @@ function renderHeatmap(data) {
   });
   wrap.addEventListener('mouseleave', hide);
   wrap.addEventListener('scroll', hide, { passive: true });
-  window.addEventListener('scroll', hide, { passive: true });
+  document.addEventListener('scroll', hide, { passive: true, capture: true });
+  document.addEventListener('visibilitychange', hide);
 })();
 
 // ── Init & live refresh ──
