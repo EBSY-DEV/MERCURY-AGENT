@@ -553,10 +553,10 @@ def cmd_outbox(args):
                 print("\n  No queued item with that id.\n")
             return
 
-        paused = (await SendingService(ctx, state).status())["reason"]
-        if paused:
-            print(f"\n  ⚠ SENDING PAUSED: {paused}")
-            print("  Resume with: mercury sending resume")
+        sending = await SendingService(ctx, state, config).status()
+        if sending["blocked"]:
+            print("\n  ⚠ SENDING STOPPED (mercury sending status):")
+            _print_sending(sending)
 
         from mercury.demos import annotate_outbox, waiting_for_demo
 
@@ -1161,23 +1161,55 @@ def cmd_demos(args):
         sys.exit(1)
 
 
+def _print_sending(status: dict) -> None:
+    """The same reasons the dashboard's Outbox banner lists."""
+    if status["paused"]:
+        print(f"  Paused by you: {status['reason']}")
+    for hold in status["holds"]:
+        where = hold.get("mailbox") or "all mail"
+        print(f"  On hold ({where}): {hold['reason']}")
+    for item in status["in_flight"]:
+        note = "interrupted, re-queued next cycle" if item["interrupted"] else "finishing"
+        print(f"  In flight: step {item['step']} to {item['to_email']} ({note})")
+    if not status["blocked"]:
+        print("  Sending: active" + (" (some inboxes are on hold)" if status["holds"] else ""))
+
+
 def cmd_sending(args):
-    """Pause/resume the sending kill switch."""
+    """Pause/resume sending, or clear a health hold."""
+    from mercury.config import load_config
     from mercury.control.context import OperatorContext
     from mercury.control.sending import SendingService
     from mercury.state import StateManager
 
+    try:
+        config = load_config()
+    except Exception:
+        config = None  # the compliance hold is then not listed
+
     async def _run():
-        sending = await SendingService(OperatorContext.local("cli"), StateManager()).ready()
-        if args.sending_action == "pause":
-            await sending.pause()
-            print("\n  Sending paused. Nothing will leave the outbox.\n")
-        elif args.sending_action == "resume":
-            await sending.resume()
-            print("\n  Sending resumed (bounce counters reset).\n")
+        sending = await SendingService(OperatorContext.local("cli"), StateManager(), config).ready()
+        action = args.sending_action
+        if action == "pause":
+            status = await sending.pause()
+            print("\n  Sending paused. Nothing new leaves the outbox.")
+        elif action == "resume":
+            status = await sending.resume()
+            print("\n  Your pause is lifted." if not status["blocked"]
+                  else "\n  Your pause is lifted, but sending is still on hold.")
+            if any(h["kind"] == "bounce_kill_switch" for h in status["holds"]):
+                print("  Bounce counters were kept. Fix the cause, then: mercury sending clear-hold")
+        elif action == "clear-hold":
+            status = await sending.clear_hold()
+            if status["cleared"]:
+                print("\n  Bounce hold cleared; the bounce count starts again from zero.")
+            else:
+                print("\n  No bounce hold to clear. Counters left as they are.")
         else:
-            paused = (await sending.status())["reason"]
-            print(f"\n  Sending: {'PAUSED — ' + paused if paused else 'active'}\n")
+            status = await sending.status()
+            print()
+        _print_sending(status)
+        print()
 
     asyncio.run(_run())
 
@@ -1445,9 +1477,10 @@ def main():
     sub.add_argument("--json", action="store_true", help="Machine-readable output")
     sub.set_defaults(func=cmd_demos)
 
-    sub = subparsers.add_parser("sending", help="Kill switch: pause/resume sending")
+    sub = subparsers.add_parser(
+        "sending", help="Pause/resume sending (your pause only), or clear a bounce hold")
     sub.add_argument("sending_action", nargs="?", default="status",
-                     choices=["pause", "resume", "status"])
+                     choices=["pause", "resume", "status", "clear-hold"])
     sub.set_defaults(func=cmd_sending)
 
     # mercury usage

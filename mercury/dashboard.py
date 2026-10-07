@@ -518,13 +518,13 @@ async def start_mercury():
 
 
 @app.post("/api/mercury/stop")
-async def stop_mercury():
-    """Stop the Mercury subprocess."""
+async def stop_mercury(force: bool = False):
+    """Ask Mercury to stop. It finishes the step it is on; ``stopping`` says
+    it has not exited yet. ``?force=true`` kills it instead."""
     try:
-        await _runtime().stop()
+        return {"success": True, **await _runtime().stop(force=force)}
     except ControlError as e:
         return {"success": False, "message": str(e)}
-    return {"success": True}
 
 
 @app.get("/api/mercury/logs")
@@ -1317,16 +1317,37 @@ async def outbox_regenerate(item_id: str, request: Request):
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
+def _sending():
+    from mercury.control.sending import SendingService
+
+    return SendingService(DASHBOARD, _state(), _demo_config())
+
+
+@app.get("/api/sending/status")
+async def sending_status():
+    """The operator pause, every hold and what is in flight: the same read
+    `mercury sending status` prints."""
+    try:
+        return await (await _sending().ready()).status()
+    except ControlError as e:
+        return _control_error(e)
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
 @app.post("/api/sending/{action}")
 async def sending_toggle(action: str):
-    if action not in ("pause", "resume"):
+    """pause / resume (the operator pause only) / clear-hold (the bounce kill
+    switch). Each answers with the status after it."""
+    if action not in ("pause", "resume", "clear-hold"):
         return JSONResponse({"success": False, "message": "unknown action"}, status_code=400)
     try:
-        from mercury.control.sending import SendingService
-
-        service = await SendingService(DASHBOARD, _state()).ready()
-        await (service.pause() if action == "pause" else service.resume())
-        return {"success": True}
+        service = await _sending().ready()
+        run = {"pause": service.pause, "resume": service.resume,
+               "clear-hold": service.clear_hold}[action]
+        return {"success": True, **await run()}
+    except ControlError as e:
+        return _control_error(e)
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
@@ -1480,7 +1501,7 @@ async def get_today():
         confirmed = [c for c in codes if c.get("status") == "confirmed"]
         pending = await state.get_outbox(status="pending_review", limit=200)
         approved = await state.get_outbox(status="approved", limit=200)
-        paused = await state.get_setting("sending_paused")
+        sending = await _sending().status()
         counts = await state.count_prospects_by_status()
 
         convos = await query_db(
@@ -1502,11 +1523,21 @@ async def get_today():
         }
 
         # Ordered by how much it blocks Mercury from doing anything at all.
-        if paused:
+        # A health hold first: resuming does not lift it.
+        for hold in sending["holds"]:
+            if hold["scope"] != "global":
+                continue
+            items.append({
+                "key": "hold:" + hold["kind"], "tone": "bad",
+                "title": "Sending is on hold",
+                "detail": hold["reason"].rstrip(".") + ". Resuming does not lift this hold.",
+                "action": "Review the hold", "tab": "outbox",
+            })
+        if sending["paused"]:
             items.append({
                 "key": "paused", "tone": "bad",
                 "title": "Sending is paused",
-                "detail": str(paused) + ". Nothing will go out until you resume it.",
+                "detail": sending["reason"].rstrip(".") + ". Nothing new will go out until you resume it.",
                 "action": "Review and resume", "tab": "outbox",
             })
 
