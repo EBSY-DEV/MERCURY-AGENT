@@ -1,31 +1,13 @@
 """Local dashboard API for writing personas, prompt inspection and previews."""
 
-import secrets
-
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
-from mercury.personas import AVATAR_SEEDS, JSON_INSTRUCTION, PersonaStore, avatar_url, generation_config
+from mercury.control.personas import EDITABLE, PersonaInput, PersonaService
+from mercury.personas import AVATAR_SEEDS, PersonaError, PersonaStore, avatar_url, generation_config
 
 router = APIRouter()
-
-
-class PersonaInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    name: str = Field(min_length=1, max_length=80)
-    description: str = Field(default="", max_length=500)
-    tone: str = Field(min_length=1, max_length=1000)
-    instructions: str = Field(default="", max_length=8000)
-    examples: str = Field(default="", max_length=8000)
-    avatar_seed: str = Field(default_factory=lambda: secrets.choice(AVATAR_SEEDS))
-    expected_revision: int | None = Field(default=None, ge=1)
-
-    @field_validator("avatar_seed")
-    @classmethod
-    def valid_avatar(cls, value):
-        if value not in AVATAR_SEEDS:
-            raise ValueError("Choose an avatar from the Critters collection")
-        return value
+HTTP_STATUS = {"not_found": 404, "provider_failed": 502}
 
 
 class PromptInput(BaseModel):
@@ -42,24 +24,27 @@ class ArchiveInput(BaseModel):
 async def context():
     from mercury.config import load_config
     from mercury.dashboard import _state
-    state = _state()
-    await state.init_db()
-    config = load_config()
-    store = PersonaStore(state)
-    await store.ensure_default(config)
-    return state, config, store
+    service = await PersonaService(_state(), load_config()).ready()
+    return service.state, service.config, service
+
+
+async def call(command):
+    """Run one service command, turning its error code into an HTTP status."""
+    try:
+        return await command
+    except PersonaError as error:
+        raise HTTPException(HTTP_STATUS.get(error.code, 409), str(error)) from error
 
 
 @router.get("/api/personas")
 async def overview():
     from mercury.brain import Brain, PROMPTS_DIR
     from mercury.config import _find_config_file
-    state, config, store = await context()
+    state, config, service = await context()
     brain = Brain(state)
     template = PROMPTS_DIR / "writer.md"
     return {
-        "personas": await store.list(),
-        "default_id": await state.get_setting("default_persona_id"),
+        **await service.list(),
         "current": generation_config(config),
         "config_file": _find_config_file(),
         "markets": [market.model_dump() for market in config.icp.markets],
@@ -74,81 +59,51 @@ async def overview():
 
 @router.post("/api/personas")
 async def create_persona(body: PersonaInput):
-    _state, _config, store = await context()
-    persona_id = await store.save(body.model_dump())
-    return {"success": True, "id": persona_id}
+    *_, service = await context()
+    persona = await call(service.create(body.model_dump()))
+    return {"success": True, "id": persona["id"]}
 
 
 @router.post("/api/personas/{persona_id}/save")
 async def save_persona(persona_id: str, body: PersonaInput):
-    _state, _config, store = await context()
-    try:
-        await store.save(body.model_dump(), persona_id)
-    except ValueError as error:
-        raise HTTPException(409, str(error)) from error
+    *_, service = await context()
+    fields = body.model_dump(include=set(EDITABLE))
+    await call(service.update(persona_id, fields, body.expected_revision))
     return {"success": True, "id": persona_id}
 
 
 @router.post("/api/personas/{persona_id}/default")
 async def default_persona(persona_id: str):
-    _state, _config, store = await context()
-    try:
-        await store.set_default(persona_id)
-    except ValueError as error:
-        raise HTTPException(409, str(error)) from error
+    *_, service = await context()
+    await call(service.set_default(persona_id))
     return {"success": True}
 
 
 @router.post("/api/personas/{persona_id}/archive")
 async def archive_persona(persona_id: str, body: ArchiveInput):
-    _state, _config, store = await context()
-    try:
-        await store.archive(persona_id, body.archived)
-    except ValueError as error:
-        raise HTTPException(409, str(error)) from error
+    *_, service = await context()
+    await call(service.set_archived(persona_id, body.archived))
     return {"success": True}
 
 
 @router.get("/api/personas/{persona_id}/versions")
 async def persona_versions(persona_id: str):
-    _state, _config, store = await context()
-    return {"versions": await store.versions(persona_id)}
-
-
-async def preview_context(body):
-    from mercury.agents.writer import Writer
-    from mercury.brain import Brain
-    state, config, store = await context()
-    prospect = await state.get_prospect(body.prospect_id)
-    if not prospect:
-        raise HTTPException(404, "Contact not found")
-    try:
-        profile = await store.resolve(config, body.version_id)
-    except ValueError as error:
-        raise HTTPException(404, str(error)) from error
-    if profile["archived"]:
-        raise HTTPException(409, "Restore this persona before generating a preview")
-    return Writer(Brain(state), state, config), prospect, profile
+    *_, service = await context()
+    return {"versions": await call(service.versions(persona_id))}
 
 
 @router.post("/api/personas/prompt")
 async def inspect_prompt(body: PromptInput):
-    writer, prospect, profile = await preview_context(body)
-    prompt, _profile = await writer.build_personal_prompt(prospect, body.instruction, profile)
-    return {"prompt": prompt + JSON_INSTRUCTION, "persona": profile}
+    *_, service = await context()
+    return await call(service.prompt("", body.prospect_id, instruction=body.instruction, version_id=body.version_id))
 
 
 @router.post("/api/personas/preview")
 async def preview_email(body: PromptInput):
-    writer, prospect, profile = await preview_context(body)
+    *_, service = await context()
     # This makes one model call, but never creates an outbox item or campaign.
-    draft = await writer._write_personal_email(prospect, body.instruction, profile)
-    if not draft:
-        raise HTTPException(502, "The writer returned no draft. Check the agent log and try again")
-    async with writer.state._connect() as db:
-        cursor = await db.execute("SELECT prompt FROM email_generations WHERE id = ?", (draft["generation_id"],))
-        prompt = (await cursor.fetchone())[0]
-    return {"success": True, **draft, "prompt": prompt, "persona": profile}
+    result = await call(service.preview("", body.prospect_id, instruction=body.instruction, version_id=body.version_id))
+    return {"success": True, **result}
 
 
 @router.get("/api/outbox/{item_id}/generation-history")

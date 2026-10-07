@@ -566,6 +566,118 @@ def cmd_signals(args):
     asyncio.run(_signals())
 
 
+def _persona_text(value, path):
+    """A long field from a flag, a file, or stdin when the file is '-'."""
+    if path:
+        return sys.stdin.read() if path == "-" else Path(path).read_text()
+    return value
+
+
+def cmd_personas(args):
+    """Writing personas: list, edit, version and preview them."""
+    import json
+
+    from mercury.config import load_config
+    from mercury.control.personas import PersonaService, avatar_seed
+    from mercury.personas import PersonaError
+    from mercury.state import StateManager
+
+    def fields():
+        changes = {"name": args.name, "description": args.description, "tone": args.tone,
+                   "instructions": _persona_text(args.instructions, args.instructions_file),
+                   "examples": _persona_text(args.examples, args.examples_file),
+                   "avatar_seed": avatar_seed(args.avatar) if args.avatar else None}
+        return {key: value for key, value in changes.items() if value is not None}
+
+    def line(p):
+        flags = [label for label, on in (("default", p["is_default"]), ("archived", p["archived"])) if on]
+        print(f"  {p['name']:<28} v{p['revision']:<4} {p['id'][:8]}  {', '.join(flags)}")
+
+    def detail(p):
+        print(f"\n  {p['name']}  v{p['revision']}" + ("  (default)" if p["is_default"] else "")
+              + ("  (archived)" if p["archived"] else ""))
+        print(f"  id {p['id']} · avatar {p['avatar_seed']}")
+        if p.get("description"):
+            print(f"  {p['description']}")
+        for label, key in (("Tone", "tone"), ("Writing preferences", "instructions"), ("Style examples", "examples")):
+            print(f"\n  {label}")
+            for text in (p.get(key) or "(none)").splitlines():
+                print(f"    {text}")
+        print()
+
+    async def _run():
+        service = await PersonaService(StateManager(), load_config()).ready()
+        action = args.persona_action or "list"
+        if action == "list":
+            result = await service.list(include_archived=args.all)
+            if args.json:
+                return print(json.dumps(result, indent=2))
+            print(f"\n  Personas ({len(result['personas'])})")
+            print("  " + "=" * 60)
+            for p in result["personas"]:
+                line(p)
+            print("\n  Details: mercury personas show NAME\n")
+        elif action == "show":
+            p = await service.get(args.persona)
+            if args.json:
+                return print(json.dumps(p, indent=2))
+            detail(p)
+        elif action == "versions":
+            versions = await service.versions(args.persona)
+            if args.json:
+                return print(json.dumps(versions, indent=2))
+            print()
+            for v in versions:
+                print(f"  v{v['revision']:<4} {v['created_at'][:16]}  {v['tone'][:60]}")
+            print()
+        elif action in ("create", "edit"):
+            if action == "create":
+                p = await service.create(fields())
+                if args.default:
+                    p = await service.set_default(p["id"])
+            else:
+                changes = fields()
+                if not changes:
+                    raise PersonaError("invalid", "Nothing to change. Pass --tone, --instructions, --name ...")
+                before = await service.find(args.persona)
+                p = await service.update(args.persona, changes, args.expected_revision)
+                if p["revision"] == before["revision"]:
+                    print(f"\n  Updated {p['name']}. Writing unchanged, still v{p['revision']}.\n")
+                    return
+            if args.json:
+                return print(json.dumps(p, indent=2))
+            print(f"\n  Saved {p['name']} as v{p['revision']}. New drafts use it from the next generation.\n")
+        elif action == "default":
+            p = await service.set_default(args.persona)
+            print(f"\n  New drafts now use {p['name']} (v{p['revision']}).\n")
+        elif action in ("archive", "restore"):
+            p = await service.set_archived(args.persona, action == "archive")
+            print(f"\n  {p['name']} {'archived' if p['archived'] else 'restored'}.\n")
+        elif action in ("prompt", "preview"):
+            command = service.prompt if action == "prompt" else service.preview
+            if action == "preview":
+                print("\n  Writing a sample (one Claude call, nothing is queued)...")
+            result = await command(args.persona, args.contact, args.version, args.instruction)
+            if args.json:
+                return print(json.dumps(result, indent=2, default=str))
+            persona = result["persona"]
+            print(f"\n  {persona['name']} v{persona['revision']}")
+            print("  " + "=" * 60)
+            if action == "prompt":
+                print(result["prompt"])
+            else:
+                print(f"  Subject: {result['subject']}\n")
+                for text in result["body"].splitlines():
+                    print(f"    {text}")
+            print()
+
+    try:
+        asyncio.run(_run())
+    except PersonaError as error:
+        print(f"\n  {error}\n")
+        sys.exit(1)
+
+
 def cmd_sending(args):
     """Pause/resume the sending kill switch."""
     from mercury.state import StateManager
@@ -711,6 +823,50 @@ def main():
     sub.add_argument("--reject", metavar="CODES", default="",
                      help="Comma-separated codes to turn off")
     sub.set_defaults(func=cmd_signals)
+
+    sub = subparsers.add_parser("personas", help="List, edit and preview writing personas")
+    personas = sub.add_subparsers(dest="persona_action")
+    sub.set_defaults(func=cmd_personas, persona_action=None, all=False, json=False)
+
+    def persona_parser(name, help, persona="required"):
+        p = personas.add_parser(name, help=help)
+        if persona == "required":
+            p.add_argument("persona", help="Name, id or id prefix")
+        elif persona == "optional":
+            p.add_argument("persona", nargs="?", default="", help="Name or id (default persona if omitted)")
+        p.add_argument("--json", action="store_true", help="Machine-readable output")
+        return p
+
+    def writing_flags(p, create):
+        p.add_argument("--name", required=create, default=None)
+        p.add_argument("--tone", required=create, default=None, help="One line, repeated in every prompt")
+        p.add_argument("--description", default=None)
+        p.add_argument("--instructions", default=None, help="Writing preferences")
+        p.add_argument("--instructions-file", default="", help="Read preferences from a file ('-' for stdin)")
+        p.add_argument("--examples", default=None, help="Style examples")
+        p.add_argument("--examples-file", default="", help="Read examples from a file ('-' for stdin)")
+        p.add_argument("--avatar", default="", help="1-24 or a seed name (random if omitted)")
+
+    p = persona_parser("list", "All personas", persona=None)
+    p.add_argument("--all", action="store_true", help="Include archived personas")
+    persona_parser("show", "One persona's writing settings")
+    persona_parser("versions", "Version history")
+    p = persona_parser("create", "Create a persona", persona=None)
+    writing_flags(p, create=True)
+    p.add_argument("--default", action="store_true", help="Use it for new drafts")
+    p = persona_parser("edit", "Change a persona. Tone, preferences or examples create a new version")
+    writing_flags(p, create=False)
+    p.add_argument("--expected-revision", type=int, default=None,
+                   help="Fail if someone saved a newer version first")
+    persona_parser("default", "Use this persona for new drafts")
+    persona_parser("archive", "Hide a persona from new drafts")
+    persona_parser("restore", "Bring back an archived persona")
+    for action, help in (("prompt", "Show the exact writer prompt (no model call)"),
+                         ("preview", "Write one sample email (one Claude call, never queued)")):
+        p = persona_parser(action, help, persona="optional")
+        p.add_argument("--contact", required=True, help="Contact id or email")
+        p.add_argument("--version", type=int, default=None, help="Revision number (default: latest)")
+        p.add_argument("--instruction", default="", help='One-off instruction, e.g. "shorter"')
 
     sub = subparsers.add_parser("sending", help="Kill switch: pause/resume sending")
     sub.add_argument("sending_action", nargs="?", default="status",
