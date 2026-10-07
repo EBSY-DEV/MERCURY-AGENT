@@ -4,23 +4,50 @@ from mercury import banner
 
 
 class _Tty(io.StringIO):
+    encoding = "utf-8"
+
     def isatty(self):
         return True
 
 
-def test_render_plain_is_the_dot_and_the_name():
-    out = banner.render(colour=False, version="1.2.3")
-    assert "●  Mercury Agent" in out
+def test_mark_is_a_disc_with_the_dot_on_its_right_edge():
+    art = banner.mark()
+    assert len(art) == banner.MARK_ROWS
+    assert set("".join(art)) <= set(" ▀▄█")
+    # The disc is wider on the left; the dot is the only thing past the bite.
+    middle = art[banner.MARK_ROWS // 2]
+    assert middle.startswith("█") and middle.rstrip().endswith(("█", "▄", "▀"))
+    assert " " in middle.strip()  # the gap between the disc and the dot
+
+
+def test_mark_is_symmetric_top_to_bottom():
+    art = banner.mark()
+    flip = {"▀": "▄", "▄": "▀", "█": "█", " ": " "}
+    width = max(len(line) for line in art)
+    padded = [line.ljust(width) for line in art]
+    mirrored = ["".join(flip[c] for c in line) for line in reversed(padded)]
+    assert padded == mirrored
+
+
+def test_render_puts_the_name_beside_the_mark():
+    out = banner.render(colour=False, version="1.2.3", folder="~/work")
+    assert "Mercury Agent" in out
     assert "Outreach agent · v1.2.3" in out
-    assert "\x1b" not in out
+    assert "~/work" in out
+    assert "█" in out and "\x1b" not in out
+
+
+def test_render_without_the_mark_is_the_plain_dot():
+    out = banner.render(colour=False, version="1.2.3", draw_mark=False)
+    assert "●  Mercury Agent" in out and "█" not in out
 
 
 def test_render_without_a_version_drops_it():
-    assert "· v" not in banner.render(colour=False, version="")
+    assert "· v" not in banner.render(colour=False, version="", folder="~")
 
 
 def test_colour_uses_the_dark_mode_accent():
-    assert "38;2;183;164;247" in banner.render(colour=True, version="1")
+    assert "38;2;183;164;247" in banner.render(colour=True, version="1", folder="~")
 
 
 def test_nothing_is_printed_when_output_is_piped():
@@ -39,3 +66,9 @@ def test_terminal_gets_colour_unless_no_color_is_set(monkeypatch):
     plain = _Tty()
     banner.print_banner(plain)
     assert "Mercury Agent" in plain.getvalue() and "\x1b" not in plain.getvalue()
+
+
+def test_non_utf8_terminal_falls_back_to_the_dot():
+    tty = _Tty()
+    tty.encoding = "ascii"
+    assert not banner._can_draw(tty)
