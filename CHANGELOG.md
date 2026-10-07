@@ -22,6 +22,10 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **`max_bounce_rate` now defaults to 2%** (was 5%), and the rate check starts
+  after 50 sends (was 10). Configs that set the value keep it. `mercury sending
+  resume` and the dashboard's Resume now clear the per-bucket counters too.
+
 - **Harvey is now Mercury Agent.** The package (`mercury/`), CLI
   (`mercury ...`), config (`mercury.yaml`, `mercury.local.yaml`) and database
   (`data/mercury.db`) are renamed. Existing checkouts migrate automatically:
@@ -51,6 +55,17 @@ minor versions can still change behaviour.
   rename a pre-rename state repo's `harvey.*` files on the next run.
 
 ### Added
+
+- **Bounces are classified by SMTP code** (#54). The Handler reads the enhanced
+  status code (`5.1.1`, `5.7.26`) from each bounce and stores `dsn_code` and a
+  `bucket` on the `bounce` event. A bad address (`LIST`) invalidates the prospect
+  as before; a sender block (`SENDER`, any 5.7.x) pauses that mailbox; a `BURNED`
+  code (5.7.606 to 5.7.614) pauses every mailbox on the domain and flags it
+  `CANCEL_CANDIDATE`; a 4.x.x throttle halves the mailbox's cap for 7 days; and
+  `NOISE` (mailbox full and similar) is ignored by every rate. The global kill
+  switch now also trips when sender plus burned bounces pass 20% of the
+  classified ones (after 30). The Mailboxes drawer shows the breakdown. No schema
+  change.
 
 - **CSV contact import** (#3). Dashboard (Contacts → Import CSV), `mercury import`
   share one service. It has a read-only preview

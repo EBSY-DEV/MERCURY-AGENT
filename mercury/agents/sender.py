@@ -22,7 +22,7 @@ from mercury.brain import Brain
 from mercury.config import MercuryConfig, EnvConfig
 from mercury.gate import pre_send_check
 from mercury.integrations.instantly import InstantlyClient
-from mercury.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from mercury.integrations.mail_provider import NATIVE_PROVIDERS, SendResult, get_mail_provider
 from mercury.integrations.mailboxes import (
     MailboxPool,
     build_rotation_pool,
@@ -727,15 +727,33 @@ class Sender:
             body_out = item["body"]
             if item["kind"] != "reply":
                 body_out = self._with_legal_footer(body_out)
-            result = await mailbox.provider.send_email(
-                item["to_email"], item["subject"], body_out,
-                thread_ref=item.get("thread_ref", ""),
-                in_reply_to=item.get("in_reply_to", ""),
-            )
+            raised = False
+            try:
+                result = await mailbox.provider.send_email(
+                    item["to_email"], item["subject"], body_out,
+                    thread_ref=item.get("thread_ref", ""),
+                    in_reply_to=item.get("in_reply_to", ""),
+                )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                # A provider that raises instead of returning SendResult
+                # (a socket reset, a library bug) must not leave the row
+                # parked in 'sending'. Treat it as a transient failure so
+                # the retry ladder below decides: retry or give up.
+                logger.exception(
+                    f"Sender: provider raised sending to {item['to_email']} "
+                    f"via {mailbox.email or mailbox.provider.name}: {exc}"
+                )
+                raised = True
+                result = SendResult(
+                    ok=False,
+                    error=f"exception: {type(exc).__name__}: {str(exc)[:200]}",
+                )
             if not result.ok:
                 err = result.error or ""
                 attempt = _retry_attempt(item.get("error") or "")
-                if attempt <= 3 and _smtp_error_is_transient(err):
+                if attempt <= 3 and (raised or _smtp_error_is_transient(err)):
                     # A connection hiccup or a 4xx deferral is not a verdict
                     # on the address: keep the row approved and try later.
                     retry_at = datetime.fromtimestamp(
@@ -861,6 +879,18 @@ class Sender:
             logger.warning(
                 f"Sender: holding email to {item['to_email']}: its thread's mailbox "
                 f"{mailbox.email or mailbox.provider.name} has no credentials."
+            )
+            return None, "hold"
+        # A disabled mailbox (enabled: false) finishes its threads but starts
+        # none. A pinned step 1 is still a new thread: nothing has gone out
+        # yet, so hold it rather than open a conversation from an inbox the
+        # operator is winding down.
+        if (item["kind"] != "reply" and int(item.get("step") or 1) <= 1
+                and not mailbox.accepts_new):
+            logger.info(
+                f"Sender: holding step 1 to {item['to_email']}: its mailbox "
+                f"{mailbox.email or mailbox.provider.name} is disabled "
+                "(enabled: false) and takes no new threads."
             )
             return None, "hold"
         # A person who wrote back is not cold volume: a reply may go past its

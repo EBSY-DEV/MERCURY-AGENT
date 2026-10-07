@@ -466,3 +466,53 @@ def test_dashboard_errors_carry_a_code(client):
                                     "rows": [4]}
     assert client.get("/api/imports/nope").status_code == 404
 
+
+
+# ── Verification: a DNS failure leaves the address alone ──
+
+
+def _verify_with_mx(monkeypatch, db_path, mx):
+    import mercury.integrations.email_finder as ef
+    svc = run(ImportService(StateManager(db_path), Env()).ready())
+    batch = run(svc.commit(BASIC.encode(), skip_invalid=True))["batch"]["id"]
+
+    async def get_mx_host(domain):
+        if isinstance(mx, Exception):
+            raise mx
+        return mx
+
+    async def verify_candidate(email, mx_type, env):
+        return "verified", True
+    monkeypatch.setattr(ef, "get_mx_host", get_mx_host)
+    monkeypatch.setattr(ef, "_verify_candidate", verify_candidate)
+    return svc, batch, run(svc.verify(batch, limit=1))
+
+
+def test_verify_dns_timeout_leaves_address_unverified(db_path, monkeypatch):
+    import mercury.integrations.email_finder as ef
+    svc, batch, step = _verify_with_mx(monkeypatch, db_path, ef.MxLookupError("timed out"))
+    assert step["checked"] == 0 and step["skipped"] == 1 and "DNS lookup" in step["note"]
+    assert step["results"] == {}
+    assert rows(db_path, "SELECT email_status FROM prospects ORDER BY import_row LIMIT 1") == [("guess",)]
+    # Still unverified, so a later run retries it instead of skipping past.
+    assert run(svc.verify_estimate(batch))["addresses"] == 3
+
+
+def test_verify_nxdomain_marks_address_invalid(db_path, monkeypatch):
+    _, _, step = _verify_with_mx(monkeypatch, db_path, None)
+    assert step["results"] == {"invalid": 1} and step["skipped"] == 0
+    assert rows(db_path, "SELECT email_status FROM prospects ORDER BY import_row LIMIT 1") == [("invalid",)]
+
+
+def test_verify_a_record_only_domain_is_checked_with_provider(db_path, monkeypatch):
+    _, _, step = _verify_with_mx(monkeypatch, db_path, "acme.com")
+    assert step["results"] == {"verified": 1}
+    assert rows(db_path, "SELECT email_status FROM prospects ORDER BY import_row LIMIT 1") == [("verified",)]
+
+
+def test_dashboard_bad_base64_is_a_structured_4xx(client):
+    for path in ("/api/imports/preview", "/api/imports/commit"):
+        res = client.post(path, json={"filename": "x.csv", "content_b64": "not base64!!"})
+        assert 400 <= res.status_code < 500, (path, res.status_code)
+        assert res.json()["detail"]["code"] == "empty"
+        assert res.json()["detail"]["message"]

@@ -349,6 +349,18 @@ async def run_cycle(rt: Runtime) -> str:
     config = rt.config
     max_calls = max(int(200 * (config.usage.max_daily_claude_percent / 100)), 1)
 
+    # 0. Re-queue outbox rows a previous process left in 'sending' (killed
+    # mid-send). One UPDATE, no model call; cheap enough to run every cycle.
+    try:
+        recovered = await rt.state.recover_stale_outbox()
+        if recovered:
+            logger.warning(
+                f"Recovered {recovered} outbox row(s) stuck in 'sending' from an "
+                "interrupted send; they are approved again and will retry."
+            )
+    except Exception as e:
+        logger.warning(f"Could not recover stale outbox rows: {e}")
+
     # 1. Check usage budget (real subscription quota when readable, else
     # Mercury's own call counter)
     over_budget = not await rt.brain.is_within_budget(

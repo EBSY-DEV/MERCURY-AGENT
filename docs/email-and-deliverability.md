@@ -207,17 +207,35 @@ Conversations move through stages `initial_outreach`, `engaged`, `qualifying`, `
 
 When a bounce arrives, Mercury matches it to the sent email (via In-Reply-To, the DSN's original Message-ID, the failed recipient, or an address in the bounce text), then:
 
-- marks the address `invalid`,
-- cancels every queued email for that prospect,
-- logs a `bounce` event attributed to the sending mailbox (which feeds the [health gates](#health-gates)),
-- increments the global bounce counter.
+- reads the enhanced status code (RFC 3463, for example `5.1.1`) from the bounce's `Status:` field or text, and sorts the bounce into a bucket,
+- logs a `bounce` event with `dsn_code` and `bucket`, attributed to the sending mailbox (which feeds the [health gates](#health-gates)),
+- increments the global bounce counters,
+- then acts on the bucket:
 
-**Global kill switch.** Once at least 10 emails have been sent, if bounces counted since the last resume exceed `max_bounce_rate` (default 5%) of all emails sent, Mercury pauses all sending. Nothing leaves the outbox until you resume. Set `max_bounce_rate: 0` to disable it (not recommended).
+| Bucket | Codes | What Mercury does |
+|---|---|---|
+| `LIST` | 5.1.1, 5.1.10, 5.1.0, 5.2.1, 5.4.1, 5.5.0 | A bad address. Marks it `invalid` and cancels the prospect's queued emails. No reputation action. |
+| `SENDER` | 5.7.1, 5.7.0, 5.7.23, 5.7.26, 5.7.509, 5.7.520, and any other 5.7.x | Authentication or policy. Pauses that mailbox (the pause reason points at the DNS checks on the Mailboxes tab). The prospect is left alone. |
+| `BURNED` | 5.7.606 to 5.7.614 | The domain is blocked on reputation. Pauses every mailbox on the domain and marks it `CANCEL_CANDIDATE` on the Mailboxes tab. Resuming a mailbox clears the flag. |
+| `THROTTLE` | any 4.x.x | The server asked us to slow down. Halves that mailbox's daily cap for 7 days. |
+| `NOISE` | 5.2.2, 5.3.4, 5.7.133 | Mailbox full, message too big, group that rejects outsiders. Logged, ignored by every rate and the address is kept. |
+| `UNKNOWN` | no code, or a code not above | Treated as a bad address (the pre-classification behaviour) and counted in the total rate. |
+
+If a `SENDER` or `BURNED` bounce cannot be pinned to a mailbox Mercury knows, or the pause cannot be saved, Mercury trips the global kill switch instead. A bounce it cannot process at all also trips it.
+
+The Mailboxes tab shows the bucket breakdown for each inbox over its health window.
+
+**Global kill switch.** Mercury pauses all sending, and nothing leaves the outbox until you resume, when either:
+
+- `SENDER` plus `BURNED` bounces are more than 20% of the classified bounces (`LIST`, `SENDER`, `BURNED` and `THROTTLE`), once at least 30 are classified. `LIST` bounces alone never trip this.
+- Bounces counted since the last resume (not `NOISE`) exceed `max_bounce_rate` (default 2%) of all emails sent, once at least 50 have been sent.
+
+Set `max_bounce_rate: 0` to disable the rate check (not recommended); the sender/burned share check stays on.
 
 ```bash
 mercury sending            # status
 mercury sending pause      # manual stop
-mercury sending resume     # resume and reset the bounce counter
+mercury sending resume     # resume and reset the bounce counters
 ```
 
 The Outbox tab has the same Pause/Resume button, and Today shows "Sending is paused" at the top of Needs you. Fix the cause (usually unverified addresses) before resuming.

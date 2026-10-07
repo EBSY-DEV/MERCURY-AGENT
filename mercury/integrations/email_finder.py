@@ -130,26 +130,68 @@ def classify_mx(mx_host: str) -> str:
     return "other"
 
 
+class MxLookupError(Exception):
+    """The DNS lookup itself failed (timeout, resolver outage). Says nothing
+    about whether the domain can receive mail; callers should retry later."""
+
+
+def _resolve_sync(domain: str, rtype: str):
+    return dns.resolver.resolve(domain, rtype)
+
+
+async def _resolve(domain: str, rtype: str):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _resolve_sync, domain, rtype)
+
+
 async def get_mx_host(domain: str) -> Optional[str]:
-    """Primary MX host for a domain (cached; None on failure)."""
+    """Mail host for a domain, cached for the process lifetime.
+
+    Returns the primary MX exchange; for a domain with no MX but an A/AAAA
+    record, the domain itself (the implicit MX of RFC 5321 section 5.1).
+    Returns None only when the answer is definitive: the name does not
+    exist or carries no MX, A or AAAA record. Raises MxLookupError when the
+    lookup could not be completed (timeout, no reachable nameserver), and
+    never caches that case.
+    """
     domain = _clean_domain(domain)
     if not domain:
         return None
     if domain in _mx_cache:
         return _mx_cache[domain]
+    definitive = (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer)
     try:
-        loop = asyncio.get_event_loop()
-        answers = await loop.run_in_executor(
-            None, lambda: dns.resolver.resolve(domain, "MX")
-        )
-        records = sorted(answers, key=lambda x: x.preference)
-        mx_host = str(records[0].exchange).rstrip(".") if records else None
-        _mx_cache[domain] = mx_host or None
-        return _mx_cache[domain]
-    except Exception as e:
-        logger.debug(f"MX lookup failed for {domain}: {e}")
+        try:
+            answers = await _resolve(domain, "MX")
+            records = sorted(answers, key=lambda x: x.preference)
+            mx_host = str(records[0].exchange).rstrip(".") if records else ""
+            # A "null MX" (RFC 7505: a single record pointing at the root,
+            # which strips to "") means the domain explicitly takes no mail.
+            if mx_host:
+                _mx_cache[domain] = mx_host
+                return mx_host
+            _mx_cache[domain] = None
+            return None
+        except dns.resolver.NXDOMAIN:
+            _mx_cache[domain] = None
+            return None
+        except dns.resolver.NoAnswer:
+            pass
+        for rtype in ("A", "AAAA"):
+            try:
+                if list(await _resolve(domain, rtype)):
+                    _mx_cache[domain] = domain
+                    return domain
+            except definitive:
+                continue
         _mx_cache[domain] = None
         return None
+    except definitive:
+        _mx_cache[domain] = None
+        return None
+    except Exception as e:
+        logger.debug(f"MX lookup failed for {domain}: {e}")
+        raise MxLookupError(f"DNS lookup for {domain} failed: {e}") from e
 
 
 # ── Pattern derivation ──
@@ -463,7 +505,10 @@ async def verify_email_smtp(email: str) -> Optional[bool]:
     if "@" not in email:
         return False
     domain = email.rsplit("@", 1)[1]
-    mx_host = await get_mx_host(domain)
+    try:
+        mx_host = await get_mx_host(domain)
+    except MxLookupError:
+        return None
     if not mx_host:
         return None
     smtp = aiosmtplib.SMTP(hostname=mx_host, port=25, timeout=10)
@@ -608,7 +653,14 @@ async def find_email(
     if not (first_name and last_name and domain):
         return EmailResult(email="", status="invalid")
 
-    mx_host = await get_mx_host(domain)
+    try:
+        mx_host = await get_mx_host(domain)
+    except MxLookupError as e:
+        # The lookup failed, not the domain. Leave the address a guess so a
+        # later pass can retry instead of writing the domain off.
+        logger.warning(f"MX lookup for {domain} failed, leaving as guess: {e}")
+        guess = build_email(DEFAULT_PATTERN, first_name, last_name, domain)
+        return EmailResult(email=guess, status="guess", mx_type="unknown")
     if not mx_host:
         # No MX → cannot receive mail at all.
         guess = build_email(DEFAULT_PATTERN, first_name, last_name, domain)
