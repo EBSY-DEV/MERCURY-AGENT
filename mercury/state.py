@@ -613,6 +613,11 @@ MIGRATIONS: list[str] = [
         WHERE company_id = '';
     CREATE INDEX idx_outbox_company ON outbox(company_id, kind, step, status);
     """,
+    # ── v15: excluded mail needs a fresh human decision after requeue ──
+    """
+    ALTER TABLE outbox ADD COLUMN requires_manual_review INTEGER NOT NULL DEFAULT 0;
+    UPDATE outbox SET requires_manual_review = 1 WHERE status = 'blocked';
+    """,
 ]
 
 # ── Exclusion matching and company capacity (shared SQL) ──
@@ -686,7 +691,8 @@ async def _block_queued(db, rule: dict, now: str) -> int:
         match += ")"
     marks = ", ".join("?" for _ in _BLOCKABLE)
     cursor = await db.execute(
-        f"UPDATE outbox SET status = 'blocked', error = ?, updated_at = ? "
+        f"UPDATE outbox SET status = 'blocked', requires_manual_review = 1, "
+        f"error = ?, updated_at = ? "
         f"WHERE status IN ({marks}) AND {match}",
         ("excluded: " + describe_rule(rule), now, *_BLOCKABLE, *params))
     return cursor.rowcount
@@ -709,14 +715,14 @@ async def _company_usage(db, company_id: str, exclude_campaign: str = "",
     ) as cur:
         (new_today,) = await cur.fetchone()
     async with db.execute(
-        f"""SELECT COUNT(*) FROM (
+        f"""SELECT COUNT(DISTINCT prospect_id) FROM (
               SELECT campaign_id, prospect_id FROM outbox
               WHERE company_id = ? AND kind = 'sequence' AND campaign_id != ''
-                AND NOT (campaign_id = ? AND prospect_id = ?)
+                AND prospect_id != ?
               GROUP BY campaign_id, prospect_id
               HAVING SUM(step = 1 AND status IN ('sent', 'sending')) > 0
                  AND SUM(status IN {_UNFINISHED}) > 0)""",
-        (company_id, exclude_campaign, exclude_prospect),
+        (company_id, exclude_prospect),
     ) as cur:
         (active,) = await cur.fetchone()
     return {"new_today": new_today, "active": active}
@@ -1339,13 +1345,13 @@ class StateManager:
         async with self._connect() as db:
             if item_id:
                 cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
+                    "UPDATE outbox SET status = 'approved', requires_manual_review = 0, updated_at = ? "
                     "WHERE id = ? AND status = 'pending_review'",
                     (_utcnow().isoformat(), item_id),
                 )
             else:
                 cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
+                    "UPDATE outbox SET status = 'approved', requires_manual_review = 0, updated_at = ? "
                     "WHERE status = 'pending_review'",
                     (_utcnow().isoformat(),),
                 )
@@ -1358,11 +1364,13 @@ class StateManager:
         is already approved or sent: the reviewer signed off on the opener,
         so the sequence it belongs to may run. A follow-up of a still-pending
         or rejected opener stays put. One step per pass, so a 3-step chain
-        whose opener was approved is fully promoted within two cycles."""
+        whose opener was approved is fully promoted within two cycles.
+        Requeued exclusions always need another explicit approval."""
         async with self._connect() as db:
             cursor = await db.execute(
                 """UPDATE outbox SET status = 'approved', updated_at = ?
                    WHERE status = 'pending_review' AND kind = 'sequence'
+                     AND requires_manual_review = 0
                      AND step > 1 AND campaign_id != ''
                      AND (
                        SELECT prev.status FROM outbox AS prev
@@ -1444,7 +1452,7 @@ class StateManager:
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'rejected', updated_at = ? "
-                "WHERE id = ? AND status IN ('pending_review', 'approved')",
+                "WHERE id = ? AND status IN ('pending_review', 'approved', 'blocked')",
                 (now, item_id),
             )
             n = cursor.rowcount
@@ -1452,7 +1460,7 @@ class StateManager:
                 cursor = await db.execute(
                     "UPDATE outbox SET status = 'rejected', error = ?, updated_at = ? "
                     "WHERE campaign_id = ? AND prospect_id = ? AND kind = 'sequence' "
-                    "AND step > ? AND status IN ('pending_review', 'approved')",
+                    "AND step > ? AND status IN ('pending_review', 'approved', 'blocked')",
                     (f"step {item['step']} rejected", now,
                      item["campaign_id"], item["prospect_id"], int(item["step"])),
                 )
@@ -1467,7 +1475,7 @@ class StateManager:
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
-                "WHERE prospect_id = ? AND status IN ('pending_review', 'approved')",
+                "WHERE prospect_id = ? AND status IN ('pending_review', 'approved', 'blocked')",
                 (reason, _utcnow().isoformat(), prospect_id),
             )
             await db.commit()
@@ -1650,7 +1658,8 @@ class StateManager:
                     await db.rollback()
                     return "excluded"
                 await db.execute(
-                    "UPDATE outbox SET status = 'pending_review', error = '', updated_at = ? "
+                    "UPDATE outbox SET status = 'pending_review', requires_manual_review = 1, "
+                    "error = '', updated_at = ? "
                     "WHERE id = ?", (_utcnow().isoformat(), item_id))
                 await db.commit()
                 return "requeued"
@@ -1739,7 +1748,8 @@ class StateManager:
     async def company_contact_usage(self, company_id: str, *, exclude_campaign: str = "",
                                     exclude_prospect: str = "") -> dict:
         """(new contacts in the last 24 hours, contacts with an unfinished
-        sequence) at one company, leaving out one thread when asked."""
+        sequence) at one company, leaving out one person across all campaigns
+        when asked. A contact occupies at most one slot."""
         async with self._connect() as db:
             return await _company_usage(db, company_id, exclude_campaign, exclude_prospect)
 
@@ -1773,7 +1783,8 @@ class StateManager:
                                                max_active, respect_holds)
                 if verdict[0] == "suppressed":
                     await db.execute(
-                        "UPDATE outbox SET status = 'blocked', error = ?, updated_at = ? "
+                        "UPDATE outbox SET status = 'blocked', requires_manual_review = 1, "
+                        "error = ?, updated_at = ? "
                         "WHERE id = ? AND status = 'approved'",
                         (verdict[1]["error"], now, item["id"]))
                 if verdict[0] != "claimed":

@@ -84,7 +84,8 @@ function renderExBlocked(items) {
     items.map(r => '<tr><td>' + escHtml(r.to_email) + '</td><td>' + escHtml(r.subject) + '</td>' +
       '<td>' + policyNote(r.policy) + '</td>' +
       '<td class="ex-act"><button class="btn btn-secondary btn-sm" onclick="exRequeue(\'' + escAttr(r.id) +
-        '\')">Send back to review</button></td></tr>').join('') +
+        '\')">Send back to review</button> <button class="btn btn-secondary btn-sm" onclick="exDiscard(\'' +
+        escAttr(r.id) + '\')">Discard</button></td></tr>').join('') +
     '</tbody></table></div></div>';
 }
 
@@ -218,6 +219,19 @@ async function exRequeue(id) {
   if (!res.ok) { showToast(res.error.message, 'error'); return; }
   showToast('Back in review. It waits for your approval in the Outbox.', 'success');
   loadExclusions();
+}
+
+async function exDiscard(id) {
+  const ok = await confirmModal({
+    title: 'Discard this blocked email?',
+    copy: 'This email and any remaining steps in its sequence are rejected. The exclusion stays in place.',
+    ok: 'Discard' });
+  if (!ok) return;
+  const res = await impSend('/api/outbox/' + encodeURIComponent(id) + '/reject', {});
+  if (!res.ok) { showToast(res.error.message, 'error'); return; }
+  showToast(res.data.rejected ? 'Discarded. The exclusion stays in place.' : 'This email was already handled.', 'success');
+  if (currentTab === 'outbox') loadOutbox();
+  else loadExclusions();
 }
 
 async function exResume(btn) {

@@ -127,3 +127,17 @@ def test_outbox_explains_blocked_and_held_mail(client):
 def test_hold_for_an_unknown_company_is_404(client):
     r = client.post("/api/company-holds", json={"company_id": "nope"})
     assert r.status_code == 404
+
+
+def test_discarding_blocked_mail_rejects_later_steps_and_keeps_the_exclusion(client):
+    item_id = _queue(client.sm, "jane@acme.com")
+    item = _run(client.sm.get_outbox_item(item_id))
+    later_id = _run(client.sm.add_outbox_item(
+        prospect_id=item["prospect_id"], to_email=item["to_email"], subject="later", body="b",
+        campaign_id=item["campaign_id"], step=2, send_at=item["send_at"], status="approved"))
+    client.post("/api/exclusions", json={"kind": "email", "value": "jane@acme.com"})
+    response = client.post(f"/api/outbox/{item_id}/reject")
+    assert response.status_code == 200 and response.json()["rejected"] == 2
+    assert _run(client.sm.get_outbox_item(later_id))["status"] == "rejected"
+    assert client.get("/api/outbox").json()["blocked"] == []
+    assert client.get("/api/exclusions/check", params={"email": item["to_email"]}).json()["excluded"]

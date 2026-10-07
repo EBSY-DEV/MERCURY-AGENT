@@ -19,6 +19,9 @@ minor versions can still change behaviour.
   `max_active_contacts_per_company`) and a company hold when someone replies
   (`pause_company_on_reply`, on by default). Dashboard **Exclusions** tab,
   reasons in the Outbox, and `mercury exclusions` / `mercury holds` commands.
+  Requeued exclusions require a fresh approval even with automatic follow-ups;
+  blocked sequences can be discarded without lifting their exclusion. Active
+  company limits count each contact once across campaigns.
 
 ### Changed
 
