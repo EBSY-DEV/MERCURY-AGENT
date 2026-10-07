@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass, field
 
 from mercury.collectors.discover import is_junk, normalize_domain
+from mercury.control.errors import ControlError
 
 MAX_BYTES = 5 * 1024 * 1024
 MAX_ROWS = 5000
@@ -82,7 +83,7 @@ FREE_MAIL = frozenset({
 EMAIL_RE = re.compile(r"^[a-z0-9!#$%&'*+/=?^_`{|}~.-]+@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}$")
 
 
-class ImportFileError(ValueError):
+class ImportFileError(ControlError):
     """A file or request that cannot be previewed or committed.
 
     Codes: too_large, too_many_rows, not_utf8, empty, ambiguous_delimiter,
@@ -92,9 +93,7 @@ class ImportFileError(ValueError):
     """
 
     def __init__(self, code: str, message: str, **details):
-        super().__init__(message)
-        self.code = code
-        self.details = details
+        super().__init__(message, code, **details)
 
 
 @dataclass

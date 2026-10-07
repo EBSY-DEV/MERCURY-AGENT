@@ -10,15 +10,15 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from mercury.control.errors import ControlError
 from mercury.demos import offers_by_key, retire_after_days, waiting_for_demo
 
 
-class DemoError(ValueError):
+class DemoError(ControlError):
     """Codes: not_found, ambiguous, invalid, unknown_offer, retired, no_config."""
 
     def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
+        super().__init__(message, code)
 
 
 class Artifacts(BaseModel):
