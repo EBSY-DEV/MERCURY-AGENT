@@ -311,6 +311,7 @@
     <div style="display:flex;gap:8px;flex-shrink:0" id="outbox-actions"></div>
   </div>
   <div id="outbox-banner"></div>
+  <div id="outbox-mailboxes"></div>
   <div id="outbox-desk"></div>
   <div id="outbox-list"></div>
 </div>
@@ -384,6 +385,7 @@
           <input type="password" class="form-input" id="smtp-pass" placeholder="Enter password / app password" autocomplete="off"></div>
           <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('smtp-pass')">Show</button></div></div>
       <button class="btn btn-primary btn-sm" onclick="saveSmtp()">Save SMTP</button>
+      <div id="settings-mailboxes"></div>
     </div>
 
     <div style="border:1px solid var(--border);border-radius:10px;padding:16px">
@@ -396,6 +398,30 @@
         <div id="instantly-test-result"></div></div>
       <button class="btn btn-primary btn-sm" onclick="saveInstantly()">Save Instantly</button>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>Prospect search <span class="optional-tag">recommended</span></h2>
+    <p class="lede">Serper gives Mercury reliable Google results when hunting for companies; without it, prospecting falls back to slower scraping. The rest are optional sources the scout and discovery use when present.</p>
+    <div class="form-group"><label class="form-label" for="serper-key">Serper API key <span id="serper-status" class="email-tag"></span></label>
+      <div class="form-row"><div class="form-group" style="margin-bottom:0">
+        <input type="password" class="form-input" id="serper-key" placeholder="2,500 free credits — serper.dev" autocomplete="off"></div>
+        <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('serper-key')">Show</button></div></div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label" for="tavily-key">Tavily API key <span id="tavily-status" class="email-tag"></span></label>
+        <input type="password" class="form-input" id="tavily-key" placeholder="Fallback search — tavily.com" autocomplete="off"></div>
+      <div class="form-group"><label class="form-label" for="semrush-key">Semrush API key <span id="semrush-status" class="email-tag"></span></label>
+        <input type="password" class="form-input" id="semrush-key" placeholder="Qualifies domains by real traffic — semrush.com" autocomplete="off"></div>
+    </div>
+    <div class="form-group"><label class="form-label" for="treg-token">treg token <span id="treg-status" class="email-tag"></span></label>
+      <input type="password" class="form-input" id="treg-token" placeholder="One prepaid balance for verification &amp; enrichment — treg.to" autocomplete="off"></div>
+    <div class="form-row">
+      <div class="form-group"><label class="form-label" for="dfs-login">DataForSEO login (email) <span id="dfs-status" class="email-tag"></span></label>
+        <input type="text" class="form-input" id="dfs-login" placeholder="Best local-business coverage outside the US" autocomplete="off"></div>
+      <div class="form-group"><label class="form-label" for="dfs-pass">DataForSEO password</label>
+        <input type="password" class="form-input" id="dfs-pass" placeholder="From dataforseo.com → API access" autocomplete="off"></div>
+    </div>
+    <button class="btn btn-primary btn-sm" onclick="saveSearchKeys()">Save search keys</button>
   </div>
 
   <div class="card">

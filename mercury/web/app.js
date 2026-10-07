@@ -774,6 +774,17 @@ async function loadSettings() {
   savedPh('reoon-key', data.reoon_api_key_set, '600 free/mo — reoon.com/email-verifier');
   savedPh('zerobounce-key', data.zerobounce_api_key_set, '100 free/mo — best for M365/Workspace catch-alls');
   savedPh('hunter-key', data.hunter_api_key_set, '50 free/mo + email-pattern lookup');
+  savedPh('serper-key', data.serper_api_key_set, '2,500 free credits — serper.dev');
+  savedPh('tavily-key', data.tavily_api_key_set, 'Fallback search — tavily.com');
+  savedPh('semrush-key', data.semrush_api_key_set, 'Qualifies domains by real traffic — semrush.com');
+  savedPh('treg-token', data.treg_token_set, 'One prepaid balance for verification & enrichment — treg.to');
+  savedPh('dfs-pass', data.dataforseo_password_set, 'From dataforseo.com → API access');
+  const dfsl = document.getElementById('dfs-login');
+  if (dfsl) dfsl.value = data.dataforseo_login || '';
+  api('/api/mailboxes').then(mb => {
+    const el = document.getElementById('settings-mailboxes');
+    if (el) el.innerHTML = mb && !mb.error && mb.rotation ? renderMailboxes(mb, true) : '';
+  });
   savedPh('linkedin-password', data.linkedin_password_set, 'Enter password');
   savedPh('cf-api-token', data.cloudflare_api_token_set, 'Your Cloudflare API Token');
 
@@ -787,6 +798,11 @@ async function loadSettings() {
   tag('reoon-status', data.reoon_api_key_set, 'set');
   tag('zerobounce-status', data.zerobounce_api_key_set, 'set');
   tag('hunter-status', data.hunter_api_key_set, 'set');
+  tag('serper-status', data.serper_api_key_set, 'set');
+  tag('tavily-status', data.tavily_api_key_set, 'set');
+  tag('semrush-status', data.semrush_api_key_set, 'set');
+  tag('treg-status', data.treg_token_set, 'set');
+  tag('dfs-status', data.dataforseo_password_set, 'set');
 }
 
 function saveGmail() {
@@ -817,6 +833,20 @@ function saveVerifiers() {
   if (h) payload.HUNTER_API_KEY = h;
   if (!Object.keys(payload).length) { showToast('Enter at least one key first.', 'error'); return; }
   saveEnv(payload, 'Verification keys saved.').then(loadSettings);
+}
+
+function saveSearchKeys() {
+  const payload = {};
+  const val = id => { const el = document.getElementById(id); return el ? el.value.trim() : ''; };
+  if (val('serper-key')) payload.SERPER_API_KEY = val('serper-key');
+  if (val('tavily-key')) payload.TAVILY_API_KEY = val('tavily-key');
+  if (val('semrush-key')) payload.SEMRUSH_API_KEY = val('semrush-key');
+  if (val('treg-token')) payload.TREG_TOKEN = val('treg-token');
+  if (val('dfs-login')) payload.DATAFORSEO_LOGIN = val('dfs-login');
+  const dp = document.getElementById('dfs-pass');
+  if (dp && dp.value) payload.DATAFORSEO_PASSWORD = dp.value;
+  if (!Object.keys(payload).length) { showToast('Enter at least one key first.', 'error'); return; }
+  saveEnv(payload, 'Search keys saved.').then(loadSettings);
 }
 
 async function saveEnv(payload, okMsg) {
@@ -1080,8 +1110,17 @@ async function loadUsage() {
 // the approval ladder exists to prevent. One email fills the pane; the rest
 // wait in the rail.
 
+// Sending capacity, shared by the Outbox panel, the desk and Settings.
+let _mailboxes = null;
+
 async function loadOutbox() {
-  const data = await api('/api/outbox');
+  const [data, mbox] = await Promise.all([api('/api/outbox'), api('/api/mailboxes')]);
+  _mailboxes = mbox && !mbox.error ? mbox : null;
+  const mboxEl = document.getElementById('outbox-mailboxes');
+  if (mboxEl) mboxEl.innerHTML = mbox && mbox.error
+    ? '<section class="panel"><div class="panel-head"><div><h3 class="icon-title">' + icon('warning-circle') +
+        'Mailbox settings unreadable</h3><p>' + escHtml(mbox.error) + '</p></div></div></section>'
+    : (_mailboxes && _mailboxes.rotation ? renderMailboxes(_mailboxes) : '');
   const banner = document.getElementById('outbox-banner');
   const desk = document.getElementById('outbox-desk');
   const list = document.getElementById('outbox-list');
@@ -1131,10 +1170,12 @@ async function loadOutbox() {
   list.innerHTML =
     table('Approved &amp; scheduled', data.approved, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
+      ['From', r => fromCell(r), true, true],
       ['Sends', r => formatDate(r.send_at), true],
     ]) +
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
+      ['From', r => r.from_mailbox || r.mailbox || '—', true],
       ['Sent', r => formatDate(r.sent_at), true],
     ]) +
     table('Didn\'t send', data.failed, [
@@ -1156,14 +1197,28 @@ function renderDesk(items, i) {
     '<div class="desk-pane">' +
       '<div class="to-line">To <b>' + escHtml(cur.to_email) + '</b> &middot; step ' +
         cur.step + ' (' + escHtml(cur.kind) + ') &middot; sends ' +
-        formatDate(cur.send_at) + '</div>' +
-      '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
-      '<div class="body">' + escHtml(cur.body) + '</div>' +
+        formatDate(cur.send_at) +
+        (_mailboxes && _mailboxes.rotation ? ' &middot; from <b>' + escHtml(fromLabel(cur)) + '</b>' : '') +
+        '</div>' +
+      followupNote(cur) +
+      '<label class="sr-only" for="desk-subject">Subject</label>' +
+      '<input class="form-input desk-subject" id="desk-subject" value="' + escAttr(cur.subject || '') +
+        '" placeholder="Subject" autocomplete="off">' +
+      '<label class="sr-only" for="desk-body">Body</label>' +
+      '<textarea class="form-input desk-body" id="desk-body" rows="12">' + escHtml(cur.body) + '</textarea>' +
+      '<div class="desk-regen">' +
+        '<label class="sr-only" for="desk-instruction">Rewrite instruction</label>' +
+        '<input class="form-input" id="desk-instruction" autocomplete="off" ' +
+          'placeholder="Optional instruction for a rewrite: shorter, warmer, mention their reviews…">' +
+        '<button class="btn btn-secondary btn-sm" id="desk-regen-btn" onclick="outboxRegenerate(\'' + cur.id + '\')">' +
+          icon('sparkle') + 'Regenerate</button>' +
+      '</div>' +
       '<div class="desk-actions">' +
         '<button class="btn btn-primary" onclick="outboxAct(\'' + cur.id + '\',\'approve\')">' +
           'Approve <kbd>A</kbd></button>' +
         '<button class="btn btn-secondary" onclick="outboxAct(\'' + cur.id + '\',\'reject\')">' +
           'Reject <kbd>R</kbd></button>' +
+        '<button class="btn btn-secondary" onclick="outboxSave(\'' + cur.id + '\')">Save edits</button>' +
         '<span class="muted" style="font-size:12px;margin-left:auto">' +
           (i + 1) + ' of ' + items.length + '</span>' +
       '</div>' +
@@ -1189,10 +1244,73 @@ document.addEventListener('keydown', e => {
   else if (k === 'r' && cur) { e.preventDefault(); outboxAct(cur.id, 'reject'); }
 });
 
+function escAttr(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+// What the reviewer changed on the desk, or null when it matches the draft.
+function deskEdits(id) {
+  const it = _desk.items.find(x => x.id === id);
+  const s = document.getElementById('desk-subject');
+  const b = document.getElementById('desk-body');
+  if (!it || !s || !b) return null;
+  const subject = s.value.trim(), body = b.value.trim();
+  if (subject === (it.subject || '') && body === (it.body || '')) return null;
+  return { it, subject, body };
+}
+
+async function outboxSave(id, quiet) {
+  const e = deskEdits(id);
+  if (!e) { if (!quiet) showToast('Nothing changed.', 'success'); return true; }
+  if (!e.subject || !e.body) { showToast('Subject and body can\'t be empty.', 'error'); return false; }
+  const data = await api('/api/outbox/' + encodeURIComponent(id), {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({subject: e.subject, body: e.body}),
+  });
+  if (data && data.success) {
+    e.it.subject = e.subject; e.it.body = e.body;
+    if (!quiet) showToast('Edits saved.', 'success');
+    return true;
+  }
+  showToast('Couldn\'t save the edits' + (data && data.message ? ': ' + data.message : '.'), 'error');
+  return false;
+}
+
+async function outboxRegenerate(id) {
+  const instruction = (document.getElementById('desk-instruction') || {}).value || '';
+  const btn = document.getElementById('desk-regen-btn');
+  if (btn) { btn.disabled = true; btn.innerHTML = icon('sparkle') + 'Writing…'; }
+  showToast('Rewriting — this can take up to a minute.', 'success');
+  const data = await api('/api/outbox/' + encodeURIComponent(id) + '/regenerate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({instruction: instruction.trim()}),
+  });
+  if (data && data.success) {
+    const it = _desk.items.find(x => x.id === id);
+    if (it) { it.subject = data.subject; it.body = data.body; }
+    document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i);
+    showToast('New draft ready. Review it before approving.', 'success');
+  } else {
+    if (btn) { btn.disabled = false; btn.innerHTML = icon('sparkle') + 'Regenerate'; }
+    showToast('Rewrite failed' + (data && data.message ? ': ' + data.message : '.'), 'error');
+  }
+}
+
 async function outboxAct(id, action) {
+  // Approving sends what is on screen, so unsaved edits go first.
+  if (action === 'approve' && deskEdits(id) && !(await outboxSave(id, true))) return;
   const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
-  if (data && data.success) showToast(action === 'approve' ? 'Approved — will send on schedule.' : 'Rejected.', 'success');
-  else showToast('Action failed.', 'error');
+  if (data && data.success) {
+    if (action === 'approve') {
+      const fu = Number(data.followups_approved || 0);
+      showToast(fu ? 'Approved, with ' + fu + ' follow-up' + (fu === 1 ? '' : 's') + ' — they send on schedule.'
+                   : 'Approved — will send on schedule.', 'success');
+    } else {
+      const later = Math.max(0, Number(data.rejected || 1) - 1);
+      showToast(later ? 'Rejected, with ' + later + ' later step' + (later === 1 ? '' : 's') + ' of the sequence.'
+                      : 'Rejected.', 'success');
+    }
+  } else showToast('Action failed.', 'error');
   loadOutbox();
 }
 
@@ -1208,6 +1326,87 @@ async function sendingToggle(action) {
   if (data && data.success) showToast(action === 'pause' ? 'Sending paused.' : 'Sending resumed.', 'success');
   else showToast('Failed.', 'error');
   loadOutbox();
+}
+
+// ── Sending mailboxes ──
+//
+// The same numbers the sender enforces (/api/mailboxes): caps after the
+// warm-up ramp and health gates, sends in the rolling 24 hours.
+
+function fromLabel(r) {
+  if (r.from_mailbox && r.from_removed) return r.from_mailbox + ' (removed — held until you add it back)';
+  if (r.from_mailbox) return r.from_mailbox;
+  if (r.mailbox) return r.mailbox;
+  if (_mailboxes && _mailboxes.rotation) return 'next free mailbox';
+  const first = _mailboxes && (_mailboxes.mailboxes || [])[0];
+  return (first && first.email) || '—';
+}
+
+function fromCell(r) {
+  const label = r.from_removed ? r.from_mailbox : fromLabel(r);
+  return (r.from_removed ? toneBadge('waiting', 'held') + ' ' : '') +
+    '<span class="' + (r.from_mailbox || r.mailbox ? 'mono-sm' : 'muted') + '"' +
+      (r.from_removed ? ' title="Its mailbox was removed from the config; held until you add it back"' : '') + '>' +
+      escHtml(label) + '</span>';
+}
+
+function autoFollowups(it) {
+  return !!(_mailboxes && _mailboxes.auto_approve_followups &&
+            it.kind === 'sequence' && Number(it.step) === 1);
+}
+
+function followupNote(it) {
+  return autoFollowups(it)
+    ? '<div class="desk-note">' + icon('info') + 'Approving this also approves its follow-ups.</div>' : '';
+}
+
+function mailboxStage(m) {
+  if (m.stage === 'removed') return toneBadge('idle', 'Removed') +
+    ' <span class="muted mb-sub">still counts toward max_daily_sends</span>';
+  if (m.configured === false) return toneBadge('bad', 'No password');
+  let h;
+  if (m.stage === 'paused') h = toneBadge('waiting', 'Paused');
+  else if (m.stage === 'scheduled') h = toneBadge('idle', 'Starts ' + shortDay(m.warmup_start));
+  else if (m.stage === 'warming') h = toneBadge('active', 'Warming') +
+    (m.full_on ? ' <span class="muted mb-sub">' + escHtml(fmtN(m.daily_cap) + '/day from ' + shortDay(m.full_on)) + '</span>' : '');
+  else if (m.stage === 'fixed') h = toneBadge('note', 'Fixed cap') +
+    ' <span class="muted mb-sub">no weekly ramp</span>';
+  else h = toneBadge('good', 'Warm');
+  if (m.gate === 'hold') h += ' ' + toneBadge('waiting', 'On hold');
+  if (m.accepts_new === false) h += ' <span class="muted mb-sub" title="Finishes its threads and is still read; starts no new ones">no new threads</span>';
+  return h;
+}
+
+function renderMailboxes(mb, compact) {
+  if (!mb || !mb.mailboxes || !mb.mailboxes.length) return '';
+  const flags = [];
+  if (mb.require_approval) flags.push(mb.auto_approve_followups
+    ? 'you approve first emails; follow-ups ride along' : 'every email needs your approval');
+  else flags.push('autopilot: no approval step');
+  if (mb.spread_sends) flags.push('paced through the day');
+  const capNote = mb.capped_by_global ? ' (capped by max_daily_sends ' + fmtN(mb.max_daily_sends) + ')' : '';
+  const rows = mb.mailboxes.map(m => {
+    const pct = m.cap_today ? Math.min(100, Math.round(100 * m.sent_24h / m.cap_today)) : 0;
+    return '<tr><td><span class="mono-sm">' + escHtml(m.email || (m.stage === 'removed' ? 'other' : '(default mailbox)')) + '</span>' +
+        (m.name && !compact ? '<div class="muted mb-sub">' + escHtml(m.name) + '</div>' : '') + '</td>' +
+      '<td class="mb-meter"><div class="progress-label"><span class="pct">' + fmtN(m.sent_24h) + ' / ' + fmtN(m.cap_today) +
+        '</span><span class="text">' + fmtN(m.remaining) + ' left</span></div>' +
+        '<div class="progress-bar"><div class="progress-fill green" style="width:' + pct + '%"></div></div></td>' +
+      '<td>' + mailboxStage(m) + '</td></tr>';
+  }).join('');
+  const table = '<div class="table-card mb-table"><table><thead><tr><th>Mailbox</th><th>Last 24 h</th><th>Stage</th></tr></thead><tbody>' +
+    rows + '</tbody></table></div>';
+  const summary = fmtN(mb.sent_24h) + ' of ' + fmtN(mb.capacity_today) + ' sent in the last 24 hours' + escHtml(capNote);
+  if (compact) {
+    return '<div class="mb-compact"><div class="mb-compact-head"><b>Rotation</b><span class="muted">' + summary + '</span></div>' +
+      table + '<p class="lede mb-hint">Mailboxes are listed under <span class="mono-sm">channels.email.mailboxes</span> in ' +
+      '<span class="mono-sm">mercury.local.yaml</span>; passwords live in <span class="mono-sm">.env</span>. ' +
+      '<button class="link-btn" onclick="goTab(\'warmup\')">Warm-up' + icon('arrow-right') + '</button></p></div>';
+  }
+  return '<section class="panel"><div class="panel-head"><div><h3>Sending mailboxes</h3><p>' + summary +
+      ' &middot; ' + flags.map(escHtml).join(' &middot; ') + '</p></div>' +
+      '<button class="link-btn" onclick="goTab(\'warmup\')">Warm-up' + icon('arrow-right') + '</button></div>' +
+    '<div class="panel-body">' + table + '</div></section>';
 }
 
 async function loadCompanies() {
@@ -2206,6 +2405,8 @@ function openEventDrawer(id, fromProspect) {
               'Back to ' + escHtml(back.item.name || 'contact') + '</button>' : '') +
     facts([
       ['To', '<span class="mono">' + escHtml(e.to_email || '—') + '</span>'],
+      ['From', e.mailbox ? '<span class="mono">' + escHtml(e.mailbox) + '</span>'
+        : '<span class="muted">' + (e.status === 'sent' ? '—' : 'Picked when it sends') + '</span>'],
       ['Step', icon(e.kind === 'reply' ? 'arrow-bend-up-left' : 'envelope-simple') + ' ' + escHtml(e.label || 'Email')],
       ['Status', calBadge(e.status)],
       [whenLabel, at ? escHtml(fullWhen(at)) + ' <span class="muted">&middot; ' + escHtml(relWhen(at)) + '</span>' : '<span class="muted">—</span>'],
@@ -2625,7 +2826,9 @@ async function loadWarmup(quiet) {
   _wu.data = res.data; _wu.key = key;
   const list = res.data.inboxes;
   if (!list.some(b => b.email === _wu.sel)) {
-    const pick = list.find(b => b.primary) || list[0];
+    // Open on what needs attention: a paused inbox, then one mid-ramp.
+    const pick = list.find(b => b.status === 'paused') || list.find(b => b.stage === 'warming') ||
+      list.find(b => b.primary) || list[0];
     _wu.sel = pick ? pick.email : null;
   }
   wuNavFlag();
@@ -2735,7 +2938,7 @@ function wuHero(b) {
   // Today's cap — what the sender enforces right now
   const capFoot = key === 'paused' ? 'Paused &middot; no cold email until you resume'
     : key === 'scheduled' ? 'Ramp starts ' + escHtml(shortDay(b.start_date))
-    : gate === 'hold' ? 'Held at yesterday\'s cap'
+    : gate === 'hold' && Number(b.base_cap || 0) > cap ? 'Held at yesterday\'s cap'
     : key === 'warm' ? 'Full volume'
     : b.ramp_days ? '<b>Day ' + fmtN(b.day) + '</b> of ' + fmtN(b.ramp_days) + ' &middot; full ' + escHtml(shortDay(b.full_on))
     : '<b>Day ' + fmtN(b.day) + '</b> &middot; below the daily cap';

@@ -594,7 +594,28 @@ td a:hover { text-decoration: underline; }
   font-size: 14.5px; line-height: 1.75; white-space: pre-wrap; max-width: 64ch;
   padding: 18px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
 }
-.desk-actions { display: flex; align-items: center; gap: 10px; margin-top: 18px; }
+.desk-actions { display: flex; align-items: center; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+/* Editable draft: subject + body are inputs, styled as the email they are */
+.desk-pane .desk-subject { font-size: 16px; font-weight: 600; letter-spacing: -0.015em; margin: 12px 0 10px; }
+.desk-pane .desk-body { font-size: 14px; line-height: 1.7; resize: vertical; min-height: 220px; white-space: pre-wrap; }
+.desk-regen { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+.desk-regen .form-input { flex: 1; min-width: 0; padding: 7px 11px; font-size: 12.5px; }
+.desk-regen .btn { flex: none; }
+.desk-note { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-2); margin-top: 8px; }
+.desk-note .ph { font-size: 14px; color: var(--text-3); }
+
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.mono-sm { font-family: var(--mono); font-size: 12px; }
+
+/* Sending mailboxes (Outbox panel, Settings) */
+.mb-table td { vertical-align: middle; }
+.mb-meter { min-width: 160px; }
+.mb-meter .progress-label { margin-bottom: 5px; font-size: 12px; }
+.mb-sub { font-size: 12px; }
+.mb-compact { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.mb-compact-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; font-size: 13px; margin-bottom: 8px; }
+.mb-compact-head .muted { font-size: 12.5px; }
+.mb-hint { margin-top: 8px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 
 @media (max-width: 900px) { .desk { grid-template-columns: 1fr; } .desk-list { max-height: 220px; } }
 

@@ -172,3 +172,17 @@ def test_load_env_reads_environment(monkeypatch):
 def test_env_config_rejects_non_string():
     with pytest.raises(ValidationError):
         EnvConfig(instantly_api_key=["not", "a", "string"])
+
+
+def test_mercury_config_env_names_the_config_file(tmp_path, monkeypatch):
+    import pytest as _pytest
+
+    from mercury.config import ConfigFileNotFoundError, _find_config_file
+
+    cfg = tmp_path / "demo.mercury.yaml"
+    cfg.write_text("persona: {}\n")
+    monkeypatch.setenv("MERCURY_CONFIG", str(cfg))
+    assert _find_config_file() == str(cfg)
+    monkeypatch.setenv("MERCURY_CONFIG", str(tmp_path / "missing.yaml"))
+    with _pytest.raises(ConfigFileNotFoundError):
+        _find_config_file()
