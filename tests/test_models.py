@@ -60,3 +60,10 @@ def test_conversation_thread_json_round_trip():
     assert len(restored) == 2
     assert restored[0].sender == "mercury"
     assert restored[1].content == "Interested!"
+
+
+def test_legacy_harvey_sender_is_still_ours():
+    # Threads recorded before the rename carry sender "harvey".
+    assert Message(sender="harvey", content="Hi").is_ours
+    assert Message(sender="mercury", content="Hi").is_ours
+    assert not Message(sender="prospect", content="Hi").is_ours
