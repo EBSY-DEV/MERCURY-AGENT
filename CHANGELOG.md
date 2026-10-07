@@ -39,6 +39,17 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **CSV contact import** (#3). Dashboard (Contacts → Import CSV), `mercury import`
+  share one service. It has a read-only preview
+  with per-row outcomes (new, needs enrichment, duplicate, invalid), column
+  mapping with header aliases, delimiter detection, a skip or fill-blanks policy
+  for duplicates, and a single-transaction commit that is safe to retry.
+  Imported contacts are held at status `imported` with `guess` addresses.
+  Verifying (`mercury imports verify`) and releasing to outreach
+  (`mercury imports release`) are separate, explicit steps. Schema v13 adds
+  `import_batches`, `import_rows` and the prospects' `import_batch_id` /
+  `import_row`.
+
 - **Inbox management in Settings.** Add SMTP/IMAP inboxes, set or replace
   passwords, edit per-inbox servers, caps and warm-up dates, stop new outreach
   while finishing existing threads, and test connections without sending.

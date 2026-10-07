@@ -1667,3 +1667,31 @@ details[open] summary::before { content: '– '; }
 #today-trend.unavailable .chart-controls { display: none; }
 #today-trend.unavailable .chart-note { min-height: 0; padding: 14px 18px 18px; }
 .dns-checked { font-size: 11.5px; color: var(--text-3); }
+
+/* ── Contacts: CSV import ─────────────────────────────────────── */
+
+.imp-card { margin-bottom: 16px; }
+.imp-needs { font-size: 12px; margin-top: 2px; }
+.imp-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.imp-step { margin-top: 18px; }
+.imp-step h3 { font-size: 13px; font-weight: 600; color: var(--text-2); margin-bottom: 10px; }
+.imp-file { cursor: pointer; }
+.imp-map { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 0 12px; }
+.imp-map .form-group { margin-bottom: 10px; }
+.imp-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.sig-stat.imp-new .n { color: var(--text); }
+.sig-stat.imp-incomplete .n { color: var(--accent-deep); }
+.sig-stat.imp-duplicate .n { color: var(--text-3); }
+.sig-stat.imp-invalid .n { color: var(--s-bad); }
+.imp-rows { max-height: 420px; }
+.imp-rows td:nth-child(n+3) { overflow-wrap: anywhere; }
+.imp-commit { display: flex; align-items: center; justify-content: flex-end; gap: 16px; flex-wrap: wrap; }
+.imp-commit .check { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+.imp-actions { display: flex; gap: 6px; justify-content: flex-end; white-space: nowrap; }
+.imp-error {
+  display: flex; gap: 8px; align-items: flex-start; margin-top: 14px; padding: 10px 12px;
+  border: 1px solid var(--s-bad-line); border-radius: var(--r-sm);
+  background: var(--s-bad-bg); font-size: 13px; color: var(--text);
+}
+.imp-error .ph { color: var(--s-bad); font-size: 16px; flex-shrink: 0; margin-top: 1px; }
+@media (max-width: 720px) { .imp-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
