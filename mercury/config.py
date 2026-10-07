@@ -107,8 +107,9 @@ class MailboxConfig(BaseModel):
     # Preserve a legacy inbox with separate IMAP credentials when rotation
     # is enabled from the dashboard. Empty uses its SMTP password.
     imap_password_env: str = ""
-    # Steady-state ceiling once warm-up has run its course.
-    daily_cap: int = 30
+    # Steady-state ceiling once warm-up has run its course. 15 is the smtp
+    # provider ceiling (provider_daily_ceilings), so the default never warns.
+    daily_cap: int = 15
     # First day this mailbox sent cold mail. The cap starts at
     # channels.email.warmup_initial_cap and grows weekly from here. Leave
     # empty for a mailbox that is already warm. A date in the future means
