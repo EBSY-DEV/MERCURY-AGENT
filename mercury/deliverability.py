@@ -114,10 +114,9 @@ class BounceComposition:
 
     @property
     def counted(self) -> int:
-        """Bounces that count toward the bounce rate (NOISE never does)."""
-        if not self.classified:
-            return self.total
-        return max(0, self.total - self.buckets.get("NOISE", 0))
+        """Bounces that count toward the bounce rate. ``total`` comes from
+        the metrics counts, which already leave NOISE out."""
+        return self.total
 
 
 async def bounce_composition(db_path: str, mailboxes: set[str], since: str,
@@ -128,15 +127,20 @@ async def bounce_composition(db_path: str, mailboxes: set[str], since: str,
     domain ('' when the domain owns the legacy rows) and ``total`` is the
     de-duplicated bounce count already attributed to them.
 
-    This is the one place bounce classification plugs in. Bounces carry no
-    SMTP status code yet, so today it returns the total, unclassified, and
-    the verdict never calls a domain burned from bounces alone. When bounce
-    records gain a DSN bucket, read them here (attributing each bounce to a
-    mailbox with ``metrics._event_mailbox_sql()``, as the totals are) and
-    return ``classified=True`` with the counts per bucket. Nothing else in
-    the ladder has to change.
+    This is the one place bounce classification plugs in. The buckets come
+    from the DSN code the handler stores on each bounce (``mercury.bounces``),
+    attributed to a mailbox the same way the totals are. Bounces logged
+    before classification read as UNKNOWN; a domain with only those is not
+    classified, so the verdict never calls it burned from bounces alone.
     """
-    return BounceComposition(total=total)
+    per_mailbox = await metrics.bucket_counts_by_mailbox(db_path, since)
+    buckets: dict[str, int] = {}
+    for mailbox in mailboxes:
+        for bucket, n in per_mailbox.get(mailbox, {}).items():
+            buckets[bucket] = buckets.get(bucket, 0) + n
+    classified = any(b != "UNKNOWN" for b in buckets)
+    return BounceComposition(total=total, classified=classified,
+                             buckets=buckets if classified else {})
 
 
 # ── The verdict ladder (pure) ────────────────────────────────────────
@@ -444,8 +448,8 @@ def format_report(report: dict, placement: dict | None = None) -> str:
                   "warm-up start."]
     lines += [f"  {t}" for t in thresholds_text(report)]
     if not report.get("bounces_classified"):
-        lines.append("  Bounces aren't classified by SMTP code yet, so a burned domain shows up "
-                     "only as missing replies.")
+        lines.append("  No bounce in the window carries an SMTP code yet, so a burned domain "
+                     "shows up only as missing replies.")
     if un.get("bounces") or un.get("replies"):
         lines.append(f"  Not charged to any domain (no matching send): {un.get('bounces', 0)} "
                      f"bounces, {un.get('replies', 0)} replies.")

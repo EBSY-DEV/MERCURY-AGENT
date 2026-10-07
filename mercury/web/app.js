@@ -3651,7 +3651,7 @@ function renderHealth() {
     '<details class="health-rules"><summary>How the verdict works</summary><ul>' +
       (d.thresholds_text || []).map(t => '<li>' + escHtml(t) + '</li>').join('') +
       '<li>The verdict reads the last ' + win + ' days. Sending age counts from the first send or the warm-up start.</li>' +
-      (d.bounces_classified ? '' : '<li>Bounces are not classified by SMTP code yet, so a burned domain only shows up as missing replies.</li>') +
+      (d.bounces_classified ? '' : '<li>No bounce in the window carries an SMTP code yet, so a burned domain only shows up as missing replies.</li>') +
     '</ul></details>';
   foot.hidden = false;
   foot.innerHTML = placementLine(d.placement);

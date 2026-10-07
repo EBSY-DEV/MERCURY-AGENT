@@ -98,15 +98,33 @@ def test_a_burned_bounce_code_cancels_even_a_young_domain():
     burned = BounceComposition(total=3, classified=True, buckets={"BURNED": 1, "LIST": 2})
     r = v(age_days=10, sent=40, replies=5, bounces=burned)
     assert r["verdict"] == "CANCEL_CANDIDATE" and "5.7.6xx" in r["reason"]
-    # Classified list bounces alone are not a burned domain; noise doesn't count.
-    listy = BounceComposition(total=4, classified=True, buckets={"LIST": 2, "NOISE": 2})
+    # Classified list bounces alone are not a burned domain. The total comes
+    # from the metrics counts, which already leave NOISE out.
+    listy = BounceComposition(total=2, classified=True, buckets={"LIST": 2, "NOISE": 2})
     assert not listy.burned and listy.counted == 2
     assert v(sent=300, replies=6, bounces=listy)["verdict"] == "KEEP"
 
 
-def test_bounce_composition_seam_is_unclassified_today(tmp_path):
-    comp = _run(dl.bounce_composition(str(tmp_path / "x.db"), {"a@x.co"}, _ago(30), 7))
-    assert comp.total == 7 and not comp.classified and not comp.burned and comp.counted == 7
+def test_bounce_composition_unclassified_without_bucketed_bounces(sm):
+    # No bounces, or only ones logged before classification: never burned.
+    pid = _send(sm, 1, "a@x.co")[0]
+    _event(sm, "bounce", pid, days_ago=1, mailbox="a@x.co")
+    comp = _run(dl.bounce_composition(sm.db_path, {"a@x.co"}, _ago(30), 1))
+    assert comp.total == 1 and not comp.classified and not comp.burned and comp.counted == 1
+
+
+def test_bounce_composition_reads_the_handlers_buckets_per_domain(sm):
+    pids = _send(sm, 3, "a@x.co") + _send(sm, 1, "b@other.co")
+    for pid, bucket in zip(pids, ["BURNED", "LIST", "NOISE", "BURNED"]):
+        _run(sm.log_action("bounce", "handler", {"prospect_id": pid, "bucket": bucket},
+                           created_at=_ago(1)))
+    comp = _run(dl.bounce_composition(sm.db_path, {"a@x.co"}, _ago(30), 2))
+    assert comp.classified and comp.burned
+    assert comp.buckets == {"BURNED": 1, "LIST": 1, "NOISE": 1}
+    assert comp.counted == 2
+    # The other domain's burned bounce is not charged here, nor an old one.
+    clean = _run(dl.bounce_composition(sm.db_path, {"a@x.co"}, _ago(0.5), 0))
+    assert not clean.classified and not clean.burned
 
 
 def test_copy_has_no_em_dashes():
@@ -283,7 +301,7 @@ def test_format_report_lists_counts_verdicts_and_thresholds(sm):
     assert "Last 7 days" in text and "Last 14 days" in text and "Last 30 days" in text
     assert "0 replies on 160 sends" in text
     assert "Keep: replies at 1% or more after 200 sends." in text
-    assert "aren't classified by SMTP code yet" in text
+    assert "carries an SMTP code yet" in text
     assert "No placement test yet" in text
     assert "—" not in text
 
