@@ -24,6 +24,13 @@ class PromptInput(BaseModel):
     version_id: str = Field(default="", max_length=100)
     instruction: str = Field(default="", max_length=500)
     draft: DraftInput | None = None
+    mailbox: str = Field(default="", max_length=320)
+
+
+class MailboxVoiceInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    persona_id: str = Field(default="", max_length=100)
+    sign_name: str = Field(default="", max_length=80, pattern=r"^[^\r\n]*$")
 
 
 class ArchiveInput(BaseModel):
@@ -31,9 +38,9 @@ class ArchiveInput(BaseModel):
 
 
 async def context():
-    from mercury.config import load_config
+    from mercury.config import load_config, load_env
     from mercury.dashboard import _state
-    service = await PersonaService(_state(), load_config()).ready()
+    service = await PersonaService(_state(), load_config(), load_env()).ready()
     return service.state, service.config, service
 
 
@@ -55,6 +62,7 @@ async def overview():
     return {
         **await service.list(),
         "totals": await service.totals(),
+        "mailboxes": await service.mailboxes(),
         "current": generation_config(config),
         "config_file": _find_config_file(),
         "markets": [market.model_dump() for market in config.icp.markets],
@@ -108,7 +116,7 @@ async def inspect_prompt(body: PromptInput):
     *_, service = await context()
     return await call(service.prompt(
         "", body.prospect_id, instruction=body.instruction, version_id=body.version_id,
-        draft=body.draft.model_dump() if body.draft else None))
+        draft=body.draft.model_dump() if body.draft else None, mailbox=body.mailbox))
 
 
 @router.post("/api/personas/preview")
@@ -117,8 +125,26 @@ async def preview_email(body: PromptInput):
     # This makes one model call, but never creates an outbox item or campaign.
     result = await call(service.preview(
         "", body.prospect_id, instruction=body.instruction, version_id=body.version_id,
-        draft=body.draft.model_dump() if body.draft else None))
+        draft=body.draft.model_dump() if body.draft else None, mailbox=body.mailbox))
     return {"success": True, **result}
+
+
+@router.get("/api/voices")
+async def mailbox_voices():
+    """Mailbox voices plus the short persona list the drawer's picker needs."""
+    *_, service = await context()
+    listing = await service.list(include_archived=False)
+    return {
+        "mailboxes": await service.mailboxes(),
+        "default_id": listing["default_id"],
+        "personas": [{key: p[key] for key in ("id", "name", "revision", "sign_name")} for p in listing["personas"]],
+    }
+
+
+@router.post("/api/voices/{email}")
+async def assign_mailbox_voice(email: str, body: MailboxVoiceInput):
+    *_, service = await context()
+    return await call(service.assign_mailbox(email, body.persona_id, body.sign_name))
 
 
 @router.get("/api/outbox/{item_id}/generation-history")

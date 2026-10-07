@@ -28,6 +28,9 @@ class Campaign(BaseModel):
     status: str = "draft"  # draft/active/paused/completed
     prospect_ids: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=_utcnow)
+    # The mailbox every step goes out from, when the campaign was written in
+    # one mailbox's voice. Empty: the sender rotates as usual.
+    mailbox: str = ""
 
     def sequence_json(self) -> str:
         return json.dumps([s.model_dump() for s in self.sequence])

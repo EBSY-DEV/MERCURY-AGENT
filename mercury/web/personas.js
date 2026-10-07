@@ -2,9 +2,9 @@
 let _voiceData = null, _voiceView = 'profiles', _personaEdit = null;
 let _voiceDirty = false, _voiceBusy = false, _voiceRequest = 0, _historyRequest = 0;
 let _voiceVersions = {}, _voiceCompare = null, _voiceContacts = null, _avatarChoice = null;
-let _voicePrompt = {persona: '', version: '', contact: '', instruction: ''}, _voicePromptTimer = null;
+let _voicePrompt = {persona: '', version: '', contact: '', instruction: '', mailbox: null}, _voicePromptTimer = null;
 
-const VOICE_LIMITS = {name: 80, description: 500, tone: 1000, instructions: 8000, examples: 8000};
+const VOICE_LIMITS = {name: 80, description: 500, sign_name: 80, tone: 1000, instructions: 8000, examples: 8000};
 const VOICE_WRITING = ['tone', 'instructions', 'examples'];
 const VOICE_SECTION_ICON = {template: 'file-text', knowledge: 'books', persona: 'sparkle', email: 'address-book', format: 'brackets-curly'};
 
@@ -71,6 +71,7 @@ function renderPersonaList() {
       (all.length > active ? ', ' + (all.length - active) + ' archived' : '') + '</p></div></div>' +
     '<div class="persona-rows">' + rows.map(p => {
       const selected = p === _personaEdit || p.id === _personaEdit.id, drafted = (_voiceData.totals[p.id] || {}).drafted;
+      const sends = voiceMailboxesFor(p.id).length;
       return '<button class="persona-row' + (selected ? ' selected' : '') + (p.archived ? ' archived' : '') + '"' +
         (p.id ? ' onclick="selectPersona(\'' + escAttr(p.id) + '\')"' : '') + ' aria-pressed="' + selected + '">' + personaImage(p) +
         '<span class="persona-row-main"><span class="persona-row-title"><strong>' + escHtml(p.name || 'New persona') + '</strong>' +
@@ -78,7 +79,8 @@ function renderPersonaList() {
         '<p>' + escHtml(p.description || p.tone || 'Not saved yet') + '</p><span class="persona-meta">' +
           (p.id === _voiceData.default_id ? toneBadge('good', 'Default') : '') +
           (p.archived ? '<span>' + icon('archive') + 'Archived</span>'
-            : p.id ? '<span>' + icon('envelope-simple') + (drafted ? voiceNum(drafted) + ' emails' : 'No emails yet') + '</span>' : '') +
+            : p.id ? '<span>' + icon('tray') + (sends ? sends + (sends === 1 ? ' mailbox' : ' mailboxes') : 'No mailbox') + '</span>' +
+              '<span>' + icon('envelope-simple') + (drafted ? voiceNum(drafted) + ' emails' : 'No emails yet') + '</span>' : '') +
         '</span></span></button>';
     }).join('') + '</div>';
 }
@@ -122,7 +124,7 @@ function voiceField(id, label, help, value, rows, placeholder) {
 
 function voiceFormValues() {
   const values = {};
-  for (const key of ['name', 'description', ...VOICE_WRITING]) {
+  for (const key of ['name', 'description', 'sign_name', ...VOICE_WRITING]) {
     const el = document.getElementById('voice-' + key);
     values[key] = el ? el.value : (_personaEdit[key] || '');
   }
@@ -134,7 +136,7 @@ function voiceChanges() {
   if (!saved) return {writing: true, label: true};
   const values = voiceFormValues(), same = key => (values[key] || '').trim() === (saved[key] || '').trim();
   return {writing: !VOICE_WRITING.every(same),
-    label: !['name', 'description'].every(same) || _personaEdit.avatar_seed !== saved.avatar_seed};
+    label: !['name', 'description', 'sign_name'].every(same) || _personaEdit.avatar_seed !== saved.avatar_seed};
 }
 
 function renderPersonaEditor() {
@@ -153,7 +155,10 @@ function renderPersonaEditor() {
           (existing && !isDefault ? '<button type="button" class="btn btn-secondary btn-sm" onclick="personaAction(\'archive\')">' + icon('archive') + (p.archived ? 'Restore' : 'Archive') + '</button>' : '') +
         '</span></div>' +
         '<input class="form-input" id="voice-description" aria-label="Description" maxlength="500" placeholder="When should Mercury use this voice?" value="' + escAttr(p.description) + '"' + off + '>' +
-        '<p class="voice-help">Name, description and avatar are labels. Changing them does not create a new version.</p></div></div>' +
+        '<label class="voice-sign"><span>Suggested sign-off</span><input class="form-input" id="voice-sign_name" maxlength="80" placeholder="' +
+          escAttr(_voiceData.current.sender.name || 'A first name') + '" value="' + escAttr(p.sign_name || '') + '"' + off + '></label>' +
+        '<p class="voice-help">Name, description, sign-off and avatar are labels. Changing them does not create a new version. ' +
+          'A mailbox with its own sign-off name always uses that instead.</p></div></div>' +
     '<fieldset class="voice-form"' + off + ' style="border:0;margin:0">' +
       '<div class="voice-section-label"><h4>How it writes</h4><p>' + (existing
         ? 'Saving changes here creates v' + (p.revision + 1) + '. Drafts already written keep the version they used.'
@@ -294,10 +299,16 @@ async function renderPersonaRail() {
         '<div class="panel-foot"><button class="link-btn" onclick="openVoicePreview()">Preview with a contact' + icon('arrow-right') + '</button></div>'
       : 'Save the persona first, then preview it with a real contact.</p></div></div>') + '</section>';
   if (!p.id) { rail.innerHTML = tryPanel; return; }
-  const t = _voiceData.totals[p.id] || {};
-  rail.innerHTML = '<section class="panel"><div class="panel-head"><div><h3>History</h3><p>Every email records the version that wrote it.</p></div></div>' +
+  const t = _voiceData.totals[p.id] || {}, sends = voiceMailboxesFor(p.id);
+  const sendsPanel = '<section class="panel"><div class="panel-head"><div><h3>Sends from</h3><p>' + (sends.length
+      ? sends.length + (sends.length === 1 ? ' mailbox writes' : ' mailboxes write') + ' in this voice.'
+      : 'No mailbox writes in this voice yet.') + '</p></div></div>' +
+    (sends.length ? '<div class="voice-sends">' + sends.map(m => '<div><span class="mono-sm">' + escHtml(m.email) + '</span><span>Signs as ' +
+      escHtml(m.signer) + '</span></div>').join('') + '</div>' : '') +
+    '<div class="panel-foot"><button class="link-btn" onclick="voiceView(\'config\')">' + (sends.length ? 'Change in Generation' : 'Assign a mailbox') + icon('arrow-right') + '</button></div></section>';
+  rail.innerHTML = sendsPanel + '<section class="panel"><div class="panel-head"><div><h3>History</h3><p>Every email records the version that wrote it.</p></div></div>' +
     '<dl class="voice-stats"><div><dt>Versions</dt><dd>' + p.revision + '</dd></div><div><dt>Emails</dt><dd>' + voiceNum(t.drafted) +
-      '</dd></div><div><dt>Replies</dt><dd>' + voiceRate(t.replies, t.sent) + '</dd></div></dl>' +
+      '</dd></div><div><dt>Replies</dt><dd>' + (t.sent ? voiceRate(t.replies, t.sent) : '<span class="voice-none">None yet</span>') + '</dd></div></dl>' +
     '<div class="voice-recent" id="voice-recent"></div>' +
     '<div class="panel-foot"><button class="link-btn" onclick="voiceView(\'versions\')">Compare versions' + icon('arrow-right') + '</button></div></section>' + tryPanel;
   const versions = await voiceVersions(p.id);
@@ -408,12 +419,15 @@ async function renderVoicePrompt() {
       '<div><label class="form-label" for="voice-prompt-persona">Persona</label><select class="form-input" id="voice-prompt-persona" onchange="voicePromptChanged(\'persona\', this.value)">' +
         active.map(p => '<option value="' + escAttr(p.id) + '"' + (p.id === persona.id ? ' selected' : '') + '>' + escHtml(p.name) + '</option>').join('') + '</select></div>' +
       '<div><label class="form-label" for="voice-prompt-version">Version</label><select class="form-input" id="voice-prompt-version" onchange="voicePromptChanged(\'version\', this.value)"><option>Loading…</option></select></div>' +
+      '<div><label class="form-label" for="voice-prompt-mailbox">From</label><select class="form-input" id="voice-prompt-mailbox" onchange="voicePromptChanged(\'mailbox\', this.value)">' +
+        (voiceMailboxes().length ? voiceMailboxes().map(m => '<option value="' + escAttr(m.email) + '"' + (m.email === voicePromptMailbox(persona.id) ? ' selected' : '') + '>' +
+          escHtml(m.email) + '</option>').join('') : '<option value="">No mailbox configured</option>') + '</select></div>' +
       '<div><label class="form-label" for="voice-prompt-contact">Contact</label><select class="form-input" id="voice-prompt-contact" onchange="voicePromptChanged(\'contact\', this.value)"><option value="">Loading contacts…</option></select></div>' +
       '<div><label class="form-label" for="voice-prompt-instruction">Instruction (optional)</label><input class="form-input" id="voice-prompt-instruction" maxlength="500" placeholder="For example: mention their Saturday hours" value="' +
         escAttr(_voicePrompt.instruction) + '" oninput="voicePromptChanged(\'instruction\', this.value)"></div>' +
-      '<div class="btn-group"><button class="btn btn-secondary" id="voice-inspect" onclick="runVoicePreview(false)" disabled>' + icon('magnifying-glass') + 'Inspect prompt</button>' +
-        '<button class="btn btn-primary" id="voice-generate" onclick="runVoicePreview(true)" disabled>' + icon('sparkle') + 'Write sample</button></div>' +
-    '</div><div class="panel-foot"><span>' + toneBadge('note', 'Inspecting makes no model call. Writing a sample uses one Claude call and never queues or sends anything.') + '</span></div></section>' +
+    '</div><div class="panel-foot"><span>' + toneBadge('note', 'Inspecting makes no model call. Writing a sample uses one Claude call and never queues or sends anything.') + '</span>' +
+      '<span class="voice-foot-buttons"><button class="btn btn-secondary btn-sm" id="voice-inspect" onclick="runVoicePreview(false)" disabled>' + icon('magnifying-glass') + 'Inspect prompt</button>' +
+        '<button class="btn btn-primary btn-sm" id="voice-generate" onclick="runVoicePreview(true)" disabled>' + icon('sparkle') + 'Write sample</button></span></div></section>' +
     '<div class="voice-columns"><section class="panel" id="voice-prompt-result">' + emptyState('eye', 'Pick a contact', 'You will see each part of the prompt the writer receives, in order.') + '</section>' +
     '<section class="panel" id="voice-sample">' + emptyState('envelope-simple', 'No sample yet', 'Write a sample to read the email this voice would send. It is never queued.') + '</section></div>';
   const [versions, contacts] = await Promise.all([voiceVersions(persona.id),
@@ -438,14 +452,14 @@ async function renderVoicePrompt() {
 
 function voicePromptChanged(key, value) {
   _voicePrompt[key] = value;
-  if (key === 'persona') { _voicePrompt.version = ''; renderVoicePrompt(); return; }
+  if (key === 'persona') { _voicePrompt.version = ''; _voicePrompt.mailbox = null; renderVoicePrompt(); return; }
   clearTimeout(_voicePromptTimer);
   _voicePromptTimer = setTimeout(() => runVoicePreview(false), key === 'instruction' ? 500 : 0);
 }
 
 function voicePromptBody() {
   const persona = voicePersona(_voicePrompt.persona);
-  const body = {prospect_id: _voicePrompt.contact, instruction: _voicePrompt.instruction.trim()};
+  const body = {prospect_id: _voicePrompt.contact, instruction: _voicePrompt.instruction.trim(), mailbox: voicePromptMailbox(persona.id)};
   if (_voicePrompt.version === 'unsaved') {
     body.version_id = persona.version_id;
     body.draft = {tone: _personaEdit.tone || '', instructions: _personaEdit.instructions || '', examples: _personaEdit.examples || ''};
@@ -480,7 +494,7 @@ function renderPromptSections(el, res) {
   if (!res.ok) { el.innerHTML = '<div class="panel-head"><div><h3>Assembled prompt</h3><p class="voice-error" role="alert">' + escHtml(res.error) + '</p></div></div>'; return; }
   const d = res.data, p = d.persona;
   const source = {template: 'prompts/writer.md', knowledge: 'Writer files in skills/', persona: p.name + ' · ' + (p.unsaved ? 'unsaved edits of v' + p.revision : 'v' + p.revision),
-    email: 'Contact facts, rules and your instruction', format: 'JSON only'};
+    email: 'Contact facts, rules, sign-off as ' + (p.signer || 'the sender') + ', your instruction', format: 'JSON only'};
   el.innerHTML = '<div class="panel-head"><div><h3>Assembled prompt</h3><p>Exactly what the writer receives, in order.</p></div>' +
       '<span class="num" title="Estimated at four characters per token">≈ ' + voiceNum(voiceTokens(d.prompt)) + ' tokens</span></div>' +
     '<div>' + d.sections.map(s => '<details class="voice-section"' + (s.key === 'persona' ? ' open' : '') + '><summary>' +
@@ -496,7 +510,8 @@ async function copyVoicePrompt(button) {
 }
 
 function renderSample(el, d) {
-  const c = (_voiceContacts || []).find(x => x.id === _voicePrompt.contact) || {}, sender = _voiceData.current.sender, p = d.persona;
+  const c = (_voiceContacts || []).find(x => x.id === _voicePrompt.contact) || {}, p = d.persona;
+  const box = voiceMailboxes().find(m => m.email === p.mailbox), sender = box ? {name: box.from_name, email: box.email} : _voiceData.current.sender;
   const words = (d.body.match(/\S+/g) || []).length, questions = (d.body.match(/\?/g) || []).length;
   el.innerHTML = '<div class="panel-head"><div><h3>Sample email</h3><p>Not queued. Nothing was sent.</p></div></div>' +
     '<div class="voice-email-head">' + facts([['From', escHtml(sender.name + (sender.email ? ' <' + sender.email + '>' : ''))],
@@ -515,13 +530,14 @@ function renderVoiceConfig() {
   const profile = voicePersona(d.default_id), text = v => escHtml(v || 'Not set');
   document.getElementById('voice-config').innerHTML = '<div class="voice-config"><div>' +
     '<section class="panel"><div class="voice-default">' + personaImage(profile, 'large') + '<div><h3>Default voice</h3>' +
-      '<p>Every new draft is written in this voice. Drafts already written keep theirs.</p></div>' +
+      '<p>Every mailbox without its own voice writes in this one. Drafts already written keep theirs.</p></div>' +
       '<select class="form-input" aria-label="Default voice" onchange="setDefaultPersona(this.value)">' + d.personas.filter(p => !p.archived).map(p =>
         '<option value="' + escAttr(p.id) + '"' + (p.id === d.default_id ? ' selected' : '') + '>' + escHtml(p.name) + ' · v' + p.revision + '</option>').join('') + '</select></div></section>' +
     '<section class="panel"><div class="panel-head"><div><h3>How emails go out</h3><p>Applies to every voice.</p></div></div><div class="panel-body">' +
       facts([['Provider', text(d.email.provider)], ['Before sending', d.email.require_approval ? 'Each draft waits in the Outbox for you' : 'Sent automatically'],
         ['Follow-ups', d.email.auto_approve_followups ? 'Approved with the first email' : 'Reviewed one by one'],
-        ['Daily limit', '<span class="mono">' + voiceNum(d.email.max_daily_sends) + '</span> emails']]) + '</div></section></div>' +
+        ['Daily limit', '<span class="mono">' + voiceNum(d.email.max_daily_sends) + '</span> emails']]) + '</div></section>' +
+    voiceMailboxPanel() + '</div>' +
     '<section class="panel"><div class="panel-head"><div><h3>What every voice knows</h3><p>The same facts, whichever voice writes.</p></div></div><div class="panel-body">' +
       facts([['Sender', text([sender.name, sender.role].filter(Boolean).join(', '))], ['Company', text(sender.company)], ['Email', text(sender.email)],
         ['Product', text(product.name)], ['Description', text(product.description)], ['Benefits', text((product.key_benefits || []).join(', '))],
@@ -535,6 +551,83 @@ async function setDefaultPersona(id) {
   if (!res.ok) { showToast(res.error, 'error'); renderVoiceConfig(); return; }
   showToast('New drafts now use ' + voicePersona(id).name + '.', 'success');
   await loadPersonas(_personaEdit && _personaEdit.id);
+}
+
+// ── Mailboxes: each one's voice and sign-off ──
+
+function voiceMailboxes() { return (_voiceData && _voiceData.mailboxes) || []; }
+function voiceMailboxesFor(id) { return voiceMailboxes().filter(m => m.persona.id === id); }
+
+function voicePromptMailbox(personaId) {
+  const all = voiceMailboxes();
+  if (_voicePrompt.mailbox !== null && all.some(m => m.email === _voicePrompt.mailbox)) return _voicePrompt.mailbox;
+  return ((all.find(m => m.persona.id === personaId) || all[0]) || {}).email || '';
+}
+
+// One voice version and one signer across every mailbox that opens threads:
+// the sender keeps rotating. Otherwise threads get their mailbox when written.
+function voicesPinned(mailboxes) {
+  return new Set(mailboxes.filter(m => m.enabled).map(m => m.persona.version_id + '|' + m.signer)).size > 1;
+}
+
+function voiceAssignControls(m, personas, defaultId) {
+  const def = personas.find(p => p.id === defaultId) || {name: 'default'};
+  const attrs = ' data-email="' + escAttr(m.email) + '" onchange="voiceAssignChange(this)"';
+  return '<select class="form-input" data-field="persona_id" aria-label="Voice for ' + escAttr(m.email) + '"' + attrs + '>' +
+      '<option value=""' + (m.persona_id && !m.follows_default ? '' : ' selected') + '>Default (' + escHtml(def.name) + ')</option>' +
+      personas.map(p => '<option value="' + escAttr(p.id) + '"' + (p.id === m.persona_id && !m.follows_default ? ' selected' : '') + '>' + escHtml(p.name) + '</option>').join('') +
+    '</select><input class="form-input" data-field="sign_name" maxlength="80" aria-label="Sign-off name for ' + escAttr(m.email) + '" value="' + escAttr(m.sign_name) +
+      '" placeholder="' + escAttr(m.suggested) + '" data-email="' + escAttr(m.email) + '" onchange="voiceAssignChange(this)">';
+}
+
+function voiceMailboxPanel() {
+  const mbs = voiceMailboxes(), personas = _voiceData.personas.filter(p => !p.archived);
+  if (!mbs.length) return '<section class="panel"><div class="panel-head"><div><h3>Voice per mailbox</h3><p>No sending mailbox is configured yet. Add one in Mailboxes.</p></div></div></section>';
+  return '<section class="panel"><div class="panel-head"><div><h3>Voice per mailbox</h3><p>Each mailbox writes in one voice and signs with one name, so a contact never hears two people from the same address. Leave the name empty to use the persona’s suggested sign-off.</p></div></div>' +
+    '<div class="voice-mb-table"><div class="voice-mb-row head"><span>Mailbox</span><span>Voice</span><span>Signs as</span></div>' +
+    mbs.map(m => '<div class="voice-mb-row"><span class="voice-mb-email"><span class="mono-sm">' + escHtml(m.email) + '</span>' +
+      (m.enabled ? '' : toneBadge('idle', 'No new threads')) + '</span>' + voiceAssignControls(m, personas, _voiceData.default_id) + '</div>').join('') + '</div>' +
+    '<div class="panel-foot"><span>' + toneBadge('note', voicesPinned(mbs)
+      ? 'These mailboxes write differently, so each new thread gets its mailbox when it is written and keeps it for every follow-up.'
+      : 'Every mailbox writes the same way, so Mercury keeps choosing the mailbox when it sends.') + '</span></div></section>';
+}
+
+async function voiceAssignChange(select) {
+  const email = select.dataset.email;
+  const current = (voiceMailboxes().length ? voiceMailboxes() : (_mb.voices || [])).find(m => m.email === email);
+  if (!current) return;
+  const body = {persona_id: current.follows_default ? '' : current.persona_id, sign_name: current.sign_name, [select.dataset.field]: select.value.trim()};
+  select.disabled = true;
+  const res = await postJSON('/api/voices/' + encodeURIComponent(email), body);
+  select.disabled = false;
+  if (!res.ok) { showToast(res.error, 'error'); return; }
+  showToast(email + ' now writes as ' + res.data.persona.name + ' and signs as ' + res.data.signer + '.', 'success');
+  const swap = list => (list || []).map(m => (m.email === email ? res.data : m));
+  if (_voiceData) _voiceData.mailboxes = swap(_voiceData.mailboxes);
+  if (typeof _mb !== 'undefined' && _mb.voices) _mb.voices = swap(_mb.voices);
+  if (currentTab === 'personas' && _voiceData) {
+    renderPersonaList(); renderPersonaRail();
+    if (_voiceView === 'config') renderVoiceConfig();
+  }
+  if (currentTab === 'mailboxes') mbRefreshDrawer();
+}
+
+function mbVoiceSection(email) {
+  const m = (_mb.voices || []).find(x => x.email === email);
+  if (!m) return '';
+  const p = m.persona;
+  return '<div class="drawer-section"><div class="mb-sec-head"><h4>Voice</h4><button class="link-btn" onclick="openVoiceFor(this.dataset.id)" data-id="' + escAttr(p.id) + '">' +
+      'Open in Voice &amp; Personas' + icon('arrow-right') + '</button></div>' +
+    '<div class="mb-voice">' + personaImage(p) + '<div class="mb-voice-main"><div class="mb-voice-name"><strong>' + escHtml(p.name) + '</strong><span class="voice-rev">v' + p.revision + '</span>' +
+      (m.follows_default ? '<span class="muted">Default voice</span>' : '') + '</div><p>' + escHtml(p.tone) + '</p>' +
+      '<div class="mb-voice-controls">' + voiceAssignControls(m, _mb.voicePersonas || [], _mb.voiceDefault) + '</div>' +
+      '<p class="voice-help">Signs as <b>' + escHtml(m.signer) + '</b>. Changes apply to threads written from now on.</p></div></div></div>';
+}
+
+function openVoiceFor(personaId) {
+  showTab('personas');
+  _voiceView = 'profiles';
+  if (!_voiceDirty) loadPersonas(personaId);
 }
 
 // ── Email history drawer (opened from the Outbox) ──
