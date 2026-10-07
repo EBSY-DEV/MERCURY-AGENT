@@ -219,3 +219,76 @@ async def test_find_email_inconclusive_is_guess_not_verified(state, monkeypatch)
     result = await find_email("Jane", "Doe", "acme.com", env=Env(), state=state)
     assert result.status == "guess"
     assert not result.verified
+
+
+# ── get_mx_host: a failed lookup is not a missing domain ──
+
+
+class _Rec:
+    def __init__(self, exchange, preference=10):
+        self.exchange, self.preference = exchange, preference
+
+
+def _mx_resolver(monkeypatch, table):
+    """``table`` maps record type to an answer list or an exception to raise."""
+    import dns.resolver
+    calls = []
+
+    def resolve(domain, rtype):
+        calls.append(rtype)
+        hit = table[rtype]
+        if isinstance(hit, Exception):
+            raise hit
+        return hit
+    monkeypatch.setattr(dns.resolver, "resolve", resolve)
+    ef._mx_cache.clear()
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_mx_timeout_raises_and_is_not_cached(monkeypatch):
+    import dns.exception
+    _mx_resolver(monkeypatch, {"MX": dns.exception.Timeout()})
+    with pytest.raises(ef.MxLookupError):
+        await ef.get_mx_host("slow.example")
+    assert "slow.example" not in ef._mx_cache
+
+
+@pytest.mark.asyncio
+async def test_mx_nxdomain_is_definitively_none(monkeypatch):
+    import dns.resolver
+    _mx_resolver(monkeypatch, {"MX": dns.resolver.NXDOMAIN()})
+    assert await ef.get_mx_host("nope.example") is None
+    assert ef._mx_cache["nope.example"] is None
+
+
+@pytest.mark.asyncio
+async def test_mx_a_record_only_counts_as_deliverable(monkeypatch):
+    import dns.resolver
+    calls = _mx_resolver(monkeypatch, {"MX": dns.resolver.NoAnswer(), "A": ["203.0.113.5"]})
+    assert await ef.get_mx_host("aonly.example") == "aonly.example"
+    assert calls == ["MX", "A"]
+
+
+@pytest.mark.asyncio
+async def test_mx_no_mx_and_no_address_is_none(monkeypatch):
+    import dns.resolver
+    _mx_resolver(monkeypatch, {"MX": dns.resolver.NoAnswer(), "A": dns.resolver.NoAnswer(),
+                               "AAAA": dns.resolver.NoAnswer()})
+    assert await ef.get_mx_host("empty.example") is None
+
+
+@pytest.mark.asyncio
+async def test_mx_primary_exchange_is_returned(monkeypatch):
+    _mx_resolver(monkeypatch, {"MX": [_Rec("mx2.example.", 20), _Rec("mx1.example.", 10)]})
+    assert await ef.get_mx_host("acme.example") == "mx1.example"
+
+
+@pytest.mark.asyncio
+async def test_find_email_lookup_failure_is_guess_not_invalid(state, monkeypatch):
+    async def boom(domain):
+        raise ef.MxLookupError("timeout")
+    monkeypatch.setattr(ef, "get_mx_host", boom)
+    result = await find_email("Jane", "Doe", "acme.com", state=state)
+    assert result.status == "guess"
+    assert result.mx_type == "unknown"

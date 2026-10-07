@@ -139,4 +139,28 @@ def test_cli_round_trip(tmp_path, monkeypatch, capsys, config):
     assert alex["is_default"] and alex["avatar_seed"] == AVATAR_SEEDS[2] and alex["examples"].startswith("Hi Maria")
     with pytest.raises(SystemExit):
         mercury("archive", "Alex")
-    assert "Choose another default" in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "Choose another default" in captured.err and captured.out == ""
+
+
+def test_cli_text_sources_fail_cleanly(tmp_path, monkeypatch, capsys, config):
+    monkeypatch.setattr(config_module, "load_config", lambda *a, **k: config)
+    monkeypatch.setattr("mercury.state.DB_PATH", tmp_path / "mercury.db")
+
+    def mercury(*argv):
+        monkeypatch.setattr(sys, "argv", ["mercury", "personas", *argv])
+        cli.main()
+        return capsys.readouterr()
+
+    assert "as v1" in mercury("create", "--name", "Alex", "--tone", "warm").out
+    monkeypatch.setattr(sys, "stdin", io.StringIO("Only once."))
+    with pytest.raises(SystemExit) as twice:
+        mercury("edit", "Alex", "--instructions-file", "-", "--examples-file", "-")
+    captured = capsys.readouterr()
+    assert twice.value.code == 1 and captured.out == ""
+    assert "stdin can only be used for one of --instructions-file/--examples-file" in captured.err
+    with pytest.raises(SystemExit) as missing:
+        mercury("edit", "Alex", "--examples-file", str(tmp_path / "nope.txt"))
+    captured = capsys.readouterr()
+    assert missing.value.code == 1 and "Cannot read" in captured.err and "nope.txt" in captured.err
+    assert json.loads(mercury("show", "Alex", "--json").out)["revision"] == 1
