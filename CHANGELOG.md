@@ -25,6 +25,10 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **`mercury run` opens with the logo.** The mark is drawn in the terminal with quadrant blocks (rasterised
+  from the symbol's own geometry), with the name, version and folder beside it. Printed only to a terminal,
+  not to a log file or a service journal, and not for `--once`. Narrow terminals get the plain dot and
+  name; terminals that cannot encode it get an ASCII fallback. `NO_COLOR` turns the colour off.
 - **`max_bounce_rate` now defaults to 2%** (was 5%), and the rate check starts
   after 50 sends (was 10). Configs that set the value keep it. `mercury sending
   resume` and the dashboard's Resume now clear the per-bucket counters too.
