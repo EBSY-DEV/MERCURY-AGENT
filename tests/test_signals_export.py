@@ -155,3 +155,21 @@ def test_to_csv_ignores_extra_keys():
     text = to_csv([{**{c: "" for c in CSV_COLUMNS}, "email": "a@b.com", "junk": "x"}])
     assert "junk" not in text.splitlines()[0]
     assert "a@b.com" in text
+
+
+def test_to_csv_disarms_spreadsheet_formulas():
+    from mercury.export import csv_safe
+    base = {c: "" for c in CSV_COLUMNS}
+    text = to_csv([
+        {**base, "email": "a@b.com", "first_name": "=HYPERLINK(\"http://evil\")",
+         "company_name": "+1 Plumbing", "title": "-CEO", "personalization": "@mention",
+         "industry": "\tTabbed", "website": "\rCr", "score": 42},
+        {**base, "email": "c@d.com", "first_name": "Plain", "score": -5},
+    ])
+    body = text.split("\r\n")[1:]
+    assert "\"'=HYPERLINK(\"\"http://evil\"\")\"" in body[0]
+    assert "'+1 Plumbing" in body[0] and "'-CEO" in body[0] and "'@mention" in body[0]
+    assert "'\tTabbed" in body[0] and "'\rCr" in text
+    assert ",42," in body[0]            # numbers untouched
+    assert "'-5" not in text and "Plain" in body[1]
+    assert csv_safe(7) == 7 and csv_safe("ok") == "ok" and csv_safe("=1") == "'=1"

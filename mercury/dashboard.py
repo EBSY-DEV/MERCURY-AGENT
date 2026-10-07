@@ -1349,7 +1349,8 @@ async def sending_toggle(action: str):
             await state.set_setting("sending_paused", "paused from dashboard")
         else:
             await state.set_setting("sending_paused", "")
-            await state.set_setting("bounce_count", "0")
+            from mercury.bounces import reset_counters
+            await reset_counters(state)
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)

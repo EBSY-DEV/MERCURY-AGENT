@@ -73,7 +73,7 @@ class Cfg:
             max_daily_sends = 50
             send_to_risky = False
             require_approval = True
-            max_bounce_rate = 0.05
+            max_bounce_rate = 0.02
 
         class linkedin:
             enabled = False
@@ -356,8 +356,7 @@ async def test_reply_cancels_pending_outbox(state):
     assert prospect.status == "opted_out"   # opt-out keywords honored
 
 
-@pytest.mark.asyncio
-async def test_bounce_marks_invalid_and_kill_switch(state):
+async def _sent_for_bounce(state, extra):
     pid = await seed_prospect(state, status="contacted")
     # A sent item whose message-id the bounce references
     item_id = await state.add_outbox_item(
@@ -367,27 +366,49 @@ async def test_bounce_marks_invalid_and_kill_switch(state):
     await state.update_outbox_item(
         item_id, status="sent", message_id="<m1@x>", sent_at=_now_iso()
     )
-    # Ten more sent items so the kill-switch minimum-sample rule is met
-    for i in range(10):
+    # `extra` more sent items, for the kill-switch minimum-sample rule
+    for i in range(extra):
         oid = await state.add_outbox_item(
             prospect_id=pid, to_email="jane@acme.com", subject="s", body="b",
             send_at=_now_iso(), status="approved", campaign_id=f"c{i+2}", step=1,
         )
         await state.update_outbox_item(oid, status="sent", sent_at=_now_iso())
+    return pid
 
-    provider = FakeProvider()
-    provider.inbound = [InboundMessage(
-        provider_id="b1", from_email="mailer-daemon@googlemail.com",
+
+def _dsn(provider_id="b1"):
+    return InboundMessage(
+        provider_id=provider_id, from_email="mailer-daemon@googlemail.com",
         subject="Delivery Status Notification (Failure)",
         body="couldn't be delivered", in_reply_to="<m1@x>", is_bounce=True,
-    )]
+    )
+
+
+@pytest.mark.asyncio
+async def test_bounce_marks_invalid_and_kill_switch(state):
+    pid = await _sent_for_bounce(state, extra=49)
+    provider = FakeProvider()
+    provider.inbound = [_dsn("b1"), _dsn("b2")]
     handler = make_handler(state, provider)
     await handler._run_native()
 
     prospect = await state.get_prospect(pid)
     assert prospect.email_status == "invalid"
-    # 1 bounce / 11 sent = 9% > 5% threshold with >= 10 sends → kill switch
+    # 2 bounces / 50 sent = 4% > 2% threshold with >= 50 sends → kill switch
     assert await state.get_setting("sending_paused") != ""
+
+
+@pytest.mark.asyncio
+async def test_bounce_in_a_small_sample_marks_invalid_without_the_kill_switch(state):
+    pid = await _sent_for_bounce(state, extra=10)
+    provider = FakeProvider()
+    provider.inbound = [_dsn()]
+    handler = make_handler(state, provider)
+    await handler._run_native()
+
+    assert (await state.get_prospect(pid)).email_status == "invalid"
+    # 1 bounce / 11 sent is 9%, but 11 sends is too few to judge the list
+    assert await state.get_setting("sending_paused") == ""
 
 
 @pytest.mark.asyncio
@@ -404,3 +425,83 @@ async def test_inbound_dedup(state):
     await handler._run_native()   # same message again → ignored via dedup
     second = await state.get_conversations_by_status("closed")
     assert len(first) == len(second) == 1
+
+
+# ── stuck 'sending' rows, raising providers, disabled mailboxes ──
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_sending_rows(state):
+    pid = await seed_prospect(state)
+    stale_id = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="s", body="Fine body.",
+        send_at=_now_iso(), status="approved",
+    )
+    fresh_id = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="s2", body="Fine body.",
+        send_at=_now_iso(), status="approved",
+    )
+    for item_id in (stale_id, fresh_id):
+        assert await state.claim_outbox_item(await state.get_outbox_item(item_id), "m@x.co")
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(tzinfo=None).isoformat()
+    async with state._connect() as db:
+        await db.execute("UPDATE outbox SET updated_at = ? WHERE id = ?", (old, stale_id))
+        await db.commit()
+
+    assert await state.recover_stale_outbox(max_age_minutes=30) == 1
+    stale = await state.get_outbox_item(stale_id)
+    assert stale["status"] == "approved"
+    assert stale["error"] == "recovered: send interrupted"
+    assert stale["send_at"]  # kept
+    fresh = await state.get_outbox_item(fresh_id)
+    assert fresh["status"] == "sending"
+    assert await state.recover_stale_outbox(max_age_minutes=30) == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_exception_requeues_instead_of_sticking(state):
+    pid = await seed_prospect(state)
+    item_id = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="hello",
+        body="Fine body. Question?", send_at=_now_iso(), status="approved",
+    )
+
+    class RaisingProvider(FakeProvider):
+        async def send_email(self, *a, **k):
+            raise RuntimeError("socket exploded")
+
+    await make_sender(state, RaisingProvider())._drain_due()
+    item = await state.get_outbox_item(item_id)
+    assert item["status"] == "approved"
+    assert item["error"].startswith("retry 1/3: exception: RuntimeError")
+    assert item["send_at"] > _now_iso()  # pushed into the future
+    assert await state.get_outbox(status="sending") == []
+
+
+@pytest.mark.asyncio
+async def test_disabled_mailbox_holds_new_threads_but_finishes_replies(state):
+    from mercury.integrations.mailboxes import Mailbox, MailboxPool
+
+    pid = await seed_prospect(state, status="contacted")
+    provider = FakeProvider()
+    pool = MailboxPool(
+        [Mailbox(email="old@x.co", provider=provider, daily_cap=50, accepts_new=False)],
+        warmup_initial_cap=50, warmup_weekly_increase=50,
+    )
+    step1 = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="hello",
+        body="Fine body. Question?", send_at=_now_iso(), status="approved",
+        campaign_id="c1", step=1, mailbox="old@x.co",
+    )
+    reply = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="Re: hello",
+        body="Thanks, here is the answer.", send_at=_now_iso(), status="approved",
+        kind="reply", mailbox="old@x.co",
+    )
+    sender = make_sender(state, provider)
+    sender.mailboxes = pool
+    await sender._drain_due()
+
+    assert (await state.get_outbox_item(step1))["status"] == "approved"
+    assert (await state.get_outbox_item(reply))["status"] == "sent"
+    assert [m["subject"] for m in provider.sent] == ["Re: hello"]

@@ -469,7 +469,7 @@
     <h2>Email Provider</h2>
     <p class="lede">How Mercury sends and reads replies. Active provider: <b id="active-provider">…</b> — change it by setting <span style="font-family:var(--mono);font-size:12px">channels.email.provider</span> in <span style="font-family:var(--mono);font-size:12px">mercury.yaml</span> to <span style="font-family:var(--mono);font-size:12px">gmail</span>, <span style="font-family:var(--mono);font-size:12px">smtp</span>, or <span style="font-family:var(--mono);font-size:12px">instantly</span>.</p>
 
-    <div style="border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px">
+    <div style="border:1px solid var(--border);border-radius:var(--r-md);padding:16px;margin-bottom:12px">
       <div style="font-weight:650;margin-bottom:4px">Gmail / Google Workspace <span class="optional-tag">recommended</span> <span id="gmail-status" class="email-tag"></span></div>
       <p class="lede" style="margin-top:4px">Use a mailbox on a dedicated secondary domain. Create an OAuth client (type "Desktop app") in Google Cloud Console → Gmail API, paste the id/secret, save, then run <span style="font-family:var(--mono);font-size:12px">mercury gmail auth</span> in your terminal.</p>
       <div class="form-group"><label class="form-label" for="gmail-id">Client ID</label>
@@ -481,7 +481,7 @@
       <button class="btn btn-primary btn-sm" onclick="saveGmail()">Save Gmail</button>
     </div>
 
-    <div style="border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px">
+    <div style="border:1px solid var(--border);border-radius:var(--r-md);padding:16px;margin-bottom:12px">
       <div style="font-weight:650;margin-bottom:4px">SMTP + IMAP mailbox</div>
       <p class="lede" style="margin-top:4px">Any real mailbox (AgentMail, Fastmail, a Workspace app password). IMAP defaults to the SMTP host/login if left blank.</p>
       <div class="form-row">
@@ -511,7 +511,7 @@
       <div id="inbox-editor" hidden></div>
     </section>
 
-    <div style="border:1px solid var(--border);border-radius:10px;padding:16px">
+    <div style="border:1px solid var(--border);border-radius:var(--r-md);padding:16px">
       <div style="font-weight:650;margin-bottom:4px">Instantly <span class="optional-tag">legacy</span></div>
       <p class="lede" style="margin-top:4px">Get your API key from <a href="https://app.instantly.ai/app/settings/integrations" target="_blank" rel="noopener">Instantly Settings → Integrations</a> (Growth plan+ for API).</p>
       <div class="form-group"><div class="form-row"><div class="form-group" style="margin-bottom:0">

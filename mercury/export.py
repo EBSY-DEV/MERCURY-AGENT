@@ -87,12 +87,25 @@ async def collect_prospects(
     return out
 
 
+# Characters a spreadsheet treats as the start of a formula (or that let a
+# cell smuggle one in after a line break). A leading quote disarms them.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value):
+    """Neutralise a cell so Excel and Sheets show it as text instead of
+    running it as a formula. Strings only; numbers pass through untouched."""
+    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
 def to_csv(rows: list[dict]) -> str:
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, extrasaction="ignore")
     writer.writeheader()
     for row in rows:
-        writer.writerow(row)
+        writer.writerow({k: csv_safe(v) for k, v in row.items()})
     return buf.getvalue()
 
 

@@ -99,8 +99,8 @@
 .voice-diff-line { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 4px; padding: 6px 10px; font: 12px/1.5 var(--mono); color: var(--text-2); }
 .voice-diff-line span:last-child { white-space: pre-wrap; overflow-wrap: anywhere; }
 .voice-diff-line.add { color: var(--text); }
-.voice-diff-line.add span:first-child { color: var(--s-good); }
-.voice-diff-line.del span:first-child { color: var(--s-bad); }
+.voice-diff-line.add span:first-child { color: var(--text-2); font-weight: 600; }
+.voice-diff-line.del span:first-child { color: var(--text-2); font-weight: 600; }
 .voice-diff-line.del span:last-child { color: var(--text-3); text-decoration: line-through; }
 .voice-diff-empty { padding: 6px 10px; font-size: 12px; color: var(--text-3); }
 
