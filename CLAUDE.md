@@ -318,6 +318,7 @@ mercury discover              # Find businesses; --providers / --estimate / --pr
 mercury exclusions            # Never-email list: add / remove / check / import / export (opt-outs and bounces land here too)
 mercury holds                 # Companies whose cold mail is paused (after a reply, or by you); release HOLD_ID to resume
 mercury sending pause|resume  # Kill switch for all outbound
+mercury paused                # Contacts paused by an out-of-office reply; set-date ID DATE / resume ID
 ```
 
 ### Common Issues
