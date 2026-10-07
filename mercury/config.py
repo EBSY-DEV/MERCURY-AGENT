@@ -396,13 +396,13 @@ def load_env(values=None) -> EnvConfig:
         smtp_host=getenv("SMTP_HOST", "").strip(),
         smtp_port=int(getenv("SMTP_PORT", "587").strip() or 587),
         smtp_username=getenv("SMTP_USERNAME", "").strip(),
-        smtp_password=getenv("SMTP_PASSWORD", "").strip(),
+        smtp_password=getenv("SMTP_PASSWORD", ""),
         imap_host=getenv("IMAP_HOST", "").strip(),
         imap_port=int(getenv("IMAP_PORT", "993").strip() or 993),
         imap_username=getenv("IMAP_USERNAME", "").strip(),
-        imap_password=getenv("IMAP_PASSWORD", "").strip(),
+        imap_password=getenv("IMAP_PASSWORD", ""),
         mailbox_secrets={
-            k: v.strip() for k, v in values.items() if k.startswith("MAILBOX_")
+            k: v for k, v in values.items() if k.startswith("MAILBOX_")
         },
     )
     return env

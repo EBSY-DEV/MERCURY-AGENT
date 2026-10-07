@@ -325,7 +325,8 @@ async def save_env_settings(request: Request):
                      "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD", "TREG_TOKEN"]:
             if key in data and data[key] is not None:
                 # Strip newlines so a crafted value can't inject extra .env entries
-                updates[key] = str(data[key]).replace("\n", " ").replace("\r", " ").strip()
+                value = str(data[key]).replace("\n", " ").replace("\r", " ")
+                updates[key] = value if key in ("SMTP_PASSWORD", "IMAP_PASSWORD") else value.strip()
         if updates:
             try:
                 _write_env_file(updates)
