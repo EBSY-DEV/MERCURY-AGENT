@@ -123,6 +123,7 @@ icp:
 | `warmup_initial_cap` | `5` | Day-one cap for a mailbox with a `warmup_start`. |
 | `warmup_weekly_increase` | `5` | Added to the cap every 7 days, up to the mailbox's `daily_cap`. |
 | `auto_approve_followups` | `false` | With approval on, approving a first email also approves its follow-ups. Replies still need approval. |
+| `thread_followups` | `true` | Native providers: send follow-ups as replies in the first email's thread (`In-Reply-To` / `References`, Gmail `threadId`, subject `Re: <first subject>`). `false` sends each step as a new email with its own subject. Also on the dashboard's Settings tab. See [Follow-ups in the same thread](email-and-deliverability.md#the-approval-outbox). |
 | `spread_sends` | `false` | Pace the day's remaining cold sends evenly over the cycles left before quiet hours, instead of up to 8 per cycle. |
 | `max_new_contacts_per_company_per_day` | `0` | Native providers: first emails to a known company in a rolling 24 hours (the same window as `max_daily_sends`, so no timezone applies). `0` = no limit. See [Exclusions and company limits](email-and-deliverability.md#exclusions-and-company-limits). |
 | `max_active_contacts_per_company` | `0` | Native providers: contacts at one company with an unfinished cold sequence at once. A paused sequence keeps its slot until its remaining steps are rejected or cancelled. `0` = no limit. |
