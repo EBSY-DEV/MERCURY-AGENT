@@ -43,7 +43,7 @@
       <button data-tab="campaigns" onclick="showTab('campaigns', this)"><i data-ph="megaphone"></i><span class="lbl">Campaigns</span></button>
       <button data-tab="personas" onclick="showTab('personas', this)"><i data-ph="sparkle"></i><span class="lbl">Voice &amp; Personas</span></button>
       <button data-tab="outbox" onclick="showTab('outbox', this)"><i data-ph="tray"></i><span class="lbl">Outbox</span><span class="nav-count" id="nav-outbox"></span></button>
-      <button data-tab="warmup" onclick="showTab('warmup', this)"><i data-ph="fire"></i><span class="lbl">Warm-up</span><span class="nav-flag" id="nav-warmup" hidden></span></button>
+      <button data-tab="mailboxes" onclick="showTab('mailboxes', this)"><i data-ph="envelope-simple"></i><span class="lbl">Mailboxes</span><span class="nav-flag" id="nav-mailboxes" hidden></span></button>
       <button data-tab="conversations" onclick="showTab('conversations', this)"><i data-ph="chat-circle-text"></i><span class="lbl">Conversations</span></button>
     </div>
     <div class="nav-group">
@@ -339,17 +339,13 @@
   <div id="outbox-list"></div>
 </div>
 
-<!-- Warm-up: a new inbox earns its volume -->
-<div id="warmup" class="section">
-  <div class="section-head split">
-    <div>
-      <h2>Warm-up</h2>
-      <p>New inboxes start slow. Mercury enforces each mailbox's send ramp, watches bounces,
-         and walks you through the setup that keeps you out of spam.</p>
-    </div>
+<!-- Mailboxes: every inbox Mercury sends from, its warm-up ramp and its health -->
+<div id="mailboxes" class="section">
+  <div class="section-head">
+    <h2>Mailboxes</h2>
+    <p>Every inbox Mercury sends from: its warm-up ramp, its health, and the few that need you.</p>
   </div>
-  <div id="wu-switch"></div>
-  <div id="wu-body"><div class="loading-note">Loading warm-up…</div></div>
+  <div id="mb-body"><div class="loading-note">Loading mailboxes…</div></div>
 </div>
 
 <!-- Conversations -->
@@ -633,7 +629,7 @@
 
 </div><!-- /.shell -->
 
-<!-- Shared right-hand drawer (Pipeline cards, Calendar events) -->
+<!-- Shared right-hand drawer (Pipeline cards, Calendar events, Mailboxes) -->
 <div class="drawer-scrim" id="drawer-scrim" onclick="closeDrawer()"></div>
 <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true">
   <div class="drawer-head">
@@ -642,6 +638,7 @@
       <h3 id="drawer-title"></h3>
       <div class="drawer-sub" id="drawer-sub"></div>
     </div>
+    <div class="drawer-head-actions" id="drawer-actions"></div>
     <button class="btn-square ghost" onclick="closeDrawer()" title="Close (Esc)" aria-label="Close"><i data-ph="x"></i></button>
   </div>
   <div class="drawer-body" id="drawer-body"></div>

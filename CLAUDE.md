@@ -46,7 +46,7 @@ People will ask "how does this work?" — explain it simply:
 
 - **"What does it cost?"** → Just your Claude Max subscription (which you already have). The only paid integration is Instantly for sending emails (their cheapest plan works). Everything else — prospecting, email writing, reply handling — is included.
 
-- **"What's the dashboard?"** → Run `mercury dashboard` to see a local web UI at localhost:5555. It opens on **Today** — anything waiting on a decision, then the pipeline. Tabs for Signals, Companies, Contacts, Pipeline, Calendar, Campaigns, Outbox, Warm-up, Conversations, Activity, Usage, Settings. Warm-up shows each sending mailbox's ramp (caps and start dates come from `channels.email.mailboxes` in mercury.yaml; the tab only pauses/resumes and keeps the checklist). For a populated demo: `python scripts/seed_demo.py`, then run the dashboard with the `MERCURY_DB_PATH` / `MERCURY_CONFIG` line it prints.
+- **"What's the dashboard?"** → Run `mercury dashboard` to see a local web UI at localhost:5555. It opens on **Today** — anything waiting on a decision, then the pipeline. Tabs for Signals, Companies, Contacts, Pipeline, Calendar, Campaigns, Outbox, Mailboxes, Conversations, Activity, Usage, Settings. Mailboxes lists every sending inbox grouped by domain, with its warm-up ramp, health, DNS and checklist; an inbox's drawer pauses/resumes it and edits its settings (saved to `channels.email.mailboxes`). For a populated demo: `python scripts/seed_demo.py`, then run the dashboard with the `MERCURY_DB_PATH` / `MERCURY_CONFIG` line it prints.
 
 - **"What are signals?"** → Signals are the facts Mercury collects about a business: who its current agency is, whether it's running ads, whether it has online booking, how it ranks. **Mercury proposes; you confirm.** Nothing is collected until the user says yes on the Signals tab (or `mercury signals --confirm ...`). That keeps spend intentional and makes every prospect list explainable — a cohort is a query over signals a human chose, not a black box.
 
@@ -241,6 +241,28 @@ Users will come back with questions and tasks. Common ones:
 - **"Train Mercury on a different product"** → `mercury train <new-url>`
 - **"How do I see the database?"** → It's at `data/mercury.db`. They can open it with any SQLite tool, or ask you to query it.
 - **"I just want the prospect list"** → `mercury export` writes a sequencer-ready CSV (verified/risky emails only; `--all` for everything). Also available as Export buttons on the dashboard's Contacts tab. Mercury is valuable purely as a list-builder even if the user never lets it send.
+
+---
+
+## Design System (mandatory for any UI work)
+
+Every change to the dashboard (`mercury/web/`) or to a design in `design/*.pen` must use the existing design system. Don't invent new visual patterns. If something you need isn't covered, extend the system in `app.css` (and the brand board in `design/mercury-brand.pen`) first, then use it.
+
+**Sources of truth:** the tokens and component classes in `mercury/web/app.css` (see the rules in its header comment), and the "Mercury by EBSY" brand board in `design/mercury-brand.pen`.
+
+**Hard rules:**
+- **Status is a Phosphor icon plus a word.** Use `.badge t-good|t-waiting|t-bad|t-active|t-note|t-idle` (`toneBadge()` in `app.js`). The colour lives only in the glyph; the label stays `--text-2` (only `t-bad` labels go red). Never use tinted pills, coloured dots, or coloured background chips for status.
+- **One accent.** Violet (`--accent`) marks what's selected, primary or interactive. Green, amber, red and blue only mean status. Don't use status colours for decoration or emphasis.
+- **Tokens only.** Colours, fonts and radii come from CSS variables (`--panel`, `--text-2`, `--border`, `--r-sm`, `--r-md`, ...). No raw hex values in new CSS or markup, except the status glyph colours already defined in `.badge`.
+- **Shape scale:** cards and panels 12px, controls 8px, badges and nav pills fully round. Nothing else.
+- **Numbers are monospaced and tabular** (`var(--mono)` / `.num`).
+- **Buttons:** primary is `.btn-primary` (accent fill), secondary is `.btn-secondary` (panel with a strong border). Don't make dark or custom-coloured buttons.
+- **Icons:** Phosphor only (`icon('name')` in `app.js`, `library: "phosphor"` in Pencil).
+- **Reuse existing components** before writing new ones: `.panel` / `.panel-head` / `.panel-foot`, `.kpi`, `.table-card`, `.drawer`, `.segmented`, `.toolbar`, `emptyState()`, `confirmModal()`, the chart helpers (`niceTicks`, `yAxis`, `chartHover`).
+- **Copy:** plain sentences. No em-dashes in UI strings, and no all-caps eyebrow labels.
+- **Light and dark:** every change has to work in both themes. Check both before you finish.
+
+**Before calling UI work done:** look at it in the browser in light and dark mode, and confirm there's no tinted pill, no raw hex value and no new radius or colour that isn't a token.
 
 ---
 

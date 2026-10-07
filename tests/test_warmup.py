@@ -511,3 +511,20 @@ def test_dns_endpoint(client, monkeypatch):
 def test_dns_endpoint_without_mail_config(client, monkeypatch):
     monkeypatch.setattr(dash, "_mail_context", lambda: (make_config(provider="instantly"), None))
     assert client.get("/api/warmup/dns").status_code == 400
+
+
+def test_overview_reports_the_stored_dns_check_per_domain(client):
+    data, _ = _inboxes(client)
+    assert data["domains"] == {"x.co": None, "y.co": None, "z.co": None}
+    good = {(k[0].replace("good.co", "x.co"), k[1]): v for k, v in GOOD.items()}
+    result = _run(warmup.check_dns("x.co", resolve=FakeDNS(good), use_cache=False))
+    _run(client.sm.set_setting(warmup.dns_setting_key("x.co"), json.dumps(result)))
+    bare = _run(warmup.check_dns("y.co", resolve=FakeDNS({}), use_cache=False))
+    _run(client.sm.set_setting(warmup.dns_setting_key("y.co"), json.dumps(bare)))
+    domains = _inboxes(client)[0]["domains"]
+    assert domains["x.co"]["all_pass"] is True and domains["x.co"]["checked_at"]
+    assert [c["key"] for c in domains["x.co"]["checks"]] == ["mx", "spf", "dkim", "dmarc"]
+    assert domains["y.co"]["all_pass"] is False
+    assert {c["key"]: c["status"] for c in domains["y.co"]["checks"]}["spf"] == "fail"
+    assert set(domains["y.co"]["checks"][0]) == {"key", "status"}
+    assert domains["z.co"] is None
