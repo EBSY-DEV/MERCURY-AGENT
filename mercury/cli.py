@@ -577,7 +577,7 @@ def cmd_personas(args):
     """Writing personas: list, edit, version and preview them."""
     import json
 
-    from mercury.config import load_config
+    from mercury.config import load_config, load_env
     from mercury.control.personas import PersonaService, avatar_seed
     from mercury.personas import PersonaError
     from mercury.state import StateManager
@@ -586,7 +586,8 @@ def cmd_personas(args):
         changes = {"name": args.name, "description": args.description, "tone": args.tone,
                    "instructions": _persona_text(args.instructions, args.instructions_file),
                    "examples": _persona_text(args.examples, args.examples_file),
-                   "avatar_seed": avatar_seed(args.avatar) if args.avatar else None}
+                   "avatar_seed": avatar_seed(args.avatar) if args.avatar else None,
+                   "sign_name": args.sign_name}
         return {key: value for key, value in changes.items() if value is not None}
 
     def line(p):
@@ -606,7 +607,7 @@ def cmd_personas(args):
         print()
 
     async def _run():
-        service = await PersonaService(StateManager(), load_config()).ready()
+        service = await PersonaService(StateManager(), load_config(), load_env()).ready()
         action = args.persona_action or "list"
         if action == "list":
             result = await service.list(include_archived=args.all)
@@ -646,6 +647,24 @@ def cmd_personas(args):
             if args.json:
                 return print(json.dumps(p, indent=2))
             print(f"\n  Saved {p['name']} as v{p['revision']}. New drafts use it from the next generation.\n")
+        elif action == "mailboxes":
+            mailboxes = await service.mailboxes()
+            if args.json:
+                return print(json.dumps(mailboxes, indent=2, default=str))
+            print(f"\n  Sending mailboxes ({len(mailboxes)})")
+            print("  " + "=" * 60)
+            for m in mailboxes:
+                voice = m["persona"]["name"] + (" (default)" if m["follows_default"] else "")
+                print(f"  {m['email']:<34} {voice:<26} signs as {m['signer']}"
+                      + ("" if m["enabled"] else "  [no new threads]"))
+            print("\n  Change one: mercury personas assign EMAIL [PERSONA] [--sign-name NAME]\n")
+        elif action == "assign":
+            current = next((m for m in await service.mailboxes() if m["email"] == args.email.strip().lower()), None)
+            persona = "" if args.default else args.persona or (current or {}).get("persona_id", "")
+            sign_name = (current or {}).get("sign_name", "") if args.sign_name is None else args.sign_name
+            m = await service.assign_mailbox(args.email, persona, sign_name)
+            voice = m["persona"]["name"] + (" (default)" if m["follows_default"] else "")
+            print(f"\n  {m['email']} now writes as {voice} and signs as {m['signer']}.\n")
         elif action == "default":
             p = await service.set_default(args.persona)
             print(f"\n  New drafts now use {p['name']} (v{p['revision']}).\n")
@@ -845,6 +864,7 @@ def main():
         p.add_argument("--examples", default=None, help="Style examples")
         p.add_argument("--examples-file", default="", help="Read examples from a file ('-' for stdin)")
         p.add_argument("--avatar", default="", help="1-24 or a seed name (random if omitted)")
+        p.add_argument("--sign-name", default=None, help="Suggested sign-off for mailboxes that set none")
 
     p = persona_parser("list", "All personas", persona=None)
     p.add_argument("--all", action="store_true", help="Include archived personas")
@@ -857,6 +877,13 @@ def main():
     writing_flags(p, create=False)
     p.add_argument("--expected-revision", type=int, default=None,
                    help="Fail if someone saved a newer version first")
+    persona_parser("mailboxes", "Each sending mailbox's voice and sign-off name", persona=None)
+    p = persona_parser("assign", "Give a mailbox a voice and a sign-off", persona=None)
+    p.add_argument("email", help="Sending mailbox address")
+    p.add_argument("persona", nargs="?", default="", help="Name or id (omit to keep or follow the default)")
+    p.add_argument("--sign-name", default=None,
+                   help="Name its emails are signed with ('' uses the persona's suggestion)")
+    p.add_argument("--default", action="store_true", help="Follow the default persona instead")
     persona_parser("default", "Use this persona for new drafts")
     persona_parser("archive", "Hide a persona from new drafts")
     persona_parser("restore", "Bring back an archived persona")

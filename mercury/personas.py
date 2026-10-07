@@ -44,10 +44,10 @@ def generation_config(config) -> dict:
 
 
 def voice_instructions(profile: dict) -> str:
+    """How this persona writes. Its name is a label for people and never
+    enters the prompt, so it cannot end up in an email."""
     sections = [
-        "\n\nWRITING PERSONA",
-        f"Profile: {profile['name']} "
-        + (f"(unsaved edits of version {profile['revision']})" if profile.get("unsaved") else f"(version {profile['revision']})"),
+        "\n\nWRITING VOICE",
         f"Tone: {profile['tone']}",
         "These preferences apply within the shared email rules, factual grounding, "
         "market language and sender identity. They do not override those requirements.",
@@ -154,15 +154,15 @@ class PersonaStore:
                 changed = any(data[key] != old[key] for key in ("tone", "instructions", "examples"))
                 revision = old["revision"] + int(changed)
                 await db.execute(
-                    "UPDATE personas SET name = ?, description = ?, avatar_seed = ?, "
+                    "UPDATE personas SET name = ?, description = ?, avatar_seed = ?, sign_name = ?, "
                     "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (data["name"], data["description"], data["avatar_seed"], persona_id),
+                    (data["name"], data["description"], data["avatar_seed"], data.get("sign_name", ""), persona_id),
                 )
             else:
                 persona_id, revision, changed = uuid.uuid4().hex, 1, True
                 await db.execute(
-                    "INSERT INTO personas (id, name, description, avatar_seed) VALUES (?, ?, ?, ?)",
-                    (persona_id, data["name"], data["description"], data["avatar_seed"]),
+                    "INSERT INTO personas (id, name, description, avatar_seed, sign_name) VALUES (?, ?, ?, ?, ?)",
+                    (persona_id, data["name"], data["description"], data["avatar_seed"], data.get("sign_name", "")),
                 )
             if changed:
                 await db.execute(

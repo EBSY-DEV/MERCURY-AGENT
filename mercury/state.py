@@ -471,6 +471,22 @@ MIGRATIONS: list[str] = [
     ALTER TABLE outbox ADD COLUMN manually_edited INTEGER DEFAULT 0;
     CREATE INDEX idx_generation_version ON email_generations(persona_version_id);
     """,
+    # ── v12: a voice and a sign-off per mailbox ──
+    """
+    -- Who a mailbox writes as. persona_id '' follows the default persona.
+    -- sign_name is the name its emails are signed with; '' uses the
+    -- persona's suggested sign-off name.
+    CREATE TABLE mailbox_voices (
+        email TEXT PRIMARY KEY,
+        persona_id TEXT DEFAULT '',
+        sign_name TEXT DEFAULT '',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    -- A persona's suggested sign-off name, for mailboxes that set none.
+    ALTER TABLE personas ADD COLUMN sign_name TEXT DEFAULT '';
+    -- A campaign written for one mailbox keeps every step on it.
+    ALTER TABLE campaigns ADD COLUMN mailbox TEXT DEFAULT '';
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -1686,13 +1702,13 @@ class StateManager:
             await db.execute(
                 """INSERT INTO campaigns
                    (id, name, channel, instantly_campaign_id, sequence_json,
-                    prospect_ids_json, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    prospect_ids_json, status, created_at, mailbox)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     campaign.id, campaign.name, campaign.channel,
                     campaign.instantly_campaign_id, campaign.sequence_json(),
                     json.dumps(campaign.prospect_ids), campaign.status,
-                    campaign.created_at.isoformat(),
+                    campaign.created_at.isoformat(), campaign.mailbox,
                 ),
             )
             await db.commit()

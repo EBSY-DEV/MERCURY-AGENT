@@ -63,6 +63,7 @@
 /* Rail */
 .voice-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 12px 18px; }
 .voice-stats dt { font-size: 11.5px; color: var(--text-2); }
+.voice-stats dd .voice-none { font: 500 12.5px var(--sans); color: var(--text-3); }
 .voice-stats dd { font-family: var(--mono); font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 3px; }
 .voice-recent { padding: 0 18px 4px; }
 .voice-recent-row { display: flex; gap: 10px; align-items: baseline; padding: 8px 0; border-top: 1px solid var(--border); font-size: 12.5px; }
@@ -104,7 +105,7 @@
 .voice-diff-empty { padding: 6px 10px; font-size: 12px; color: var(--text-3); }
 
 /* Prompt preview */
-.voice-controls { display: grid; grid-template-columns: minmax(0, 1fr) 140px minmax(0, 1.3fr) minmax(0, 1.3fr) auto; gap: 12px; align-items: end; padding: 16px 18px; }
+.voice-controls { display: grid; grid-template-columns: minmax(0, 1fr) 140px minmax(0, 1.2fr) minmax(0, 1.2fr) minmax(0, 1.2fr); gap: 12px; align-items: end; padding: 16px 18px; }
 .voice-controls .form-label { color: var(--text); font-weight: 600; }
 .voice-controls .btn-group { margin: 0; flex-wrap: nowrap; }
 .voice-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 440px); gap: 16px; align-items: start; }
@@ -135,6 +136,33 @@
 .voice-default p { font-size: 12.5px; color: var(--text-2); margin-top: 2px; }
 .voice-default select { width: 220px; }
 
+/* Long notes in footers wrap instead of running off the panel. */
+#personas .panel-foot .badge { white-space: normal; align-items: flex-start; line-height: 1.45; }
+#personas .panel-foot .badge .ph { flex: none; margin-top: 2px; }
+
+/* Mailboxes */
+.voice-sign { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--text-2); }
+.voice-sign span { white-space: nowrap; }
+.voice-sign .form-input { max-width: 240px; }
+.voice-sends > div { display: flex; flex-direction: column; gap: 2px; padding: 9px 18px; border-top: 1px solid var(--border); font-size: 12px; color: var(--text-2); }
+.voice-sends .mono-sm { color: var(--text); overflow-wrap: anywhere; }
+.voice-mb-table { border-top: 1px solid var(--border); margin-top: 12px; }
+.voice-mb-row { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1fr); gap: 12px; align-items: center; padding: 8px 18px; border-bottom: 1px solid var(--border); }
+.voice-mb-row.head { padding-top: 8px; padding-bottom: 8px; background: var(--panel-raised); font-size: 11.5px; font-weight: 600; color: var(--text-2); }
+.voice-mb-row:last-child { border-bottom: 0; }
+.voice-mb-row .form-input { padding-top: 6px; padding-bottom: 6px; font-size: 12.5px; }
+.voice-mb-email { display: flex; flex-direction: column; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+.mb-voice { display: flex; gap: 12px; align-items: flex-start; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-sm); }
+.mb-voice .persona-avatar { width: 40px; height: 40px; }
+.mb-voice-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.mb-voice-name { display: flex; align-items: baseline; gap: 8px; font-size: 13.5px; }
+.mb-voice-name .muted { font-size: 11.5px; }
+.mb-voice-main > p:not(.voice-help) { font-size: 12.5px; color: var(--text-2); line-height: 1.45; }
+.mb-voice-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.mb-voice-controls .form-input { padding-top: 6px; padding-bottom: 6px; font-size: 12.5px; }
+.mb-voice .voice-help { margin: 0; }
+.mb-voice .voice-help b { color: var(--text); font-weight: 600; }
+
 /* Avatar picker */
 .modal.avatar-modal { width: min(520px, 100%); }
 .avatar-modal-head { display: flex; gap: 12px; align-items: flex-start; margin-bottom: 16px; }
@@ -162,6 +190,7 @@
 @media (max-width: 1180px) {
   .voice-profiles, .voice-config { grid-template-columns: 1fr; }
   .voice-controls { grid-template-columns: 1fr 1fr; }
+  .voice-mb-row { grid-template-columns: 1fr; }
   .voice-columns { grid-template-columns: 1fr; }
 }
 @media (max-width: 850px) {

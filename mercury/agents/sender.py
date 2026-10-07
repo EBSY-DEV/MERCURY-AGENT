@@ -499,6 +499,7 @@ class Sender:
                     status=initial_status,
                     provider=self.provider.name,
                     generation_id=step.generation_id,
+                    mailbox=campaign.mailbox,
                 )
                 if item_id:
                     staged += 1
