@@ -355,6 +355,12 @@ const ACTIVITY_LABELS = {
   email_sent: ['paper-plane-tilt', 'Email sent'],
   pipeline_move: ['kanban', 'Moved a contact in the pipeline'],
   outbox_reschedule: ['calendar-blank', 'Rescheduled an email'],
+  ooo_paused: ['pause-circle', 'Paused a sequence: out of office'],
+  ooo_pause_updated: ['pause-circle', 'Updated an out-of-office return date'],
+  ooo_return_date_set: ['calendar-blank', 'Set an out-of-office return date'],
+  ooo_resumed: ['play', 'Resumed a sequence after out of office'],
+  ooo_pause_ended: ['x-circle', 'Ended an out-of-office pause'],
+  ooo_pause_unavailable: ['warning-circle', 'Could not pause an out-of-office contact'],
   write_campaign: ['pencil-simple', 'Drafted a campaign'],
   send_campaign: ['paper-plane-tilt', 'Sent a campaign'],
   analyze: ['chart-line-up', 'Updated analytics'],
@@ -1315,6 +1321,7 @@ let _mailboxes = null;
 async function loadOutbox() {
   const [data, mbox] = await Promise.all([api('/api/outbox'), api('/api/mailboxes')]);
   _mailboxes = mbox && !mbox.error ? mbox : null;
+  if (typeof loadAway === 'function') loadAway();
   const mboxEl = document.getElementById('outbox-mailboxes');
   if (mboxEl) mboxEl.innerHTML = mbox && mbox.error
     ? '<section class="panel"><div class="panel-head"><div><h3 class="icon-title">' + icon('warning-circle') +
