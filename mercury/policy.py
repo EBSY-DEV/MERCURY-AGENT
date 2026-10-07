@@ -151,6 +151,11 @@ class ContactPolicy:
                            _lift_hint(rule), "bad")
         if item.get("kind") != "sequence":
             return Verdict("ok")
+        pause = await self.state.get_active_pause(item.get("prospect_id", ""))
+        if pause:
+            return Verdict("ooo_pause", _pause_reason(pause),
+                           "Correct the return date or resume them under Away in the Outbox.",
+                           "waiting")
         if prospect is None:
             prospect = await self.state.get_prospect(item.get("prospect_id", ""))
         company_id = await self.company_for(prospect)
@@ -184,6 +189,13 @@ class ContactPolicy:
                 "are already in a sequence.",
                 "It goes out when one of those sequences finishes or you end one.", "waiting")
         return Verdict("ok")
+
+
+def _pause_reason(pause: dict) -> str:
+    if pause.get("review_state") == "scheduled" and pause.get("resume_at"):
+        return (f"Out of office: waits until {pause['resume_at'][:16].replace('T', ' ')} UTC, "
+                "when they are back.")
+    return "Out of office with no clear return date: waits until you set one or resume them."
 
 
 def _hold_reason(hold: dict) -> str:
