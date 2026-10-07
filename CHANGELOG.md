@@ -1,6 +1,6 @@
 # Changelog
 
-Notable changes to Mercury (formerly Harvey). Dates are release dates; the format follows
+Notable changes to Mercury Agent (formerly Harvey). Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely and versions
 follow [semver](https://semver.org/), with the caveat that Mercury is pre-1.0 and
 minor versions can still change behaviour.
@@ -9,12 +9,15 @@ minor versions can still change behaviour.
 
 ### Changed
 
-- **Harvey is now Mercury.** The package (`mercury/`), CLI
+- **Harvey is now Mercury Agent.** The package (`mercury/`), CLI
   (`mercury ...`), config (`mercury.yaml`, `mercury.local.yaml`) and database
   (`data/mercury.db`) are renamed. Existing checkouts migrate automatically:
   `harvey.local.yaml` and `data/harvey.db*` / `harvey.log` are renamed in place
   on first start, never overwriting a newer file. Re-run `pip install -e .`
-  so the `mercury` command exists.
+  so the `mercury` command exists. The distribution is now `mercury-agent`
+  (the `mercury` command and the deprecated `harvey` alias are unchanged).
+- **License is now AGPL-3.0-or-later.** Code that originates from Harvey stays
+  available under its original MIT license; see `NOTICE`.
 - **Dashboard redesign.** Light, lavender-tinted theme with a single violet
   accent; dark mode re-tokenised as deep aubergine. Sans-only type (Geist +
   Geist Mono). Tokens live in `mercury/web/app.css`; the matching Pencil

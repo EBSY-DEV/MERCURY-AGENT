@@ -1,4 +1,4 @@
-"""Mercury CLI — simple commands to install, setup, run, and manage Mercury."""
+"""Mercury Agent CLI — simple commands to install, setup, run, and manage Mercury."""
 
 import argparse
 import asyncio
@@ -593,7 +593,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="mercury",
-        description="Mercury: an autonomous AI sales agent that runs on your Claude subscription.",
+        description="Mercury Agent: an autonomous outreach agent that runs on your Claude subscription.",
     )
     subparsers = parser.add_subparsers(dest="command")
 

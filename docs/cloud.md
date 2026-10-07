@@ -1,4 +1,4 @@
-# Running Mercury on a schedule in the cloud
+# Running Mercury Agent on a schedule in the cloud
 
 Mercury is built as a daemon: `mercury run` loops forever, sleeping between
 heartbeats, keeping its pipeline in a SQLite file next to the checkout. That

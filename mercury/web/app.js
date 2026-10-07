@@ -181,7 +181,7 @@ function showTab(id, btn) {
   const meta = TAB_META[id] || [id, 'squares-four'];
   const crumb = document.getElementById('crumb');
   if (crumb) crumb.innerHTML = icon(meta[1]) + '<span>' + escHtml(meta[0]) + '</span>';
-  document.title = meta[0] + ' · Mercury';
+  document.title = meta[0] + ' · Mercury Agent';
   toggleSidebar(false);
   document.querySelectorAll('.hm-tip').forEach(t => { t.hidden = true; });
   closeDrawer();

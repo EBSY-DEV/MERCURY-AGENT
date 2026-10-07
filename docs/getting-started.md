@@ -1,6 +1,6 @@
 # Getting started
 
-This guide takes you from a fresh clone to a running Mercury: install, connect a mailbox, train Mercury on your product, confirm which signals matter, run a first discovery, approve the first emails, and start the heartbeat loop. Plan on about half an hour, most of it spent on mailbox setup and reading Mercury's first drafts.
+This guide takes you from a fresh clone to a running Mercury Agent: install, connect a mailbox, train Mercury on your product, confirm which signals matter, run a first discovery, approve the first emails, and start the heartbeat loop. Plan on about half an hour, most of it spent on mailbox setup and reading Mercury's first drafts.
 
 ## Prerequisites
 

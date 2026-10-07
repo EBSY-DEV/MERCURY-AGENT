@@ -1,6 +1,6 @@
 # Architecture
 
-Mercury is a single Python process that wakes up on a timer, decides what to do from the state of a SQLite database, runs a few small agents, and goes back to sleep. Model work goes through the `claude` CLI in headless mode; everything that can be done without a model (search, scraping, verification, sending, scheduling, gating) is plain Python. This page describes the components, how data flows between them, how the Claude budget is enforced, and how to extend Mercury with a new discovery provider, signal or dashboard view.
+Mercury Agent is a single Python process that wakes up on a timer, decides what to do from the state of a SQLite database, runs a few small agents, and goes back to sleep. Model work goes through the `claude` CLI in headless mode; everything that can be done without a model (search, scraping, verification, sending, scheduling, gating) is plain Python. This page describes the components, how data flows between them, how the Claude budget is enforced, and how to extend Mercury with a new discovery provider, signal or dashboard view.
 
 ## Components
 

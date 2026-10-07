@@ -1,14 +1,15 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mercury"
+name = "mercury-agent"
 version = "0.2.0"
-description = "Mercury: an autonomous AI sales agent that runs on your Claude subscription."
+description = "Mercury Agent: an autonomous outreach agent that runs on your Claude subscription."
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "EBSY" }]
 keywords = ["sales", "ai-agent", "cold-email", "prospecting", "autonomous-agent", "claude"]
 classifiers = [
@@ -40,11 +41,6 @@ dev = [
     "pytest>=8.0,<9",
     "pytest-asyncio>=0.23,<1",
 ]
-
-[project.urls]
-Homepage = "https://github.com/ethanplusai/harvey"
-Issues = "https://github.com/ethanplusai/harvey/issues"
-Changelog = "https://github.com/ethanplusai/harvey/blob/main/CHANGELOG.md"
 
 [project.scripts]
 mercury = "mercury.cli:main"
