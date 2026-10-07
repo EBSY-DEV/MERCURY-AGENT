@@ -9,7 +9,7 @@ minor versions can still change behaviour.
 
 ### Changed
 
-- **`mercury run` opens with the logo.** The mark is drawn in the terminal with half-blocks (rasterised
+- **`mercury run` opens with the logo.** The mark is drawn in the terminal with quadrant blocks (rasterised
   from the symbol's own geometry), with the name, version and folder beside it. Printed only to a terminal,
   not to a log file or a service journal, and not for `--once`. Narrow or non-UTF-8 terminals get the plain
   dot and name, and `NO_COLOR` turns the colour off.

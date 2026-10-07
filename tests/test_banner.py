@@ -13,16 +13,17 @@ class _Tty(io.StringIO):
 def test_mark_is_a_disc_with_the_dot_on_its_right_edge():
     art = banner.mark()
     assert len(art) == banner.MARK_ROWS
-    assert set("".join(art)) <= set(" ▀▄█")
-    # The disc is wider on the left; the dot is the only thing past the bite.
+    assert set("".join(art)) <= set(banner._QUADRANTS)
+    # The disc starts on the left and the dot is the last thing on the right.
     middle = art[banner.MARK_ROWS // 2]
-    assert middle.startswith("█") and middle.rstrip().endswith(("█", "▄", "▀"))
+    assert middle.startswith("█") and middle.rstrip()[-1] != " "
     assert " " in middle.strip()  # the gap between the disc and the dot
 
 
 def test_mark_is_symmetric_top_to_bottom():
     art = banner.mark()
-    flip = {"▀": "▄", "▄": "▀", "█": "█", " ": " "}
+    flip = {"▘": "▖", "▖": "▘", "▝": "▗", "▗": "▝", "▀": "▄", "▄": "▀", "▛": "▙",
+            "▙": "▛", "▜": "▟", "▟": "▜", "▚": "▞", "▞": "▚", "▌": "▌", "▐": "▐", "█": "█", " ": " "}
     width = max(len(line) for line in art)
     padded = [line.ljust(width) for line in art]
     mirrored = ["".join(flip[c] for c in line) for line in reversed(padded)]

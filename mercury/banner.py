@@ -1,5 +1,5 @@
 """What Mercury prints when ``mercury run`` starts: the mark, drawn in the
-terminal with half-blocks, and the name beside it.
+terminal with quadrant blocks, and the name beside it.
 
 The mark is rasterised from the symbol's own geometry (the small cut in
 design/brand/final/mercury-symbol-small.svg) rather than drawn by hand, so it
@@ -42,21 +42,29 @@ def _lit(x: float, y: float) -> bool:
     return (_inside(_DISC, x, y) and not _inside(_BITE, x, y)) or _inside(_DOT, x, y)
 
 
+# Quadrant glyphs by which quarters of the cell are filled, as a 4-bit mask:
+# upper-left = 1, upper-right = 2, lower-left = 4, lower-right = 8.
+_QUADRANTS = " ▘▝▀▖▌▞▛▗▚▐▜▄▙▟█"
+
+
 def mark(rows: int = MARK_ROWS, samples: int = 8) -> list[str]:
-    """The symbol as ``rows`` lines of half-block characters.
+    """The symbol as ``rows`` lines of quadrant-block characters.
 
-    Each character cell is two square pixels tall. The grid is sized so the
-    disc is exactly ``2 * rows`` pixels across and its centre falls on a pixel
-    edge, which keeps the disc symmetric.
+    A terminal cell is about twice as tall as it is wide, so a round disc is
+    ``2 * rows`` columns across. Each cell is cut into four quarters and gets
+    the glyph that fills the quarters the shape covers, which gives twice the
+    horizontal detail of half-blocks. The grid is sized so the disc's centre
+    falls on a cell edge, which keeps the disc symmetric.
     """
-    size = 2 * _DISC[2] / (2 * rows)
+    row_h = 2 * _DISC[2] / rows   # design units per terminal row
+    col_w = row_h / 2             # ...and per column
     left, top = _DISC[0] - _DISC[2], _DISC[1] - _DISC[2]
-    width = round((_DOT[0] + _DOT[2] - left) / size)
+    width = round((_DOT[0] + _DOT[2] - left) / col_w)
 
-    def pixel(col: int, row: int) -> bool:
+    def filled(col: int, row: int, qx: int, qy: int) -> bool:
         hits = sum(
-            _lit(left + (col + (a + 0.5) / samples) * size,
-                 top + (row + (b + 0.5) / samples) * size)
+            _lit(left + (col + (qx + (a + 0.5) / samples) / 2) * col_w,
+                 top + (row + (qy + (b + 0.5) / samples) / 2) * row_h)
             for a in range(samples) for b in range(samples)
         )
         return hits * 2 >= samples * samples
@@ -65,8 +73,9 @@ def mark(rows: int = MARK_ROWS, samples: int = 8) -> list[str]:
     for r in range(rows):
         line = ""
         for c in range(width):
-            upper, lower = pixel(c, 2 * r), pixel(c, 2 * r + 1)
-            line += "█" if upper and lower else "▀" if upper else "▄" if lower else " "
+            bits = (filled(c, r, 0, 0) | filled(c, r, 1, 0) << 1
+                    | filled(c, r, 0, 1) << 2 | filled(c, r, 1, 1) << 3)
+            line += _QUADRANTS[bits]
         lines.append(line.rstrip())
     return lines
 
