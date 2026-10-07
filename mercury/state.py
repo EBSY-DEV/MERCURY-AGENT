@@ -487,6 +487,39 @@ MIGRATIONS: list[str] = [
     -- A campaign written for one mailbox keeps every step on it.
     ALTER TABLE campaigns ADD COLUMN mailbox TEXT DEFAULT '';
     """,
+    # ── v13: CSV import batches ──
+    """
+    -- One row per committed import. The fingerprint covers the file and
+    -- every choice made about it, so committing the same thing twice
+    -- returns the first result instead of importing again.
+    CREATE TABLE import_batches (
+        id TEXT PRIMARY KEY,
+        fingerprint TEXT NOT NULL UNIQUE,
+        filename TEXT DEFAULT '',
+        origin TEXT DEFAULT '',
+        policy TEXT DEFAULT 'skip',
+        total_rows INTEGER DEFAULT 0,
+        created INTEGER DEFAULT 0,
+        filled INTEGER DEFAULT 0,
+        skipped INTEGER DEFAULT 0,
+        excluded INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    -- What happened to each data row. Outcomes and ids only: the imported
+    -- values themselves live in prospects, or nowhere.
+    CREATE TABLE import_rows (
+        batch_id TEXT NOT NULL REFERENCES import_batches(id),
+        row_number INTEGER NOT NULL,
+        outcome TEXT NOT NULL,
+        action TEXT NOT NULL,
+        reason TEXT DEFAULT '',
+        prospect_id TEXT DEFAULT '',
+        PRIMARY KEY(batch_id, row_number)
+    );
+    ALTER TABLE prospects ADD COLUMN import_batch_id TEXT DEFAULT '';
+    ALTER TABLE prospects ADD COLUMN import_row INTEGER DEFAULT 0;
+    CREATE INDEX idx_prospects_import_batch ON prospects(import_batch_id);
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -606,41 +639,48 @@ class StateManager:
         website still has to dedup across re-runs, and for anyone selling
         websites those are the best prospects on the list.
         """
+        async with self._connect() as db:
+            company_id = await self.insert_company(db, company)
+            await db.commit()
+        return company_id
+
+    @staticmethod
+    async def insert_company(db, company: Company) -> str:
+        """``add_company`` on an open connection, without committing, so a
+        caller can insert many inside one transaction."""
         if not company.id:
             company.id = _new_id()
         company.domain = _norm(company.domain)
-        async with self._connect() as db:
-            cursor = await db.execute(
-                """INSERT OR IGNORE INTO companies
-                   (id, name, domain, website, description, industry,
-                    company_size, location, phone, source, source_url,
-                    external_id, notes, tech_stack_json, signals_json,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    company.id, company.name, company.domain, company.website,
-                    company.description, company.industry, company.company_size,
-                    company.location, company.phone, company.source,
-                    company.source_url, company.external_id, company.notes,
-                    json.dumps(company.tech_stack), json.dumps(company.signals),
-                    company.created_at.isoformat(),
-                    company.updated_at.isoformat(),
-                ),
-            )
-            await db.commit()
-            if cursor.rowcount == 0:
-                # Uniqueness conflict: hand back the existing record's id.
-                for column, value in (("domain", company.domain),
-                                      ("external_id", company.external_id)):
-                    if not value:
-                        continue
-                    async with db.execute(
-                        f"SELECT id FROM companies WHERE {column} = ?", (value,)
-                    ) as cur:
-                        row = await cur.fetchone()
-                        if row:
-                            company.id = row[0]
-                            break
+        cursor = await db.execute(
+            """INSERT OR IGNORE INTO companies
+               (id, name, domain, website, description, industry,
+                company_size, location, phone, source, source_url,
+                external_id, notes, tech_stack_json, signals_json,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                company.id, company.name, company.domain, company.website,
+                company.description, company.industry, company.company_size,
+                company.location, company.phone, company.source,
+                company.source_url, company.external_id, company.notes,
+                json.dumps(company.tech_stack), json.dumps(company.signals),
+                company.created_at.isoformat(),
+                company.updated_at.isoformat(),
+            ),
+        )
+        if cursor.rowcount == 0:
+            # Uniqueness conflict: hand back the existing record's id.
+            for column, value in (("domain", company.domain),
+                                  ("external_id", company.external_id)):
+                if not value:
+                    continue
+                async with db.execute(
+                    f"SELECT id FROM companies WHERE {column} = ?", (value,)
+                ) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        company.id = row[0]
+                        break
         return company.id
 
     async def update_company_signals(
@@ -758,52 +798,60 @@ class StateManager:
     async def add_prospect(self, prospect: Prospect) -> str:
         """Insert a prospect. Duplicates (same email or LinkedIn URL) are not
         re-inserted; the existing record's id is returned instead."""
+        async with self._connect() as db:
+            prospect_id = await self.insert_prospect(db, prospect)
+            await db.commit()
+        return prospect_id
+
+    @staticmethod
+    async def insert_prospect(db, prospect: Prospect) -> str:
+        """``add_prospect`` on an open connection, without committing, so a
+        caller can insert many inside one transaction."""
         if not prospect.id:
             prospect.id = _new_id()
         prospect.email = _norm(prospect.email)
         prospect.linkedin_url = (prospect.linkedin_url or "").strip()
-        async with self._connect() as db:
-            cursor = await db.execute(
-                """INSERT OR IGNORE INTO prospects
-                   (id, company_id, first_name, last_name, email, email_verified,
-                    email_status, phone, phone_verified, linkedin_url, title,
-                    seniority, department, source, source_url, status, score,
-                    personalization_notes, company, industry, company_size,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    prospect.id, prospect.company_id,
-                    prospect.first_name, prospect.last_name,
-                    prospect.email, int(prospect.email_verified),
-                    prospect.email_status,
-                    prospect.phone, int(prospect.phone_verified),
-                    prospect.linkedin_url, prospect.title,
-                    prospect.seniority, prospect.department,
-                    prospect.source, prospect.source_url,
-                    prospect.status, prospect.score,
-                    prospect.personalization_notes,
-                    prospect.company, prospect.industry, prospect.company_size,
-                    prospect.created_at.isoformat(),
-                    prospect.updated_at.isoformat(),
-                ),
-            )
-            await db.commit()
-            if cursor.rowcount == 0:
-                # Unique-constraint conflict: resolve to the existing record.
-                for column, value in (
-                    ("email", prospect.email),
-                    ("linkedin_url", prospect.linkedin_url),
-                    ("id", prospect.id),
-                ):
-                    if not value:
-                        continue
-                    async with db.execute(
-                        f"SELECT id FROM prospects WHERE {column} = ?", (value,)
-                    ) as cur:
-                        row = await cur.fetchone()
-                        if row:
-                            prospect.id = row[0]
-                            break
+        cursor = await db.execute(
+            """INSERT OR IGNORE INTO prospects
+               (id, company_id, first_name, last_name, email, email_verified,
+                email_status, phone, phone_verified, linkedin_url, title,
+                seniority, department, source, source_url, status, score,
+                personalization_notes, company, industry, company_size,
+                import_batch_id, import_row, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                prospect.id, prospect.company_id,
+                prospect.first_name, prospect.last_name,
+                prospect.email, int(prospect.email_verified),
+                prospect.email_status,
+                prospect.phone, int(prospect.phone_verified),
+                prospect.linkedin_url, prospect.title,
+                prospect.seniority, prospect.department,
+                prospect.source, prospect.source_url,
+                prospect.status, prospect.score,
+                prospect.personalization_notes,
+                prospect.company, prospect.industry, prospect.company_size,
+                prospect.import_batch_id, prospect.import_row,
+                prospect.created_at.isoformat(),
+                prospect.updated_at.isoformat(),
+            ),
+        )
+        if cursor.rowcount == 0:
+            # Unique-constraint conflict: resolve to the existing record.
+            for column, value in (
+                ("email", prospect.email),
+                ("linkedin_url", prospect.linkedin_url),
+                ("id", prospect.id),
+            ):
+                if not value:
+                    continue
+                async with db.execute(
+                    f"SELECT id FROM prospects WHERE {column} = ?", (value,)
+                ) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        prospect.id = row[0]
+                        break
         return prospect.id
 
     async def get_prospect(self, prospect_id: str) -> Prospect | None:

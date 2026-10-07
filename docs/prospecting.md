@@ -129,6 +129,47 @@ While reading sites, Mercury also detects the tools a site runs (HubSpot, Shopif
 
 For each named person, the address is found pattern-first and verified once. See [Address verification](email-and-deliverability.md#address-verification) for the order and the `verified` / `risky` / `guess` / `invalid` statuses. Only sendable prospects (verified, plus risky with `send_to_risky`) are handed to the Writer.
 
+## Importing a list
+
+Already have a list? Import it from a CSV in the dashboard (Contacts → **Import CSV**) or with `mercury import`. Both run the same checks and give the same row outcomes.
+
+```bash
+mercury import leads.csv --dry-run                # preview: changes nothing, calls nothing
+mercury import leads.csv --skip-invalid           # import, leaving invalid rows out
+mercury import leads.csv --map email="Work Email" --map company_name=Account
+mercury import leads.csv --policy fill            # fill blank fields on contacts you already have
+mercury imports                                   # recent batches
+mercury imports verify BATCH --estimate           # what verification would cost
+mercury imports verify BATCH --all                # verify the batch's addresses
+mercury imports release BATCH                     # hand verified contacts to outreach
+```
+
+Add `--json` to any of them for a machine-readable summary.
+
+**The file.** UTF-8 CSV (a byte-order mark is fine), up to **5 MB** and **5,000 rows** per import. Quoted commas and line breaks inside cells work. The delimiter (comma, semicolon or tab) is detected; when more than one fits, you're asked to choose (`--delimiter`). Row numbers count from the header as row 1, as in a spreadsheet.
+
+**Columns.** Common header spellings are recognised (`Work Email`, `Job Title`, `Organisation`, `Person Linkedin Url`...). You can override any of them. The fields are `email` (required), `first_name`, `last_name`, `full_name` (split into first and last when those are missing), `title`, `company_name`, `website`, `industry`, `linkedin_url`, `phone` and `personalization`. Columns such as `Email Status` or `Verified` are ignored: a CSV can't vouch for an address.
+
+**Every row gets an outcome.**
+
+| Outcome | Meaning | Default action |
+|---|---|---|
+| new | A valid contact Mercury doesn't have | Import |
+| needs enrichment | Valid email, but no first name, last name or title | Import, flagged |
+| duplicate | Same email, same LinkedIn profile, or same name at the same company as an existing contact, or as an earlier row | Skip |
+| invalid | No email, a malformed one, or an overlong field | Refused until you leave it out |
+
+Emails are lowercased and trimmed, and websites are reduced to a bare domain (`https://www.Acme.com/` → `acme.com`), so an address or a company Mercury already knows always resolves to the existing record. With no website, the company comes from the email's domain, unless that's a consumer provider such as gmail.com. Two people at gmail.com aren't colleagues. Without either, the company name is the key.
+
+**Duplicates.** By default they're skipped. `--policy fill` (the "Fill their blank fields" toggle) fills only fields that are empty. It never replaces a value, and never changes a contact's status, verification or notes. Contacts who opted out, or whose address is marked invalid, are always skipped.
+
+**Committing.** The commit re-checks every row under a write lock, because the database may have changed since the preview, then imports in a single transaction. If anything fails, nothing is written. Committing the same file with the same choices again is a no-op that returns the first result. Each batch records the file name, where it came from (cli or dashboard), the time and every row's outcome. It keeps outcomes and reasons, never the row contents. The uploaded file itself is never stored.
+
+**Nothing happens on its own.** Imported contacts are held at status `imported` with their addresses `guess`. The Writer, the Scout's background re-verification and the Sender all ignore them. Two separate, deliberate steps follow:
+
+1. **Verify** spends one credit per address with your configured verifiers (Reoon, ZeroBounce, Hunter), and shows the cost first. Opted-out, invalid and already-verified contacts are never sent to a provider.
+2. **Release** moves the batch's verified contacts (`--include-risky` adds catch-alls) to `new`. From there the Writer drafts for them like any other contact, and drafts wait in the Outbox for approval unless you turned approval off. Unverified contacts stay held and are never sent.
+
 ## Exporting the list
 
 Mercury is useful as a list builder even if you never let it send.

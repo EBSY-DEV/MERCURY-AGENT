@@ -25,6 +25,7 @@ logger = logging.getLogger("mercury.dashboard")
 
 from mercury.paths import PROJECT_ROOT  # noqa: E402
 from mercury.personas_api import router as personas_router  # noqa: E402
+from mercury.imports_api import router as imports_router  # noqa: E402
 # MERCURY_DB_PATH points the dashboard at another database (e.g. the demo
 # DB from scripts/seed_demo.py) without touching the real one.
 DB_PATH = Path(os.environ.get("MERCURY_DB_PATH") or (PROJECT_ROOT / "data" / "mercury.db"))
@@ -35,6 +36,7 @@ LOG_FILE = PROJECT_ROOT / "data" / "mercury.log"
 
 app = FastAPI(title="Mercury Dashboard")
 app.include_router(personas_router)
+app.include_router(imports_router)
 
 # Mercury process tracking
 _mercury_process: subprocess.Popen | None = None
