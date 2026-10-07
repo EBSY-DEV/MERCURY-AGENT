@@ -129,7 +129,7 @@ One card per sending mailbox (gmail or smtp; Instantly runs its own warm-up):
 - **DNS check**: MX, SPF, DKIM and DMARC for the sending domain, each with a plain-language fix.
 - **Notes**, and **Pause** / **Resume** for that mailbox.
 
-Caps and start dates come only from `channels.email.mailboxes` in your config; the tab shows a config snippet when none are set. See [Warm-up ramp](email-and-deliverability.md#warm-up-ramp) and [Health gates](email-and-deliverability.md#health-gates).
+Use **Settings → Sending inboxes** to add inboxes, set or replace passwords, and edit daily caps and start dates. These settings are persisted to your private mailbox configuration; restart a running Mercury agent after changing them. The Warm-up tab keeps monitoring, pause/resume, and the checklist. See [Mailbox rotation](email-and-deliverability.md#mailbox-rotation), [Warm-up ramp](email-and-deliverability.md#warm-up-ramp), and [Health gates](email-and-deliverability.md#health-gates).
 
 ## Conversations
 
@@ -145,7 +145,7 @@ Your live Claude quota (5-hour and weekly windows, read the same way Claude Code
 
 ## Settings
 
-Credentials for the email provider, prospect search, email verification, LinkedIn and Cloudflare. Saving writes them to `.env`. Secrets are shown only as set or not set; their values are never sent back to the browser. Config file settings (`mercury.local.yaml`) are not editable here.
+Credentials for the email provider, prospect search, email verification, LinkedIn and Cloudflare. Saving writes them to `.env`. Secrets are shown only as set or not set; their values are never sent back to the browser. **Sending inboxes** lets you add SMTP/IMAP addresses, update passwords and server settings, edit sending caps and warm-up dates, and test connections. Mailbox settings are saved to your private configuration; other YAML settings remain managed through the configuration file.
 
 ## Controls
 

@@ -15,7 +15,7 @@ import pathlib
 
 import aiosqlite
 import yaml
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import (
     HTMLResponse, JSONResponse, PlainTextResponse, Response,
@@ -71,23 +71,16 @@ def _mask_key(key: str) -> str:
 
 def _read_env_file() -> dict[str, str]:
     """Read .env file and return as dict."""
-    env_vars = {}
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                env_vars[key.strip()] = value.strip()
-    return env_vars
+    return {k: v for k, v in dotenv_values(ENV_FILE, interpolate=False).items()
+            if v is not None} if ENV_FILE.exists() else {}
 
 
 def _write_env_file(updates: dict[str, str]):
     """Update .env file with new values, preserving existing entries."""
-    existing = _read_env_file()
-    existing.update(updates)
-    lines = [f"{k}={v}" for k, v in existing.items()]
-    ENV_FILE.write_text("\n".join(lines) + "\n")
-    load_dotenv(str(ENV_FILE), override=True)
+    from mercury.inbox_settings import write_env
+
+    write_env(ENV_FILE, updates)
+    load_dotenv(str(ENV_FILE), override=True, interpolate=False)
 
 
 def _check_mercury_pid() -> int | None:
@@ -144,7 +137,12 @@ async def get_setup_status():
                          "'mercury gmail auth' in your terminal.")
     elif provider == "smtp":
         provider_done = _has("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD")
-        provider_help = "Enter your SMTP host, username, and password in Settings."
+        try:
+            _config, pool = _mail_context()
+            provider_done = bool(pool and pool.configured())
+        except Exception:
+            pass
+        provider_help = "Add an inbox and its password in Settings → Sending inboxes."
     else:
         instantly_key = env_vars.get("INSTANTLY_API_KEY", "") or os.getenv("INSTANTLY_API_KEY", "")
         provider_done = bool(instantly_key) and instantly_key != "your_instantly_api_key_here"
@@ -327,7 +325,8 @@ async def save_env_settings(request: Request):
                      "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD", "TREG_TOKEN"]:
             if key in data and data[key] is not None:
                 # Strip newlines so a crafted value can't inject extra .env entries
-                updates[key] = str(data[key]).replace("\n", " ").replace("\r", " ").strip()
+                value = str(data[key]).replace("\n", " ").replace("\r", " ")
+                updates[key] = value if key in ("SMTP_PASSWORD", "IMAP_PASSWORD") else value.strip()
         if updates:
             try:
                 _write_env_file(updates)
@@ -694,7 +693,7 @@ def _mail_context():
     # here (the agent the dashboard starts inherits it).
     values = dict(os.environ)
     if ENV_FILE.exists():
-        values.update({k: v for k, v in dotenv_values(str(ENV_FILE)).items() if v is not None})
+        values.update({k: v for k, v in dotenv_values(str(ENV_FILE), interpolate=False).items() if v is not None})
     config = load_config()
     return config, MailboxPool.from_config(config, load_env(values))
 
@@ -769,6 +768,72 @@ async def get_mailboxes():
         logger.error(f"/api/mailboxes: {e}")
         return {"error": f"Could not read the mail configuration: {type(e).__name__}. "
                          "Check mercury.local.yaml (channels.email) and the dashboard log."}
+
+
+@app.get("/api/settings/mailboxes")
+async def get_inbox_settings():
+    from mercury.config import _find_config_file
+    from mercury.inbox_settings import settings
+
+    try:
+        return settings(Path(_find_config_file()), ENV_FILE)
+    except Exception:
+        return JSONResponse({"error": "Could not read inbox settings. Check your Mercury configuration."},
+                            status_code=400)
+
+
+async def _save_inbox(request: Request, email: str | None = None):
+    from mercury.config import _find_config_file
+    from mercury.inbox_settings import InboxError, save
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
+    async with _env_lock:
+        try:
+            source = Path(_find_config_file())
+            private = (source.with_name("mercury.local.yaml")
+                       if source.name == "mercury.yaml" and not os.getenv("MERCURY_CONFIG") else None)
+            result = save(source, ENV_FILE, data, email, private)
+            result["restart_required"] = _check_mercury_pid() is not None
+            return result
+        except InboxError as e:
+            return JSONResponse({"success": False, "message": str(e)}, status_code=e.status)
+        except Exception:
+            logger.warning("Could not save inbox settings", exc_info=False)
+            return JSONResponse({"success": False, "message": "Could not save inbox settings. Check file permissions and configuration."},
+                                status_code=500)
+
+
+@app.post("/api/settings/mailboxes")
+async def add_inbox(request: Request):
+    return await _save_inbox(request)
+
+
+@app.patch("/api/settings/mailboxes/{email}")
+async def edit_inbox(email: str, request: Request):
+    return await _save_inbox(request, email)
+
+
+@app.post("/api/settings/mailboxes/{email}/test")
+async def test_inbox(email: str):
+    from mercury.config import _find_config_file, load_config, load_env
+    from mercury.inbox_settings import configured_inboxes, env_values
+    from mercury.integrations.smtp_mail import SmtpImapProvider
+
+    try:
+        config = load_config(_find_config_file())
+        env = load_env(env_values(ENV_FILE))
+        box = next((b for b in configured_inboxes(config, env) if b.email == email.lower()), None)
+        if box is None:
+            return JSONResponse({"success": False, "message": "Inbox not found."}, status_code=404)
+        ok, _message = await asyncio.wait_for(SmtpImapProvider(config, env, box).test_connection(), 35)
+        # Provider errors may echo credential data; return only a generic result.
+        return {"success": ok, "message": "SMTP and IMAP connected." if ok else
+                "Could not connect. Check the inbox password, server settings, and SMTP/IMAP access."}
+    except Exception:
+        return {"success": False, "message": "Connection test failed or timed out. Check the inbox settings."}
 
 
 @app.post("/api/outbox/approve-all")
