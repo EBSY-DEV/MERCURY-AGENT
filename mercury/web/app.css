@@ -296,6 +296,9 @@ main:has(> #pipeline.active), main:has(> #calendar.active) { max-width: none; pa
 .link-btn:hover { color: var(--accent-deep); }
 .link-btn .ph { font-size: 13px; }
 
+.today-cols { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.today-cols .stack > .panel, .today-cols .stack > div > .panel { margin-bottom: 16px; }
+@media (max-width: 1100px) { .today-cols { grid-template-columns: 1fr; gap: 0; } }
 .grid-2-1 { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 .grid-2-1 > .panel, .stack > .panel, .stack > div > .panel { margin-bottom: 16px; }
 .stack { display: flex; flex-direction: column; min-width: 0; }
@@ -726,6 +729,17 @@ details[open] summary::before { content: '– '; }
 .activity-item .time { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); min-width: 108px; flex: none; }
 .activity-item .agent { font-family: var(--mono); font-size: 11px; color: var(--text-2); min-width: 62px; flex: none; }
 .activity-item .action { color: var(--text-2); }
+/* Today's feed: merged events with an icon, relative time on the right. */
+.act-row { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 8px 0; font-size: 13px; }
+.act-row .act-ico {
+  width: 24px; height: 24px; border-radius: 7px; display: inline-flex; align-items: center; justify-content: center;
+  background: var(--panel-raised); color: var(--text-2);
+}
+.act-row .act-ico .ph { font-size: 13px; }
+.act-row .action { color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.act-row .agent { font-family: var(--sans); color: var(--text-3); font-size: 12px; margin-left: 6px; min-width: 0; }
+.act-row .times { color: var(--text-3); font-size: 11.5px; margin-left: 6px; font-family: var(--mono); }
+.act-row .time { min-width: 0; white-space: nowrap; }
 
 /* ── Help & misc ─────────────────────────────────────────────── */
 
@@ -1255,6 +1269,35 @@ details[open] summary::before { content: '– '; }
 .hm-legend .hm-c:first-of-type { margin-left: 6px; }
 .hm-legend .hm-c:last-of-type { margin-right: 6px; }
 @media (max-width: 700px) { .hm-legend { display: none; } }
+
+/* ── Chart entrances ─────────────────────────────────────────
+   Subtle and one-shot: lines draw in, areas fade up, bars grow from the
+   baseline, heatmap cells fill left to right. Only while .ch-anim is set
+   (chartIntro), so resizes and live refreshes never replay them. */
+
+@keyframes ch-draw  { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+@keyframes ch-fade  { from { opacity: 0; } to { opacity: 1; } }
+@keyframes ch-grow  { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+@keyframes ch-growx { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+@keyframes ch-pop   { from { opacity: 0; transform: scale(.6); } to { opacity: 1; transform: none; } }
+
+.ch-anim .tr-line { stroke-dasharray: 1; animation: ch-draw 1.1s cubic-bezier(.33, 1, .68, 1) both; }
+.ch-anim .tr-replies { animation-delay: .15s; }
+.ch-anim .tr-area { animation: ch-fade .9s .25s ease-out both; }
+.ch-anim .tr-bounces rect,
+.ch-anim .rp-cap, .ch-anim .rp-sent {
+  transform-box: fill-box; transform-origin: 50% 100%;
+  animation: ch-grow .6s cubic-bezier(.16, 1, .3, 1) both;
+}
+.ch-anim .tr-bounces rect { animation-delay: .5s; }
+.ch-anim .rp-sent { animation-delay: .25s; }
+.ch-anim .rp-target, .ch-anim .rp-target-l, .ch-anim .rp-today, .ch-anim .rp-today-l { animation: ch-fade .5s .45s both; }
+.ch-anim .funnel-bar span { transform-origin: 0 50%; animation: ch-growx .8s cubic-bezier(.16, 1, .3, 1) both; }
+.ch-anim .funnel-row:nth-child(2) .funnel-bar span { animation-delay: .06s; }
+.ch-anim .funnel-row:nth-child(3) .funnel-bar span { animation-delay: .12s; }
+.ch-anim .funnel-row:nth-child(4) .funnel-bar span { animation-delay: .18s; }
+.ch-anim .funnel-row:nth-child(5) .funnel-bar span { animation-delay: .24s; }
+.ch-anim .hm-grid .hm-c { animation: ch-pop .35s ease-out both; animation-delay: calc(var(--w, 0) * 9ms); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001ms !important; transition-duration: .001ms !important; }

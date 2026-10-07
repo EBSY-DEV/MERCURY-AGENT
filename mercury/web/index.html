@@ -122,13 +122,31 @@
     </div>
   </section>
 
-  <div class="grid-2-1">
+  <!-- Two independent columns: panels stack under each other instead of
+       sitting in rows, so a short panel never leaves a hole beside a tall one. -->
+  <div class="today-cols">
+    <div class="stack">
     <section class="panel">
       <div class="panel-head">
         <div><h3>Needs you</h3><p>Decisions only you can make, most blocking first.</p></div>
       </div>
       <div id="today-queue"></div>
     </section>
+    <section class="panel">
+      <div class="panel-head">
+        <div><h3>Pipeline</h3><p>How far each business has made it through Mercury.</p></div>
+      </div>
+      <div class="panel-body" id="today-funnel"></div>
+    </section>
+  <section class="panel">
+    <div class="panel-head">
+      <div><h3>Recent activity</h3><p>Every action Mercury takes, newest first.</p></div>
+      <button class="link-btn" onclick="goTab('activity')">View all<i data-ph="arrow-right"></i></button>
+    </div>
+    <div class="panel-body" id="today-activity"></div>
+  </section>
+    </div>
+    <div class="stack">
     <section class="panel">
       <div class="panel-head">
         <div><h3>Quick actions</h3><p>Shortcuts to the usual next steps.</p></div>
@@ -141,16 +159,6 @@
         <button class="quick" onclick="window.location='/api/export/prospects.csv'"><i data-ph="download-simple"></i><span><b>Export prospects</b><small>Sequencer-ready CSV.</small></span><i data-ph="caret-right"></i></button>
       </div>
     </section>
-  </div>
-
-  <div class="grid-2-1">
-    <section class="panel">
-      <div class="panel-head">
-        <div><h3>Pipeline</h3><p>How far each business has made it through Mercury.</p></div>
-      </div>
-      <div class="panel-body" id="today-funnel"></div>
-    </section>
-    <div class="stack">
       <div id="today-setup"></div>
       <section class="panel" id="today-runs-block">
         <div class="panel-head"><div><h3>Collector runs</h3><p>Latest discovery and profiling jobs.</p></div></div>
@@ -158,14 +166,6 @@
       </section>
     </div>
   </div>
-
-  <section class="panel">
-    <div class="panel-head">
-      <div><h3>Recent activity</h3><p>Every action Mercury takes, newest first.</p></div>
-      <button class="link-btn" onclick="goTab('activity')">View all<i data-ph="arrow-right"></i></button>
-    </div>
-    <div class="panel-body" id="today-activity"></div>
-  </section>
 </div>
 
 <!-- Signals: the confirmation gate -->
