@@ -121,6 +121,8 @@ class Sender:
         # Disabled in tests to skip inter-send sleeps.
         self.send_pacing = True
         self._last_drain_at: float | None = None  # monotonic, for spread_sends
+        # Naive-UTC "now" for scheduling decisions; tests substitute their own.
+        self.clock = lambda: datetime.now(timezone.utc).replace(tzinfo=None)
 
     @property
     def is_native(self) -> bool:
@@ -370,8 +372,34 @@ class Sender:
 
     # ── Native provider flow (Gmail / SMTP via the outbox) ──
 
+    async def _resume_due_pauses(self):
+        """Release out-of-office pauses whose return time has come. This only
+        moves their queued steps' send times; approvals are untouched and the
+        drain below still applies pacing, caps and every gate."""
+        try:
+            resumed = await self.state.resume_due_pauses(self.clock())
+        except Exception as e:
+            logger.error(f"Sender: resuming out-of-office pauses failed: {e}")
+            return
+        for pause in resumed:
+            logger.info(
+                f"Sender: out-of-office pause for prospect {pause['prospect_id']} ended; "
+                f"{pause.get('rescheduled', 0)} queued step(s) rescheduled."
+            )
+            try:
+                await self.state.log_action(
+                    action_type="sequence_resumed",
+                    agent="sender",
+                    details={"prospect_id": pause["prospect_id"], "by": "return date",
+                             "resume_at": pause.get("resume_at") or "",
+                             "rescheduled": pause.get("rescheduled", 0)},
+                )
+            except Exception as e:
+                logger.debug(f"Sender: sequence_resumed log failed: {e}")
+
     async def _run_native(self):
         """Stage new campaigns into the outbox, then drain what's due."""
+        await self._resume_due_pauses()
         paused = await self.state.get_setting(KILL_SWITCH_KEY)
         if paused:
             logger.warning(
@@ -467,7 +495,7 @@ class Sender:
 
         staged = 0
         skipped = 0
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        now = self.clock()
         seen_emails: set[str] = set()
 
         for prospect_id in campaign.prospect_ids:
@@ -484,10 +512,21 @@ class Sender:
                 continue
             seen_emails.add(email)
 
+            # A prospect on an out-of-office pause is staged normally (the
+            # drafts still wait for review) but the sequence starts after
+            # their return; the drain holds it until the pause ends anyway.
+            base = now
+            pause = await self.state.get_active_pause(prospect.id)
+            if pause and pause.get("resume_at"):
+                try:
+                    base = max(base, datetime.fromisoformat(pause["resume_at"]))
+                except ValueError:
+                    pass
+
             cumulative_days = 0
             for step in campaign.sequence:
                 cumulative_days += max(0, step.delay_days)
-                send_at = now + timedelta(days=cumulative_days)
+                send_at = base + timedelta(days=cumulative_days)
                 item_id = await self.state.add_outbox_item(
                     prospect_id=prospect.id,
                     campaign_id=campaign.id,
@@ -580,12 +619,15 @@ class Sender:
             logger.info(f"Sender: daily send cap reached ({sent_today}/{capacity}).")
             return
 
-        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        now = self.clock().isoformat()
         # The whole due set, not a budget-sized slice: rows pinned to a
         # mailbox at its cap are skipped below, and a slice of the oldest
         # rows could be nothing but those while other mailboxes sat idle.
+        # Prospects on an out-of-office pause are left out of the scan, so a
+        # long pause cannot crowd due mail out of the scan limit.
         due = await self.state.get_outbox(
-            status="approved", due_before=now, limit=DUE_SCAN_LIMIT
+            status="approved", due_before=now, limit=DUE_SCAN_LIMIT,
+            exclude_paused=True,
         )
         if not due:
             return
@@ -684,6 +726,18 @@ class Sender:
                 )
                 continue
 
+            # A vacation notice may have landed since the due scan was read.
+            # Look again right before claiming (the claim itself refuses a
+            # paused prospect too), so a stale scan cannot send into a pause.
+            if item["kind"] == "sequence" and await self.state.get_active_pause(
+                item["prospect_id"]
+            ):
+                logger.info(
+                    f"Sender: holding step {item['step']} to {item['to_email']}: "
+                    "out-of-office pause."
+                )
+                continue
+
             # The reviewed text and its generation must stay together during
             # the provider call. A stale due scan cannot send a replaced draft.
             if not await self.state.claim_outbox_item(item, mailbox.email):
@@ -748,7 +802,7 @@ class Sender:
                 cold_sent += 1
             remaining[mailbox.email] = remaining.get(mailbox.email, 0) - 1
             sent_this_cycle[mailbox.email] = sent_this_cycle.get(mailbox.email, 0) + 1
-            now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+            now_iso = self.clock().isoformat()
             await self.state.update_outbox_item(
                 item["id"], status="sent", sent_at=now_iso, body=body_out,
                 message_id=result.message_id, thread_ref=result.thread_ref,
