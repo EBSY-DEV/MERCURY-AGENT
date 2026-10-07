@@ -233,6 +233,10 @@ async def decide_next_action(
                     "SELECT COUNT(*) FROM outbox o JOIN prospects p "
                     "ON p.email = o.to_email WHERE o.status = 'approved' "
                     "AND o.sent_at IS NULL "
+                    # Mail held by an out-of-office pause is not sendable work.
+                    "AND NOT (o.kind = 'sequence' AND EXISTS ("
+                    "SELECT 1 FROM sequence_pauses sp WHERE sp.prospect_id = o.prospect_id "
+                    "AND sp.state IN ('paused', 'needs_review'))) "
                     f"AND p.email_status IN ({placeholders})",
                     statuses,
                 ) as cursor:
