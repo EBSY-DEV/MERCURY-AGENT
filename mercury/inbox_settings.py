@@ -9,12 +9,22 @@ from pathlib import Path
 
 import yaml
 from dotenv import dotenv_values
+from ruamel.yaml import YAML
 from dotenv.parser import parse_stream
 from pydantic import ValidationError
 
 from mercury.config import MailboxConfig, MercuryConfig, load_env
 from mercury.integrations.mailboxes import local_today
 from mercury.integrations.smtp_mail import SmtpImapProvider
+
+
+def _plain(node):
+    """Convert ruamel's round-trip containers into plain dicts/lists."""
+    if isinstance(node, dict):
+        return {k: _plain(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_plain(v) for v in node]
+    return node
 
 
 def atomic_write(path: Path, content: str):
@@ -41,8 +51,11 @@ def write_env(path: Path, updates: dict[str, str]):
     lines = []
     for binding in parse_stream(StringIO(original)):
         if binding.key in replacements:
-            lines.append(replacements[binding.key])
-            seen.add(binding.key)
+            # Replace the first occurrence only; drop later duplicates so a
+            # stale copy can never shadow the rotated value.
+            if binding.key not in seen:
+                lines.append(replacements[binding.key])
+                seen.add(binding.key)
         else:
             lines.append(binding.original.string)
     content = "".join(lines)
@@ -79,6 +92,7 @@ def public_inbox(box: MailboxConfig, config: MercuryConfig, env) -> dict:
     provider = SmtpImapProvider(config, env, mailbox=box)
     data = box.model_dump(mode="json", exclude={"password_env", "imap_password_env"})
     data.update(password_set=bool(env.secret(box.password_env)),
+                imap_password_set=bool(box.imap_password_env and env.secret(box.imap_password_env)),
                 configured=provider.is_configured())
     return data
 
@@ -106,11 +120,20 @@ def save(config_path: Path, env_path: Path, data: dict, email: str | None = None
          private_path: Path | None = None) -> dict:
     allowed = {"email", "name", "username", "password", "smtp_host", "smtp_port",
                "imap_host", "imap_port", "daily_cap", "warmup_start", "enabled",
-               "activate_smtp", "imap_username"}
+               "activate_smtp", "imap_username", "imap_password"}
     if not isinstance(data, dict) or set(data) - allowed:
         raise InboxError("Use only the supported inbox settings.")
-    raw = yaml.safe_load(config_path.read_text())
-    config = MercuryConfig(**raw)
+    # Round-trip loader so saving keeps the user's comments and key order.
+    rt_yaml = YAML(typ="rt")
+    rt_yaml.preserve_quotes = True
+    rt_yaml.width = 4096
+    raw = rt_yaml.load(config_path.read_text()) or {}
+    # A bare `channels:` / `email:` key loads as None; treat it as empty.
+    if not isinstance(raw.get("channels"), dict):
+        raw["channels"] = {}
+    if not isinstance(raw["channels"].get("email"), dict):
+        raw["channels"]["email"] = {}
+    config = MercuryConfig(**_plain(raw))
     env = load_env(env_values(env_path))
     boxes = configured_inboxes(config, env)
     current = next((b for b in boxes if b.email == (email or "").lower()), None)
@@ -120,7 +143,7 @@ def save(config_path: Path, env_path: Path, data: dict, email: str | None = None
         raise InboxError("Confirm switching the email provider to SMTP + IMAP to use these inboxes.")
     if "activate_smtp" in data and not isinstance(data["activate_smtp"], bool):
         raise InboxError("The provider confirmation must be true or false.")
-    changes = {k: v for k, v in data.items() if k not in ("password", "activate_smtp")}
+    changes = {k: v for k, v in data.items() if k not in ("password", "imap_password", "activate_smtp")}
     for field in ("email", "name", "username", "smtp_host", "imap_host", "imap_username"):
         if field in changes and not isinstance(changes[field], str):
             raise InboxError(f"{field.replace('_', ' ')} must be text.")
@@ -152,10 +175,12 @@ def save(config_path: Path, env_path: Path, data: dict, email: str | None = None
     if not current and any(b.email == box.email for b in boxes):
         raise InboxError("This inbox already exists. Edit it instead.", 409)
     password = data.get("password")
-    if password is not None and not isinstance(password, str):
-        raise InboxError("The password must be text.")
-    if password and any(c in password for c in ("\n", "\r", "\x00")):
-        raise InboxError("The password must not contain line breaks or null characters.")
+    imap_password = data.get("imap_password")
+    for label, value in (("password", password), ("IMAP password", imap_password)):
+        if value is not None and not isinstance(value, str):
+            raise InboxError(f"The {label} must be text.")
+        if value and any(c in value for c in ("\n", "\r", "\x00")):
+            raise InboxError(f"The {label} must not contain line breaks or null characters.")
     updates = {}
     if password:
         # Editing a shared legacy credential must not change other inboxes.
@@ -163,18 +188,36 @@ def save(config_path: Path, env_path: Path, data: dict, email: str | None = None
         if shared or not box.password_env.startswith("MAILBOX_"):
             box.password_env = f"MAILBOX_{uuid.uuid4().hex.upper()}_PASSWORD"
         updates[box.password_env] = password
+        legacy_imap = box.imap_password_env and not box.imap_password_env.endswith("_IMAP_PASSWORD")
+        if legacy_imap and box.imap_password_env != box.password_env and not imap_password:
+            # A legacy inbox materialised from SMTP_PASSWORD + IMAP_PASSWORD
+            # keeps a separate IMAP secret. Rotating only the SMTP password
+            # would leave IMAP on the stale one, so unless a new IMAP password
+            # is supplied, assume the common case: one credential for both.
+            # A MAILBOX_*_IMAP_PASSWORD key set from the dashboard is kept.
+            box.imap_password_env = box.password_env
+    if imap_password:
+        # A distinct IMAP secret gets its own MAILBOX_* key; it is never
+        # written into YAML and never echoed back by public_inbox.
+        if not (box.imap_password_env.startswith("MAILBOX_")
+                and box.imap_password_env.endswith("_IMAP_PASSWORD")
+                and sum(b.imap_password_env == box.imap_password_env for b in boxes) <= 1):
+            box.imap_password_env = f"MAILBOX_{uuid.uuid4().hex.upper()}_IMAP_PASSWORD"
+        updates[box.imap_password_env] = imap_password
     if current:
         boxes = [box if b.email == current.email else b for b in boxes]
     else:
         boxes.append(box)
-    raw.setdefault("channels", {}).setdefault("email", {}).update(
-        provider="smtp", mailboxes=[b.model_dump(mode="json") for b in boxes])
+    raw["channels"]["email"]["provider"] = "smtp"
+    raw["channels"]["email"]["mailboxes"] = [b.model_dump(mode="json") for b in boxes]
     # Validate the entire result before either file is changed.
-    validated = MercuryConfig(**raw)
+    validated = MercuryConfig(**_plain(raw))
     target = private_path or config_path
     target = target.resolve()
     before = target.read_text() if target.exists() else None
-    atomic_write(target, yaml.safe_dump(raw, sort_keys=False, allow_unicode=True))
+    out = StringIO()
+    rt_yaml.dump(raw, out)
+    atomic_write(target, out.getvalue())
     try:
         if updates:
             write_env(env_path, updates)

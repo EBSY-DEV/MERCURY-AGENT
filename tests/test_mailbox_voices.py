@@ -154,3 +154,15 @@ def test_voices_api_and_prompt_preview_sign_off(client):
     prompt = client.post("/api/personas/prompt", json={"prospect_id": prospect, "version_id": version,
                                                         "mailbox": "hello@two.example"}).json()
     assert "no other: Alex." in prompt["prompt"] and prompt["persona"]["mailbox"] == "hello@two.example"
+
+
+def test_voices_api_leaves_out_fields_unchanged(client):
+    mailboxes(client, *TWO)
+    pid = create(client, sign_name="Alex")
+    assert client.post("/api/voices/hello@two.example", json={"persona_id": pid, "sign_name": "Alexandra"}).status_code == 200
+    only_sign = client.post("/api/voices/hello@two.example", json={"sign_name": "Lex"}).json()
+    assert (only_sign["persona"]["id"], only_sign["signer"], only_sign["follows_default"]) == (pid, "Lex", False)
+    only_voice = client.post("/api/voices/hello@two.example", json={"persona_id": "workspace"}).json()
+    assert (only_voice["persona"]["id"], only_voice["signer"]) == ("workspace", "Lex")
+    cleared = client.post("/api/voices/hello@two.example", json={"persona_id": "", "sign_name": ""}).json()
+    assert cleared["follows_default"] and cleared["signer"] == client.config.persona.name

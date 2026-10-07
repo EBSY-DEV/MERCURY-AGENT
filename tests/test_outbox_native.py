@@ -404,3 +404,83 @@ async def test_inbound_dedup(state):
     await handler._run_native()   # same message again → ignored via dedup
     second = await state.get_conversations_by_status("closed")
     assert len(first) == len(second) == 1
+
+
+# ── stuck 'sending' rows, raising providers, disabled mailboxes ──
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_sending_rows(state):
+    pid = await seed_prospect(state)
+    stale_id = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="s", body="Fine body.",
+        send_at=_now_iso(), status="approved",
+    )
+    fresh_id = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="s2", body="Fine body.",
+        send_at=_now_iso(), status="approved",
+    )
+    for item_id in (stale_id, fresh_id):
+        assert await state.claim_outbox_item(await state.get_outbox_item(item_id), "m@x.co")
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).replace(tzinfo=None).isoformat()
+    async with state._connect() as db:
+        await db.execute("UPDATE outbox SET updated_at = ? WHERE id = ?", (old, stale_id))
+        await db.commit()
+
+    assert await state.recover_stale_outbox(max_age_minutes=30) == 1
+    stale = await state.get_outbox_item(stale_id)
+    assert stale["status"] == "approved"
+    assert stale["error"] == "recovered: send interrupted"
+    assert stale["send_at"]  # kept
+    fresh = await state.get_outbox_item(fresh_id)
+    assert fresh["status"] == "sending"
+    assert await state.recover_stale_outbox(max_age_minutes=30) == 0
+
+
+@pytest.mark.asyncio
+async def test_provider_exception_requeues_instead_of_sticking(state):
+    pid = await seed_prospect(state)
+    item_id = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="hello",
+        body="Fine body. Question?", send_at=_now_iso(), status="approved",
+    )
+
+    class RaisingProvider(FakeProvider):
+        async def send_email(self, *a, **k):
+            raise RuntimeError("socket exploded")
+
+    await make_sender(state, RaisingProvider())._drain_due()
+    item = await state.get_outbox_item(item_id)
+    assert item["status"] == "approved"
+    assert item["error"].startswith("retry 1/3: exception: RuntimeError")
+    assert item["send_at"] > _now_iso()  # pushed into the future
+    assert await state.get_outbox(status="sending") == []
+
+
+@pytest.mark.asyncio
+async def test_disabled_mailbox_holds_new_threads_but_finishes_replies(state):
+    from mercury.integrations.mailboxes import Mailbox, MailboxPool
+
+    pid = await seed_prospect(state, status="contacted")
+    provider = FakeProvider()
+    pool = MailboxPool(
+        [Mailbox(email="old@x.co", provider=provider, daily_cap=50, accepts_new=False)],
+        warmup_initial_cap=50, warmup_weekly_increase=50,
+    )
+    step1 = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="hello",
+        body="Fine body. Question?", send_at=_now_iso(), status="approved",
+        campaign_id="c1", step=1, mailbox="old@x.co",
+    )
+    reply = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="Re: hello",
+        body="Thanks, here is the answer.", send_at=_now_iso(), status="approved",
+        kind="reply", mailbox="old@x.co",
+    )
+    sender = make_sender(state, provider)
+    sender.mailboxes = pool
+    await sender._drain_due()
+
+    assert (await state.get_outbox_item(step1))["status"] == "approved"
+    assert (await state.get_outbox_item(reply))["status"] == "sent"
+    assert [m["subject"] for m in provider.sent] == ["Re: hello"]

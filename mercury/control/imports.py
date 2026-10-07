@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 from collections import Counter
 
 import aiosqlite
@@ -30,6 +31,8 @@ from mercury.csv_import import (
 from mercury.models.company import Company
 from mercury.models.prospect import Prospect
 from mercury.state import _new_id, _utcnow
+
+logger = logging.getLogger(__name__)
 
 POLICIES = ("skip", "fill")
 HELD_STATUS = "imported"
@@ -417,9 +420,18 @@ class ImportService:
                      "ZEROBOUNCE_API_KEY or HUNTER_API_KEY to .env."),
         }
 
-    async def _verify_one(self, email: str) -> str:
-        from mercury.integrations.email_finder import _verify_candidate, classify_mx, get_mx_host
-        mx = await get_mx_host(email.split("@", 1)[1])
+    async def _verify_one(self, email: str) -> str | None:
+        """One address's status, or None when the DNS lookup itself failed
+        (timeout, resolver outage): the address stays as it is and a later
+        Verify run retries it. Only a definitive "this domain takes no mail"
+        answer marks it invalid."""
+        from mercury.integrations.email_finder import (
+            MxLookupError, _verify_candidate, classify_mx, get_mx_host)
+        try:
+            mx = await get_mx_host(email.split("@", 1)[1])
+        except MxLookupError as error:
+            logger.warning(f"Verification skipped for {email}: {error}")
+            return None
         if not mx:
             return "invalid"
         status, _ = await _verify_candidate(email, classify_mx(mx), self.env)
@@ -438,15 +450,18 @@ class ImportService:
         limit = max(1, min(int(limit), VERIFY_BATCH_LIMIT))
         todo = await self._unverified(batch["id"], after_row, limit)
         results: Counter = Counter()
-        stopped, last_row = "", after_row
+        stopped, last_row, skipped = "", after_row, 0
         for index, row in enumerate(todo, start=1):
             try:
                 status = await self._verify_one(row["email"])
             except VerifierExhausted as error:
                 stopped = f"Verifier out of credits: {error}"
                 break
-            await self.state.update_prospect_email(row["id"], row["email"], status)
-            results[status] += 1
+            if status is None:
+                skipped += 1
+            else:
+                await self.state.update_prospect_email(row["id"], row["email"], status)
+                results[status] += 1
             last_row = row["import_row"]
             if progress:
                 await progress(index, len(todo))
@@ -454,6 +469,12 @@ class ImportService:
         return {"batch_id": batch["id"], "checked": sum(results.values()),
                 "results": dict(results), "next_after_row": last_row,
                 "remaining": 0 if stopped else remaining, "stopped": stopped,
+                # DNS lookups that failed outright (timeout, resolver down).
+                # Nothing was written for these; run Verify again later.
+                "skipped": skipped,
+                "note": (f"{skipped} address(es) could not be checked because the DNS lookup "
+                         "failed. They were left unverified; run Verify again later."
+                         if skipped else ""),
                 # Still 'guess' after a provider looked: running Verify again
                 # would spend credits on these same addresses.
                 "unresolved": results.get("guess", 0)}
