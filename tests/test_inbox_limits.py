@@ -89,7 +89,7 @@ def test_legacy_configs_have_no_warnings_and_still_load():
     assert legacy.max_inboxes_per_domain == 2
     assert legacy.provider_daily_ceilings == {"gmail": 30, "smtp": 15}
     # Warnings never change a cap.
-    assert legacy.mailboxes[0].daily_cap == 30
+    assert legacy.mailboxes[0].daily_cap == 15
 
 
 def test_negative_domain_limit_rejected():

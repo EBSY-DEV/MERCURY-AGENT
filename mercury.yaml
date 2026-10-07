@@ -65,7 +65,7 @@ channels:
     mailboxes: []
     #  - email: "you@yourcompany-mail.com"
     #    password_env: "MAILBOX_YOU_PASSWORD"
-    #    daily_cap: 30
+    #    daily_cap: 15
     #    warmup_start: "2026-10-07"
     # Warm-up health gate (per mailbox, last 7 days): over 5% bounces after
     # 20 sends pauses that mailbox until you resume it on the Warm-up tab;

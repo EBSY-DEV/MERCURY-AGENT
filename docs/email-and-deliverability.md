@@ -105,11 +105,11 @@ channels:
     mailboxes:
       - email: "jordan@acme-mail.com"       # already warm
         password_env: "MAILBOX_JORDAN_PASSWORD"
-        daily_cap: 30
+        daily_cap: 15
       - email: "alex@getacme.com"           # warming since Sept 21
         name: "Alex Rivera"
         password_env: "MAILBOX_ALEX_PASSWORD"
-        daily_cap: 30
+        daily_cap: 15
         warmup_start: "2026-09-21"
       - email: "sam@tryacme.com"            # different provider, starts next week
         password_env: "MAILBOX_SAM_PASSWORD"
