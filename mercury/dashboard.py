@@ -759,6 +759,11 @@ async def get_mailboxes():
         config, pool = _mail_context()
         state = _state()
         await state.init_db()
+        if pool is not None:
+            # The same health gates the sender applies, so caps agree.
+            from mercury.warmup import apply_health
+
+            await apply_health(state, pool)
         return mailbox_report(config, pool, await state.count_outbox_sent_today_by_mailbox())
     except Exception as e:
         logger.error(f"/api/mailboxes: {e}")
@@ -1136,7 +1141,7 @@ async def get_calendar(start: str | None = None, end: str | None = None):
     rows = await query_db(
         f"""SELECT o.id, {_CAL_EVENT_EXPR} AS at, o.kind, o.step, o.status,
                    o.subject, o.to_email, o.prospect_id, o.campaign_id, o.error,
-                   o.body, p.first_name, p.last_name,
+                   o.body, COALESCE(o.mailbox, '') AS mailbox, p.first_name, p.last_name,
                    COALESCE(NULLIF(c.name, ''), p.company, '') AS company_name
             FROM outbox o
             LEFT JOIN prospects p ON p.id = o.prospect_id
@@ -1146,6 +1151,18 @@ async def get_calendar(start: str | None = None, end: str | None = None):
             ORDER BY datetime({_CAL_EVENT_EXPR}) ASC, o.step ASC""",
         (d0.isoformat(), d1.isoformat()),
     )
+    # The address each email goes (or went) out from, resolved like the
+    # Outbox does: '' = a new thread that has not rotated onto a mailbox yet.
+    legacy_email = ""
+    try:
+        _cfg, pool = _mail_context()
+        legacy_email = pool.legacy.email if pool else ""
+    except Exception:
+        pass
+    try:
+        rows = await _with_from_mailbox(_state(), rows, legacy_email)
+    except Exception as e:
+        logger.debug("calendar mailbox resolve failed: %s", e)
     items = []
     for r in rows:
         name = f"{r.get('first_name') or ''} {r.get('last_name') or ''}".strip()
@@ -1165,6 +1182,7 @@ async def get_calendar(start: str | None = None, end: str | None = None):
             "campaign_id": r.get("campaign_id") or "",
             "error": r.get("error") or "",
             "body": r.get("body") or "",
+            "mailbox": r.get("from_mailbox", r.get("mailbox")) or "",
         })
     return {"start": start, "end": end, "items": items}
 
@@ -1794,32 +1812,15 @@ async def get_heatmap(weeks: str = "53"):
 
 
 # ── Inbox warm-up ──
+#
+# Which inboxes exist, their caps and start dates come from mercury.yaml
+# (channels.email.mailboxes) — these endpoints never write config. What they
+# do write is the overlay in warmup_inboxes: pause/resume, the checklist and
+# notes. See mercury/warmup.py.
 
 
 def _err(message: str, status: int = 400) -> JSONResponse:
     return JSONResponse({"success": False, "error": message}, status_code=status)
-
-
-def _sender_config() -> tuple[str | None, int | None]:
-    """(persona.email, channels.email.max_daily_sends) — best-effort.
-
-    The active inbox can also be forced with MERCURY_SENDER_EMAIL (handy for
-    the demo DB, whose config is the untrained template); see
-    mercury/warmup.py → resolve_sender_email."""
-    try:
-        from mercury.config import load_config
-        cfg = load_config()
-        return cfg.persona.email, cfg.channels.email.max_daily_sends
-    except Exception:
-        pass
-    try:
-        with open(CONFIG_FILE) as f:
-            raw = yaml.safe_load(f) or {}
-        email = (raw.get("persona") or {}).get("email")
-        max_daily = ((raw.get("channels") or {}).get("email") or {}).get("max_daily_sends")
-        return email, int(max_daily) if max_daily is not None else None
-    except Exception:
-        return None, None
 
 
 async def _json_body(request: Request) -> dict | None:
@@ -1830,49 +1831,41 @@ async def _json_body(request: Request) -> dict | None:
     return body if isinstance(body, dict) else None
 
 
-def _valid_day(value) -> str | None:
-    if not isinstance(value, str) or len(value.strip()) != 10:
-        return None
+async def _warmup_mailbox(email: str):
+    """(state, pool, mailbox) for an address in the mail config, or a
+    JSONResponse explaining why it can't be edited."""
     try:
-        return date.fromisoformat(value.strip()).isoformat()
-    except ValueError:
-        return None
-
-
-def _valid_target(value) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return value if 1 <= value <= 200 else None
-
-
-async def _warmup_context():
-    """(state, active_email, rows) for the mutating warm-up endpoints."""
-    from mercury import warmup
+        _config, pool = _mail_context()
+    except Exception as e:
+        logger.error(f"warm-up: mail config unreadable: {e}")
+        return _err(f"Could not read the mail configuration: {type(e).__name__}", 500)
+    if pool is None:
+        return _err("warm-up applies to the gmail and smtp providers only")
+    key = (email or "").strip().lower()
+    mailbox = next((mb for mb in pool.mailboxes if mb.email and mb.email == key), None)
+    if mailbox is None:
+        return _err("that inbox is not in channels.email.mailboxes", 404)
     state = _state()
     await state.init_db()
-    rows = await state.list_warmup_inboxes()
-    email, _max = _sender_config()
-    return state, warmup.resolve_sender_email(email, rows), rows
-
-
-async def _warmup_row(state, active: str | None, email: str, create: bool) -> dict | None:
-    """Fetch an inbox row; the virtual sender inbox is materialized on demand."""
-    row = await state.get_warmup_inbox(email)
-    if row is None and create and active and email == active:
-        await state.add_warmup_inbox(email)
-        row = await state.get_warmup_inbox(email)
-    return row
+    return state, pool, mailbox
 
 
 @app.get("/api/warmup")
 async def get_warmup():
     from mercury import warmup
     try:
+        config, pool = _mail_context()
+    except Exception as e:
+        logger.error(f"/api/warmup: {e}")
+        return {"error": f"Could not read the mail configuration: {type(e).__name__}. "
+                         "Check mercury.local.yaml (channels.email) and the dashboard log.",
+                "inboxes": [], "config_hint": warmup.CONFIG_HINT}
+    try:
         state = _state()
         await state.init_db()
-        email, max_daily = _sender_config()
-        return await warmup.overview(state, email, max_daily)
+        return await warmup.overview(state, config, pool)
     except Exception as e:
+        logger.error(f"/api/warmup: {e}", exc_info=True)
         return _err(str(e), 500)
 
 
@@ -1881,10 +1874,10 @@ async def get_warmup_dns(domain: str | None = None):
     from mercury import warmup
     if domain is None or not domain.strip():
         try:
-            _state_obj, active, _rows = await _warmup_context()
+            _config, pool = _mail_context()
+            domain = pool.primary.domain if pool else None
         except Exception:
-            active = None
-        domain = active.rsplit("@", 1)[1] if active else None
+            domain = None
     normalized = warmup.normalize_domain(domain)
     if not normalized:
         return _err("a valid domain is required (or configure a sending email)")
@@ -1898,38 +1891,7 @@ async def get_warmup_dns(domain: str | None = None):
     return result
 
 
-@app.post("/api/warmup/inboxes")
-async def add_warmup_inbox(request: Request):
-    from mercury import warmup
-    body = await _json_body(request)
-    if body is None:
-        return _err("invalid request body")
-    email = str(body.get("email") or "").strip().lower()
-    if not warmup.is_valid_email(email):
-        return _err("a valid email address is required")
-    start = None
-    if body.get("start_date") not in (None, ""):
-        start = _valid_day(body.get("start_date"))
-        if not start:
-            return _err("start_date must be YYYY-MM-DD")
-    target = None
-    if body.get("target_daily") is not None:
-        target = _valid_target(body.get("target_daily"))
-        if target is None:
-            return _err("target_daily must be a whole number from 1 to 200")
-    state = _state()
-    await state.init_db()
-    created = await state.add_warmup_inbox(
-        email, status="warming" if start else "not_started",
-        start_date=start, target_daily=target,
-    )
-    if not created:
-        return _err("that inbox is already on the warm-up plan")
-    await state.log_action("warmup_inbox_added", "dashboard", {"email": email})
-    return {"success": True}
-
-
-WARMUP_ACTIONS = ("start", "pause", "resume", "reset", "remove")
+WARMUP_ACTIONS = ("pause", "resume")
 
 
 @app.post("/api/warmup/inboxes/{email}/action")
@@ -1939,39 +1901,21 @@ async def warmup_inbox_action(email: str, request: Request):
     action = (body or {}).get("action")
     if action not in WARMUP_ACTIONS:
         return _err(f"action must be one of {', '.join(WARMUP_ACTIONS)}")
-    email = email.strip().lower()
-    state, active, _rows = await _warmup_context()
-    row = await _warmup_row(state, active, email, create=action in ("start", "reset"))
-    if row is None:
-        return _err("inbox not found", 404)
-    today = warmup.utc_today().isoformat()
-    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
-
-    if action == "start":
-        if row["status"] in ("warming", "complete"):
-            return _err(f"warm-up is already {row['status']}")
-        await state.update_warmup_inbox(
-            email, status="warming", start_date=row.get("start_date") or today,
-            paused_at=None, pause_reason="", resumed_at=now if row["status"] == "paused" else None,
-        )
-    elif action == "pause":
-        if row["status"] != "warming":
-            return _err("only a warming inbox can be paused")
-        await state.update_warmup_inbox(
-            email, status="paused", paused_at=now, pause_reason="paused manually")
-    elif action == "resume":
-        if row["status"] != "paused":
+    ctx = await _warmup_mailbox(email)
+    if isinstance(ctx, JSONResponse):
+        return ctx
+    state, _pool, mailbox = ctx
+    row = await state.get_warmup_inbox(mailbox.email) or {}
+    paused = row.get("status") == "paused"
+    if action == "pause":
+        if paused:
+            return _err("inbox is already paused")
+        await warmup.set_paused(state, mailbox.email, "paused manually")
+    else:
+        if not paused:
             return _err("inbox is not paused")
-        await state.update_warmup_inbox(
-            email, status="warming", start_date=row.get("start_date") or today,
-            paused_at=None, pause_reason="", resumed_at=now)
-    elif action == "reset":
-        await state.update_warmup_inbox(
-            email, status="warming", start_date=today,
-            paused_at=None, pause_reason="", resumed_at=now)
-    elif action == "remove":
-        await state.delete_warmup_inbox(email)
-    await state.log_action("warmup_" + action, "dashboard", {"email": email})
+        await warmup.set_resumed(state, mailbox.email)
+    await state.log_action("warmup_" + action, "dashboard", {"email": mailbox.email})
     return {"success": True}
 
 
@@ -1988,52 +1932,31 @@ async def warmup_inbox_task(email: str, request: Request):
         return _err("unknown task")
     if not isinstance(body.get("done"), bool):
         return _err("done must be true or false")
-    email = email.strip().lower()
-    state, active, _rows = await _warmup_context()
-    row = await _warmup_row(state, active, email, create=True)
-    if row is None:
-        return _err("inbox not found", 404)
-    tasks = warmup._load_tasks(row.get("tasks_json"))
-    if body["done"]:
-        tasks[key] = True
-    else:
-        tasks.pop(key, None)
-    await state.update_warmup_inbox(email, tasks_json=json.dumps(tasks))
+    ctx = await _warmup_mailbox(email)
+    if isinstance(ctx, JSONResponse):
+        return ctx
+    state, _pool, mailbox = ctx
+    await warmup.set_task(state, mailbox.email, key, body["done"])
     return {"success": True}
 
 
 @app.post("/api/warmup/inboxes/{email}")
 async def update_warmup_inbox(email: str, request: Request):
+    """Notes only. Caps and start dates live in mercury.yaml."""
+    from mercury import warmup
     body = await _json_body(request)
     if body is None:
         return _err("invalid request body")
-    fields: dict = {}
-    if "target_daily" in body:
-        target = _valid_target(body.get("target_daily"))
-        if target is None:
-            return _err("target_daily must be a whole number from 1 to 200")
-        fields["target_daily"] = target
-    if "start_date" in body:
-        start = _valid_day(body.get("start_date"))
-        if not start:
-            return _err("start_date must be YYYY-MM-DD")
-        fields["start_date"] = start
-    if "notes" in body:
-        if not isinstance(body.get("notes"), str):
-            return _err("notes must be text")
-        fields["notes"] = body["notes"][:4000]
-    if not fields:
-        return _err("nothing to update (target_daily, start_date, notes)")
-    email = email.strip().lower()
-    state, active, _rows = await _warmup_context()
-    row = await _warmup_row(state, active, email, create=True)
-    if row is None:
-        return _err("inbox not found", 404)
-    # Giving a not-started inbox a start date schedules its warm-up, the
-    # same as adding it with one.
-    if "start_date" in fields and row["status"] == "not_started":
-        fields["status"] = "warming"
-    await state.update_warmup_inbox(email, **fields)
+    if "target_daily" in body or "start_date" in body:
+        return _err("daily caps and start dates come from mercury.yaml "
+                    "(channels.email.mailboxes); edit them there")
+    if not isinstance(body.get("notes"), str):
+        return _err("nothing to update (notes)")
+    ctx = await _warmup_mailbox(email)
+    if isinstance(ctx, JSONResponse):
+        return ctx
+    state, _pool, mailbox = ctx
+    await warmup.set_notes(state, mailbox.email, body["notes"][:4000])
     return {"success": True}
 
 

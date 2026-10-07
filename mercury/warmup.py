@@ -1,36 +1,40 @@
-"""Inbox warm-up: an enforced send ramp, health gates, a week-by-week plan
-for new inboxes, and DNS authentication checks.
+"""Inbox warm-up: health gates on top of the mailbox ramp, a week-by-week
+plan for new inboxes, and DNS authentication checks.
 
 What warm-up means here (and what it doesn't): Mercury does not run a
 "warm-up network" that trades fake emails with other inboxes. It does the
 parts that actually move reputation for a new mailbox — authenticate the
-domain, start small, ramp slowly, stop when bounces climb — and enforces the
-ramp in the sender so nobody can accidentally send 50 cold emails on day one.
+domain, start small, ramp slowly, stop when bounces climb.
 
-Ramp: 28 days, day 1 = ``start_date``. Week 1 is 5,5,6,7,8,9,10/day, week 2
-climbs 12→20, week 3 climbs 22→35, week 4 ramps to ``target_daily``. Every
-value is clipped to ``target_daily`` and the curve never goes down. After
-day 28 the inbox is ``complete`` and its cap is ``target_daily``.
+Single source of truth: which inboxes exist, their daily caps and their ramp
+come from ``channels.email.mailboxes`` in mercury.yaml (``warmup_start``,
+``warmup_initial_cap``, ``warmup_weekly_increase``), through
+``mercury.integrations.mailboxes.MailboxPool``. Without a mailboxes list the
+pool is the one configured inbox, capped by ``max_daily_sends``, no ramp.
 
-Health gate (last 7 days, or since the last manual resume if that's later):
-  * fewer than 20 sends            → ok ("not enough sends yet")
-  * bounce rate > 5%               → pause: the inbox flips to ``paused`` and
-                                     stays there until a human resumes it
-  * 3% < bounce rate ≤ 5%          → hold: today's cap is yesterday's plan cap
-  * otherwise                      → ok
+This module adds what the config can't know, kept in the ``warmup_inboxes``
+table as an overlay keyed by mailbox address:
 
-Enforcement (native providers only — Instantly runs its own warm-up): the
-sender's daily cap becomes ``min(channels.email.max_daily_sends, today_cap)``
-while the sending inbox is ``warming``, and 0 while it is ``paused``.
-``not_started`` / ``complete`` / no row leave the configured cap untouched.
-Warm-up can only ever LOWER the cap.
+* **Health gate**, per mailbox, over the last 7 days (or since the last
+  manual resume, if later). Sends are that mailbox's outreach sends; bounces
+  are attributed through the outbox row they bounced (or the inbox the DSN
+  arrived in).
 
-Which inbox is "the sender": the outbox has no from-address column, so every
-native send is attributed to one identity, resolved in this order:
-``MERCURY_SENDER_EMAIL`` env var → ``persona.email`` from config (unless it
-is the untrained template placeholder) → the first warming/paused inbox on
-the plan. Only that inbox has real sent/bounce data; other inboxes on the
-plan track their schedule and checklist, and their sent counts are 0.
+    fewer than 20 sends          → ok ("not enough sends yet")
+    bounce rate > 5%             → pause: the mailbox flips to ``paused`` and
+                                   stays there until a human resumes it
+    3% < bounce rate ≤ 5%        → hold: today's cap is yesterday's ramp cap
+    otherwise                    → ok
+
+* **Manual pause** from the dashboard (cap 0 until resumed).
+* The **checklist** and free-form **notes**.
+
+Enforcement: ``apply_health`` fills ``MailboxPool.gates`` and the pool's
+``cap_on`` applies them, so the sender, the Outbox capacity card and this
+page compute the same caps with the same rolling-24-hour counts. A paused
+mailbox sends no cold email (openers or follow-ups are held, not cancelled);
+replies to people who wrote back still go out, as with the ramp, bounded only
+by ``max_daily_sends``. A gate can only ever lower a cap.
 """
 
 from __future__ import annotations
@@ -38,32 +42,41 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
 
 from mercury import metrics
+from mercury.integrations.mailboxes import (
+    MailboxPool,
+    full_volume_on,
+    local_today,
+    mailbox_report,
+)
 
 logger = logging.getLogger("mercury.warmup")
 
-RAMP_DAYS = 28
-DEFAULT_TARGET = 30
-MAX_RECOMMENDED_TARGET = 50
 MIN_SENDS_FOR_GATE = 20
 HOLD_BOUNCE_RATE = 0.03
 PAUSE_BOUNCE_RATE = 0.05
 HEALTH_WINDOW_DAYS = 7
+# The plan view lists at most this many days of a ramp.
+MAX_PLAN_DAYS = 56
 
-STATUSES = ("not_started", "warming", "paused", "complete")
+STATUSES = ("active", "paused")
 
-SENDER_ENV = "MERCURY_SENDER_EMAIL"
-PLACEHOLDER_DOMAINS = {
-    "yourcompany.com", "example.com", "example.org", "example.net", "company.com",
-}
-
-EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+CONFIG_HINT = """channels:
+  email:
+    provider: smtp
+    warmup_initial_cap: 5        # day-1 cap of a new mailbox
+    warmup_weekly_increase: 5    # added every 7 days, up to daily_cap
+    mailboxes:
+      - email: "you@yourcompany-mail.com"
+        password_env: "MAILBOX_YOU_PASSWORD"   # the password goes in .env
+        daily_cap: 30
+        warmup_start: "2026-10-07"             # omit for an already-warm inbox"""
 
 
 def utc_today() -> date:
@@ -74,48 +87,7 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
-# ── Pure plan / cap / gate logic ──────────────────────────────────────
-
-_WEEK1 = [5, 5, 6, 7, 8, 9, 10]
-
-
-def _linear(lo: float, hi: float, n: int = 7) -> list[int]:
-    return [int(lo + (hi - lo) * i / (n - 1) + 0.5) for i in range(n)]
-
-
-def default_target(config_max: int | None) -> int:
-    """Warm-up target when the user hasn't set one: the configured daily
-    cap, never above the 50/day a single inbox should do."""
-    if not config_max or config_max <= 0:
-        return DEFAULT_TARGET
-    return min(int(config_max), MAX_RECOMMENDED_TARGET)
-
-
-def ramp_plan(target_daily: int) -> list[int]:
-    """The 28 daily caps. Clipped to target, monotonic non-decreasing."""
-    target = max(1, int(target_daily))
-    raw = _WEEK1 + _linear(12, 20) + _linear(22, 35)
-    week4_from = raw[-1]
-    raw += _linear(week4_from, max(target, week4_from), 8)[1:]
-    caps, high = [], 0
-    for value in raw:
-        high = max(high, min(value, target))
-        caps.append(high)
-    return caps
-
-
-def plan_day(start_date: date | None, today: date) -> int | None:
-    """Raw 1-based plan day (may exceed 28, or be < 1 before the start)."""
-    if start_date is None:
-        return None
-    return (today - start_date).days + 1
-
-
-def plan_cap(day: int, target_daily: int) -> int:
-    """Cap for a plan day, clamped into 1..28 (past the end → target)."""
-    if day > RAMP_DAYS:
-        return max(1, int(target_daily))
-    return ramp_plan(target_daily)[max(1, day) - 1]
+# ── Pure gate logic ───────────────────────────────────────────────────
 
 
 def health_gate(sent: int, bounces: int) -> tuple[str, str]:
@@ -136,32 +108,19 @@ def health_gate(sent: int, bounces: int) -> tuple[str, str]:
     return "ok", f"bounce rate {rate:.1%} is healthy"
 
 
-def effective_cap(status: str, day: int | None, target_daily: int, gate: str) -> int | None:
-    """Today's enforced cap for an inbox, or None when warm-up doesn't apply.
-
-    ``day`` is the raw plan day. Before the start date the day-1 cap applies
-    (a scheduled warm-up is never looser than its first day)."""
-    if status == "paused":
-        return 0
-    if status == "complete":
-        return max(1, int(target_daily))
-    if status != "warming":
-        return None
-    d = 1 if day is None or day < 1 else day
-    if gate == "pause":
-        return 0
-    if gate == "hold":
-        d = max(1, d - 1)
-    return plan_cap(d, target_daily)
+def ramp_cap(week: int, daily_cap: int, initial: int, weekly_increase: int) -> int:
+    """The ramp's cap during plan week ``week`` (1-based), independent of
+    the start date — the same formula as ``mailboxes.warmup_cap``."""
+    return max(0, min(int(daily_cap), int(initial) + (max(1, week) - 1) * int(weekly_increase)))
 
 
-def week_for_day(day: int | None) -> int:
-    """0 = setup (not started), 1-4 = ramp weeks, 5 = after warm-up."""
-    if day is None or day < 1:
+def ramp_weeks(daily_cap: int, initial: int, weekly_increase: int) -> int:
+    """Weeks spent below daily_cap (0 when the ramp starts at full volume)."""
+    if daily_cap <= initial:
         return 0
-    if day > RAMP_DAYS:
-        return 5
-    return (day - 1) // 7 + 1
+    if weekly_increase <= 0:
+        return 4  # never reaches the cap; the plan shows the first month
+    return -(-(int(daily_cap) - int(initial)) // int(weekly_increase))
 
 
 # ── The week-by-week plan ─────────────────────────────────────────────
@@ -208,17 +167,27 @@ TASK_KEYS = {key for w in WEEKS for key, _ in w["tasks"]}
 AUTO_TASKS = {"dns"}
 
 
-def _week_range(week: int, target: int) -> str:
-    if week == 0:
-        return "no cold email yet"
-    if week == 5:
-        return f"{target}/day"
-    caps = ramp_plan(target)[(week - 1) * 7: week * 7]
-    lo, hi = min(caps), max(caps)
+def _range(lo: int, hi: int) -> str:
     return f"{lo}/day" if lo == hi else f"{lo}-{hi}/day"
 
 
-def build_weeks(tasks_done: dict, dns_ok: bool, target: int) -> list[dict]:
+def week_range(week: int, daily_cap: int, initial: int, weekly_increase: int) -> str:
+    """The volume a plan week stands for, phrased from the configured ramp.
+    Week 4 ("Reach target") covers every remaining ramp week."""
+    if week == 0:
+        return "no cold email yet"
+    if week >= 5:
+        return f"{daily_cap}/day"
+    if week < 4:
+        c = ramp_cap(week, daily_cap, initial, weekly_increase)
+        return f"{c}/day"
+    last = max(4, ramp_weeks(daily_cap, initial, weekly_increase))
+    return _range(ramp_cap(4, daily_cap, initial, weekly_increase),
+                  ramp_cap(last, daily_cap, initial, weekly_increase))
+
+
+def build_weeks(tasks_done: dict, dns_ok: bool, daily_cap: int,
+                initial: int, weekly_increase: int) -> list[dict]:
     weeks = []
     for w in WEEKS:
         tasks = []
@@ -227,7 +196,8 @@ def build_weeks(tasks_done: dict, dns_ok: bool, target: int) -> list[dict]:
             tasks.append({"key": key, "label": label, "done": done})
         weeks.append({
             "week": w["week"], "title": w["title"],
-            "range": _week_range(w["week"], target), "tasks": tasks,
+            "range": week_range(w["week"], daily_cap, initial, weekly_increase),
+            "tasks": tasks,
         })
     return weeks
 
@@ -240,40 +210,11 @@ def dns_all_pass(result: dict | None) -> bool:
     return all(statuses.get(k) == "pass" for k in ("mx", "spf", "dkim", "dmarc"))
 
 
-# ── Identity resolution ───────────────────────────────────────────────
-
-def is_valid_email(email: str | None) -> bool:
-    return bool(email) and bool(EMAIL_RE.match(email.strip()))
+# ── Overlay helpers ───────────────────────────────────────────────────
 
 
-def is_placeholder_email(email: str | None) -> bool:
-    if not is_valid_email(email):
-        return True
-    return email.strip().lower().rsplit("@", 1)[1] in PLACEHOLDER_DOMAINS
-
-
-def resolve_sender_email(config_email: str | None, inboxes: list[dict]) -> str | None:
-    """The inbox every native send is attributed to (see module docstring)."""
-    override = (os.environ.get(SENDER_ENV) or "").strip().lower()
-    if is_valid_email(override):
-        return override
-    if not is_placeholder_email(config_email):
-        return config_email.strip().lower()
-    for row in inboxes:
-        if row.get("status") in ("warming", "paused") and row.get("start_date"):
-            return row["email"]
-    return None
-
-
-# ── Async helpers over StateManager ───────────────────────────────────
-
-def _parse_date(value) -> date | None:
-    if not value:
-        return None
-    try:
-        return date.fromisoformat(str(value)[:10])
-    except ValueError:
-        return None
+def _parse_ts(value) -> str | None:
+    return str(value).replace(" ", "T") if value else None
 
 
 def _load_tasks(raw) -> dict:
@@ -296,148 +237,233 @@ async def load_dns_result(state, domain: str) -> dict | None:
         return None
 
 
-async def inbox_view(
-    state,
-    row: dict,
-    *,
-    is_sender: bool,
-    config_max: int | None,
-    today: date | None = None,
-    persist: bool = True,
-) -> dict:
-    """Evaluate one inbox into the API shape.
-
-    With ``persist`` (the default), state transitions the evaluation finds
-    are written back: past day 28 → ``complete``; a 'pause' health gate on a
-    warming inbox → ``paused`` (which then needs a manual resume)."""
-    today = today or utc_today()
-    email = row["email"]
-    status = row.get("status") or "not_started"
-    start = _parse_date(row.get("start_date"))
-    target = int(row.get("target_daily") or default_target(config_max))
-    raw_day = plan_day(start, today) if status != "not_started" else None
-
-    if status == "warming" and raw_day is not None and raw_day > RAMP_DAYS:
-        status = "complete"
-        if persist and row.get("_persisted", True):
-            await state.update_warmup_inbox(email, status="complete")
-
-    # Health — only the sending identity has real send data.
-    if is_sender:
-        since_dt = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=HEALTH_WINDOW_DAYS)
-        resumed = row.get("resumed_at")
-        since = since_dt.isoformat(timespec="seconds")
-        if resumed and str(resumed).replace(" ", "T") > since:
-            since = str(resumed)
-        counts = await metrics.window_counts(state.db_path, since)
-    else:
-        counts = dict.fromkeys(metrics.METRICS, 0)
-    sent_7d = counts["sent"]
-    gate, reason = health_gate(sent_7d, counts["bounces"])
-    if not is_sender:
-        reason = "no send data — Mercury only sends from the active inbox"
-
-    if status == "warming" and gate == "pause":
-        status = "paused"
-        if persist and row.get("_persisted", True):
-            await state.update_warmup_inbox(
-                email, status="paused", paused_at=_utcnow_iso(),
-                pause_reason=reason,
-            )
-    elif status == "paused":
-        reason = row.get("pause_reason") or "paused manually — resume when you're ready"
-
-    today_cap = effective_cap(status, raw_day, target, gate)
-
-    # Daily plan with actual volume per day.
-    plan = []
-    sent_today = 0
-    if is_sender:
-        sent_today = (await metrics.sent_by_day(state.db_path, today, today)).get(today.isoformat(), 0)
-    if start is not None:
-        end = start + timedelta(days=RAMP_DAYS - 1)
-        by_day = (await metrics.sent_by_day(state.db_path, start, min(end, today))
-                  if is_sender else {})
-        for i, cap in enumerate(ramp_plan(target)):
-            d = start + timedelta(days=i)
-            plan.append({
-                "day": i + 1, "date": d.isoformat(), "cap": cap,
-                "sent": None if d > today else by_day.get(d.isoformat(), 0),
-            })
-
-    domain = email.rsplit("@", 1)[-1]
-    dns_ok = dns_all_pass(await load_dns_result(state, domain))
-    day_out = None
-    if raw_day is not None and raw_day >= 1:
-        day_out = min(raw_day, RAMP_DAYS)
-
-    return {
-        "email": email,
-        "is_sender": is_sender,
-        "status": status,
-        "start_date": start.isoformat() if start else None,
-        "day": day_out,
-        "target_daily": target,
-        "today_cap": today_cap,
-        "sent_today": sent_today,
-        "plan": plan,
-        "weeks": build_weeks(_load_tasks(row.get("tasks_json")), dns_ok, target),
-        "current_week": (5 if status == "complete" else week_for_day(raw_day))
-                        if status != "not_started" else 0,
-        "health": {
-            "sent_7d": sent_7d,
-            "bounce_rate": round(counts["bounces"] / sent_7d, 4) if sent_7d else None,
-            "reply_rate": round(counts["replies"] / sent_7d, 4) if sent_7d else None,
-            "gate": gate,
-            "reason": reason,
-        },
-        "notes": row.get("notes") or "",
-    }
+def _owner(pool: MailboxPool, key: str):
+    """The pool mailbox an outbox/event mailbox value belongs to, or None
+    for a mailbox no longer in the config."""
+    return pool.resolve(key)
 
 
-def virtual_row(email: str) -> dict:
-    """The active sender with no warm-up row yet (shown, never persisted)."""
-    return {"email": email.lower(), "status": "not_started", "start_date": None,
-            "target_daily": None, "notes": "", "tasks_json": "{}", "_persisted": False}
+async def _health_counts(state, pool: MailboxPool, since_by_email: dict[str, str]) -> dict[str, dict]:
+    """``{email: {sent, bounces, replies}}`` for each pool mailbox over its
+    own window. One query set per distinct window start."""
+    out = {mb.email: {"sent": 0, "bounces": 0, "replies": 0} for mb in pool.mailboxes}
+    by_since: dict[str, list[str]] = {}
+    for email, since in since_by_email.items():
+        by_since.setdefault(since, []).append(email)
+    for since, emails in by_since.items():
+        counts = await metrics.window_counts_by_mailbox(state.db_path, since)
+        for key, c in counts.items():
+            mb = _owner(pool, key)
+            if mb is None or mb.email not in emails:
+                continue
+            for metric in ("sent", "bounces", "replies"):
+                out[mb.email][metric] += c.get(metric, 0)
+    return out
 
 
-async def overview(state, config_email: str | None, config_max: int | None,
-                   today: date | None = None) -> dict:
-    """The ``/api/warmup`` payload."""
-    rows = await state.list_warmup_inboxes()
-    active = resolve_sender_email(config_email, rows)
-    if active and not any(r["email"] == active for r in rows):
-        rows = [virtual_row(active)] + rows
-    inboxes = []
-    for row in rows:
-        inboxes.append(await inbox_view(
-            state, row, is_sender=(row["email"] == active),
-            config_max=config_max, today=today,
-        ))
-    # Active sender first, then the rest in plan order.
-    inboxes.sort(key=lambda i: not i["is_sender"])
-    return {"active_email": active, "inboxes": inboxes}
+async def apply_health(state, pool: MailboxPool, *, persist: bool = True,
+                       now: datetime | None = None) -> dict[str, dict]:
+    """Evaluate every mailbox's health and set ``pool.gates``.
+
+    Returns ``{email: {status, gate, reason, sent_7d, bounces, replies,
+    since, row}}``. With ``persist``, a 'pause' verdict flips the overlay
+    row to ``paused`` (it then needs a manual resume)."""
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    window_start = (now - timedelta(days=HEALTH_WINDOW_DAYS)).isoformat(timespec="seconds")
+    rows = {r["email"]: r for r in await state.list_warmup_inboxes()}
+
+    since_by_email = {}
+    for mb in pool.mailboxes:
+        since = window_start
+        resumed = _parse_ts((rows.get(mb.email) or {}).get("resumed_at"))
+        if resumed and resumed > since:
+            since = resumed
+        since_by_email[mb.email] = since
+    counts = await _health_counts(state, pool, since_by_email)
+
+    result: dict[str, dict] = {}
+    gates: dict[str, str] = {}
+    for mb in pool.mailboxes:
+        row = rows.get(mb.email)
+        c = counts.get(mb.email, {"sent": 0, "bounces": 0, "replies": 0})
+        gate, reason = health_gate(c["sent"], c["bounces"])
+        status = "paused" if (row and row.get("status") == "paused") else "active"
+        if status == "paused":
+            reason = (row.get("pause_reason") or "paused manually — resume when you're ready")
+        elif gate == "pause":
+            status = "paused"
+            if persist and mb.email:
+                await set_paused(state, mb.email, reason)
+                row = await state.get_warmup_inbox(mb.email)
+                logger.warning(f"Warm-up: {mb.email} paused automatically — {reason}")
+        if status == "paused":
+            gates[mb.email] = "paused"
+        elif gate == "hold":
+            gates[mb.email] = "hold"
+        result[mb.email] = {
+            "status": status, "gate": gate, "reason": reason,
+            "sent_7d": c["sent"], "bounces": c["bounces"], "replies": c["replies"],
+            "since": since_by_email[mb.email], "row": row or {},
+        }
+    pool.gates = gates
+    return result
 
 
-async def sender_daily_cap(state, config) -> int | None:
-    """The warm-up cap for the sending inbox today, or None if warm-up
-    doesn't constrain it. Callers must take ``min()`` with the configured
-    cap — this never raises it."""
-    rows = await state.list_warmup_inboxes()
-    email_cfg = getattr(getattr(config, "persona", None), "email", None)
-    active = resolve_sender_email(email_cfg, rows)
-    if not active:
-        return None
-    row = next((r for r in rows if r["email"] == active), None)
+async def _ensure_row(state, email: str) -> dict:
+    row = await state.get_warmup_inbox(email)
     if row is None:
-        return None
-    config_max = getattr(config.channels.email, "max_daily_sends", None)
-    view = await inbox_view(state, row, is_sender=True, config_max=config_max)
-    if view["status"] == "paused":
-        return 0
-    if view["status"] == "warming":
-        return view["today_cap"]
-    return None
+        await state.add_warmup_inbox(email)
+        row = await state.get_warmup_inbox(email)
+    return row
+
+
+async def set_paused(state, email: str, reason: str) -> None:
+    await _ensure_row(state, email)
+    await state.update_warmup_inbox(email, status="paused", paused_at=_utcnow_iso(),
+                                    pause_reason=reason)
+
+
+async def set_resumed(state, email: str) -> None:
+    """Resume, and restart the health window so the old spike can't
+    immediately re-pause a fixed inbox."""
+    await _ensure_row(state, email)
+    await state.update_warmup_inbox(email, status="active", paused_at=None,
+                                    pause_reason="", resumed_at=_utcnow_iso())
+
+
+async def set_task(state, email: str, key: str, done: bool) -> None:
+    row = await _ensure_row(state, email)
+    tasks = _load_tasks(row.get("tasks_json"))
+    if done:
+        tasks[key] = True
+    else:
+        tasks.pop(key, None)
+    await state.update_warmup_inbox(email, tasks_json=json.dumps(tasks))
+
+
+async def set_notes(state, email: str, notes: str) -> None:
+    await _ensure_row(state, email)
+    await state.update_warmup_inbox(email, notes=notes)
+
+
+# ── The /api/warmup payload ───────────────────────────────────────────
+
+
+def _plan(pool: MailboxPool, mb, today: date, full_on: date | None,
+          sent_by_day: dict[str, int]) -> list[dict]:
+    """Per-day ramp caps from warmup_start up to the day it reaches full
+    volume (at most MAX_PLAN_DAYS), with what actually went out on past days."""
+    if mb.warmup_start is None:
+        return []
+    start = mb.warmup_start
+    span = (full_on - start).days + 1 if full_on else 28
+    span = max(1, min(span, MAX_PLAN_DAYS))
+    plan = []
+    for i in range(span):
+        d = start + timedelta(days=i)
+        plan.append({
+            "day": i + 1, "date": d.isoformat(),
+            "cap": pool.base_cap_on(mb, d),
+            "sent": None if d > today else sent_by_day.get(d.isoformat(), 0),
+        })
+    return plan
+
+
+async def overview(state, config, pool: MailboxPool | None,
+                   today: date | None = None) -> dict:
+    """Everything the Warm-up tab shows, built from the same pool and caps
+    the sender enforces (``mailbox_report``) plus the overlay."""
+    today = today or local_today(config)
+    if pool is None:
+        report = mailbox_report(config, None, {}, today)
+        return {**report, "active_email": None, "inboxes": [], "config_hint": CONFIG_HINT,
+                "note": "Warm-up applies to the native providers (gmail, smtp); "
+                        "Instantly runs its own."}
+
+    health = await apply_health(state, pool)
+    by_mailbox = await state.count_outbox_sent_today_by_mailbox()
+    report = mailbox_report(config, pool, by_mailbox, today)
+    rows_by_email = {r["email"]: r for r in report["mailboxes"] if r["stage"] != "removed"}
+
+    # Daily volume per mailbox for the plan charts (UTC days).
+    starts = [mb.warmup_start for mb in pool.mailboxes if mb.warmup_start]
+    per_day: dict[str, dict[str, int]] = {}
+    if starts:
+        raw = await metrics.sent_by_day_by_mailbox(state.db_path, min(starts), today)
+        for key, days in raw.items():
+            owner = _owner(pool, key)
+            if owner is None:
+                continue
+            bucket = per_day.setdefault(owner.email, {})
+            for d, n in days.items():
+                bucket[d] = bucket.get(d, 0) + n
+
+    initial, inc = pool.warmup_initial_cap, pool.warmup_weekly_increase
+    inboxes = []
+    for idx, mb in enumerate(pool.mailboxes):
+        rep = rows_by_email.get(mb.email, {})
+        h = health.get(mb.email, {})
+        row = h.get("row") or {}
+        full_on = full_volume_on(mb.daily_cap, mb.warmup_start, initial, inc)
+        started = mb.warmup_start is not None and today >= mb.warmup_start
+        day = (today - mb.warmup_start).days + 1 if started else None
+        if mb.warmup_start is None:
+            current_week = 5
+        elif not started:
+            current_week = 0
+        elif full_on and today >= full_on:
+            current_week = 5
+        else:
+            current_week = min(4, (day - 1) // 7 + 1)
+        dns_ok = dns_all_pass(await load_dns_result(state, mb.domain)) if mb.domain else False
+        sent_7d = h.get("sent_7d", 0)
+        inboxes.append({
+            "email": mb.email,
+            "name": rep.get("name", ""),
+            "domain": mb.domain,
+            "primary": idx == 0,
+            "is_sender": idx == 0,
+            "legacy": mb.legacy,
+            "status": h.get("status", "active"),
+            "stage": rep.get("stage", ""),
+            "accepts_new": mb.accepts_new,
+            "configured": rep.get("configured"),
+            "start_date": mb.warmup_start.isoformat() if mb.warmup_start else None,
+            "full_on": full_on.isoformat() if full_on else None,
+            "ramp_days": (full_on - mb.warmup_start).days if full_on else None,
+            "day": day,
+            "target_daily": mb.daily_cap,
+            "today_cap": rep.get("cap_today", 0),
+            "base_cap": rep.get("base_cap_today", 0),
+            "sent_today": rep.get("sent_24h", 0),
+            "remaining": rep.get("remaining", 0),
+            "plan": _plan(pool, mb, today, full_on, per_day.get(mb.email, {})),
+            "weeks": build_weeks(_load_tasks(row.get("tasks_json")), dns_ok,
+                                 mb.daily_cap, initial, inc),
+            "current_week": current_week,
+            "health": {
+                "sent_7d": sent_7d,
+                "bounce_rate": round(h.get("bounces", 0) / sent_7d, 4) if sent_7d else None,
+                "reply_rate": round(h.get("replies", 0) / sent_7d, 4) if sent_7d else None,
+                "gate": h.get("gate", "ok"),
+                "reason": h.get("reason", ""),
+            },
+            "paused_at": row.get("paused_at"),
+            "pause_reason": row.get("pause_reason") or "",
+            "notes": row.get("notes") or "",
+        })
+
+    removed = next((r for r in report["mailboxes"] if r["stage"] == "removed"), None)
+    return {
+        **{k: v for k, v in report.items() if k != "mailboxes"},
+        "active_email": pool.primary.email or None,
+        "single_inbox": pool.single_inbox,
+        "warmup_initial_cap": initial,
+        "warmup_weekly_increase": inc,
+        "removed_sent_24h": removed["sent_24h"] if removed else 0,
+        "inboxes": inboxes,
+        "config_hint": CONFIG_HINT,
+    }
 
 
 # ── DNS authentication checks ─────────────────────────────────────────

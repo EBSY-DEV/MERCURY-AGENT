@@ -552,6 +552,18 @@ class Sender:
         today = local_today(self.config)
         sent_today = await self.state.count_outbox_sent_today()
         by_mailbox = await self.state.count_outbox_sent_today_by_mailbox()
+        # Warm-up health gates (bounce spike / manual pause) lower the caps
+        # the pool hands out below. Replies are not cap-bound, so a paused
+        # mailbox still answers people who wrote back.
+        try:
+            from mercury.warmup import apply_health
+
+            await apply_health(self.state, pool)
+            for email, gate in pool.gates.items():
+                logger.info(f"Sender: warm-up gate on {email or 'the mailbox'}: {gate}.")
+        except Exception as e:
+            logger.warning(f"Sender: warm-up health check failed ({e}); "
+                           "using the configured caps.")
         remaining = pool.remaining(by_mailbox, today)
         global_left = max(0, max_daily - sent_today)
         # Cold mail (openers, follow-ups) is bound by the mailboxes' caps and

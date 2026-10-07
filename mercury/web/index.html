@@ -320,10 +320,9 @@
   <div class="section-head split">
     <div>
       <h2>Warm-up</h2>
-      <p>New inboxes start slow. Mercury enforces a daily send ramp, watches bounces,
+      <p>New inboxes start slow. Mercury enforces each mailbox's send ramp, watches bounces,
          and walks you through the setup that keeps you out of spam.</p>
     </div>
-    <button class="btn btn-secondary btn-sm" id="wu-add-btn" onclick="wuOpenAdd()" hidden><i data-ph="plus"></i>Add inbox</button>
   </div>
   <div id="wu-switch"></div>
   <div id="wu-body"><div class="loading-note">Loading warm-up…</div></div>
@@ -593,34 +592,6 @@
       <button class="btn btn-primary btn-sm" id="modal-ok" onclick="closeModal(true)">Confirm</button>
     </div>
   </div>
-</div>
-
-<!-- Add a warm-up inbox -->
-<div class="modal-wrap" id="wu-modal" aria-hidden="true">
-  <div class="modal-scrim" onclick="wuCloseAdd()"></div>
-  <form class="modal" role="dialog" aria-modal="true" aria-labelledby="wu-modal-title" onsubmit="wuSubmitAdd(event)" novalidate>
-    <h3 id="wu-modal-title">Add an inbox to warm up</h3>
-    <p>Mercury caps what this inbox sends each day and raises the cap over four weeks.</p>
-    <div class="form-group">
-      <label class="form-label" for="wu-new-email">Email address</label>
-      <input class="form-input" id="wu-new-email" type="email" placeholder="you@yourdomain.co" autocomplete="off" required>
-    </div>
-    <div class="form-row">
-      <div class="form-group">
-        <label class="form-label" for="wu-new-start">Start date <span class="optional-tag">optional</span></label>
-        <input class="form-input" id="wu-new-start" type="date">
-      </div>
-      <div class="form-group">
-        <label class="form-label" for="wu-new-target">Target per day</label>
-        <input class="form-input" id="wu-new-target" type="number" min="5" max="500" step="1" placeholder="40">
-      </div>
-    </div>
-    <div class="form-error" id="wu-new-error" hidden></div>
-    <div class="modal-actions">
-      <button type="button" class="btn btn-secondary btn-sm" onclick="wuCloseAdd()">Cancel</button>
-      <button type="submit" class="btn btn-primary btn-sm" id="wu-new-ok">Add inbox</button>
-    </div>
-  </form>
 </div>
 
 <div class="menu" id="move-menu" role="menu" hidden></div>

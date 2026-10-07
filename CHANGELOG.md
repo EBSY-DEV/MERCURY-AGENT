@@ -20,6 +20,19 @@ minor versions can still change behaviour.
   Geist Mono). Tokens live in `mercury/web/app.css`; the matching Pencil
   source is `design/mercury-brand.pen` (rebuild with
   `design/build_brand_pen.py`).
+- **Warm-up follows the mailbox config.** The Warm-up tab shows every mailbox
+  in `channels.email.mailboxes` (or the single configured inbox) with the ramp
+  the sender enforces. Caps and start dates are edited in `mercury.yaml`
+  only; the tab keeps pause/resume, the checklist, notes and DNS checks. A
+  per-mailbox health gate sits on top of the ramp: over 5% bounces (after 20
+  sends in 7 days) pauses that mailbox until resumed, 3-5% holds it at
+  yesterday's cap. A paused mailbox still sends replies. Bounce events now
+  record the mailbox they came back to. `MERCURY_SENDER_EMAIL` is gone.
+- The deprecated `harvey` command still works as an alias of `mercury`, and
+  conversation threads recorded with sender `harvey` still read as ours.
+- `scripts/cloud_run.sh` / `local_dashboard.sh` read `MERCURY_STATE_REPO`
+  (falling back to `HARVEY_STATE_REPO`), keep state in `.mercury-state/`, and
+  rename a pre-rename state repo's `harvey.*` files on the next run.
 
 ### Added
 
@@ -48,7 +61,8 @@ minor versions can still change behaviour.
   Migrations now take the write lock first and apply atomically.
 - The usage tab's daily bar chart referenced undefined colour tokens and
   rendered invisible bars.
-
+- The heartbeat backed off an hour on `budget_exhausted`, a value the cycle
+  never returns; a spent Claude quota now backs off on `over_budget` as meant.
 - A follow-up waits its delay after the previous email actually went out,
   not after the day the sequence was staged. Approving an old opener no
   longer sends its follow-ups right behind it.

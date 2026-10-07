@@ -2279,7 +2279,6 @@ document.getElementById('drawer-body').addEventListener('click', e => {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     if (modalOpen()) { e.preventDefault(); closeModal(false); return; }
-    if (wuAddOpen()) { e.preventDefault(); wuCloseAdd(); return; }
     const menu = document.getElementById('move-menu');
     if (menu && !menu.hidden) { e.preventDefault(); closeMoveMenu(true); return; }
     if (drawerOpen()) { e.preventDefault(); closeDrawer(); }
@@ -2578,20 +2577,24 @@ function renderTrend() {
 
 // ── Warm-up: a new inbox earns its volume ──
 //
-// Mercury caps what an inbox may send each day and raises the cap on a
-// 28-day schedule. This tab shows where the inbox is on that ramp, whether
-// bounces are holding it back, the setup checklist for each week, and the
-// DNS records that decide whether mail lands in the inbox at all.
+// Which inboxes exist, their daily caps and their ramp (warmup_start, then
+// +warmup_weekly_increase every week) come from mercury.yaml →
+// channels.email.mailboxes. The sender enforces those caps, lowered by the
+// health gate (bounces) or a manual pause from this tab. This tab shows where
+// each inbox is on its ramp, the setup checklist for each week, and the DNS
+// records that decide whether mail lands in the inbox at all.
 
-let _wu = { data: null, key: '', sel: null, open: {}, dns: {}, dnsLoading: {}, seq: 0 };
+let _wu = { data: null, key: '', sel: null, open: {}, dns: {}, dnsLoading: {}, seq: 0, hint: false };
 
 const WU_STATUS = {
-  not_started: ['Not started', 'idle'],
-  warming:     ['Warming up', 'active'],
-  paused:      ['Paused', 'waiting'],
-  complete:    ['Fully warmed', 'good'],
+  scheduled: ['Scheduled', 'idle'],
+  warming:   ['Warming up', 'active'],
+  fixed:     ['Capped', 'active'],
+  warm:      ['Fully warmed', 'good'],
+  paused:    ['Paused', 'waiting'],
 };
-const wuBadge = st => { const m = WU_STATUS[st] || [String(st || 'Unknown'), 'idle']; return toneBadge(m[1], m[0]); };
+const wuKey = b => (b.status === 'paused' ? 'paused' : (b.stage || 'warm'));
+const wuMeta = b => WU_STATUS[wuKey(b)] || [String(wuKey(b)), 'idle'];
 const wuEnc = email => encodeURIComponent(email);
 const wuDomain = email => String(email || '').split('@')[1] || '';
 
@@ -2602,7 +2605,7 @@ function wuInbox() {
 
 function wuBusy() {
   const a = document.activeElement;
-  return modalOpen() || wuAddOpen() || !!(a && a.closest && a.closest('#warmup') && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+  return modalOpen() || !!(a && a.closest && a.closest('#warmup') && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
 }
 
 async function loadWarmup(quiet) {
@@ -2610,22 +2613,19 @@ async function loadWarmup(quiet) {
   const seq = ++_wu.seq;
   const res = await getJSON('/api/warmup');
   if (seq !== _wu.seq) return;
-  const addBtn = document.getElementById('wu-add-btn');
   if (!res.ok || !res.data || !Array.isArray(res.data.inboxes)) {
     if (quiet && _wu.data) return;
     _wu.data = null; _wu.key = '';
-    addBtn.hidden = true;
     document.getElementById('wu-switch').innerHTML = '';
     body.innerHTML = unavailableState(res, 'fire', 'Warm-up');
     return;
   }
-  addBtn.hidden = false;
   const key = JSON.stringify(res.data);
   if (quiet && key === _wu.key) return;
   _wu.data = res.data; _wu.key = key;
   const list = res.data.inboxes;
   if (!list.some(b => b.email === _wu.sel)) {
-    const pick = list.find(b => b.is_sender) || list.find(b => b.email === res.data.active_email) || list[0];
+    const pick = list.find(b => b.primary) || list[0];
     _wu.sel = pick ? pick.email : null;
   }
   wuNavFlag();
@@ -2636,7 +2636,7 @@ function wuNavFlag() {
   const el = document.getElementById('nav-warmup');
   if (!el) return;
   const list = (_wu.data && _wu.data.inboxes) || [];
-  const worst = list.some(b => b.health && b.health.gate === 'pause') ? 'bad'
+  const worst = list.some(b => b.status === 'paused') ? 'bad'
     : list.some(b => b.health && b.health.gate === 'hold') ? 'wait' : '';
   el.hidden = !worst;
   el.className = 'nav-flag ' + worst;
@@ -2650,32 +2650,48 @@ function wuSelect(i) {
   renderWarmup();
 }
 
+function wuConfigHint(open) {
+  const hint = (_wu.data && _wu.data.config_hint) || '';
+  return '<div class="wu-config">' +
+    '<p>' + icon('info') + '<span>Caps and start dates come from <span class="mono">mercury.yaml</span> &rarr; ' +
+      '<span class="mono">channels.email.mailboxes</span>. Edit them there; Mercury picks them up on the next cycle.</span></p>' +
+    (hint ? '<details' + (open ? ' open' : '') + ' ontoggle="_wu.hint = this.open"><summary>Config snippet</summary>' +
+      '<div class="wu-snippet"><pre>' + escHtml(hint) + '</pre>' +
+      '<button class="btn-square xs ghost" title="Copy snippet" aria-label="Copy config snippet" data-copy="' + escHtml(hint) +
+        '" onclick="wuCopy(this)">' + icon('copy') + '</button></div></details>' : '') +
+    '</div>';
+}
+
 function renderWarmup() {
   const body = document.getElementById('wu-body');
   const sw = document.getElementById('wu-switch');
   const list = (_wu.data && _wu.data.inboxes) || [];
   if (!list.length) {
     sw.innerHTML = '';
-    body.innerHTML = emptyState('envelope-simple', 'No inbox to warm up yet',
-      'Add the mailbox Mercury sends from and it gets a 28-day ramp, bounce monitoring and a setup checklist.') ;
-    body.querySelector('.empty').insertAdjacentHTML('beforeend',
-      '<div class="btn-group" style="justify-content:center"><button class="btn btn-primary btn-sm" onclick="wuOpenAdd()">' +
-      icon('plus') + 'Add inbox</button></div>');
+    const note = _wu.data && _wu.data.note;
+    body.innerHTML = '<section class="panel">' + emptyState('envelope-simple',
+        note ? 'Nothing to warm up here' : 'No sending inbox configured',
+        note ? escHtml(note) : 'Configure the mailbox Mercury sends from and it shows up here with its ramp, ' +
+          'bounce monitoring and a setup checklist.') +
+      '<div class="panel-foot">' + wuConfigHint(true) + '</div></section>';
     return;
   }
   const b = wuInbox();
 
   sw.innerHTML = list.length > 1
-    ? '<div class="toolbar wu-switch"><div class="segmented wu-seg" role="tablist" aria-label="Inbox">' + list.map((x, i) =>
-        '<button role="tab" aria-selected="' + (x.email === _wu.sel) + '" class="' + (x.email === _wu.sel ? 'on' : '') +
-          '" onclick="wuSelect(' + i + ')">' +
-          '<span class="wu-seg-ic t-' + ((WU_STATUS[x.status] || [0, 'idle'])[1]) + '">' + icon(TONE_ICON[(WU_STATUS[x.status] || [0, 'idle'])[1]]) + '</span>' +
+    ? '<div class="toolbar wu-switch"><div class="segmented wu-seg" role="tablist" aria-label="Inbox">' + list.map((x, i) => {
+        const m = wuMeta(x);
+        return '<button role="tab" aria-selected="' + (x.email === _wu.sel) + '" class="' + (x.email === _wu.sel ? 'on' : '') +
+          '" onclick="wuSelect(' + i + ')" title="' + escHtml(m[0]) + '">' +
+          '<span class="wu-seg-ic t-' + m[1] + '">' + icon(TONE_ICON[m[1]]) + '</span>' +
           '<span class="mono">' + escHtml(x.email) + '</span>' +
-          (x.is_sender ? '<span class="wu-seg-tag">sender</span>' : '') + '</button>').join('') +
-      '</div></div>'
+          (x.primary ? '<span class="wu-seg-tag">primary</span>' : '') + '</button>';
+      }).join('') +
+      '</div>' + wuRotationNote() + '</div>'
     : '<div class="toolbar wu-switch"><span class="wu-one">' + icon('envelope-simple') +
-        '<span class="mono">' + escHtml(b.email) + '</span>' +
-        (b.is_sender ? '<span class="toolbar-note">the inbox Mercury sends from</span>' : '') + '</span></div>';
+        '<span class="mono">' + escHtml(b.email || 'your sending inbox') + '</span>' +
+        '<span class="toolbar-note">' + (_wu.data.rotation ? 'the only mailbox in the rotation' : 'the inbox Mercury sends from') + '</span></span>' +
+        wuRotationNote() + '</div>';
 
   body.innerHTML =
     '<div class="kpis" id="wu-hero">' + wuHero(b) + '</div>' +
@@ -2695,95 +2711,96 @@ function renderWarmup() {
   renderWuDns();
   renderWuRamp();
   observeWidth(document.getElementById('wu-ramp'), renderWuRamp);
-  if (!_wu.dns[wuDomain(b.email)]) loadWuDns(false);
+  if (b.domain && !_wu.dns[b.domain]) loadWuDns(false);
+}
+
+function wuRotationNote() {
+  const d = _wu.data || {};
+  if (!d.max_daily_sends) return '';
+  return '<span class="toolbar-note wu-total"><b>' + fmtN(d.sent_24h || 0) + '</b> sent in 24 h &middot; ' +
+    'capacity today <b>' + fmtN(d.capacity_today || 0) + '</b>' +
+    (d.capped_by_global ? ' (max_daily_sends ' + fmtN(d.max_daily_sends) + ')' : '') + '</span>';
 }
 
 function wuHero(b) {
-  const st = b.status;
-  const started = st !== 'not_started';
-  const cap = b.today_cap, target = b.target_daily;
+  const key = wuKey(b);
+  const m = wuMeta(b);
+  const h = b.health || {};
+  const gate = h.gate || 'ok';
+  const cap = Number(b.today_cap || 0), target = Number(b.target_daily || 0);
   const kpi = (label, value, foot, extra, cls) =>
     '<div class="kpi static' + (cls ? ' ' + cls : '') + '"><span class="kpi-label">' + label + '</span>' +
       value + (extra || '') + '<span class="kpi-foot">' + foot + '</span></div>';
 
-  // Today's cap
-  const capFoot = st === 'complete' ? 'Ramp complete &middot; full volume'
-    : st === 'not_started' ? 'Not started'
-    : '<b>Day ' + fmtN(b.day) + '</b> of 28' + (st === 'paused' ? ' &middot; paused' : '');
-  const capVal = '<span class="kpi-value' + (cap === null || cap === undefined ? ' zero' : '') + '">' +
-    (cap === null || cap === undefined ? '—' : fmtN(cap)) + '<small>/ ' + fmtN(target) + ' target</small></span>';
+  // Today's cap — what the sender enforces right now
+  const capFoot = key === 'paused' ? 'Paused &middot; no cold email until you resume'
+    : key === 'scheduled' ? 'Ramp starts ' + escHtml(shortDay(b.start_date))
+    : gate === 'hold' ? 'Held at yesterday\'s cap'
+    : key === 'warm' ? 'Full volume'
+    : b.ramp_days ? '<b>Day ' + fmtN(b.day) + '</b> of ' + fmtN(b.ramp_days) + ' &middot; full ' + escHtml(shortDay(b.full_on))
+    : '<b>Day ' + fmtN(b.day) + '</b> &middot; below the daily cap';
+  const capVal = '<span class="kpi-value' + (cap ? '' : ' zero') + '">' + fmtN(cap) +
+    '<small>/ ' + fmtN(target) + ' daily cap</small></span>';
 
-  // Sent today
+  // Sent in the rolling 24 hours (the window the cap is enforced over)
   const sent = Number(b.sent_today || 0);
   const pct = cap ? Math.min(100, sent / cap * 100) : 0;
-  const left = cap ? Math.max(0, cap - sent) : 0;
-  const halted = st === 'paused' || (b.health && b.health.gate === 'pause');
-  const sentFoot = !started ? 'Sends wait until the warm-up starts'
-    : halted ? 'Paused &middot; nothing sends from this inbox'
-    : !cap ? 'No sends allowed today'
-    : left ? '<b>' + fmtN(left) + '</b> more allowed today'
-    : 'Cap reached &middot; the rest wait for tomorrow';
+  const left = Number(b.remaining || 0);
+  const sentFoot = key === 'paused' ? 'Replies to people who wrote back still go out'
+    : !b.configured ? toneBadge('bad', 'No password in .env')
+    : !cap ? 'No cold email allowed today'
+    : left ? '<b>' + fmtN(left) + '</b> more allowed now'
+    : 'Cap reached &middot; the rest wait';
   const sentVal = '<span class="kpi-value tight' + (sent ? '' : ' zero') + '">' + fmtN(sent) +
     (cap ? '<small>/ ' + fmtN(cap) + '</small>' : '') + '</span>';
-  const bar = '<span class="kpi-bar' + (cap && !left ? ' full' : '') + '"><span style="width:' + pct.toFixed(1) + '%"></span></span>';
+  const bar = '<span class="kpi-bar' + (cap && sent >= cap ? ' full' : '') + '"><span style="width:' + pct.toFixed(1) + '%"></span></span>';
 
   // Bounce rate (7d) + gate
-  const h = b.health || {};
-  const gate = h.gate || 'ok';
-  const gateFoot = gate === 'pause' ? toneBadge('bad', 'Paused' + (h.reason ? ': ' + h.reason : ''))
-    : gate === 'hold' ? toneBadge('waiting', 'Ramp on hold' + (h.reason ? ': ' + h.reason : ''))
+  const gateFoot = key === 'paused' && gate !== 'ok' ? toneBadge('bad', 'Bounces over 5%')
+    : gate === 'pause' ? toneBadge('bad', 'Bounces over 5%')
+    : gate === 'hold' ? toneBadge('waiting', 'Ramp on hold')
     : toneBadge('good', h.sent_7d ? 'Healthy' : 'Healthy · nothing sent yet');
   const bVal = '<span class="kpi-value' + (h.bounce_rate === null || h.bounce_rate === undefined ? ' zero' : '') +
     (gate === 'pause' ? ' is-bad' : gate === 'hold' ? ' is-wait' : '') + '">' + fmtPct(h.bounce_rate) +
     '<small>' + fmtN(h.sent_7d) + ' sent in 7 days</small></span>';
 
-  // Status + actions
+  // Status + the one action this tab owns: pause / resume
   const act = (a, label, cls, ic) => '<button class="btn ' + cls + ' btn-sm" onclick="wuAction(\'' + a + '\')">' +
     (ic ? icon(ic) : '') + label + '</button>';
-  let actions = '';
-  if (st === 'not_started') actions += act('start', 'Start warm-up', 'btn-primary', 'play');
-  if (st === 'warming') actions += act('pause', 'Pause', 'btn-secondary', 'pause');
-  if (st === 'paused') actions += act('resume', 'Resume', 'btn-primary', 'play');
-  if (st !== 'not_started') actions += act('reset', 'Reset', 'btn-secondary', 'arrow-counter-clockwise').replace('<button ', '<button title="Reset the ramp to day one" ');
-  if (!b.is_sender) actions += '<button class="btn-square sm" title="Remove this inbox" aria-label="Remove this inbox" ' +
-    'onclick="wuAction(\'remove\')">' + icon('trash') + '</button>';
-  const m = WU_STATUS[st] || [st, 'idle'];
+  const actions = !b.email ? ''
+    : key === 'paused' ? act('resume', 'Resume', 'btn-primary', 'play')
+    : act('pause', 'Pause', 'btn-secondary', 'pause');
   const stVal = '<span class="kpi-value wu-status t-' + m[1] + '">' + icon(TONE_ICON[m[1]]) + escHtml(m[0]) + '</span>';
-  const since = b.start_date ? '<span class="kpi-sub">' + (st === 'not_started' ? 'Starts ' : 'Started ') + escHtml(shortDay(b.start_date)) + '</span>' : '';
+  const subs = [];
+  if (b.start_date) subs.push((key === 'scheduled' ? 'Starts ' : 'Started ') + escHtml(shortDay(b.start_date)));
+  if (b.accepts_new === false) subs.push('no new threads');
+  const since = subs.length ? '<span class="kpi-sub">' + subs.join(' &middot; ') + '</span>' : '';
 
   return kpi('Today\'s cap', capVal, capFoot) +
-    kpi('Sent today', sentVal, sentFoot, bar) +
+    kpi('Sent (24 h)', sentVal, sentFoot, bar) +
     kpi('Bounce rate (7d)', bVal, gateFoot, '', 'gate-' + gate) +
     kpi('Status', stVal, '<span class="kpi-actions">' + actions + '</span>', since, 'wu-status-card');
 }
 
 function wuRampPanel(b) {
-  const started = b.status !== 'not_started' && (b.plan || []).length;
-  return '<div class="panel-head wrap"><div><h3>Ramp</h3><p>' + (started
-      ? 'Planned daily cap for 28 days, with what actually went out.'
-      : 'Four weeks from a handful a day to your target.') + '</p></div>' +
-      (started ? '<div class="legend static">' +
+  const hasPlan = (b.plan || []).length > 0;
+  const d = _wu.data || {};
+  const desc = hasPlan
+    ? 'Planned daily cap from ' + escHtml(shortDay(b.start_date)) +
+      (b.full_on ? ' to full volume on ' + escHtml(shortDay(b.full_on)) : '') + ', with what actually went out.'
+    : 'Starts at ' + fmtN(d.warmup_initial_cap) + '/day and adds ' + fmtN(d.warmup_weekly_increase) + ' every week.';
+  return '<div class="panel-head wrap"><div><h3>Ramp</h3><p>' + desc + '</p></div>' +
+      (hasPlan ? '<div class="legend static">' +
         '<span class="legend-btn"><span class="sw sw-cap"></span>Planned cap</span>' +
         '<span class="legend-btn"><span class="sw sw-sent-bar"></span>Sent</span>' +
-        '<span class="legend-btn"><span class="sw sw-target"></span>Target</span></div>' : '') +
+        '<span class="legend-btn"><span class="sw sw-target"></span>Daily cap</span></div>' : '') +
     '</div>' +
-    (started
+    (hasPlan
       ? '<div class="chart-wrap ramp" id="wu-ramp"></div>'
-      : '<div class="panel-body">' + emptyState('fire', 'Start the warm-up to see your ramp',
-          'Day one allows a few emails; the cap climbs every day until it reaches <b>' + fmtN(b.target_daily) +
-          ' a day</b>. Bounces above the safe line pause the climb automatically.') + '</div>') +
-    '<div class="panel-foot wu-ramp-foot">' +
-      '<div class="wu-inline">' +
-        '<span class="wu-field"><label for="wu-target">Target per day</label>' +
-        '<input class="form-input sm" id="wu-target" type="number" min="5" max="500" step="1" value="' + escHtml(String(b.target_daily || '')) + '"></span>' +
-        '<span class="wu-field"><label for="wu-start">Start</label>' +
-        '<input class="form-input sm" id="wu-start" type="date" value="' + escHtml(String(b.start_date || '').slice(0, 10)) + '"></span>' +
-        '<button class="btn btn-secondary btn-sm" onclick="wuSaveSettings()">Save</button>' +
-      '</div>' +
-      (b.status === 'not_started'
-        ? '<button class="btn btn-primary btn-sm" onclick="wuAction(\'start\')">' + icon('play') + 'Start warm-up</button>'
-        : '<span class="toolbar-note">' + (b.day ? 'Day <b>' + b.day + '</b> of 28' : '') + '</span>') +
-    '</div>';
+      : '<div class="panel-body">' + emptyState('fire', 'This inbox is already at full volume',
+          'It sends up to <b>' + fmtN(b.target_daily) + ' a day</b>. To ramp a new inbox, give it a ' +
+          '<span class="mono">warmup_start</span> date in mercury.yaml.') + '</div>') +
+    '<div class="panel-foot wu-ramp-foot">' + wuConfigHint(_wu.hint) + '</div>';
 }
 
 function renderWuRamp() {
@@ -2806,8 +2823,8 @@ function renderWuRamp() {
   const curWeek = todayIdx >= 0 ? Math.floor(todayIdx / 7) : -1;
 
   let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
-    'aria-label="28-day send ramp: planned daily cap and emails actually sent">';
-  // week bands, labelled W1–W4
+    'aria-label="Send ramp: planned daily cap and emails actually sent">';
+  // week bands, labelled W1, W2, ...
   for (let w = 0; w * 7 < n; w++) {
     const bx = x0 + w * 7 * slot, bwid = Math.min(7, n - w * 7) * slot;
     svg += '<rect class="rp-band' + (w % 2 ? ' alt' : '') + (w === curWeek ? ' cur' : '') + '" x="' + bx.toFixed(1) + '" y="' + (y0 - 20) +
@@ -2830,7 +2847,7 @@ function renderWuRamp() {
   // target line
   if (target) {
     svg += '<line class="rp-target" x1="' + x0 + '" x2="' + x1 + '" y1="' + y(target).toFixed(1) + '" y2="' + y(target).toFixed(1) + '"/>' +
-      '<text class="rp-target-l" x="' + (x1 - 4) + '" y="' + (y(target) - 6).toFixed(1) + '" text-anchor="end">Target ' + fmtN(target) + '/day</text>';
+      '<text class="rp-target-l" x="' + (x1 - 4) + '" y="' + (y(target) - 6).toFixed(1) + '" text-anchor="end">Daily cap ' + fmtN(target) + '/day</text>';
   }
   // x labels: the first day of each week, plus a Today marker
   const xl = [];
@@ -3024,15 +3041,17 @@ function wuNotesPanel(b) {
   return '<div class="panel-head"><div><h3>Notes</h3><p>Anything worth remembering about this inbox.</p></div></div>' +
     '<div class="panel-body"><textarea class="form-input wu-notes" id="wu-notes" rows="4" ' +
       'placeholder="e.g. Google Postmaster verified Oct 2; forwarding set up for replies" ' +
+      (b.email ? '' : 'disabled ') +
       'onblur="wuSaveNotes(this)">' + escHtml(b.notes || '') + '</textarea>' +
       '<div class="wu-notes-hint" id="wu-notes-hint">Saves when you click away.</div></div>';
 }
 
 function wuRulesPanel(b) {
-  return '<div class="panel-head"><div><h3>How the ramp protects you</h3><p>Rules Mercury enforces while warming.</p></div></div>' +
+  return '<div class="panel-head"><div><h3>How the ramp protects you</h3><p>Rules Mercury enforces for every mailbox.</p></div></div>' +
     '<div class="panel-body"><ul class="wu-rules">' +
-      '<li>' + icon('shield-check') + '<span>Never sends more than today\'s cap from this inbox, no matter how much is approved.</span></li>' +
-      '<li>' + icon('pause') + '<span>Holds the ramp when bounces climb, and pauses sending if they spike.</span></li>' +
+      '<li>' + icon('shield-check') + '<span>Never sends more cold email than today\'s cap from this inbox, no matter how much is approved.</span></li>' +
+      '<li>' + icon('pause') + '<span>Holds the ramp when bounces pass 3%, and pauses the inbox past 5% (after 20 sends in 7 days) until you resume it.</span></li>' +
+      '<li>' + icon('arrow-bend-up-left') + '<span>A paused inbox still answers people who replied; follow-ups wait, they aren\'t cancelled.</span></li>' +
       '<li>' + icon('globe-simple') + '<span>Re-checks SPF, DKIM and DMARC so a broken record is caught before it costs you.</span></li>' +
     '</ul></div>';
 }
@@ -3053,93 +3072,22 @@ async function wuSaveNotes(ta) {
   }
 }
 
-async function wuSaveSettings() {
-  const b = wuInbox();
-  if (!b) return;
-  const target = Number(document.getElementById('wu-target').value);
-  const start = document.getElementById('wu-start').value;
-  if (!Number.isFinite(target) || target < 1) { showToast('Set a target of at least 1 email a day.', 'error'); return; }
-  const body = {};
-  if (target !== Number(b.target_daily)) body.target_daily = Math.round(target);
-  if (start && start !== String(b.start_date || '').slice(0, 10)) body.start_date = start;
-  if (!Object.keys(body).length) { showToast('Nothing changed.', 'success'); return; }
-  const res = await postJSON('/api/warmup/inboxes/' + wuEnc(b.email), body);
-  if (res.ok) { showToast('Ramp updated.', 'success'); document.activeElement && document.activeElement.blur(); loadWarmup(); }
-  else showToast('Couldn\'t update the ramp: ' + res.error, 'error');
-}
-
-const WU_CONFIRM = {
-  reset: b => ({ title: 'Reset the ramp for ' + b.email + '?',
-    copy: 'The cap goes back to day one and climbs again over 28 days. Sent history and your checklist are kept.', ok: 'Reset ramp' }),
-  remove: b => ({ title: 'Remove ' + b.email + ' from warm-up?',
-    copy: 'Mercury stops tracking its ramp and checklist. This doesn\'t touch the mailbox itself.', ok: 'Remove inbox' }),
-};
 const WU_DONE = {
-  start: 'Warm-up started — today\'s cap is live.', pause: 'Warm-up paused. Nothing sends from this inbox until you resume.',
-  resume: 'Warm-up resumed.', reset: 'Ramp reset to day one.', remove: 'Inbox removed from warm-up.',
+  pause: 'Inbox paused. No cold email goes out from it until you resume.',
+  resume: 'Inbox resumed. The bounce window starts fresh from now.',
 };
 
 async function wuAction(action) {
   const b = wuInbox();
-  if (!b) return;
-  const email = b.email;
-  if (WU_CONFIRM[action] && !(await confirmModal(WU_CONFIRM[action](b)))) return;
-  const res = await postJSON('/api/warmup/inboxes/' + wuEnc(email) + '/action', { action });
-  if (res.ok) {
-    showToast(WU_DONE[action] || 'Done.', 'success');
-    if (action === 'remove' && _wu.sel === email) _wu.sel = null;
-  } else {
-    showToast('Couldn\'t ' + action + ': ' + res.error, 'error');
-  }
-  loadWarmup();
-}
-
-// Add-inbox dialog
-let _wuPrevFocus = null;
-function wuAddOpen() { const m = document.getElementById('wu-modal'); return !!m && m.classList.contains('open'); }
-
-function wuOpenAdd() {
-  const m = document.getElementById('wu-modal');
-  _wuPrevFocus = document.activeElement;
-  document.getElementById('wu-new-email').value = '';
-  document.getElementById('wu-new-start').value = '';
-  document.getElementById('wu-new-target').value = '';
-  document.getElementById('wu-new-error').hidden = true;
-  m.classList.add('open');
-  m.setAttribute('aria-hidden', 'false');
-  setTimeout(() => document.getElementById('wu-new-email').focus(), 0);
-}
-
-function wuCloseAdd() {
-  const m = document.getElementById('wu-modal');
-  if (!m.classList.contains('open')) return;
-  m.classList.remove('open');
-  m.setAttribute('aria-hidden', 'true');
-  if (_wuPrevFocus && document.contains(_wuPrevFocus)) _wuPrevFocus.focus({ preventScroll: true });
-}
-
-async function wuSubmitAdd(e) {
-  e.preventDefault();
-  const email = document.getElementById('wu-new-email').value.trim();
-  const start = document.getElementById('wu-new-start').value;
-  const target = document.getElementById('wu-new-target').value;
-  const err = document.getElementById('wu-new-error');
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-    err.textContent = 'Enter a full email address, like you@yourdomain.co.';
-    err.hidden = false;
-    return;
-  }
-  const body = { email };
-  if (start) body.start_date = start;
-  if (target) body.target_daily = Math.round(Number(target));
-  const ok = document.getElementById('wu-new-ok');
-  ok.disabled = true;
-  const res = await postJSON('/api/warmup/inboxes', body);
-  ok.disabled = false;
-  if (!res.ok) { err.textContent = 'Couldn\'t add it: ' + res.error; err.hidden = false; return; }
-  wuCloseAdd();
-  _wu.sel = email;
-  showToast('Added ' + email + ' to warm-up.', 'success');
+  if (!b || !b.email) return;
+  if (action === 'pause' && !(await confirmModal({
+    title: 'Pause ' + b.email + '?',
+    copy: 'Openers and follow-ups from this inbox wait until you resume (nothing is cancelled). Replies to people who wrote back still go out.',
+    ok: 'Pause inbox',
+  }))) return;
+  const res = await postJSON('/api/warmup/inboxes/' + wuEnc(b.email) + '/action', { action });
+  if (res.ok) showToast(WU_DONE[action] || 'Done.', 'success');
+  else showToast('Couldn\'t ' + action + ': ' + res.error, 'error');
   loadWarmup();
 }
 

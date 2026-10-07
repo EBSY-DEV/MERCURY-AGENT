@@ -130,6 +130,74 @@ async def sent_by_day(db_path: str, start: date, end: date) -> dict[str, int]:
             return {d: n for d, n in await cursor.fetchall() if d}
 
 
+async def sent_by_day_by_mailbox(db_path: str, start: date, end: date) -> dict[str, dict[str, int]]:
+    """``{mailbox: {YYYY-MM-DD: n}}`` — ``sent_by_day`` split by the mailbox
+    each email went out from ('' = sent before mailbox tracking)."""
+    out: dict[str, dict[str, int]] = {}
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT COALESCE(mailbox, ''), date(sent_at) AS d, COUNT(*) FROM outbox "
+            "WHERE status = 'sent' AND sent_at IS NOT NULL "
+            "AND date(sent_at) BETWEEN ? AND ? GROUP BY 1, 2",
+            (start.isoformat(), end.isoformat()),
+        ) as cursor:
+            for mailbox, d, n in await cursor.fetchall():
+                if d:
+                    out.setdefault(mailbox, {})[d] = n
+    return out
+
+
+# The mailbox an event belongs to: the one recorded on the event, else the
+# mailbox of the latest email sent to that prospect ('' = untracked/legacy).
+def _event_mailbox_sql() -> str:
+    return f"""COALESCE(NULLIF(lower({_j('mailbox')}), ''), (
+        SELECT COALESCE(o.mailbox, '') FROM outbox o
+        WHERE o.prospect_id = {_j('prospect_id')} AND o.status = 'sent'
+        ORDER BY o.sent_at DESC LIMIT 1
+    ), '')"""
+
+
+async def window_counts_by_mailbox(db_path: str, since: str) -> dict[str, dict[str, int]]:
+    """``{mailbox: {sent, bounces, replies}}`` since a timestamp — the
+    warm-up health gate's inputs, per sending mailbox.
+
+    Same definitions as ``window_counts``: sent = outreach (sequence) sends;
+    bounces and replies are de-duplicated per prospect per day, and an
+    out-of-office reply is not a reply. Events logged before they carried a
+    mailbox are attributed through the prospect's last sent email."""
+    out: dict[str, dict[str, int]] = {}
+
+    def bump(mailbox: str, metric: str, n: int) -> None:
+        out.setdefault(mailbox or "", {"sent": 0, "bounces": 0, "replies": 0})[metric] += n
+
+    mb = _event_mailbox_sql()
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT COALESCE(mailbox, ''), COUNT(*) FROM outbox "
+            "WHERE status = 'sent' AND kind = 'sequence' AND sent_at IS NOT NULL "
+            "AND datetime(sent_at) >= datetime(?) GROUP BY 1",
+            (since,),
+        ) as cursor:
+            for mailbox, n in await cursor.fetchall():
+                bump(mailbox, "sent", n)
+        for metric, action, extra in (
+            ("bounces", "bounce", ""),
+            ("replies", "reply_received", f"AND COALESCE({_j('intent')}, '') != 'ooo'"),
+        ):
+            key = (f"CASE WHEN COALESCE({_j('prospect_id')}, '') != '' "
+                   f"THEN {_j('prospect_id')} ELSE id END")
+            sql = (
+                f"SELECT m, COUNT(DISTINCT k || '|' || d) FROM ("
+                f"  SELECT {mb} AS m, {key} AS k, date(created_at) AS d FROM actions "
+                f"  WHERE action_type = ? AND datetime(created_at) >= datetime(?) {extra}"
+                f") GROUP BY m"
+            )
+            async with db.execute(sql, (action, since)) as cursor:
+                for mailbox, n in await cursor.fetchall():
+                    bump(mailbox, metric, n)
+    return out
+
+
 def _rate(n: int, sent: int) -> float | None:
     return round(n / sent, 4) if sent else None
 

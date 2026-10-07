@@ -1407,12 +1407,21 @@ details[open] summary::before { content: '– '; }
 .chart-wrap svg text.rp-today-l { font-family: var(--sans); font-size: 11.5px; font-weight: 600; fill: var(--accent-deep); }
 
 .wu-ramp-foot { flex-wrap: wrap; }
-.wu-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.wu-inline label { font-size: 12.5px; color: var(--text-2); }
-.wu-field { display: inline-flex; align-items: center; gap: 8px; margin-right: 6px; }
-.form-input.sm { width: auto; padding: 5px 9px; font-size: 12.5px; }
-.form-input.sm[type='number'] { width: 76px; font-family: var(--mono); }
-.wu-ramp-foot .toolbar-note b { font-family: var(--mono); }
+.wu-total { margin-left: auto; }
+
+/* Where caps come from: config, read-only here */
+.wu-config { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.wu-config p { display: flex; gap: 8px; font-size: 12.5px; color: var(--text-2); text-wrap: pretty; }
+.wu-config p .ph { font-size: 15px; color: var(--text-3); flex: none; margin-top: 1px; }
+.wu-config .mono { font-size: 12px; color: var(--text); }
+.wu-config summary { font-size: 12.5px; font-weight: 500; color: var(--accent-deep); cursor: pointer; width: max-content; }
+.wu-snippet { position: relative; margin-top: 8px; }
+.wu-snippet pre {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.55; color: var(--text-2);
+  background: var(--panel-raised); border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: 10px 12px; overflow-x: auto; white-space: pre;
+}
+.wu-snippet .btn-square { position: absolute; top: 6px; right: 6px; }
 
 /* Plan: weeks as an accordion; only the current week's header is tinted */
 .wu-weeks { padding: 8px 10px 12px; display: flex; flex-direction: column; gap: 2px; }
@@ -1491,7 +1500,6 @@ details[open] summary::before { content: '– '; }
 
 .form-error { font-size: 12.5px; color: var(--s-bad); margin: -4px 0 14px; }
 .form-error[hidden] { display: none; }
-#wu-modal .modal { width: min(460px, 100%); }
 
 @media (max-width: 700px) {
   .section-head.split { flex-direction: column; align-items: flex-start; }
@@ -1502,7 +1510,6 @@ details[open] summary::before { content: '– '; }
   .wu-ramp-foot { align-items: flex-start; }
 }
 .nowrap { white-space: nowrap; }
-#wu-modal .form-input { height: 38px; }
 .ch-band-hi { fill: var(--accent); opacity: .08; }
 #today-trend.unavailable .chart-controls { display: none; }
 #today-trend.unavailable .chart-note { min-height: 0; padding: 14px 18px 18px; }
