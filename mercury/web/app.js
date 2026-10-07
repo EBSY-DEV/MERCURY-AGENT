@@ -3,6 +3,7 @@ let companyDrill = false;      // true while viewing a single company's contacts
 let _companies = [], _prospects = [], _campaigns = [];
 let _signals = null;           // last /api/signals payload, for the cohort builder
 let _desk = { items: [], i: 0 };
+let _outbox = null;            // last /api/outbox payload, for the demo drawer
 
 // ── Appearance ──
 //
@@ -362,6 +363,9 @@ const ACTIVITY_LABELS = {
   analyze: ['chart-line-up', 'Updated analytics'],
   discover: ['compass', 'Discovered businesses'],
   profile: ['buildings', 'Read company websites'],
+  demo_ready: ['check-circle', 'Marked a demo ready'],
+  demo_retired: ['archive', 'Retired a demo'],
+  demos_retired: ['archive', 'Retired demos nobody answered'],
 };
 
 function activityLabel(type) {
@@ -1300,6 +1304,7 @@ async function loadOutbox() {
   const list = document.getElementById('outbox-list');
   const actions = document.getElementById('outbox-actions');
   if (!data) { desk.innerHTML = offlineState(); list.innerHTML = ''; return; }
+  _outbox = data;
 
   const pending = data.pending || [];
   _desk.items = pending;
@@ -1342,6 +1347,7 @@ async function loadOutbox() {
   };
 
   list.innerHTML =
+    demoWaitingCard(data.waiting_demo || []) +
     table('Sending', data.sending, [
       ['To', r => r.to_email], ['Subject', r => r.subject],
       ['From', r => r.from_mailbox || r.mailbox || '—', true],
@@ -1352,7 +1358,8 @@ async function loadOutbox() {
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
       ['From', r => fromCell(r), true, true],
       ['Persona', r => personaChip(r), false, true],
-      ['Sends', r => formatDate(r.send_at), true],
+      ['Sends', r => r.demo && r.demo.held ? toneBadge('waiting', 'Waiting for demo') : formatDate(r.send_at),
+       true, true],
     ]) +
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
@@ -1383,6 +1390,7 @@ function renderDesk(items, i) {
         (_mailboxes && _mailboxes.rotation ? ' &middot; from <b>' + escHtml(fromLabel(cur)) + '</b>' : '') +
         '</div>' +
       followupNote(cur) +
+      demoNote(cur) +
       '<div class="desk-persona">' + personaChip(cur) +
         (cur.manually_edited ? '<span class="muted">Edited before sending</span>' : '') + '</div>' +
       '<label class="sr-only" for="desk-subject">Subject</label>' +
@@ -1623,6 +1631,130 @@ function autoFollowups(it) {
 function followupNote(it) {
   return autoFollowups(it)
     ? '<div class="desk-note">' + icon('info') + 'Approving this also approves its follow-ups.</div>' : '';
+}
+
+// ── Demo gate ──
+//
+// An offer that promises something already built for one business (a voice
+// line, a draft site) holds its emails until that demo is marked ready. The
+// gate itself runs in the sender; this only shows why an email waits and
+// lets you mark the demo ready.
+
+// Codes the user can clear by marking the demo ready. The rest (an offer
+// missing from mercury.yaml, an unreadable config) need a config fix.
+const DEMO_FIXABLE = new Set(['no_demo', 'demo_requested']);
+const DEMO_KIND = { voice: 'Voice line demo', website: 'Website demo' };
+
+function demoBadge(code) {
+  return {
+    demo_requested: toneBadge('waiting', 'Requested'),
+    no_demo: toneBadge('idle', 'Not registered'),
+    unknown_offer: toneBadge('bad', 'Offer not set up'),
+    no_config: toneBadge('bad', 'Config unreadable'),
+    no_prospect: toneBadge('bad', 'No contact'),
+    error: toneBadge('bad', 'Check failed'),
+  }[code] || toneBadge('waiting', 'Waiting');
+}
+
+function demoNote(it) {
+  const d = it.demo;
+  if (!d || !d.held) return '';
+  return '<div class="desk-note hold">' + toneBadge('waiting', 'Waiting for demo') +
+    '<span>' + escHtml(d.reason) + (DEMO_FIXABLE.has(d.code) ? ' You can still approve it now.' : '') + '</span>' +
+    (DEMO_FIXABLE.has(d.code)
+      ? '<button class="btn btn-secondary btn-sm" onclick="demoOpen(\'' + escAttr(it.id) + '\')">' +
+          icon('check-circle') + 'Mark demo ready</button>' : '') +
+    '</div>';
+}
+
+function demoWaitingCard(rows) {
+  if (!rows.length) return '';
+  const body = rows.map(w =>
+    '<tr><td>' + (w.name ? escHtml(w.name) + '<div class="muted mb-sub mono-sm">' + escHtml(w.to_email) + '</div>'
+                         : '<span class="mono-sm">' + escHtml(w.to_email) + '</span>') + '</td>' +
+      '<td>' + escHtml(w.offer_key) + (DEMO_KIND[w.kind] ? '<div class="muted mb-sub">' + DEMO_KIND[w.kind] + '</div>' : '') + '</td>' +
+      '<td>' + demoBadge(w.code) + '</td>' +
+      '<td class="muted">Step ' + escHtml(w.step) + ' &middot; ' + badge(w.status) + '</td>' +
+      '<td>' + (DEMO_FIXABLE.has(w.code)
+        ? '<button class="btn btn-secondary btn-sm" onclick="demoOpen(\'' + escAttr(w.outbox_id) + '\')">Mark ready</button>'
+        : '<span class="muted mb-sub">' + escHtml(w.reason) + '</span>') + '</td></tr>').join('');
+  return '<div class="card"><h2>Waiting for a demo</h2>' +
+    '<p class="lede">These emails say something was already built for the business. ' +
+      'They stay in the outbox until its demo is marked ready, then send on the next run.</p>' +
+    '<div class="table-card"><table><thead><tr><th>Contact</th><th>Offer</th><th>Demo</th><th>Email</th><th></th>' +
+    '</tr></thead><tbody>' + body + '</tbody></table></div></div>';
+}
+
+// The waiting entry for an outbox row, from the last /api/outbox payload.
+function demoFind(id) {
+  const data = _outbox || {};
+  const w = (data.waiting_demo || []).find(x => x.outbox_id === id);
+  if (w) return w;
+  const it = [...(data.pending || []), ...(data.approved || [])].find(x => x.id === id);
+  if (!it || !it.demo) return null;
+  return { outbox_id: it.id, to_email: it.to_email, name: '', offer_key: it.demo.offer_key, kind: '',
+           step: it.step, status: it.status, code: it.demo.code, reason: it.demo.reason };
+}
+
+function demoOpen(id) {
+  const w = demoFind(id);
+  if (!w) { showToast('That email is no longer waiting for a demo.', 'success'); loadOutbox(); return; }
+  const field = (key, label, type, placeholder, hint) => '<div class="form-group"><label class="form-label" for="demo-' +
+    key + '">' + label + '</label><input class="form-input" id="demo-' + key + '" type="' + type +
+    '" placeholder="' + escAttr(placeholder) + '" autocomplete="off">' + (hint ? '<p class="mb-hint">' + hint + '</p>' : '') + '</div>';
+  const html = facts([
+      ['To', '<span class="mono">' + escHtml(w.to_email) + '</span>'],
+      ['Offer', escHtml(w.offer_key) + (DEMO_KIND[w.kind] ? ' <span class="muted">&middot; ' + DEMO_KIND[w.kind] + '</span>' : '')],
+      ['Demo', demoBadge(w.code)],
+      ['Held', 'Step ' + escHtml(w.step) + ' &middot; ' + badge(w.status)],
+    ]) +
+    '<form id="demo-form" class="mb-settings" onsubmit="demoSubmit(event, \'' + escAttr(w.outbox_id) + '\')" autocomplete="off">' +
+      '<div class="drawer-section"><h4>What was built</h4>' +
+        field('url', 'Demo link', 'url', 'https://', 'Where the business can see it.') +
+        field('recording', 'Recording', 'text', 'demos/acme-call.mp3',
+          'The short recording the email offers to send, if it has one.') +
+        (w.kind === 'website' ? '' : field('agent', 'Voice agent id', 'text', '', '')) +
+        field('by', 'Built by', 'text', '', '') +
+        '<div class="form-group"><label class="form-label" for="demo-notes">Notes</label>' +
+          '<textarea class="form-input" id="demo-notes" rows="3"></textarea></div>' +
+        '<p class="drawer-note">Everything here is optional. You can mark it ready now and add the recording later.</p>' +
+      '</div>' +
+      '<p class="form-error" id="demo-error" role="alert" hidden></p>' +
+      '<div class="drawer-actions mb-settings-foot">' +
+        '<button type="submit" class="btn btn-primary btn-sm" id="demo-save">' + icon('check-circle') + 'Mark ready</button>' +
+        '<button type="button" class="btn btn-secondary btn-sm" onclick="closeDrawer()">Cancel</button>' +
+        '<span class="mb-hint">Approved emails send on the next run.</span>' +
+      '</div>' +
+    '</form>';
+  openDrawer('Demo', w.name || w.to_email, escHtml(w.reason), html);
+  const first = document.getElementById('demo-url');
+  if (first) first.focus({ preventScroll: true });
+}
+
+async function demoSubmit(e, id) {
+  e.preventDefault();
+  const val = key => { const el = document.getElementById('demo-' + key); return el ? el.value.trim() : ''; };
+  const body = { target: id };
+  for (const [key, name] of [['url', 'demo_url'], ['recording', 'recording_path'], ['agent', 'agent_id'],
+                             ['by', 'built_by'], ['notes', 'notes']]) {
+    if (val(key)) body[name] = val(key);
+  }
+  const btn = document.getElementById('demo-save');
+  const err = document.getElementById('demo-error');
+  if (btn) btn.disabled = true;
+  const res = await postJSON('/api/demos/ready', body);
+  if (btn) btn.disabled = false;
+  if (!res.ok) {
+    const detail = res.data && res.data.detail;
+    if (err) {
+      err.textContent = (detail && detail.message) || res.error || 'Could not mark the demo ready.';
+      err.hidden = false;
+    }
+    return;
+  }
+  closeDrawer();
+  showToast('Demo marked ready. Its emails send on the next run.', 'success');
+  loadOutbox();
 }
 
 function mailboxStage(m) {
