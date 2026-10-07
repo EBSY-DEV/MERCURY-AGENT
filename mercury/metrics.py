@@ -149,12 +149,28 @@ async def sent_by_day_by_mailbox(db_path: str, start: date, end: date) -> dict[s
 
 # The mailbox an event belongs to: the one recorded on the event, else the
 # mailbox of the latest email sent to that prospect ('' = untracked/legacy).
+# An event no send can be traced to. Not an address, so MailboxPool.resolve()
+# returns None and no mailbox is charged for it.
+UNATTRIBUTED = "?"
+
+
 def _event_mailbox_sql() -> str:
+    """The mailbox an action event belongs to: its own ``mailbox`` field, else
+    the last sent email to its ``prospect_id``, else (bounces logged before
+    either existed) the last sent email to the bounced address in
+    ``prospect``. A matched pre-rotation send yields '' (the legacy mailbox,
+    which did send it); no match at all yields UNATTRIBUTED, so old bounces
+    are never blamed on whichever mailbox happens to own '' rows."""
     return f"""COALESCE(NULLIF(lower({_j('mailbox')}), ''), (
         SELECT COALESCE(o.mailbox, '') FROM outbox o
         WHERE o.prospect_id = {_j('prospect_id')} AND o.status = 'sent'
         ORDER BY o.sent_at DESC LIMIT 1
-    ), '')"""
+    ), (
+        SELECT COALESCE(o.mailbox, '') FROM outbox o
+        WHERE lower(o.to_email) = lower({_j('prospect')}) AND o.status = 'sent'
+          AND COALESCE({_j('prospect')}, '') != ''
+        ORDER BY o.sent_at DESC LIMIT 1
+    ), '{UNATTRIBUTED}')"""
 
 
 async def window_counts_by_mailbox(db_path: str, since: str) -> dict[str, dict[str, int]]:

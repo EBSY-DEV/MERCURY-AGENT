@@ -166,6 +166,23 @@ def test_bounces_pause_only_the_mailbox_they_came_from(sm):
     assert _run(warmup.apply_health(sm, pool))["a@x.co"]["reason"] == "kept"
 
 
+def test_pre_rotation_bounces_are_traced_by_address_not_blamed_on_legacy(sm):
+    """Production bounces logged before rotation carry only {"prospect": email}.
+    They must follow the email to the mailbox that sent it; an untraceable one
+    must not be charged to whichever mailbox owns '' rows."""
+    pool = make_pool(("a@x.co", 30, None), ("b@y.co", 30, None))   # a is legacy
+    _sent(sm, 30, mailbox="a@x.co")
+    b_pids = _sent(sm, 30, mailbox="b@y.co")
+    b_emails = [_run(sm.get_prospect(p)).email for p in b_pids[:3]]
+    for email in b_emails:                                         # 10% of b's sends
+        _run(sm.log_action("bounce", "handler", {"prospect": email}))
+    for i in range(3):                                             # matches no send at all
+        _run(sm.log_action("bounce", "handler", {"prospect": f"ghost{i}@nowhere.co"}))
+    health = _run(warmup.apply_health(sm, pool, persist=False))
+    assert health["b@y.co"]["bounces"] == 3 and health["b@y.co"]["gate"] == "pause"
+    assert health["a@x.co"]["bounces"] == 0 and health["a@x.co"]["gate"] == "ok"
+
+
 def test_hold_between_three_and_five_percent(sm):
     pool = make_pool(("a@x.co", 30, _today() - timedelta(days=7)))
     pids = _sent(sm, 25, mailbox="a@x.co")
