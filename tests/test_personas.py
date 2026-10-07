@@ -274,3 +274,16 @@ def test_version_stats_count_outbox_emails_and_replies(client, monkeypatch):
     versions = client.get(f"/api/personas/{persona_id}/versions").json()["versions"]
     assert [(v["revision"], v["drafted"], v["sent"], v["replies"]) for v in versions] == [(2, 0, 0, 0), (1, 2, 2, 1)]
     assert client.get("/api/personas").json()["totals"][persona_id] == {"drafted": 2, "sent": 2, "replies": 1}
+
+
+def test_save_without_optional_fields_keeps_them(client):
+    persona_id = create(client, sign_name="Alex")
+    before = profile(client, persona_id)
+    body = {key: before[key] for key in ("name", "description", "tone", "instructions", "examples")}
+    body["expected_revision"] = before["revision"]
+    assert client.post(f"/api/personas/{persona_id}/save", json=body).status_code == 200
+    after = profile(client, persona_id)
+    assert (after["sign_name"], after["avatar_seed"], after["revision"]) == ("Alex", before["avatar_seed"], before["revision"])
+    body["sign_name"] = ""
+    client.post(f"/api/personas/{persona_id}/save", json=body)
+    assert profile(client, persona_id)["sign_name"] == ""

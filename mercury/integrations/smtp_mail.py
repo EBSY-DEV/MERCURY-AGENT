@@ -99,6 +99,9 @@ class SmtpImapProvider(MailProvider):
             self.imap_host = mailbox.imap_host or getattr(env, "imap_host", "") or self.smtp_host
             self.imap_port = int(mailbox.imap_port or self.imap_port)
             self.imap_user = mailbox.imap_username or self.smtp_user
+            # Empty imap_password_env means IMAP shares the SMTP credential.
+            # The dashboard points it at password_env after a rotation unless
+            # a separate IMAP password was supplied.
             self.imap_pass = (env.secret(mailbox.imap_password_env)
                               if mailbox.imap_password_env else secret)
             self.from_email = mailbox.email
