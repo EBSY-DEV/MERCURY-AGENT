@@ -3049,8 +3049,9 @@ function mbBusy() {
 async function loadMailboxes(quiet) {
   const body = document.getElementById('mb-body');
   const seq = ++_mb.seq;
-  const res = await getJSON('/api/warmup');
+  const [res, voices] = await Promise.all([getJSON('/api/warmup'), getJSON('/api/voices')]);
   if (seq !== _mb.seq) return;
+  if (voices.ok) { _mb.voices = voices.data.mailboxes; _mb.voicePersonas = voices.data.personas; _mb.voiceDefault = voices.data.default_id; }
   if (!res.ok || !res.data || !Array.isArray(res.data.inboxes)) {
     if (quiet && _mb.data) return;
     _mb.data = null; _mb.key = '';
@@ -3348,6 +3349,8 @@ function mbInboxBody(b) {
       ? '<div class="ev-note bad">' + icon('warning-circle') + '<span>' + escHtml(b.pause_reason || h.reason || 'Paused by hand.') +
         ' Mercury holds the ramp at 3% bounces and pauses the inbox at 5%. Replies still go out.</span></div>' : '') +
     '</div>';
+
+  html += mbVoiceSection(b.email);
 
   if (mbDnsFails(b.domain)) {
     const d = mbDns(b.domain);

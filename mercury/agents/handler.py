@@ -779,7 +779,7 @@ Respond with ONLY the category label, nothing else."""
 
         prompt = self.brain.load_prompt("handler", stage=convo.stage)
         if not prompt:
-            prompt = f"""You are {self.config.persona.name}, {self.config.persona.role} at {self.config.persona.company}.
+            prompt = f"""You are {profile.get('signer') or self.config.persona.name}, {self.config.persona.role} at {self.config.persona.company}.
 Your tone is: {profile['tone']}
 Product: {self.config.product.name} — {self.config.product.description}"""
 

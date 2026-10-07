@@ -309,6 +309,7 @@ mercury mail test             # Verify whichever provider is configured (gmail o
 mercury outbox                # Review queued emails; --approve <id> / --approve-all / --reject <id>
 mercury signals               # The signal vocabulary; --confirm / --reject CODES (or 'free' / 'all')
 mercury personas              # Writing voices: list / show / create / edit / default / archive / versions / prompt / preview
+mercury personas mailboxes    # Each sending mailbox's voice and sign-off; change one with: personas assign EMAIL [PERSONA] --sign-name NAME
 mercury discover              # Find businesses; --providers / --estimate / --provider <key>
 mercury sending pause|resume  # Kill switch for all outbound
 ```

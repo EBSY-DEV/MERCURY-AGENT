@@ -10,8 +10,9 @@ import secrets
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from mercury.personas import AVATAR_SEEDS, JSON_INSTRUCTION, PersonaError, PersonaStore
+from mercury.voices import MailboxVoices
 
-EDITABLE = ("name", "description", "tone", "instructions", "examples", "avatar_seed")
+EDITABLE = ("name", "description", "tone", "instructions", "examples", "avatar_seed", "sign_name")
 
 
 class PersonaInput(BaseModel):
@@ -22,6 +23,8 @@ class PersonaInput(BaseModel):
     instructions: str = Field(default="", max_length=8000)
     examples: str = Field(default="", max_length=8000)
     avatar_seed: str = Field(default_factory=lambda: secrets.choice(AVATAR_SEEDS))
+    # Suggested sign-off name for mailboxes that set none. A label: no new version.
+    sign_name: str = Field(default="", max_length=80, pattern=r"^[^\r\n]*$")
     expected_revision: int | None = Field(default=None, ge=1)
 
     @field_validator("avatar_seed")
@@ -52,9 +55,10 @@ def validated(data: dict) -> dict:
 
 
 class PersonaService:
-    def __init__(self, state, config):
+    def __init__(self, state, config, env=None):
         self.state, self.config = state, config
         self.store = PersonaStore(state)
+        self.voices = MailboxVoices(state, config, env)
 
     async def ready(self):
         await self.state.init_db()
@@ -147,7 +151,17 @@ class PersonaService:
                 total[key] += row[key]
         return result
 
-    async def _generation_inputs(self, ref, prospect_id, revision=None, version_id="", draft=None):
+    async def mailboxes(self) -> list[dict]:
+        """Each sending mailbox with its voice and the name it signs with."""
+        return await self.voices.assignments()
+
+    async def assign_mailbox(self, email: str, ref: str = "", sign_name: str = "") -> dict:
+        """Give a mailbox a voice (empty ref: follow the default) and a sign-off
+        name (empty: the persona's suggestion)."""
+        persona_id = (await self.find(ref))["id"] if ref else ""
+        return await self.voices.assign(email, persona_id, sign_name)
+
+    async def _generation_inputs(self, ref, prospect_id, revision=None, version_id="", draft=None, mailbox=""):
         """Contact by id or email; persona by reference and revision, or the default."""
         from mercury.agents.writer import Writer
         from mercury.brain import Brain
@@ -172,11 +186,14 @@ class PersonaService:
             edits = validated({key: profile[key] or "" for key in EDITABLE} | {
                 key: draft[key] for key in ("tone", "instructions", "examples") if key in draft})
             profile = profile | {key: edits[key] for key in ("tone", "instructions", "examples")} | {"unsaved": True}
+        # The sign-off depends on the mailbox; the voice is what was chosen here.
+        signer = await self.voices.profile_for(mailbox)
+        profile = profile | {"signer": signer["signer"], "mailbox": signer["mailbox"]}
         return Writer(Brain(self.state), self.state, self.config), prospect, profile
 
-    async def prompt(self, ref, prospect_id, revision=None, instruction="", version_id="", draft=None) -> dict:
+    async def prompt(self, ref, prospect_id, revision=None, instruction="", version_id="", draft=None, mailbox="") -> dict:
         """The exact writer prompt, assembled without a model call, plus its labelled sections."""
-        writer, prospect, profile = await self._generation_inputs(ref, prospect_id, revision, version_id, draft)
+        writer, prospect, profile = await self._generation_inputs(ref, prospect_id, revision, version_id, draft, mailbox)
         sections, _profile = await writer.personal_prompt_sections(prospect, instruction, profile)
         sections.append(("format", "Output format", JSON_INSTRUCTION))
         return {
@@ -185,9 +202,9 @@ class PersonaService:
             "persona": profile,
         }
 
-    async def preview(self, ref, prospect_id, revision=None, instruction="", version_id="", draft=None) -> dict:
+    async def preview(self, ref, prospect_id, revision=None, instruction="", version_id="", draft=None, mailbox="") -> dict:
         """Write one sample email. One model call; nothing is queued or sent."""
-        writer, prospect, profile = await self._generation_inputs(ref, prospect_id, revision, version_id, draft)
+        writer, prospect, profile = await self._generation_inputs(ref, prospect_id, revision, version_id, draft, mailbox)
         draft = await writer._write_personal_email(prospect, instruction, profile)
         if not draft:
             raise PersonaError("provider_failed", "The writer returned no draft. Check the agent log and try again")
