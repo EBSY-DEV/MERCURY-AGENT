@@ -16,6 +16,10 @@ sending mailboxes through ``outbox.mailbox``:
   with part of the checklist ticked and notes.
 * sam@trynorthwind.com   — scheduled: its ramp starts in three days.
 
+Plus one inbox placement test from yesterday (rows in ``placement_tests``,
+nothing sent): the warm inbox and the control land in the inbox, the
+warming one mostly in spam.
+
 Which inboxes exist, their caps and start dates come from the mail config,
 not the database (see mercury/warmup.py). So next to the database the seed
 writes a demo config, ``<db>.mercury.yaml`` (data/demo.mercury.yaml by
@@ -276,7 +280,44 @@ async def seed(db_path: Path) -> dict:
 
     counts.update(await seed_history(sm))
     counts.update(await seed_warmup(sm))
+    counts.update(await seed_placement(sm))
     return counts
+
+
+async def seed_placement(sm: StateManager) -> dict:
+    """One placement test from yesterday, so the Mailboxes domain drawer and
+    the Today card have a result to show: the warm inbox lands in the inbox,
+    the warming one mostly in spam, and the control in Primary, which reads
+    as a domain problem for getnorthwind.com. No email is sent."""
+    from mercury import placement
+
+    await placement.ensure_schema(sm.db_path)
+    run_id = "demo0001"
+    at = iso(NOW - timedelta(days=1))
+    landed = {
+        MB_WARM: ("primary", "inbox", "inbox"),
+        MB_ALEX: ("spam", "inbox", "spam"),
+        "you@gmail.com": ("primary", "inbox", "inbox"),
+    }
+    seeds = (("seed.northwind@gmail.com", "gmail"), ("seed.northwind@outlook.com", "outlook"),
+             ("seed.northwind@yahoo.com", "yahoo"))
+    n = 0
+    for sender, folders in landed.items():
+        for (seed, provider), folder in zip(seeds, folders):
+            n += 1
+            await placement._insert(sm.db_path, {
+                "id": f"demo-pl-{n}", "run_id": run_id, "sender": sender,
+                "role": "control" if sender == "you@gmail.com" else "fleet",
+                "domain": sender.split("@")[1], "seed": seed, "seed_provider": provider,
+                "message_id": f"<demo-pl-{n}@{sender.split('@')[1]}>",
+                "subject": "Summit Peak Roofing on page two", "folder": folder, "sent_at": at,
+            })
+    async with sm._connect() as db:
+        await db.execute("UPDATE placement_tests SET created_at = ?, checked_at = ? WHERE run_id = ?",
+                         (at, at, run_id))
+        await db.commit()
+    await placement.finish(sm, run_id)
+    return {"placement_rows": n}
 
 
 # ── The demo mail config (mailboxes come from config, not the DB) ──
