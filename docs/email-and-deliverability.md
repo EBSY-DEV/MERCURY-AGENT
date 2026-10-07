@@ -42,13 +42,13 @@ With `require_approval: false`, rows start as `approved`.
 
 **Draining.** Each heartbeat the Sender picks up due, approved rows:
 
-1. If the global kill switch is on, nothing goes out.
+1. If you paused sending, or a health hold is on (the bounce kill switch), nothing goes out. See [Pauses and holds](#pauses-and-holds).
 2. If `compliance.postal_address` is empty, nothing goes out ("compliance hold").
 3. Rows are ordered replies first, then follow-ups, then new first emails, so a backlog of openers never starves step 2.
 4. A sequence row is cancelled if the prospect's status is `replied`, `opted_out`, `lost`, `meeting` or `closed`.
 5. Step N never leaves before step N-1 was sent. If the earlier step was rejected, cancelled or failed, this one is cancelled too. A follow-up is rescheduled to the earlier step's actual send time plus its delay, so an opener approved a week late does not drag its follow-ups out right behind it.
 6. A mailbox is chosen (see [Mailbox rotation](#mailbox-rotation)) and the [pre-send gate](#the-pre-send-gate) runs.
-7. The email is sent with the [compliance footer](#compliance-footer-and-opt-outs) appended (not on replies). The prospect moves to `contacted`.
+7. The pause and hold check runs again, then the row is claimed (`sending`) and sent with the [compliance footer](#compliance-footer-and-opt-outs) appended (not on replies). The prospect moves to `contacted`.
 
 At most 8 emails leave per cycle, with 4 to 15 seconds of random delay between sends. `max_daily_sends` caps all native sends in a rolling 24-hour window. With `spread_sends: true`, the day's remaining cold budget is divided over the cycles left before quiet hours.
 
@@ -245,22 +245,40 @@ If a `SENDER` or `BURNED` bounce cannot be pinned to a mailbox Mercury knows, or
 
 The Mailboxes tab shows the bucket breakdown for each inbox over its health window.
 
-**Global kill switch.** Mercury pauses all sending, and nothing leaves the outbox until you resume, when either:
+**Global kill switch.** Mercury puts all sending on hold, and nothing leaves the outbox until you clear the hold, when either:
 
 - `SENDER` plus `BURNED` bounces are more than 20% of the classified bounces (`LIST`, `SENDER`, `BURNED` and `THROTTLE`), once at least 30 are classified. `LIST` bounces alone never trip this.
-- Bounces counted since the last resume (not `NOISE`) exceed `max_bounce_rate` (default 2%) of all emails sent, once at least 50 have been sent.
+- Bounces counted since the hold was last cleared (not `NOISE`) exceed `max_bounce_rate` (default 2%) of all emails sent, once at least 50 have been sent.
 
 Set `max_bounce_rate: 0` to disable the rate check (not recommended); the sender/burned share check stays on.
 
+The kill switch is global. The health gates are per mailbox. Both can be in effect.
+
+### Pauses and holds
+
+Your pause and a health hold are kept apart, because they are lifted differently:
+
+| What | Set by | Lifted by |
+|---|---|---|
+| **Your pause** | `mercury sending pause`, **Pause all sending** on the Outbox tab, or MCP | `mercury sending resume` / **Resume sending**. Lifts your pause and nothing else. |
+| **Bounce hold** (the kill switch) | The bounce monitor, above | `mercury sending clear-hold` / **Clear bounce hold**, after you fix the cause. This is the only thing that restarts the bounce count. It needs the admin permission. |
+| **Compliance hold** | `compliance.postal_address` is empty | Setting the address. |
+| **Inbox paused or on hold** | You (inbox drawer), the warm-up health gate, or a sender/reputation bounce | **Resume** in that inbox's drawer on the Mailboxes tab. Other inboxes keep sending. |
+
 ```bash
-mercury sending            # status
-mercury sending pause      # manual stop
-mercury sending resume     # resume and reset the bounce counters
+mercury sending              # your pause, every hold, and what is in flight
+mercury sending pause        # stop new sends
+mercury sending resume       # lift your pause; prints any hold still in force
+mercury sending clear-hold   # lift the bounce hold and reset the bounce counters
 ```
 
-The Outbox tab has the same Pause/Resume button, and Today shows "Sending is paused" at the top of Needs you. Fix the cause (usually unverified addresses) before resuming.
+Resume never resets the bounce counters, never lifts a hold, and never bypasses suppression, caps, pacing, the warm-up ramp or an inbox's gates. If a hold is still in force, resume says so and sending stays blocked. Pausing or resuming twice changes nothing.
 
-The kill switch is global. The health gates are per mailbox. Both can be in effect.
+**What can be in flight.** The sender checks for a pause or hold right before it claims each email, so a pause stops the next email, not the next cycle. An email already claimed (outbox status `sending`) is mid-way through its provider call. That call is not cut off: an SMTP send stopped halfway cannot tell whether the message left, and retrying it could send twice. It finishes and is recorded as sent, failed or queued for retry like any other. `mercury sending` and the Outbox banner list these rows. A row still `sending` after 30 minutes was interrupted (the agent was killed mid-send); the next cycle puts it back to `approved`, where your pause or a hold keeps it.
+
+**Stopping the agent.** **Stop** on the Controls tab asks the agent to finish the step it is on: the email in flight finishes, nothing new is claimed, and the pacing delay is skipped. If it has not exited within a few seconds, Controls shows **Stopping** until it has. Pressing Stop again only checks progress. `POST /api/mercury/stop?force=true` kills it outright.
+
+The Outbox tab lists your pause and each hold with its reason, and Today shows "Sending is paused" or "Sending is on hold" at the top of Needs you. `mercury sending`, the Outbox tab and Today all read the same status.
 
 ## Deliverability health
 
