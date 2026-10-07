@@ -1554,6 +1554,8 @@ details[open] summary::before { content: '– '; }
 .mb-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden; }
 .mb-stats > div { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; }
 .mb-stats > div + div { border-left: 1px solid var(--border); }
+.mb-stats > div:nth-child(3n+1) { border-left: 0; }
+.mb-stats > div:nth-child(n+4) { border-top: 1px solid var(--border); }
 .mb-stats span { font-size: 11.5px; color: var(--text-3); }
 .mb-stats b { font-family: var(--mono); font-size: 15px; font-weight: 500; font-variant-numeric: tabular-nums; }
 .mb-stats b.is-bad { color: var(--s-bad); }

@@ -3397,9 +3397,10 @@ function mbOpenTasks(b) {
 // What the inbox needs next, worst first: [text, tone] where tone '' is muted.
 function mbNext(b) {
   const st = mbStage(b);
-  if (st.key === 'paused') return ['Resume once bounces are fixed', 'bad'];
+  if (st.key === 'paused') return [b.verdict === 'CANCEL_CANDIDATE' ? 'Domain burned: consider replacing it' : 'Resume once bounces are fixed', 'bad'];
   if (b.configured === false) return ['Add the inbox password', 'bad'];
   if (st.key === 'hold') return ['Bounces over 3%', 'waiting'];
+  if (b.throttled_until) return ['Throttled: cap halved until ' + shortDay(b.throttled_until.slice(0, 10)), 'waiting'];
   if (mbDnsFails(b.domain)) return ['Waiting on domain DNS', ''];
   if (st.key === 'soon') return ['Starts ' + shortDay(b.start_date), ''];
   const open = mbOpenTasks(b);
@@ -3409,7 +3410,33 @@ function mbNext(b) {
 
 function mbNeeds(b) {
   const st = mbStage(b);
-  return st.key === 'paused' || st.key === 'hold' || b.configured === false || mbDnsFails(b.domain);
+  return st.key === 'paused' || st.key === 'hold' || !!b.throttled_until || b.configured === false || mbDnsFails(b.domain);
+}
+
+// Bounce buckets, as the handler classifies them from the DSN status code.
+const MB_BUCKETS = [
+  ['LIST', 'Bad address'], ['SENDER', 'Sender blocked'], ['BURNED', 'Domain burned'],
+  ['THROTTLE', 'Throttled'], ['NOISE', 'Ignored'], ['UNKNOWN', 'No code'],
+];
+
+function mbBucketSection(b) {
+  const bb = b.bounce_buckets || {};
+  const bad = (bb.SENDER || 0) + (bb.BURNED || 0);
+  let notes = '';
+  if (b.verdict === 'CANCEL_CANDIDATE') {
+    notes += '<div class="ev-note bad">' + icon('warning-circle') + '<span><b>' + escHtml(b.domain) + ' is a cancel candidate.</b> ' +
+      'A receiving server rejected it as burned (5.7.606 to 5.7.614). Every inbox on the domain is paused. Resuming one clears this flag.</span></div>';
+  }
+  if (b.throttled_until) {
+    notes += '<div class="ev-note">' + icon('warning-circle') + '<span>A server asked Mercury to slow down (a 4.x.x reply), so this inbox sends half its usual cap until ' +
+      escHtml(shortDay(b.throttled_until.slice(0, 10))) + '.</span></div>';
+  }
+  return '<div class="drawer-section"><div class="mb-sec-head"><h4>Bounce types</h4><span class="muted">last 7 days</span></div>' +
+    '<div class="mb-stats">' + MB_BUCKETS.map(([k, label]) =>
+      '<div><span>' + label + '</span><b class="' + ((k === 'SENDER' || k === 'BURNED') && bb[k] ? 'is-bad' : k === 'THROTTLE' && bb[k] ? 'is-wait' : '') + '">' +
+      fmtN(bb[k] || 0) + '</b></div>').join('') + '</div>' + notes +
+    (bad ? '<p class="drawer-note">Sender and burned blocks are reputation problems, not list problems. Fix the cause before resuming.</p>' : '') +
+    '</div>';
 }
 
 function mbInFilter(b, k) {
@@ -3737,6 +3764,8 @@ function mbInboxBody(b) {
       ? '<div class="ev-note bad">' + icon('warning-circle') + '<span>' + escHtml(b.pause_reason || h.reason || 'Paused by hand.') +
         ' Mercury holds the ramp at 3% bounces and pauses the inbox at 5%. Replies still go out.</span></div>' : '') +
     '</div>';
+
+  html += mbBucketSection(b);
 
   html += mbVoiceSection(b.email);
 

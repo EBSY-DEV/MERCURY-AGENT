@@ -118,7 +118,7 @@ icp:
 | `max_daily_sends` | `50` | Hard cap on all native sends (first emails, follow-ups and replies) in a rolling 24 hours. On Instantly, the number of leads added per day. |
 | `send_to_risky` | `false` | Also send to `risky` (catch-all) addresses. Off means verified addresses only. |
 | `require_approval` | `true` | Native providers: every outgoing email, including replies, waits in the outbox until approved. |
-| `max_bounce_rate` | `0.05` | Global kill switch threshold. `0` disables it. See [Bounces](email-and-deliverability.md#bounces-and-the-kill-switch). |
+| `max_bounce_rate` | `0.02` | Global kill switch threshold, checked once 50 emails have been sent. `0` disables this rate check (the sender/burned share check stays on). See [Bounces](email-and-deliverability.md#bounces-and-the-kill-switch). |
 | `mailboxes` | `[]` | SMTP only: rotate sends across several mailboxes. Empty uses the single `SMTP_*` mailbox. Ignored (with a warning) for other providers. |
 | `warmup_initial_cap` | `5` | Day-one cap for a mailbox with a `warmup_start`. |
 | `warmup_weekly_increase` | `5` | Added to the cap every 7 days, up to the mailbox's `daily_cap`. |
