@@ -24,12 +24,12 @@ STRICT EMAIL RULES — FOLLOW EVERY SINGLE ONE:
 8. NEVER start an email with "I" or "We". Start with them.
 9. NEVER use exclamation marks.
 10. Email 1 MUST be under 75 words. Email 2 under 75 words. Email 3 under 40 words. Count them.
-11. Email 1 does NOT pitch the product. It makes an observation and asks a question.
+11. Email 1 does NOT pitch the product. It makes an observation and asks a question. It MAY state the entry offer in one plain sentence when the writing voice or an offer brief asks for it.
 12. Subject lines: lowercase, 2-5 words, no prospect name, no "quick question".
 13. Each email has exactly ONE question or CTA. Not two. Not zero. One.
 14. Write like a real person, not a marketer. Read it out loud. If it sounds like AI wrote it, rewrite it.
-15. Do NOT name the product in email 1. Save that for email 2 or the reply.
-16. NEVER use "no pressure", "no obligation", "no contracts" in email 1.
+15. Do NOT name the product in email 1. Save that for email 2 or the reply. Describing what we build in plain words ("a line that picks up when you can't") is not naming it.
+16. NEVER use "no pressure", "no obligation", "no contracts" in email 1. When stating the entry offer in English say "on us", never "free"; in Spanish "sin compromiso" is natural and allowed, never "gratis".
 17. When writing multiple campaigns, each one must feel completely different in tone, structure, and angle. Not just different pain points in the same format.
 
 SPAM FILTER RULES — these words and patterns get emails junked. NEVER use:
