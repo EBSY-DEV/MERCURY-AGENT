@@ -13,6 +13,17 @@ AVATAR_SEEDS = [f"mercury-persona-{i:02d}" for i in range(1, 25)]
 JSON_INSTRUCTION = "\n\nRespond ONLY with valid JSON. No markdown, no explanation."
 
 
+class PersonaError(ValueError):
+    """A persona command that cannot proceed, with a stable code for every interface.
+
+    Codes: not_found, revision_conflict, invalid, ambiguous, provider_failed.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def avatar_url(seed: str) -> str:
     return f"/static/avatars/{seed}.svg"
 
@@ -106,7 +117,7 @@ class PersonaStore:
             cursor = await db.execute(sql, args)
             profile = self._profile(await cursor.fetchone())
             if profile is None:
-                raise ValueError("Persona version not found")
+                raise PersonaError("not_found", "Persona version not found")
             return profile
 
     async def for_generation(self, config, generation_id=""):
@@ -133,11 +144,11 @@ class PersonaStore:
                 )
                 old = await cursor.fetchone()
                 if old is None:
-                    raise ValueError("Persona not found")
+                    raise PersonaError("not_found", "Persona not found")
                 if old["archived"]:
-                    raise ValueError("Restore the persona before editing it")
+                    raise PersonaError("invalid", "Restore the persona before editing it")
                 if data.get("expected_revision") != old["revision"]:
-                    raise ValueError("This persona changed. Reload it before saving")
+                    raise PersonaError("revision_conflict", "This persona changed. Reload it before saving")
                 changed = any(data[key] != old[key] for key in ("tone", "instructions", "examples"))
                 revision = old["revision"] + int(changed)
                 await db.execute(
@@ -166,7 +177,7 @@ class PersonaStore:
             cursor = await db.execute("SELECT archived FROM personas WHERE id = ?", (persona_id,))
             row = await cursor.fetchone()
             if row is None or row[0]:
-                raise ValueError("Choose an active persona")
+                raise PersonaError("invalid", "Choose an active persona")
             await db.execute(
                 "UPDATE settings SET value = ?, updated_at = CURRENT_TIMESTAMP "
                 "WHERE key = 'default_persona_id'", (persona_id,),
@@ -179,13 +190,13 @@ class PersonaStore:
             cursor = await db.execute("SELECT value FROM settings WHERE key = 'default_persona_id'")
             row = await cursor.fetchone()
             if archived and row and row[0] == persona_id:
-                raise ValueError("Choose another default before archiving this persona")
+                raise PersonaError("invalid", "Choose another default before archiving this persona")
             cursor = await db.execute(
                 "UPDATE personas SET archived = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (int(archived), persona_id),
             )
             if not cursor.rowcount:
-                raise ValueError("Persona not found")
+                raise PersonaError("not_found", "Persona not found")
             await db.commit()
 
     async def versions(self, persona_id):
