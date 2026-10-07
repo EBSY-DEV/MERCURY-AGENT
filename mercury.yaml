@@ -81,6 +81,19 @@ compliance:
   postal_address: ""
   # opt_out_line_en / opt_out_line_es override the default opt-out sentences.
 
+# Offers a campaign can carry (its offer_key). An offer with requires_demo
+# promises something already built for that business, so none of its
+# sequence emails send until that prospect's demo is marked ready
+# (`mercury demos`, or the Outbox tab). Empty = no demo gate.
+offers: []
+#  - key: "voice"
+#    requires_demo: true
+#    demo_kind: "voice"       # voice | website
+demos:
+  # Retire a ready demo this many days after the last email to a prospect
+  # who never replied. The break-up email's "stays ready" must match it.
+  retire_after_days: 14
+
 usage:
   max_daily_claude_percent: 80
   heartbeat_interval_minutes: 15

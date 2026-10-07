@@ -315,6 +315,7 @@ mercury personas              # Writing voices: list / show / create / edit / de
 mercury personas mailboxes    # Each sending mailbox's voice and sign-off; change one with: personas assign EMAIL [PERSONA] --sign-name NAME
 mercury discover              # Find businesses; --providers / --estimate / --provider <key>
 mercury sending pause|resume  # Kill switch for all outbound
+mercury demos                 # Demo gate: who waits for a demo; ready / request / retire EMAIL_OR_ID
 ```
 
 ### Common Issues

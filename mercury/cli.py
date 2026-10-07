@@ -372,14 +372,27 @@ def cmd_outbox(args):
             print(f"\n  ⚠ SENDING PAUSED: {paused}")
             print("  Resume with: mercury sending resume")
 
+        from mercury.config import load_config
+        from mercury.demos import annotate_outbox, waiting_for_demo
+
+        try:
+            config = load_config()
+        except Exception:
+            config = None  # the demo gate fails closed without its config
         pending = await state.get_outbox(status="pending_review", limit=50)
         approved = await state.get_outbox(status="approved", limit=10)
+        await annotate_outbox(state, config, pending)
         print(f"\n  Outbox — {len(pending)} awaiting approval, "
               f"{len(approved)}+ approved/scheduled")
+        waiting = await waiting_for_demo(state, config)
+        if waiting:
+            print(f"  {len(waiting)} contact(s) waiting for a demo: mercury demos")
         print("  " + "=" * 60)
         for item in pending:
             print(f"\n  [{item['id']}] step {item['step']} ({item['kind']}) "
                   f"→ {item['to_email']}  (send {item['send_at'][:16]})")
+            if item.get("demo") and item["demo"]["held"]:
+                print(f"  Held: {item['demo']['reason']}")
             print(f"  Subject: {item['subject']}")
             body_preview = (item["body"][:200] + "...") if len(item["body"]) > 200 else item["body"]
             for line in body_preview.splitlines():
@@ -901,6 +914,80 @@ def cmd_imports(args):
         sys.exit(1)
 
 
+def cmd_demos(args):
+    """Per-prospect demos: who is waiting, mark one ready, retire one."""
+    import json
+
+    from mercury.config import load_config
+    from mercury.control.demos import DemoError, DemoService
+    from mercury.state import StateManager
+
+    def line(d):
+        who = d.get("email") or d["prospect_id"]
+        when = (d.get("ready_at") or d.get("created_at") or "").replace("T", " ")[:16]
+        artifact = d.get("demo_url") or d.get("recording_path") or d.get("agent_id") or ""
+        print(f"  {d['id']:<13} {d['status']:<10} {d['offer_key']:<10} {who:<34} {when:<17} {artifact}")
+
+    async def _run():
+        action = args.demos_action or "list"
+        try:
+            config = load_config()
+        except Exception:
+            if action != "list":
+                raise
+            config = None  # listing fails closed: every offer row shows held
+        service = await DemoService(StateManager(), config).ready()
+        if action != "list" and not args.target:
+            raise DemoError("invalid", f"Which demo? mercury demos {action} EMAIL_OR_ID")
+        if action == "list":
+            overview = await service.overview(include_retired=args.all)
+            if args.json:
+                return print(json.dumps(overview, indent=2, default=str))
+            waiting, demos = overview["waiting"], overview["demos"]
+            if not overview["offers"] and not demos and not waiting:
+                return print("\n  No offer needs a demo. Add one under offers: in mercury.yaml "
+                             "with requires_demo: true.\n")
+            print(f"\n  Waiting for a demo: {len(waiting)}")
+            for w in waiting:
+                print(f"    {w['to_email']:<34} {w['offer_key']:<10} step {w['step']}  "
+                      f"{w['status']:<15} {w['reason']}")
+            if waiting:
+                print("  Mark one ready: mercury demos ready EMAIL --url URL (or --recording PATH)")
+            print(f"\n  Demos: {len(demos)}" + ("" if args.all else " (retired hidden; --all shows them)"))
+            for d in demos:
+                line(d)
+            if overview["retire_after_days"]:
+                print(f"\n  Ready demos retire {overview['retire_after_days']} days after the last "
+                      "email to a contact who never replied.")
+            print()
+        elif action == "ready":
+            fields = {"demo_url": args.url, "recording_path": args.recording,
+                      "agent_id": args.agent_id, "built_by": args.by, "notes": args.notes}
+            demo = await service.mark_ready(args.target, args.offer,
+                                            **{k: v for k, v in fields.items() if v is not None})
+            if args.json:
+                return print(json.dumps(demo, indent=2, default=str))
+            print(f"\n  Demo {demo['id']} ({demo['offer_key']}) is ready. Its held emails go out "
+                  "on the next heartbeat, once approved.\n")
+        elif action == "request":
+            demo = await service.request(args.target, args.offer)
+            if args.json:
+                return print(json.dumps(demo, indent=2, default=str))
+            print(f"\n  Demo {demo['id']} ({demo['offer_key']}) is {demo['status']}.\n")
+        elif action == "retire":
+            demo = await service.retire(args.target, args.offer, args.reason)
+            if args.json:
+                return print(json.dumps(demo, indent=2, default=str))
+            print(f"\n  Demo {demo['id']} retired. Emails of its offer to this contact now wait "
+                  "for a new demo.\n")
+
+    try:
+        asyncio.run(_run())
+    except DemoError as error:
+        print(f"\n  {error}\n", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_sending(args):
     """Pause/resume the sending kill switch."""
     from mercury.state import StateManager
@@ -1133,6 +1220,23 @@ def main():
         p.add_argument("--contact", required=True, help="Contact id or email")
         p.add_argument("--version", type=int, default=None, help="Revision number (default: latest)")
         p.add_argument("--instruction", default="", help='One-off instruction, e.g. "shorter"')
+
+    sub = subparsers.add_parser(
+        "demos", help="Per-prospect demos: who is waiting, mark ready, retire")
+    sub.add_argument("demos_action", nargs="?", default="list",
+                     choices=["list", "ready", "request", "retire"])
+    sub.add_argument("target", nargs="?", default="",
+                     help="Demo id, contact id or email, or an outbox email id")
+    sub.add_argument("--offer", default="", help="Offer key, when the contact has several")
+    sub.add_argument("--url", default=None, help="ready: where the demo lives (https://...)")
+    sub.add_argument("--recording", default=None, help="ready: path to the call recording")
+    sub.add_argument("--agent-id", default=None, help="ready: the voice agent's id")
+    sub.add_argument("--by", default=None, help="ready: who built it")
+    sub.add_argument("--notes", default=None, help="ready: anything worth knowing")
+    sub.add_argument("--reason", default="", help="retire: why")
+    sub.add_argument("--all", action="store_true", help="list: include retired demos")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub.set_defaults(func=cmd_demos)
 
     sub = subparsers.add_parser("sending", help="Kill switch: pause/resume sending")
     sub.add_argument("sending_action", nargs="?", default="status",

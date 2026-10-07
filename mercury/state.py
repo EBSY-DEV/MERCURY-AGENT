@@ -520,12 +520,47 @@ MIGRATIONS: list[str] = [
     ALTER TABLE prospects ADD COLUMN import_row INTEGER DEFAULT 0;
     CREATE INDEX idx_prospects_import_batch ON prospects(import_batch_id);
     """,
+    # ── v14: offer attribution and the per-prospect demo gate ──
+    """
+    -- The offer an email was written for (offers[].key in mercury.yaml).
+    -- '' = written before offers existed: no offer, so no demo gate. An
+    -- outbox row inherits its campaign's key when it is queued.
+    ALTER TABLE campaigns ADD COLUMN offer_key TEXT DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN offer_key TEXT DEFAULT '';
+    -- A demo built for one prospect: the answering line or draft site an
+    -- offer's email says already exists. Sequence emails of an offer with
+    -- requires_demo wait until the prospect's demo is 'ready'.
+    --   requested -> ready -> retired
+    CREATE TABLE demos (
+        id TEXT PRIMARY KEY,
+        prospect_id TEXT NOT NULL,
+        offer_key TEXT NOT NULL,
+        kind TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'requested'
+            CHECK (status IN ('requested', 'ready', 'retired')),
+        demo_url TEXT DEFAULT '',
+        recording_path TEXT DEFAULT '',
+        agent_id TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        built_by TEXT DEFAULT '',
+        retire_reason TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ready_at TIMESTAMP,
+        retired_at TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    -- One live demo per prospect and offer; retired ones stay as history.
+    CREATE UNIQUE INDEX uq_demos_live ON demos(prospect_id, offer_key)
+        WHERE status != 'retired';
+    CREATE INDEX idx_demos_status ON demos(status);
+    CREATE INDEX idx_outbox_offer ON outbox(offer_key) WHERE offer_key != '';
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
 _CAMPAIGN_COLUMNS = frozenset({
     "name", "channel", "instantly_campaign_id",
-    "sequence_json", "prospect_ids_json", "status",
+    "sequence_json", "prospect_ids_json", "status", "offer_key",
 })
 _CONVERSATION_COLUMNS = frozenset({
     "prospect_id", "campaign_id", "channel",
@@ -985,22 +1020,27 @@ class StateManager:
         in_reply_to: str = "",
         mailbox: str = "",
         generation_id: str = "",
+        offer_key: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
-        (campaign, prospect, step) slot already exists — the double-send guard."""
+        (campaign, prospect, step) slot already exists — the double-send guard.
+        Without an ``offer_key`` the row takes its campaign's, so every path
+        that queues a sequence email carries the offer the demo gate reads."""
         item_id = _new_id()
         async with self._connect() as db:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO outbox
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
-                    thread_ref, in_reply_to, mailbox, generation_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    thread_ref, in_reply_to, mailbox, generation_id, offer_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           COALESCE(NULLIF(?, ''),
+                                    (SELECT offer_key FROM campaigns WHERE id = ?), ''))""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
                     status, send_at, provider, thread_ref, in_reply_to,
-                    _norm(mailbox), generation_id,
+                    _norm(mailbox), generation_id, _norm(offer_key), campaign_id,
                 ),
             )
             inserted = cursor.rowcount > 0
@@ -1292,6 +1332,165 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    # ── Demos: what an offer's email says was already built for them ──
+
+    DEMO_ARTIFACTS = ("demo_url", "recording_path", "agent_id", "notes", "built_by")
+    # The offer a sequence row belongs to: its own key, else its campaign's.
+    _OUTBOX_OFFER_SQL = "COALESCE(NULLIF(o.offer_key, ''), c.offer_key, '')"
+
+    async def request_demo(self, prospect_id: str, offer_key: str,
+                           kind: str = "") -> tuple[str, bool]:
+        """Register a demo as 'requested'. Returns (demo id, created); a live
+        demo for the same prospect and offer is returned as it is."""
+        offer_key = _norm(offer_key)
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO demos (id, prospect_id, offer_key, kind) "
+                "VALUES (?, ?, ?, ?)",
+                (_new_id(), prospect_id, offer_key, _norm(kind)),
+            )
+            await db.commit()
+            created = cursor.rowcount > 0
+        demo = await self.find_live_demo(prospect_id, offer_key)
+        return (demo["id"] if demo else ""), created
+
+    async def get_demo(self, demo_id: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM demos WHERE id = ?", (demo_id,)) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def find_live_demo(self, prospect_id: str, offer_key: str) -> dict | None:
+        """The requested or ready demo for this prospect and offer, if any."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM demos WHERE prospect_id = ? AND offer_key = ? "
+                "AND status != 'retired'",
+                (prospect_id, _norm(offer_key)),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def list_demos(self, status: str | None = None, prospect_id: str = "",
+                         limit: int = 200) -> list[dict]:
+        """Demo records, newest first, with the prospect's name and address."""
+        where, params = [], []
+        if status:
+            where.append("d.status = ?")
+            params.append(status)
+        if prospect_id:
+            where.append("d.prospect_id = ?")
+            params.append(prospect_id)
+        sql = ("SELECT d.*, COALESCE(p.email, '') AS email, COALESCE(p.first_name, '') AS first_name, "
+               "COALESCE(p.last_name, '') AS last_name, COALESCE(p.company, '') AS company "
+               "FROM demos d LEFT JOIN prospects p ON p.id = d.prospect_id")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY d.updated_at DESC, d.created_at DESC LIMIT ?"
+        params.append(int(limit))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def mark_demo_ready(self, demo_id: str, **artifacts) -> bool:
+        """requested -> ready, or update a ready demo's artifacts. Only the
+        artifact fields given (not None) change. A retired demo stays retired."""
+        fields = {k: str(v).strip() for k, v in artifacts.items()
+                  if k in self.DEMO_ARTIFACTS and v is not None}
+        sets = "".join(f", {k} = ?" for k in fields)
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE demos SET status = 'ready', ready_at = COALESCE(ready_at, ?), "
+                f"updated_at = ?{sets} WHERE id = ? AND status IN ('requested', 'ready')",
+                (now, now, *fields.values(), demo_id),
+            )
+            await db.commit()
+            return bool(cursor.rowcount)
+
+    async def retire_demo(self, demo_id: str, reason: str = "") -> bool:
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE demos SET status = 'retired', retired_at = ?, retire_reason = ?, "
+                "updated_at = ? WHERE id = ? AND status != 'retired'",
+                (now, reason, now, demo_id),
+            )
+            await db.commit()
+            return bool(cursor.rowcount)
+
+    async def outbox_offer_key(self, item: dict) -> str:
+        """The offer an outbox row was written for: its own key, else its
+        campaign's (a row queued before the campaign carried one)."""
+        own = _norm(item.get("offer_key"))
+        if own or not item.get("campaign_id"):
+            return own
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COALESCE(offer_key, '') FROM campaigns WHERE id = ?",
+                (item["campaign_id"],),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return _norm(row[0]) if row else ""
+
+    async def queued_offer_outbox(self, ids: list[str] | None = None) -> list[dict]:
+        """Queued sequence rows that carry an offer, each with its resolved
+        ``offer``, its prospect, and the live demo for that prospect and offer
+        (``demo_id`` / ``demo_status``, None when no demo is registered).
+        ``ids`` limits the scan to those outbox rows."""
+        offer = self._OUTBOX_OFFER_SQL
+        sql = (
+            f"SELECT o.*, {offer} AS offer, d.id AS demo_id, d.status AS demo_status, "
+            "d.kind AS demo_kind, COALESCE(p.first_name, '') AS first_name, "
+            "COALESCE(p.last_name, '') AS last_name, COALESCE(p.company, '') AS company "
+            "FROM outbox o "
+            "LEFT JOIN campaigns c ON c.id = o.campaign_id AND o.campaign_id != '' "
+            "LEFT JOIN prospects p ON p.id = o.prospect_id "
+            f"LEFT JOIN demos d ON d.prospect_id = o.prospect_id AND d.offer_key = {offer} "
+            "AND d.status != 'retired' "
+            "WHERE o.kind = 'sequence' AND o.status IN ('pending_review', 'approved') "
+            f"AND {offer} != ''"
+        )
+        params: list = []
+        if ids is not None:
+            ids = [i for i in ids if i]
+            if not ids:
+                return []
+            sql += f" AND o.id IN ({', '.join('?' for _ in ids)})"
+            params.extend(ids)
+        sql += " ORDER BY o.send_at ASC, o.created_at ASC LIMIT 2000"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def demos_due_for_retirement(self, days: int) -> list[dict]:
+        """Ready demos whose prospect never replied, with nothing queued for
+        them, and no email to them (nor the demo itself) newer than ``days``."""
+        cutoff = (_utcnow() - timedelta(days=max(0, int(days)))).strftime("%Y-%m-%d %H:%M:%S")
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT d.* FROM demos d
+                   LEFT JOIN prospects p ON p.id = d.prospect_id
+                   WHERE d.status = 'ready'
+                     AND COALESCE(p.status, '') NOT IN ('replied', 'meeting', 'closed')
+                     AND NOT EXISTS (
+                       SELECT 1 FROM outbox o WHERE o.prospect_id = d.prospect_id
+                         AND o.kind = 'sequence'
+                         AND o.status IN ('pending_review', 'approved', 'sending'))
+                     AND MAX(
+                       REPLACE(COALESCE((SELECT MAX(REPLACE(o.sent_at, 'T', ' ')) FROM outbox o
+                                         WHERE o.prospect_id = d.prospect_id AND o.status = 'sent'),
+                                        ''), 'T', ' '),
+                       REPLACE(COALESCE(d.ready_at, d.created_at), 'T', ' ')) < ?""",
+                (cutoff,),
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
 
     # ── Signal vocabulary (governed; user-confirmed before collection) ──
 
@@ -1771,13 +1970,14 @@ class StateManager:
             await db.execute(
                 """INSERT INTO campaigns
                    (id, name, channel, instantly_campaign_id, sequence_json,
-                    prospect_ids_json, status, created_at, mailbox)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    prospect_ids_json, status, created_at, mailbox, offer_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     campaign.id, campaign.name, campaign.channel,
                     campaign.instantly_campaign_id, campaign.sequence_json(),
                     json.dumps(campaign.prospect_ids), campaign.status,
                     campaign.created_at.isoformat(), campaign.mailbox,
+                    _norm(campaign.offer_key),
                 ),
             )
             await db.commit()

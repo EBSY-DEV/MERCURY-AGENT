@@ -39,6 +39,17 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Demo gate** (#62). An offer under `offers:` with `requires_demo: true`
+  holds every sequence email that carries its key until the prospect's demo
+  is marked ready, so an email never claims something was built before it
+  was. A `demos` table tracks each demo (requested, ready, retired) with its
+  link, recording, agent id and builder. `mercury demos` lists who is waiting
+  and marks demos ready or retired; the Outbox shows why an email waits with
+  a Mark ready drawer, and Today counts the contacts waiting. The gate fails
+  closed on an unknown offer or a failed check. Ready demos retire
+  `demos.retire_after_days` after the last email to a contact who never
+  replied. Campaigns and outbox rows gain an `offer_key` for the offer router
+  (#57) to fill.
 - **CSV contact import** (#3). Dashboard (Contacts → Import CSV), `mercury import`
   share one service. It has a read-only preview
   with per-row outcomes (new, needs enrichment, duplicate, invalid), column
