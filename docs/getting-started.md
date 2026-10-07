@@ -16,7 +16,7 @@ Optional: a DataForSEO or Serper account for paid discovery, LinkedIn credential
 ## 1. Install
 
 ```bash
-git clone <repo-url> mercury && cd mercury
+git clone https://github.com/EBSY-DEV/MERCURY-AGENT.git mercury-agent && cd mercury-agent
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
