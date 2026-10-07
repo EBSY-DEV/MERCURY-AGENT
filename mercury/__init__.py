@@ -16,4 +16,4 @@ if sys.version_info < (3, 11):  # pragma: no cover - version guard
         f"    source .venv/bin/activate && pip install -e ."
     )
 
-"""Mercury by EBSY: autonomous sales agent."""
+"""Mercury: an autonomous AI sales agent."""

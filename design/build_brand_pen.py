@@ -1,4 +1,4 @@
-"""Build design/mercury-brand.pen: the Mercury by EBSY tokens + UI kit.
+"""Build design/mercury-brand.pen: the Mercury tokens + UI kit.
 
 Source of truth is mercury/web/app.css. Re-run after changing tokens:
 
@@ -57,9 +57,7 @@ const build=(root)=>{
   Insert(mark,T({name:"M",content:"M",fontSize:26,fontWeight:"600",fill:"#FFFFFF"}));
   const wm=Insert(brand,{type:"frame",name:"Wordmark",layout:"vertical",gap:2});
   Insert(wm,T({name:"Name",content:"Mercury",fontSize:30,fontWeight:"600",letterSpacing:-0.8}));
-  const by=Insert(wm,{type:"frame",name:"By",gap:4});
-  Insert(by,T({name:"by",content:"by",fontSize:14,fontWeight:"500",fill:"$text-3"}));
-  Insert(by,T({name:"EBSY",content:"EBSY",fontSize:14,fontWeight:"600",fill:"$accent-deep"}));
+  Insert(wm,T({name:"Tagline",content:"Sales agent",fontSize:14,fontWeight:"500",fill:"$text-3"}));
   Insert(head,M({name:"Sheet label",content:"Brand + UI tokens",fontSize:12}));
 
   const sec=(title,sub)=>{const s=Insert(root,{type:"frame",name:title,layout:"vertical",gap:16,width:"fill_container"});
@@ -109,8 +107,8 @@ const build=(root)=>{
   const qa=Insert(qb,{type:"frame",name:"Action",padding:[7,14],cornerRadius:"$r-sm",fill:"$panel",stroke:"$border-strong",strokeWidth:1});
   Insert(qa,T({name:"Label",content:"Review",fontSize:12,fontWeight:"500"}));
 };
-lightId=sheet("Mercury by EBSY / Light","light",0);build(lightId);
-darkId=sheet("Mercury by EBSY / Dark","dark",1360);build(darkId);
+lightId=sheet("Mercury / Light","light",0);build(lightId);
+darkId=sheet("Mercury / Dark","dark",1360);build(darkId);
 
 const GRAD={type:"gradient",gradientType:"linear",rotation:220,colors:[{color:"#C7B6FF",position:0},{color:"#9C84F0",position:0.55},{color:"#7A5EDB",position:1}]};
 const BAR={type:"gradient",gradientType:"linear",rotation:270,colors:[{color:"#C7B6FF",position:0},{color:"$accent",position:1}]};
@@ -134,9 +132,7 @@ const screen=(name,theme,x,y)=>{
   Insert(mk,T({name:"M",content:"M",fontSize:15,fontWeight:"600",fill:"#FFFFFF"}));
   const wm=F(br,{name:"Wordmark",layout:"vertical",gap:1});
   Insert(wm,T({name:"Name",content:"Mercury",fontSize:15.5,fontWeight:"600",letterSpacing:-0.3}));
-  const by=F(wm,{name:"By",gap:3});
-  Insert(by,T({name:"by",content:"by",fontSize:11.5,fontWeight:"500",fill:"$text-3"}));
-  Insert(by,T({name:"EBSY",content:"EBSY",fontSize:11.5,fontWeight:"600",fill:"$accent-deep"}));
+  Insert(wm,T({name:"Tagline",content:"Sales agent",fontSize:11.5,fontWeight:"500",fill:"$text-3"}));
   const cta=F(sb,{name:"CTA",gap:8,width:W});
   const fb=F(cta,{name:"Find businesses",width:W,height:34,gap:6,justifyContent:"center",alignItems:"center",cornerRadius:"$r-sm",fill:"$accent",effect:SH});
   I(fb,"plus",14,"$accent-contrast");
@@ -166,6 +162,7 @@ const screen=(name,theme,x,y)=>{
   I(ag,"caret-right",14,"$text-3");
   F(ft,{name:"Gap",width:W,height:7});
   item(ft,"question","Help",0);item(ft,"circle-half","Appearance",0,"Auto");
+  Insert(ft,T({name:"Credit",content:"Built by EBSY",fontSize:11,fill:"$text-3"}));
 
   const sh=F(s,{name:"Content sheet",width:W,height:W,layout:"vertical",fill:"$panel",stroke:"$border",strokeWidth:1,cornerRadius:14,clip:true,effect:SH});
   const tb=F(sh,{name:"Topbar",width:W,height:56,padding:[0,18],gap:8,alignItems:"center",stroke:"$border",strokeWidth:{bottom:1}});

@@ -10,11 +10,11 @@ On top of that: ~60 days of outreach history (sends, replies, positive
 replies, bounces) so the Trends chart has 30/90-day shape, spread over three
 sending mailboxes through ``outbox.mailbox``:
 
-* jordan@getebsy.com — already warm (30/day), carries the older history and
+* jordan@northwind-outreach.com — already warm (30/day), carries the older history and
   owns pre-rotation rows; a 4% bounce rate this week puts it on *hold*.
-* alex@tryebsy.com  — warming since 16 days ago (week 3 of a 5 → 30 ramp),
+* alex@getnorthwind.com  — warming since 16 days ago (week 3 of a 5 → 30 ramp),
   with part of the checklist ticked and notes.
-* sam@tryebsy.com   — scheduled: its ramp starts in three days.
+* sam@trynorthwind.com   — scheduled: its ramp starts in three days.
 
 Which inboxes exist, their caps and start dates come from the mail config,
 not the database (see mercury/warmup.py). So next to the database the seed
@@ -281,9 +281,9 @@ async def seed(db_path: Path) -> dict:
 
 # ── The demo mail config (mailboxes come from config, not the DB) ──
 
-MB_WARM = "jordan@getebsy.com"      # warm, persona email -> owns pre-rotation rows
-MB_ALEX = "alex@tryebsy.com"        # warming
-MB_SAM = "sam@tryebsy.com"          # scheduled
+MB_WARM = "jordan@northwind-outreach.com"      # warm, persona email -> owns pre-rotation rows
+MB_ALEX = "alex@getnorthwind.com"        # warming
+MB_SAM = "sam@trynorthwind.com"          # scheduled
 ALEX_START_DAYS_AGO = 16            # day 17: week 3 of the ramp (15/day)
 SAM_START_IN_DAYS = 3
 DAILY_CAP = 30
@@ -298,7 +298,7 @@ def demo_config(template: Path) -> dict:
     """The tracked template with a demo persona and three SMTP mailboxes."""
     cfg = yaml.safe_load(template.read_text()) or {}
     cfg.setdefault("persona", {}).update({
-        "name": "Jordan Hale", "company": "EBSY", "email": MB_WARM,
+        "name": "Jordan Hale", "company": "Northwind Outreach", "email": MB_WARM,
     })
     email = cfg.setdefault("channels", {}).setdefault("email", {})
     email.update({
@@ -306,12 +306,12 @@ def demo_config(template: Path) -> dict:
         "auto_approve_followups": True,
         "warmup_initial_cap": INITIAL_CAP, "warmup_weekly_increase": WEEKLY_INCREASE,
         "mailboxes": [
-            {"email": MB_WARM, "name": "Jordan | EBSY", "password_env": DEMO_PASSWORD_ENV,
+            {"email": MB_WARM, "name": "Jordan | Northwind", "password_env": DEMO_PASSWORD_ENV,
              "smtp_host": "smtp.invalid", "daily_cap": DAILY_CAP},
-            {"email": MB_ALEX, "name": "Alex | EBSY", "password_env": DEMO_PASSWORD_ENV,
+            {"email": MB_ALEX, "name": "Alex | Northwind", "password_env": DEMO_PASSWORD_ENV,
              "smtp_host": "smtp.invalid", "daily_cap": DAILY_CAP,
              "warmup_start": ALEX_START.isoformat()},
-            {"email": MB_SAM, "name": "Sam | EBSY", "password_env": DEMO_PASSWORD_ENV,
+            {"email": MB_SAM, "name": "Sam | Northwind", "password_env": DEMO_PASSWORD_ENV,
              "smtp_host": "smtp.invalid", "daily_cap": DAILY_CAP,
              "warmup_start": (TODAY + timedelta(days=SAM_START_IN_DAYS)).isoformat()},
         ],

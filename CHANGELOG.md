@@ -9,7 +9,7 @@ minor versions can still change behaviour.
 
 ### Changed
 
-- **Harvey is now Mercury by EBSY.** The package (`mercury/`), CLI
+- **Harvey is now Mercury.** The package (`mercury/`), CLI
   (`mercury ...`), config (`mercury.yaml`, `mercury.local.yaml`) and database
   (`data/mercury.db`) are renamed. Existing checkouts migrate automatically:
   `harvey.local.yaml` and `data/harvey.db*` / `harvey.log` are renamed in place

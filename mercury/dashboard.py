@@ -464,7 +464,7 @@ async def start_mercury():
         log_handle = open(LOG_FILE, "a")
         try:
             _mercury_process = subprocess.Popen(
-                [sys.executable, "-m", "mercury"],
+                [sys.executable, "-m", "mercury", "run"],
                 cwd=str(PROJECT_ROOT),
                 stdout=log_handle,
                 stderr=log_handle,

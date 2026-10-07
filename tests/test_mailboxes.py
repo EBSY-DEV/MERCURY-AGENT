@@ -44,7 +44,7 @@ def make_config(**email_overrides):
     )
     email.update(email_overrides)
     return SimpleNamespace(
-        persona=SimpleNamespace(name="Carlos", email="carlos@main.co", company="EBSY",
+        persona=SimpleNamespace(name="Carlos", email="carlos@main.co", company="Northwind Outreach",
                                 role="BD", tone="direct"),
         channels=SimpleNamespace(email=SimpleNamespace(**email),
                                  linkedin=SimpleNamespace(enabled=False)),
@@ -108,7 +108,7 @@ def test_planned_capacity_is_the_smaller_of_global_and_mailbox_caps():
 
 
 def test_mailbox_config_normalises_and_rejects_duplicates():
-    assert MailboxConfig(email=" Mercury@EbsyHQ.com ").email == "mercury@ebsyhq.com"
+    assert MailboxConfig(email=" Mercury@NorthwindHQ.example ").email == "mercury@northwindhq.example"
     with pytest.raises(ValueError):
         MailboxConfig(email="not-an-address")
     with pytest.raises(ValueError):
@@ -126,13 +126,13 @@ def test_env_secret_reads_mailbox_vars_and_known_fields():
 def test_smtp_provider_sends_as_its_mailbox():
     env = EnvConfig(smtp_host="mail.example.com", smtp_port=465, smtp_username="old@main.co",
                     smtp_password="legacy", mailbox_secrets={"MAILBOX_PASSWORD": "pw"})
-    mb = MailboxConfig(email="mercury@ebsyhq.com", name="Carlos | EBSY",
+    mb = MailboxConfig(email="mercury@northwindhq.example", name="Carlos | Northwind",
                        password_env="MAILBOX_PASSWORD")
     p = SmtpImapProvider(make_config(), env, mailbox=mb)
     assert (p.smtp_user, p.smtp_pass, p.imap_user, p.imap_pass) == (
-        "mercury@ebsyhq.com", "pw", "mercury@ebsyhq.com", "pw")
+        "mercury@northwindhq.example", "pw", "mercury@northwindhq.example", "pw")
     assert p.smtp_host == "mail.example.com" and p.smtp_port == 465
-    assert p.sender_address == "mercury@ebsyhq.com"
+    assert p.sender_address == "mercury@northwindhq.example"
     assert "pw" not in repr(p)
     missing = SmtpImapProvider(make_config(), env, mailbox=MailboxConfig(
         email="x@y.co", password_env="MAILBOX_NOPE"))
@@ -143,13 +143,13 @@ def test_pool_from_config_keeps_disabled_mailboxes_for_their_threads():
     env = EnvConfig(smtp_host="h", smtp_username="old@main.co", smtp_password="p",
                     mailbox_secrets={"MAILBOX_PASSWORD": "pw"})
     cfg = make_config(mailboxes=[
-        MailboxConfig(email="new@ebsyhq.com", password_env="MAILBOX_PASSWORD"),
+        MailboxConfig(email="new@northwindhq.example", password_env="MAILBOX_PASSWORD"),
         MailboxConfig(email="old@main.co"),
         MailboxConfig(email="off@x.co", enabled=False, password_env="MAILBOX_PASSWORD"),
     ])
     cfg.persona.email = "nobody@else.co"
     pool = MailboxPool.from_config(cfg, env)
-    assert [mb.email for mb in pool.mailboxes] == ["new@ebsyhq.com", "old@main.co", "off@x.co"]
+    assert [mb.email for mb in pool.mailboxes] == ["new@northwindhq.example", "old@main.co", "off@x.co"]
     assert [mb.accepts_new for mb in pool.mailboxes] == [True, True, False]
     assert pool.legacy.email == "old@main.co"          # SMTP login, persona not listed
     assert pool.resolve("") is pool.legacy
