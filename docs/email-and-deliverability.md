@@ -207,17 +207,35 @@ Conversations move through stages `initial_outreach`, `engaged`, `qualifying`, `
 
 When a bounce arrives, Mercury matches it to the sent email (via In-Reply-To, the DSN's original Message-ID, the failed recipient, or an address in the bounce text), then:
 
-- marks the address `invalid`,
-- cancels every queued email for that prospect,
-- logs a `bounce` event attributed to the sending mailbox (which feeds the [health gates](#health-gates)),
-- increments the global bounce counter.
+- reads the enhanced status code (RFC 3463, for example `5.1.1`) from the bounce's `Status:` field or text, and sorts the bounce into a bucket,
+- logs a `bounce` event with `dsn_code` and `bucket`, attributed to the sending mailbox (which feeds the [health gates](#health-gates)),
+- increments the global bounce counters,
+- then acts on the bucket:
 
-**Global kill switch.** Once at least 10 emails have been sent, if bounces counted since the last resume exceed `max_bounce_rate` (default 5%) of all emails sent, Mercury pauses all sending. Nothing leaves the outbox until you resume. Set `max_bounce_rate: 0` to disable it (not recommended).
+| Bucket | Codes | What Mercury does |
+|---|---|---|
+| `LIST` | 5.1.1, 5.1.10, 5.1.0, 5.2.1, 5.4.1, 5.5.0 | A bad address. Marks it `invalid` and cancels the prospect's queued emails. No reputation action. |
+| `SENDER` | 5.7.1, 5.7.0, 5.7.23, 5.7.26, 5.7.509, 5.7.520, and any other 5.7.x | Authentication or policy. Pauses that mailbox (the pause reason points at the DNS checks on the Mailboxes tab). The prospect is left alone. |
+| `BURNED` | 5.7.606 to 5.7.614 | The domain is blocked on reputation. Pauses every mailbox on the domain and marks it `CANCEL_CANDIDATE` on the Mailboxes tab. Resuming a mailbox clears the flag. |
+| `THROTTLE` | any 4.x.x | The server asked us to slow down. Halves that mailbox's daily cap for 7 days. |
+| `NOISE` | 5.2.2, 5.3.4, 5.7.133 | Mailbox full, message too big, group that rejects outsiders. Logged, ignored by every rate and the address is kept. |
+| `UNKNOWN` | no code, or a code not above | Treated as a bad address (the pre-classification behaviour) and counted in the total rate. |
+
+If a `SENDER` or `BURNED` bounce cannot be pinned to a mailbox Mercury knows, or the pause cannot be saved, Mercury trips the global kill switch instead. A bounce it cannot process at all also trips it.
+
+The Mailboxes tab shows the bucket breakdown for each inbox over its health window.
+
+**Global kill switch.** Mercury pauses all sending, and nothing leaves the outbox until you resume, when either:
+
+- `SENDER` plus `BURNED` bounces are more than 20% of the classified bounces (`LIST`, `SENDER`, `BURNED` and `THROTTLE`), once at least 30 are classified. `LIST` bounces alone never trip this.
+- Bounces counted since the last resume (not `NOISE`) exceed `max_bounce_rate` (default 2%) of all emails sent, once at least 50 have been sent.
+
+Set `max_bounce_rate: 0` to disable the rate check (not recommended); the sender/burned share check stays on.
 
 ```bash
 mercury sending            # status
 mercury sending pause      # manual stop
-mercury sending resume     # resume and reset the bounce counter
+mercury sending resume     # resume and reset the bounce counters
 ```
 
 The Outbox tab has the same Pause/Resume button, and Today shows "Sending is paused" at the top of Needs you. Fix the cause (usually unverified addresses) before resuming.
@@ -239,7 +257,32 @@ The company comes from `persona.company`, the address from `compliance.postal_ad
 
 While `compliance.postal_address` is empty, the native sender sends nothing and logs a compliance hold on every cycle.
 
-Opting out is by reply. Opted-out prospects are never emailed again. For regional rules beyond this, see the [FAQ](faq.md#is-this-legal-can-spam-gdpr).
+Opting out is by reply. An opt-out is recorded as an exclusion on the address itself (see below), so deleting the contact, importing it again or rediscovering it never makes it emailable. For regional rules beyond this, see the [FAQ](faq.md#is-this-legal-can-spam-gdpr).
+
+## Exclusions and company limits
+
+**Exclusions** stop every Mercury email, replies included, to an exact address or a domain. A domain rule matches that domain only; tick *include subdomains* (`--subdomains`) to also match `eu.acme.com` and the like. Each rule records its source:
+
+| Source | Added by | Lifting it |
+|---|---|---|
+| `opt_out` | The reply handler, when someone asks to stop | Needs an explicit confirmation and a note. Never lifted by an import or by removing another rule. |
+| `bounce` | The bounce handler | Any time, with a note. |
+| `manual` | You, in the dashboard (**Exclusions**) or `mercury exclusions add` | Any time. |
+| `import` | A CSV of exclusions | Any time. An import only ever adds rules. |
+
+Rules for the same address from different sources are separate, so removing a manual rule leaves an opt-out in place. Rules are never deleted: lifting one stamps who did it and why, and every change is kept in an append-only history.
+
+Exclusions are checked when contacts are imported, when a campaign is staged, and again inside the same database transaction that claims an email for sending. Email already queued when a rule is added (approved or not) is moved to **blocked** at once. Lifting the rule does not send it: send it back to review from the Exclusions or Outbox tab and approve it again.
+
+**Company limits** count against a *known company*: the contact's `company_id`, or the company whose domain is the contact's email domain. Shared providers such as gmail.com or outlook.com never make two people colleagues, and a contact with no known company shows "Company unknown" and gets no company limit.
+
+- `max_new_contacts_per_company_per_day` caps first emails per company in a rolling 24 hours.
+- `max_active_contacts_per_company` caps unfinished cold sequences per company (first email sent, later steps still queued, paused or blocked).
+- `pause_company_on_reply` holds cold mail to the rest of a company once one person writes back. Replies to the people who wrote keep going. Resume it on the Exclusions tab or with `mercury holds release`. You can also pause a company yourself from its contact list.
+
+Limits are enforced when an email is claimed for sending. A claimed first email counts until the provider answers, so two sender processes cannot both take the last slot. A send that fails frees its slot, and a person contacted twice in a day counts once. Held email keeps its status: when the hold lifts or a slot frees up, approved email goes out and drafts still wait for review. The Outbox shows why each held email is waiting.
+
+The legacy Instantly provider sends sequences itself, so Mercury applies exclusions only when it adds leads and cannot enforce company limits or reply holds there.
 
 ## DNS: SPF, DKIM, DMARC, MX
 
