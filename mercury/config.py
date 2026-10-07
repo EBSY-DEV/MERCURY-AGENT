@@ -151,8 +151,11 @@ class EmailChannelConfig(BaseModel):
     # Set false for full autopilot once you trust the output.
     require_approval: bool = True
     # Kill switch: pause all sending when bounces exceed this fraction of
-    # sent mail (measured over the trailing sends). 0 disables the switch.
-    max_bounce_rate: float = 0.05
+    # sent mail (checked once 50 emails have gone out; NOISE bounces such as
+    # "mailbox full" do not count). 0 disables this rate check. Sender and
+    # reputation blocks (5.7.x) have their own trigger, see mercury/bounces.py.
+    # 2% is where Gmail reputation damage starts; 5% was already past it.
+    max_bounce_rate: float = 0.02
     # SMTP only: rotate sends across these mailboxes. Empty keeps the single
     # SMTP_USERNAME mailbox from .env. max_daily_sends still caps the total.
     mailboxes: list[MailboxConfig] = []

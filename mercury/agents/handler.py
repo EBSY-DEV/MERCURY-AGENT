@@ -1,16 +1,18 @@
 """Handler — monitors replies and manages conversations.
 
 Works against Instantly (legacy) or a native mail provider (Gmail/SMTP).
-The native path also owns bounce handling: a bounce marks the address
-invalid, cancels the prospect's queued sends, and — past a bounce-rate
-threshold — flips the global kill switch so a bad list can't torch the
-sending domain while nobody's watching.
+The native path also owns bounce handling (see mercury/bounces.py): each
+bounce is bucketed by its DSN status code. A dead address is marked invalid
+and its queued sends cancelled; a sender or reputation block pauses the
+mailbox or domain; and past the kill-switch thresholds the global switch
+flips, so a bad list can't torch the sending domain while nobody's watching.
 """
 
 import logging
 import re
 from datetime import datetime, timezone
 
+from mercury import bounces as bounce_policy
 from mercury.brain import Brain
 from mercury.config import MercuryConfig, EnvConfig
 from mercury.integrations.instantly import InstantlyClient
@@ -28,8 +30,10 @@ logger = logging.getLogger("mercury.handler")
 
 KILL_SWITCH_KEY = "sending_paused"
 BOUNCE_COUNT_KEY = "bounce_count"
-# Kill switch only engages after this many sends (a tiny sample lies).
-MIN_SENDS_FOR_KILL_SWITCH = 10
+# The bounce-rate kill switch only engages after this many sends (a tiny
+# sample lies). SENDER/BURNED bounces do not wait for it.
+MIN_SENDS_FOR_KILL_SWITCH = bounce_policy.MIN_SENDS_FOR_RATE
+DEFAULT_MAX_BOUNCE_RATE = 0.02
 
 INTENT_LABELS = {
     "interested",
@@ -483,6 +487,7 @@ class Handler:
             dedup_key = msg.provider_id or msg.message_id
             if not dedup_key or await self.state.is_reply_processed(dedup_key):
                 continue
+            keep_for_retry = False
             try:
                 if msg.is_bounce:
                     await self._handle_bounce(msg)
@@ -505,8 +510,19 @@ class Handler:
                 handled += 1
             except Exception as e:
                 logger.error(f"Handler: error processing {msg.from_email}: {e}")
+                if msg.is_bounce:
+                    # A bounce we could not account for is a reputation signal
+                    # we never saw. Stop sending until someone looks; if even
+                    # that cannot be saved, leave the bounce unread so the next
+                    # heartbeat tries again instead of dropping it.
+                    keep_for_retry = not await bounce_policy.engage_kill_switch(
+                        self.state,
+                        f"a bounce could not be processed ({e}) — review the "
+                        "log before resuming",
+                    )
             finally:
-                await self.state.mark_reply_processed(dedup_key)
+                if not keep_for_retry:
+                    await self.state.mark_reply_processed(dedup_key)
 
         if handled:
             logger.info(f"Handler: processed {handled} inbound message(s).")
@@ -542,22 +558,9 @@ class Handler:
                 if prospect is not None:
                     break
 
-        if prospect:
-            await self.state.update_prospect_email(
-                prospect.id, prospect.email, "invalid"
-            )
-            cancelled = await self.state.cancel_pending_outbox_for_prospect(
-                prospect.id, reason="bounced"
-            )
-            logger.warning(
-                f"Handler: BOUNCE for {prospect.email} — marked invalid, "
-                f"cancelled {cancelled} queued email(s)."
-            )
-        else:
-            logger.warning(
-                f"Handler: bounce received ({msg.subject[:60]}) but couldn't "
-                "match it to a sent email."
-            )
+        # What the bounce says (RFC 3463 code) decides what it costs: a dead
+        # address is one prospect, a blocked sender is the mailbox or domain.
+        dsn_code, bucket = bounce_policy.classify_bounce(headers, msg.body or "")
 
         # Attribute the bounce to the mailbox that sent the email, so the
         # warm-up health gate can pause just that inbox. The DSN normally
@@ -567,30 +570,67 @@ class Handler:
             bounced_from = outbox_item.get("mailbox") or ""
         if not bounced_from:
             bounced_from = getattr(msg, "mailbox", "") or ""
+        bounced_from = bounced_from.strip().lower()
 
+        # Count and log first, the address second: whatever happens to the
+        # prospect, the reputation signal must not be lost.
         bounces = await self.state.increment_setting(BOUNCE_COUNT_KEY)
+        await bounce_policy.record_bucket(self.state, bucket)
         total_sent = await self.state.count_outbox_sent()
         await self.state.log_action(
             action_type="bounce",
             agent="handler",
             details={"prospect": prospect.email if prospect else "unknown",
                      "prospect_id": prospect.id if prospect else "",
-                     "mailbox": bounced_from.strip().lower(),
+                     "mailbox": bounced_from,
+                     "dsn_code": dsn_code, "bucket": bucket,
                      "bounces": bounces, "total_sent": total_sent},
         )
 
-        max_rate = getattr(self.config.channels.email, "max_bounce_rate", 0.05)
-        if (
-            max_rate > 0
-            and total_sent >= MIN_SENDS_FOR_KILL_SWITCH
-            and bounces / total_sent > max_rate
-        ):
-            reason = (
-                f"bounce rate {bounces}/{total_sent} exceeded "
-                f"{max_rate:.0%} — check list quality before resuming"
+        note = await bounce_policy.apply_bucket(
+            self.state, self._pool(), bucket=bucket, code=dsn_code, mailbox=bounced_from)
+        logger.warning(
+            f"Handler: bounce {dsn_code or 'with no status code'} → {bucket}"
+            + (f" ({note})" if note else "") + "."
+        )
+
+        address_error = None
+        if prospect and bucket in bounce_policy.ADDRESS_BUCKETS:
+            try:
+                await self.state.update_prospect_email(
+                    prospect.id, prospect.email, "invalid"
+                )
+                cancelled = await self.state.cancel_pending_outbox_for_prospect(
+                    prospect.id, reason="bounced"
+                )
+                logger.warning(
+                    f"Handler: BOUNCE for {prospect.email} — marked invalid, "
+                    f"cancelled {cancelled} queued email(s)."
+                )
+            except Exception as e:
+                # Still run the kill-switch check below, then fail the bounce:
+                # a dead address left sendable is not something to log and move on from.
+                address_error = e
+                logger.error(f"Handler: could not mark {prospect.email} invalid: {e}")
+        elif prospect:
+            logger.warning(
+                f"Handler: {bucket} bounce for {prospect.email} — the address is "
+                "not the problem, so it stays as it is."
             )
-            await self.state.set_setting(KILL_SWITCH_KEY, reason)
-            logger.error(f"Handler: KILL SWITCH ENGAGED — {reason}")
+        else:
+            logger.warning(
+                f"Handler: bounce received ({msg.subject[:60]}) but couldn't "
+                "match it to a sent email."
+            )
+
+        max_rate = getattr(self.config.channels.email, "max_bounce_rate",
+                           DEFAULT_MAX_BOUNCE_RATE)
+        reason = bounce_policy.kill_switch_reason(
+            await bounce_policy.load_counts(self.state), bounces, total_sent, max_rate)
+        if reason:
+            await bounce_policy.engage_kill_switch(self.state, reason)
+        if address_error is not None:
+            raise address_error
 
     async def _queue_native_reply(
         self, response: str, prospect, convo, reply_meta: dict, intent: str

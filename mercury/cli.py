@@ -913,8 +913,9 @@ def cmd_sending(args):
             print("\n  Sending paused. Nothing will leave the outbox.\n")
         elif args.sending_action == "resume":
             await state.set_setting("sending_paused", "")
-            await state.set_setting("bounce_count", "0")
-            print("\n  Sending resumed (bounce counter reset).\n")
+            from mercury.bounces import reset_counters
+            await reset_counters(state)
+            print("\n  Sending resumed (bounce counters reset).\n")
         else:
             paused = await state.get_setting("sending_paused")
             print(f"\n  Sending: {'PAUSED — ' + paused if paused else 'active'}\n")
