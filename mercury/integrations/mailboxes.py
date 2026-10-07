@@ -138,6 +138,9 @@ class MailboxPool:
         self.single_inbox = False
         # email -> "paused" | "hold", filled by warmup.apply_health().
         self.gates: dict[str, str] = {}
+        # email -> multiplier on the cap (0.5 for 7 days after a 4.x.x
+        # throttling bounce), filled by warmup.apply_health().
+        self.cap_factors: dict[str, float] = {}
 
     # ── construction ──
 
@@ -246,6 +249,11 @@ class MailboxPool:
             if mb.warmup_start is not None and prev < mb.warmup_start:
                 prev = mb.warmup_start
             cap = min(cap, self.base_cap_on(mb, prev))
+        factor = self.cap_factors.get(mb.email)
+        if factor is not None and cap > 0:
+            # Halved, never to zero: a throttled inbox slows down, it does
+            # not stop (a pause is a different bucket).
+            cap = max(1, int(cap * factor))
         return cap
 
     def used(self, mb: Mailbox, sent_by_mailbox: dict[str, int]) -> int:
