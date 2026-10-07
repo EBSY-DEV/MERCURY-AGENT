@@ -1,5 +1,7 @@
 import io
 
+import pytest
+
 from mercury import banner
 
 
@@ -69,7 +71,29 @@ def test_terminal_gets_colour_unless_no_color_is_set(monkeypatch):
     assert "Mercury Agent" in plain.getvalue() and "\x1b" not in plain.getvalue()
 
 
-def test_non_utf8_terminal_falls_back_to_the_dot():
+@pytest.mark.parametrize("encoding", ["ascii", "cp1252", "utf-8"])
+def test_banner_can_be_written_to_the_actual_terminal_encoding(encoding, monkeypatch):
+    class EncodedTty(io.TextIOWrapper):
+        def isatty(self):
+            return True
+
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(banner, "_version", lambda: "1.2.3")
+    monkeypatch.setattr(banner, "_folder", lambda: "~/José/水星")
+    buffer = io.BytesIO()
+    tty = EncodedTty(buffer, encoding=encoding)
+    banner.print_banner(tty)
+    tty.flush()
+    output = buffer.getvalue().decode(encoding)
+    assert "Mercury Agent" in output and "v1.2.3" in output
+    if encoding != "utf-8":
+        assert ".  Mercury Agent" in output and "Outreach agent - v1.2.3" in output
+
+
+def test_narrow_utf8_terminal_keeps_the_plain_dot(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "30")
     tty = _Tty()
-    tty.encoding = "ascii"
     assert not banner._can_draw(tty)
+    monkeypatch.setenv("NO_COLOR", "1")
+    banner.print_banner(tty)
+    assert "●  Mercury Agent" in tty.getvalue()
