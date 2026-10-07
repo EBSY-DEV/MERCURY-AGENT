@@ -300,21 +300,51 @@
 
 <!-- Voice & Personas -->
 <div id="personas" class="section">
-  <div class="section-head split">
-    <div><h2>Voice &amp; Personas</h2><p>Give your outreach a voice. See the instructions behind it, and keep its history with every email.</p></div>
-    <button class="btn btn-primary" onclick="newPersona()"><i data-ph="plus"></i>New persona</button>
+  <div class="section-head">
+    <h2>Voice &amp; Personas</h2>
+    <p>How Mercury sounds in every email. Edit a persona, see the exact prompt, and keep its history with every draft.</p>
   </div>
-  <div class="voice-nav" aria-label="Voice views">
-    <button class="active" data-voice-view="profiles" onclick="voiceView('profiles')">Personas</button>
-    <button data-voice-view="prompt" onclick="voiceView('prompt')">Prompt &amp; preview</button>
-    <button data-voice-view="config" onclick="voiceView('config')">Current configuration</button>
+  <div class="toolbar voice-toolbar">
+    <div class="segmented" aria-label="Voice views">
+      <button class="on" data-voice-view="profiles" onclick="voiceView('profiles')"><i data-ph="users-three"></i>Personas</button>
+      <button data-voice-view="versions" onclick="voiceView('versions')"><i data-ph="clock-counter-clockwise"></i>Versions</button>
+      <button data-voice-view="prompt" onclick="voiceView('prompt')"><i data-ph="eye"></i>Prompt preview</button>
+      <button data-voice-view="config" onclick="voiceView('config')"><i data-ph="sliders-horizontal"></i>Generation</button>
+    </div>
+    <span class="voice-spacer"></span>
+    <div class="voice-actions" id="voice-actions">
+      <button class="btn btn-secondary" onclick="newPersona(true)"><i data-ph="copy"></i>Duplicate</button>
+      <button class="btn btn-primary" onclick="newPersona()"><i data-ph="plus"></i>New persona</button>
+    </div>
   </div>
-  <div id="voice-loading" role="status">Loading your writing profiles…</div>
-  <div id="voice-profiles" class="voice-view" hidden>
-    <div class="voice-layout"><div id="persona-list"></div><div id="persona-editor"></div></div>
+  <div id="voice-loading" role="status">Loading your writing personas…</div>
+  <div class="voice-layout" id="voice-layout" hidden>
+    <section class="panel persona-list" id="persona-list" aria-label="Personas"></section>
+    <div class="voice-main">
+      <div id="voice-profiles" class="voice-view voice-profiles"><div id="persona-editor"></div><aside id="persona-rail"></aside></div>
+      <div id="voice-versions" class="voice-view" hidden></div>
+    </div>
   </div>
   <div id="voice-prompt" class="voice-view" hidden></div>
   <div id="voice-config" class="voice-view" hidden></div>
+</div>
+
+<div class="modal-wrap" id="avatar-modal" aria-hidden="true">
+  <div class="modal-scrim" onclick="closeAvatarPicker(false)"></div>
+  <div class="modal avatar-modal" role="dialog" aria-modal="true" aria-labelledby="avatar-modal-title">
+    <div class="avatar-modal-head">
+      <div><h3 id="avatar-modal-title">Choose an avatar</h3>
+        <p>It shows next to this voice on drafts and in the Outbox. Changing it does not create a new version.</p></div>
+      <button class="btn-square ghost" onclick="closeAvatarPicker(false)" aria-label="Close"><i data-ph="x"></i></button>
+    </div>
+    <div class="avatar-picker" id="avatar-picker"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-sm" onclick="shuffleAvatarChoice()"><i data-ph="shuffle"></i>Shuffle</button>
+      <span class="voice-spacer"></span>
+      <button class="btn btn-secondary btn-sm" onclick="closeAvatarPicker(false)">Cancel</button>
+      <button class="btn btn-primary btn-sm" onclick="closeAvatarPicker(true)">Use this avatar</button>
+    </div>
+  </div>
 </div>
 
 <!-- Campaigns -->

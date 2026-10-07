@@ -233,3 +233,44 @@ def test_unknown_legacy_email_and_late_regeneration_are_safe(client):
     with pytest.raises(ValueError, match="no longer"):
         run(PersonaStore(client.state).replace_draft(item_id, {"subject":"new", "body":"new draft"}))
     assert run(client.state.get_outbox_item(item_id))["subject"] == "old"
+
+
+def test_prompt_sections_join_into_the_exact_prompt(client, monkeypatch):
+    model = fake_model(monkeypatch)
+    pid = contact(client)
+    persona = profile(client, create(client))
+    data = client.post("/api/personas/prompt", json={"prospect_id": pid, "version_id": persona["version_id"]}).json()
+    assert [s["key"] for s in data["sections"]] == ["template", "knowledge", "persona", "email", "format"]
+    assert "".join(s["text"] for s in data["sections"]) == data["prompt"]
+    preview = client.post("/api/personas/preview", json={"prospect_id": pid, "version_id": persona["version_id"]}).json()
+    assert preview["prompt"] == data["prompt"]
+    model.assert_awaited_once()
+
+
+def test_unsaved_edits_preview_without_a_new_version(client, monkeypatch):
+    fake_model(monkeypatch)
+    pid = contact(client)
+    persona = profile(client, create(client))
+    body = {"prospect_id": pid, "version_id": persona["version_id"],
+            "draft": {"tone": "brisk and plain", "instructions": "Never mention price", "examples": ""}}
+    data = client.post("/api/personas/prompt", json=body).json()
+    assert "brisk and plain" in data["prompt"] and "Never mention price" in data["prompt"]
+    assert "Use short sentences" not in data["prompt"] and data["persona"]["unsaved"]
+    assert client.post("/api/personas/preview", json=body).status_code == 200
+    assert profile(client, persona["id"])["revision"] == 1
+    assert client.post("/api/personas/prompt", json=body | {"draft": {"tone": ""}}).status_code == 422
+
+
+def test_version_stats_count_outbox_emails_and_replies(client, monkeypatch):
+    fake_model(monkeypatch)
+    persona_id = create(client)
+    first = profile(client, persona_id)
+    replied, silent = contact(client), run(client.state.add_prospect(Prospect(first_name="Sam", email="sam@x.example")))
+    for pid, status in ((replied, "sent"), (silent, "sent")):
+        draft = client.post("/api/personas/preview", json={"prospect_id": pid, "version_id": first["version_id"]}).json()
+        queue(client, draft, pid, status=status, campaign_id=pid)
+    run(client.state.update_prospect_status(replied, "replied"))
+    client.post(f"/api/personas/{persona_id}/save", json=update_body(first, tone="formal"))
+    versions = client.get(f"/api/personas/{persona_id}/versions").json()["versions"]
+    assert [(v["revision"], v["drafted"], v["sent"], v["replies"]) for v in versions] == [(2, 0, 0, 0), (1, 2, 2, 1)]
+    assert client.get("/api/personas").json()["totals"][persona_id] == {"drafted": 2, "sent": 2, "replies": 1}
