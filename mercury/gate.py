@@ -78,8 +78,11 @@ def pre_send_check(
         reasons.append("empty subject")
     if not body:
         reasons.append("empty body")
-    if len(subject) > MAX_SUBJECT_LEN:
-        reasons.append(f"subject too long ({len(subject)} > {MAX_SUBJECT_LEN})")
+    # A threaded follow-up's "Re: " is added by us, not written, so it
+    # doesn't count against the limit its opener already passed.
+    own_subject = re.sub(r"^re:\s*", "", subject, flags=re.IGNORECASE)
+    if len(own_subject) > MAX_SUBJECT_LEN:
+        reasons.append(f"subject too long ({len(own_subject)} > {MAX_SUBJECT_LEN})")
     word_count = len(body.split())
     if word_count > MAX_BODY_WORDS:
         reasons.append(f"body too long ({word_count} words > {MAX_BODY_WORDS})")

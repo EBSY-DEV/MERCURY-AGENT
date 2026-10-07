@@ -433,3 +433,11 @@ def test_settings_toggle_keeps_comments(client):  # noqa: F811
                        json={"thread_followups": False}).json()["success"]
     text = client.local_path.read_text()
     assert "# top comment" in text and "# keep me" in text
+
+
+def test_gate_does_not_count_the_reply_prefix_against_the_subject_limit():
+    from mercury.gate import MAX_SUBJECT_LEN, pre_send_check
+
+    opener = "x" * MAX_SUBJECT_LEN
+    assert pre_send_check("a@example.com", reply_subject(opener), "Hi there.")
+    assert not pre_send_check("a@example.com", "Re: " + opener + "x", "Hi there.")
