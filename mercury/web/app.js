@@ -202,7 +202,7 @@ function toggleSidebar(open) {
 
 function loadCurrentTab() {
   switch (currentTab) {
-    case 'today': loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); loadTrend(); loadHeatmap(); break;
+    case 'today': loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); loadTrend(); loadHeatmap(); loadHealth(); break;
     case 'help': break;
     case 'mailboxes': loadMailboxes(); break;
     case 'signals': loadSignals(); break;
@@ -3571,6 +3571,103 @@ function renderTrend() {
     : 'Nothing sent in the last ' + (d.days || n) + ' days';
 }
 
+// ── Deliverability health: a verdict per sending domain ──
+//
+// /api/health (mercury/deliverability.py): per domain, outreach sends,
+// replies and bounces over 7, 14 and 30 days, how long it has been sending,
+// and a verdict on a ladder that never says "keep" without 200 sends of
+// evidence. The last placement test (mercury/placement.py) sits under it.
+
+let _health = { data: null, key: '', seq: 0 };
+
+const PLACEMENT_TONE = {
+  primary: 'good', inbox: 'good', promotions: 'waiting', other_tab: 'waiting',
+  spam: 'bad', missing: 'idle', unchecked: 'idle', send_failed: 'bad',
+};
+
+function healthAge(r) {
+  if (r.age_days === null || r.age_days === undefined) return '<span class="muted">Not started</span>';
+  return '<span class="hl-n">' + fmtN(r.age_days) + '</span> day' + (r.age_days === 1 ? '' : 's');
+}
+
+function healthCounts(w) {
+  w = w || {};
+  return fmtN(w.replies) + ' repl' + (Number(w.replies) === 1 ? 'y' : 'ies') + ', ' +
+    fmtN(w.bounces) + ' bounce' + (Number(w.bounces) === 1 ? '' : 's');
+}
+
+function healthFlags(r) {
+  return (r.flags || []).map(f => '<small class="hl-flag t-' + escHtml(f.tone) + '">' +
+    icon(TONE_ICON[f.tone] || 'warning-circle') + '<span>' + escHtml(f.text) + '</span></small>').join('');
+}
+
+async function loadHealth(quiet) {
+  const body = document.getElementById('health-body');
+  if (!body) return;
+  const seq = ++_health.seq;
+  const res = await getJSON('/api/health');
+  if (seq !== _health.seq) return;
+  const foot = document.getElementById('health-foot');
+  if (!res.ok || !res.data || !Array.isArray(res.data.domains)) {
+    if (quiet && _health.data) return;            // keep the last good card on a blip
+    _health.data = null; _health.key = '';
+    body.innerHTML = unavailableState(res, 'shield-check', 'Deliverability');
+    foot.hidden = true;
+    return;
+  }
+  const { generated_at, ...rest } = res.data;
+  const key = JSON.stringify(rest);
+  if (quiet && key === _health.key) return;       // unchanged; keep an open "how it works"
+  _health.data = res.data; _health.key = key;
+  renderHealth();
+}
+
+function renderHealth() {
+  const d = _health.data;
+  const body = document.getElementById('health-body');
+  const foot = document.getElementById('health-foot');
+  const rows = d.domains || [];
+  if (!rows.length) {
+    body.innerHTML = emptyState('shield-check', 'No sending domain yet',
+      'Once Mercury sends from a mailbox, each sending domain gets a verdict here: keep it, ' +
+      'give it more time, or test where its mail lands.');
+    foot.hidden = true;
+    return;
+  }
+  const win = d.window_days || 30;
+  const keys = (d.short_windows || [7, 14]).map(n => n + 'd').concat([win + 'd']);
+  body.innerHTML = '<div class="health-table"><table><thead><tr><th>Domain</th><th>Sending for</th>' +
+    keys.map((k, i) => '<th class="num' + (i < keys.length - 1 ? ' hl-short' : '') + '">Sent, last ' + k.slice(0, -1) + ' days</th>').join('') +
+    '<th>Verdict</th></tr></thead><tbody>' +
+    rows.map(r => '<tr>' +
+      '<td><span class="mono">' + escHtml(r.domain) + '</span><small class="hl-sub">' +
+        fmtN((r.mailboxes || []).length) + ' inbox' + ((r.mailboxes || []).length === 1 ? '' : 'es') + '</small></td>' +
+      '<td class="hl-age">' + healthAge(r) + '</td>' +
+      keys.map((k, i) => '<td class="num' + (i < keys.length - 1 ? ' hl-short' : '') + '"><span class="hl-n">' + fmtN((r.windows[k] || {}).sent) + '</span>' +
+        '<small class="hl-sub">' + healthCounts(r.windows[k]) + '</small></td>').join('') +
+      '<td class="hl-verdict">' + toneBadge(r.tone, r.label) +
+        '<small class="hl-reason">' + escHtml(r.reason) + '</small>' + healthFlags(r) + '</td>' +
+    '</tr>').join('') + '</tbody></table></div>' +
+    '<details class="health-rules"><summary>How the verdict works</summary><ul>' +
+      (d.thresholds_text || []).map(t => '<li>' + escHtml(t) + '</li>').join('') +
+      '<li>The verdict reads the last ' + win + ' days. Sending age counts from the first send or the warm-up start.</li>' +
+      (d.bounces_classified ? '' : '<li>No bounce in the window carries an SMTP code yet, so a burned domain only shows up as missing replies.</li>') +
+    '</ul></details>';
+  foot.hidden = false;
+  foot.innerHTML = placementLine(d.placement);
+}
+
+function placementLine(p) {
+  if (!p) {
+    return '<span class="health-pl">' + toneBadge('idle', 'No placement test yet') +
+      '<span>Run <span class="mono">mercury mail placement</span> to see whether email 1 lands in the inbox or in spam.</span></span>';
+  }
+  const s = p.summary || {};
+  return '<span class="health-pl">' + toneBadge(s.tone || 'idle', s.label || 'Placement test') +
+    '<span>' + escHtml(s.text || '') + '</span></span>' +
+    (p.created_at ? '<span class="muted nowrap">Placement test &middot; ' + escHtml(agoShort(parseUTC(p.created_at))) + '</span>' : '');
+}
+
 // ── Mailboxes: every inbox Mercury sends from ──
 //
 // Which inboxes exist, their daily caps and their ramp (warmup_start, then
@@ -3684,9 +3781,12 @@ function mbBusy() {
 async function loadMailboxes(quiet) {
   const body = document.getElementById('mb-body');
   const seq = ++_mb.seq;
-  const [res, voices] = await Promise.all([getJSON('/api/warmup'), getJSON('/api/voices')]);
+  const [res, voices, health] = await Promise.all([getJSON('/api/warmup'), getJSON('/api/voices'), getJSON('/api/health')]);
   if (seq !== _mb.seq) return;
   if (voices.ok) { _mb.voices = voices.data.mailboxes; _mb.voicePersonas = voices.data.personas; _mb.voiceDefault = voices.data.default_id; }
+  // Verdicts and the last placement test are extras: without them the tab still works.
+  if (health.ok && health.data && Array.isArray(health.data.domains)) _mb.health = health.data;
+  else if (!quiet) _mb.health = null;
   if (!res.ok || !res.data || !Array.isArray(res.data.inboxes)) {
     if (quiet && _mb.data) return;
     _mb.data = null; _mb.key = '';
@@ -3694,8 +3794,10 @@ async function loadMailboxes(quiet) {
     return;
   }
   const key = JSON.stringify(res.data);
-  if (quiet && key === _mb.key) return;
-  _mb.data = res.data; _mb.key = key;
+  const { generated_at, ...healthRest } = _mb.health || {};
+  const healthKey = JSON.stringify(healthRest);
+  if (quiet && key === _mb.key && healthKey === _mb.healthKey) return;
+  _mb.data = res.data; _mb.key = key; _mb.healthKey = healthKey;
   mbNavFlag();
   renderMailboxes();
   if (quiet) mbRefreshDrawer();
@@ -3867,7 +3969,7 @@ function renderMbTable() {
         '" onclick="mbToggleDomain(' + mbArg(dm) + ')">' + icon(open ? 'caret-down' : 'caret-right') + '</button>' +
       '<button class="mb-domain mono" onclick="mbOpenDomain(' + mbArg(dm) + ')">' + escHtml(dm) + '</button>' +
       '<span class="mb-group-meta">' + all.length + ' inbox' + (all.length === 1 ? '' : 'es') + ' &middot; <span class="mono">' + fmtN(sent) + '/' + fmtN(cap) + '</span> today</span>' +
-      mbDnsMini(dm) + flags.join('') +
+      mbDnsMini(dm) + mbVerdictBadge(dm) + flags.join('') +
       '<button class="link-btn mb-group-open" onclick="mbOpenDomain(' + mbArg(dm) + ')">Domain' + icon('arrow-right') + '</button>' +
     '</div></td></tr>';
     if (!open) return head;
@@ -4350,6 +4452,7 @@ function mbOpenDomain(domain, inPlace) {
       '<button class="link-btn" id="mb-dns-recheck" onclick="mbLoadDns(' + mbArg(domain) + ', true)">' + icon('arrow-clockwise') + 'Re-check</button></div>' +
       '<p class="drawer-note">Add these at your domain registrar. One fix covers every inbox on ' + escHtml(domain) + '.</p>' +
       '<div class="mb-dns-list" id="mb-dns-list"><div class="loading-note">Checking DNS…</div></div></div>' +
+    mbDomainHealth(domain) + mbDomainPlacement(domain) +
     '<div class="drawer-section"><div class="mb-sec-head"><h4>Inboxes on this domain</h4><span class="muted mono">' +
       fmtN(boxes.reduce((s, b) => s + Number(b.sent_today || 0), 0)) + '/' + fmtN(boxes.reduce((s, b) => s + Number(b.today_cap || 0), 0)) + ' today</span></div>' +
       '<div class="ev-list">' + boxes.map(b => {
@@ -4361,6 +4464,73 @@ function mbOpenDomain(domain, inPlace) {
   mbDrawerActions('');
   if (_mb.dns[domain]) mbRenderDns(domain);
   mbLoadDns(domain, false);
+}
+
+// ── Deliverability verdict and placement test, per domain ──
+
+const mbHealthOf = dm => ((_mb.health && _mb.health.domains) || []).find(d => d.domain === dm) || null;
+
+function mbVerdictBadge(dm) {
+  const h = mbHealthOf(dm);
+  return h ? '<span class="mb-verdict" title="' + escHtml(h.reason) + '">' + toneBadge(h.tone, h.label) + '</span>' : '';
+}
+
+function mbDomainHealth(dm) {
+  const h = mbHealthOf(dm);
+  let html = '<div class="drawer-section"><div class="mb-sec-head"><h4>Deliverability</h4>' +
+    (h ? toneBadge(h.tone, h.label) : '') + '</div>';
+  if (!h) {
+    return html + '<p class="drawer-note">' + (_mb.health ? 'Nothing sent from this domain yet.'
+      : 'The verdict isn\'t available on this server yet.') + '</p></div>';
+  }
+  const win = (_mb.health && _mb.health.window_days) || 30;
+  const keys = ((_mb.health && _mb.health.short_windows) || [7, 14]).map(n => n + 'd').concat([win + 'd']);
+  html += '<p class="hl-lead">' + escHtml(h.reason) + '</p>' +
+    '<div class="mb-stats hl-stats">' + keys.map(k => {
+      const w = h.windows[k] || {};
+      return '<div><span>Sent, last ' + k.slice(0, -1) + ' days</span><b>' + fmtN(w.sent) + '</b>' +
+        '<small>' + healthCounts(w) + '</small></div>';
+    }).join('') + '</div>' +
+    '<p class="drawer-note">' + escHtml(h.next) + ' Sending for ' +
+      (h.age_days === null || h.age_days === undefined ? 'no days yet' : fmtN(h.age_days) + ' day' + (h.age_days === 1 ? '' : 's')) + '.</p>' +
+    healthFlags(h);
+  return html + '</div>';
+}
+
+function mbDomainPlacement(dm) {
+  const p = _mb.health && _mb.health.placement;
+  const pd = p && p.domains && p.domains[dm];
+  let html = '<div class="drawer-section"><div class="mb-sec-head"><h4>Placement test</h4>' +
+    (pd ? toneBadge(pd.tone, pd.label) : '') + '</div>';
+  if (!pd) {
+    return html + '<p class="drawer-note">' + (p ? 'The last placement test didn\'t send from this domain. ' : '') +
+      'Run <span class="mono">mercury mail placement</span> to send email 1 to your seed inboxes and see where it lands.</p></div>';
+  }
+  // One row per seed inbox, one column per sender: this domain's mailboxes, then the control.
+  const labels = p.folder_labels || {};
+  const rows = (pd.rows || []).concat(p.control || []);
+  const senders = [...new Set(rows.map(r => r.sender))];
+  const seeds = [...new Set(rows.map(r => r.seed))];
+  const cell = (seed, sender) => {
+    const r = rows.find(x => x.seed === seed && x.sender === sender);
+    return r ? toneBadge(PLACEMENT_TONE[r.folder] || 'idle', labels[r.folder] || r.folder) : '<span class="muted">Not sent</span>';
+  };
+  const head = s => {
+    const ctl = (p.control || []).some(r => r.sender === s);
+    return '<th title="' + escHtml(s) + '">' + (ctl ? 'Control' : '<span class="mono">' + escHtml(s.split('@')[0]) + '@</span>') + '</th>';
+  };
+  const seedName = seed => {
+    const r = rows.find(x => x.seed === seed) || {};
+    const prov = { gmail: 'Gmail', outlook: 'Outlook', yahoo: 'Yahoo', icloud: 'iCloud' }[r.seed_provider] || 'Seed';
+    return '<td><b>' + prov + '</b><small class="hl-sub mono">' + escHtml(seed) + '</small></td>';
+  };
+  return html + '<p class="drawer-note">' + escHtml(pd.text) + '</p>' +
+    '<div class="mb-dns-list pl-table"><table><thead><tr><th>Seed inbox</th>' + senders.map(head).join('') +
+      '</tr></thead><tbody>' + seeds.map(seed => '<tr>' + seedName(seed) +
+        senders.map(s => '<td>' + cell(seed, s) + '</td>').join('') + '</tr>').join('') + '</tbody></table>' +
+      (p.created_at ? '<p class="dns-checked mb-dns-when">Tested ' + escHtml(agoShort(parseUTC(p.created_at))) +
+        ' &middot; run <span class="mono">' + escHtml(p.run_id) + '</span></p>' : '') +
+    '</div></div>';
 }
 
 function mbDomainSub(domain) {
@@ -4545,6 +4715,7 @@ loadRuns();
 loadTodayActivity();
 loadTrend();
 loadHeatmap();
+loadHealth();
 loadMercuryStatus();
 
 // Agent status: quick poll
@@ -4566,7 +4737,7 @@ setInterval(async () => {
 setInterval(() => {
   if (document.hidden) return;
   switch (currentTab) {
-    case 'today': loadToday(); loadRuns(); loadTodayActivity(); loadTrend(true); loadHeatmap(true); break;
+    case 'today': loadToday(); loadRuns(); loadTodayActivity(); loadTrend(true); loadHeatmap(true); loadHealth(true); break;
     case 'mailboxes': if (!mbBusy()) loadMailboxes(true); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;

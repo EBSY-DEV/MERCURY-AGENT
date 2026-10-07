@@ -1839,6 +1839,24 @@ async def get_today():
                 "action": "Read their sites", "tab": "discover",
             })
 
+        try:
+            health = await _health_report(state)
+            cancel = [d for d in health.get("domains", [])
+                      if d.get("verdict") == "CANCEL_CANDIDATE"]
+        except Exception as e:
+            logger.debug("today: health report failed: %s", e)
+            cancel = []
+        if cancel:
+            items.append({
+                "key": "deliverability", "tone": "warn",
+                "title": (f"{cancel[0]['domain']} is a candidate to cancel" if len(cancel) == 1
+                          else f"{len(cancel)} sending domains are candidates to cancel"),
+                "detail": ((cancel[0]["reason"] + " " if len(cancel) == 1 else "")
+                           + "Run a placement test (mercury mail placement) to tell the "
+                             "domain apart from the copy before you retire it."),
+                "action": "Open mailboxes", "tab": "mailboxes",
+            })
+
         if pending:
             items.append({
                 "key": "outbox", "tone": "warn",
@@ -2090,6 +2108,35 @@ async def get_heatmap(weeks: str = "53"):
     except Exception as e:
         logger.debug("heatmap init_db failed: %s", e)
     return await metrics.heatmap(str(DB_PATH), n, datetime.now(timezone.utc).date())
+
+
+async def _health_report(state) -> dict:
+    """Per-domain deliverability verdicts plus the last placement test.
+    Definitions and thresholds live in mercury/deliverability.py."""
+    from mercury import deliverability, placement
+
+    try:
+        config, pool = _mail_context()
+    except Exception as e:
+        logger.debug("health: mail config unreadable: %s", e)
+        from mercury.config import load_config
+        config, pool = load_config(), None
+    report = await deliverability.domain_report(state, config, pool)
+    report["placement"] = await placement.report(state)
+    report["thresholds_text"] = deliverability.thresholds_text(report)
+    return report
+
+
+@app.get("/api/health")
+async def get_health():
+    """The ``mercury health`` numbers for the Today card and the Mailboxes tab."""
+    try:
+        state = _state()
+        await state.init_db()
+        return await _health_report(state)
+    except Exception as e:
+        logger.error(f"/api/health: {e}", exc_info=True)
+        return _err(f"Could not build the health report: {type(e).__name__}", 500)
 
 
 # ── Inbox warm-up ──

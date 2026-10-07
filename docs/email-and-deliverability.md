@@ -262,6 +262,57 @@ The Outbox tab has the same Pause/Resume button, and Today shows "Sending is pau
 
 The kill switch is global. The health gates are per mailbox. Both can be in effect.
 
+## Deliverability health
+
+Zero replies on its own says nothing: it can be the copy, the list, or mail landing in spam, and on a small sample it is not even a signal. `mercury health` (and the **Deliverability** card on Today, plus a verdict per domain on the Mailboxes tab) answers the narrower question Mercury can answer honestly: is there enough evidence to keep a sending domain, or to cancel it?
+
+Per sending domain (every mailbox on it added together) it shows outreach sends, replies and bounces over the last 7, 14 and 30 days, how long the domain has been sending, and a verdict over the last 30 days. The ladder, checked in this order:
+
+| Verdict | When |
+|---|---|
+| Cancel candidate | Bounce composition says the domain is burned (a 5.7.6xx reputation block). Reads the `BURNED` bucket the Handler stores on each bounce (see [bounces and the kill switch](#bounces-and-the-kill-switch)); bounces logged before classification never trigger it. |
+| Too young | Under 30 days of sending, or nothing sent yet. |
+| Keep | 200 or more sends and replies at 1% or above. |
+| Cancel candidate | 0 replies on 150 or more sends, or replies under 1% after 200 sends. |
+| Not enough data | Everything else: the reply rate needs 200 sends and the bounce rate 50. |
+
+A domain is never "keep" without evidence, and a cancel candidate is only a candidate: run a [placement test](#placement-test) before retiring it. Today lists cancel candidates under Needs you.
+
+Definitions match the trends chart: a send is an outreach email (Mercury's own replies don't count), a reply is a human reply (out-of-office excluded, one per prospect per day), and a bounce is attributed to the mailbox that sent the bounced email. Events no send can be traced to are reported as unattributed and charged to no domain. **Sending age** counts from the domain's first outreach send or the earliest `warmup_start` of its mailboxes, whichever is older; it is not the registration date, so a domain warmed elsewhere reads young until Mercury has 30 days of its history.
+
+A high bounce rate is shown as a flag (over `max_bounce_rate`, after 50 sends) but does not change the verdict on its own: a bounce could be a bad address (a list problem) as easily as a blocked sender (a domain problem). Only a `BURNED` bounce makes a domain a cancel candidate. The per-mailbox [health gates](#health-gates) already pause an inbox past 5%.
+
+```bash
+mercury health          # the table, the reasons, the thresholds and the last placement test
+mercury health --json
+```
+
+## Placement test
+
+`mercury mail placement` sends the campaign's real email 1 (the newest step-one email in the outbox, with the legal footer exactly as a prospect gets it) from every configured mailbox to a few seed inboxes you own, plus the same text from a control sender with a known-good reputation, usually a personal Gmail. Then it reads the seeds over IMAP and records where each copy landed: Primary, Promotions or another Gmail tab, Inbox (non-Gmail), Spam, or not found. Configure the seeds and the control under [`channels.email.placement`](configuration.md#channelsemail).
+
+| Result | Reads as |
+|---|---|
+| Your mailboxes mostly in spam, the control in the inbox | Domain or reputation problem. |
+| Both in spam | Copy problem. Rewrite it and test again. |
+| Your mailboxes in spam, no control configured (or not found) | Assume the copy first. |
+| Your mailboxes mostly in the inbox | Placement is fine. Low replies point at the copy or the list. |
+
+"Mostly" means at least half of the copies found; copies not found yet are left out. Each domain is judged on its own against the same control, so one burned domain can't hide behind a healthy one.
+
+The test never touches the prospect outbox: nothing it sends counts toward a daily cap, a warm-up ramp, the trends or the health verdict. Results are stored one row per sender and seed in the `placement_tests` table, with the last run's summary line in `settings`. The last result shows on Today and next to the DNS checklist in each domain's drawer on the Mailboxes tab.
+
+```bash
+mercury mail placement --dry-run            # who would send to whom; sends nothing
+mercury mail placement                      # send, wait up to placement.wait_seconds, read the seeds
+mercury mail placement --mailbox x.com      # only this domain (or address); repeatable
+mercury mail placement show [RUN]           # the last (or a given) result
+mercury mail placement check [RUN]          # read the seeds again for late mail
+mercury mail placement mark RUN --seed you@outlook.com --sender a@x.com --folder spam
+```
+
+Seeds are read with an app password (Gmail and Yahoo need 2-step verification turned on to create one). Outlook.com has moved IMAP to OAuth sign-in and may refuse app passwords; if it does, leave its `password_env` empty, look at the inbox yourself and record the folder with `mark`. Gmail tabs (Primary, Promotions) are read with Gmail's own search; other providers only distinguish inbox from spam.
+
 ## Compliance footer and opt-outs
 
 CAN-SPAM requires a valid physical postal address and a clear opt-out mechanism in commercial email. Mercury appends a footer to every sequence email at send time, outside the draft so the writer can never drop or rewrite it:
