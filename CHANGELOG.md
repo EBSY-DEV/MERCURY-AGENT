@@ -25,8 +25,8 @@ minor versions can still change behaviour.
   `design/build_brand_pen.py`).
 - **Warm-up follows the mailbox config.** The Warm-up tab shows every mailbox
   in `channels.email.mailboxes` (or the single configured inbox) with the ramp
-  the sender enforces. Caps and start dates are edited in `mercury.yaml`
-  only; the tab keeps pause/resume, the checklist, notes and DNS checks. A
+  the sender enforces. Caps and start dates can be edited in Settings →
+  Sending inboxes; the tab keeps pause/resume, the checklist, notes and DNS checks. A
   per-mailbox health gate sits on top of the ramp: over 5% bounces (after 20
   sends in 7 days) pauses that mailbox until resumed, 3-5% holds it at
   yesterday's cap. A paused mailbox still sends replies. Bounce events now
@@ -39,6 +39,12 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Inbox management in Settings.** Add SMTP/IMAP inboxes, set or replace
+  passwords, edit per-inbox servers, caps and warm-up dates, stop new outreach
+  while finishing existing threads, and test connections without sending.
+  Credentials are stored privately and never returned to the browser. The
+  existing single sender is preserved when enabling rotation; configuration
+  saves use the private local file by default. Restart a running agent after saving.
 - **Mailbox rotation.** `channels.email.mailboxes` lists several SMTP
   mailboxes, each with its own daily cap and an optional warm-up ramp
   (`warmup_start`, `warmup_initial_cap`, `warmup_weekly_increase`).
