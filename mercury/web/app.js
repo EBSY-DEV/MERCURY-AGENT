@@ -826,6 +826,7 @@ async function loadSettings() {
     const el = document.getElementById('settings-mailboxes');
     if (el) el.innerHTML = mb && !mb.error && mb.rotation ? renderMailboxes(mb, true) : '';
   });
+  await loadInboxSettings();
   savedPh('linkedin-password', data.linkedin_password_set, 'Enter password');
   savedPh('cf-api-token', data.cloudflare_api_token_set, 'Your Cloudflare API Token');
 
@@ -862,6 +863,122 @@ function saveSmtp() {
   const pass = document.getElementById('smtp-pass').value;
   if (pass) payload.SMTP_PASSWORD = pass;
   saveEnv(payload, 'SMTP settings saved.').then(loadSettings);
+}
+
+// Inbox configuration is separate from the rotation's live capacity report.
+let _inboxSettings = null, _inboxEditing = null;
+
+async function loadInboxSettings() {
+  const data = await api('/api/settings/mailboxes');
+  const el = document.getElementById('inbox-list');
+  const add = document.getElementById('inbox-add');
+  if (!el || !add) return;
+  if (!data || data.error) {
+    _inboxSettings = null;
+    add.disabled = true;
+    el.innerHTML = '<p class="muted">Could not load inbox settings. Check the configuration and reload Settings.</p>';
+    return;
+  }
+  _inboxSettings = data;
+  add.disabled = false;
+  el.innerHTML = (data.inboxes || []).map((b, i) =>
+    '<div class="inbox-setting-row"><div class="inbox-setting-info"><b>' + escHtml(b.email) + '</b>' +
+      '<div class="inbox-setting-meta">' + toneBadge(b.password_set ? 'good' : 'waiting', b.password_set ? 'Password saved' : 'Password needed') +
+      (b.password_set && !b.configured ? toneBadge('waiting', 'Server needed') : '') +
+      '<span>' + fmtN(b.daily_cap) + '/day · ' + (b.enabled ? 'New outreach enabled' : 'Existing threads only') + '</span></div></div>' +
+    '<div class="inbox-setting-actions"><button type="button" class="btn btn-secondary btn-sm" onclick="openInboxEditor(' + i + ')">Edit inbox</button>' +
+    '<button type="button" class="btn btn-secondary btn-sm" onclick="testInbox(' + i + ', this)">Test connection</button></div></div>'
+  ).join('') || '<p class="muted">No SMTP inboxes added yet. Add your first inbox to get started.</p>';
+  el.innerHTML += '<p class="inbox-limit-note muted">All inboxes share the overall limit of ' + fmtN(data.max_daily_sends) +
+    ' emails/day. Each new inbox starts with its warm-up ramp.</p>';
+}
+
+function openInboxEditor(index) {
+  if (!_inboxSettings) return;
+  const b = Number.isInteger(index) ? _inboxSettings.inboxes[index] : null;
+  _inboxEditing = b ? b.email : null;
+  const defaults = _inboxSettings.defaults || {};
+  const input = (id, label, type, value, extra = '') => '<div class="form-group"><label class="form-label" for="inbox-' + id + '">' + label +
+    '</label><input class="form-input" id="inbox-' + id + '" type="' + type + '" value="' + escHtml(value) + '" ' + extra + '></div>';
+  const host = (id, label, placeholder) => input(id, label, 'text', b && b[id.replace('-', '_')] || '',
+    'placeholder="' + escHtml(placeholder || 'Enter server hostname') + '" autocomplete="off"');
+  const editor = document.getElementById('inbox-editor');
+  editor.hidden = false;
+  editor.innerHTML = '<form id="inbox-form" onsubmit="saveInbox(event)">' +
+    '<h4>' + (b ? 'Edit inbox' : 'Add inbox') + '</h4>' +
+    '<div class="form-row">' + input('email', 'Email address', 'email', b ? b.email : '', 'required autocomplete="off"' + (b ? ' readonly' : '')) +
+    input('name', 'Sender name', 'text', b ? b.name : '', 'autocomplete="off" placeholder="Uses your default sender name"') + '</div>' +
+    input('password', b && b.password_set ? 'Change password' : 'Password / app password', 'password', '',
+      'autocomplete="new-password" placeholder="' + (b && b.password_set ? 'Leave blank to keep the saved password' : 'Can be added later') + '"') +
+    '<div class="form-row">' + input('cap', 'Daily sending limit', 'number', b ? b.daily_cap : 30, 'required min="0" step="1"') +
+    input('start', 'Warm-up start date', 'date', b ? b.warmup_start || '' : _inboxSettings.today) + '</div>' +
+    '<p class="muted inbox-field-hint">Clear the date only if this inbox is already warmed up.</p>' +
+    '<details class="inbox-servers"' + (!defaults.smtp_host || b && !b.configured ? ' open' : '') + '><summary>Server settings</summary>' +
+    '<p class="muted">Blank fields use the shared SMTP and IMAP settings.</p>' +
+    '<div class="form-row">' + host('smtp-host', 'SMTP host', defaults.smtp_host) +
+    input('smtp-port', 'SMTP port', 'number', b && b.smtp_port || '', 'min="1" max="65535" placeholder="' + (defaults.smtp_port || 587) + '"') + '</div>' +
+    '<div class="form-row">' + host('imap-host', 'IMAP host', defaults.imap_host) +
+    input('imap-port', 'IMAP port', 'number', b && b.imap_port || '', 'min="1" max="65535" placeholder="' + (defaults.imap_port || 993) + '"') + '</div>' +
+    input('username', 'SMTP login', 'text', b ? b.username : '', 'autocomplete="off" placeholder="Defaults to the inbox email"') +
+    input('imap-username', 'IMAP login', 'text', b ? b.imap_username : '', 'autocomplete="off" placeholder="Defaults to the SMTP login"') + '</details>' +
+    '<label class="inbox-checkbox"><input type="checkbox" id="inbox-enabled"' + (!b || b.enabled ? ' checked' : '') + '>Use this inbox for new outreach</label>' +
+    '<p class="muted inbox-field-hint">Turning this off keeps replies and existing follow-ups on this inbox.</p>' +
+    (_inboxSettings.provider !== 'smtp' ? '<label class="inbox-checkbox"><input type="checkbox" id="inbox-activate" required>Switch email sending from ' +
+      escHtml(_inboxSettings.provider) + ' to SMTP + IMAP</label>' : '') +
+    '<p id="inbox-form-error" class="inbox-form-error" role="alert"></p>' +
+    '<div class="inbox-setting-actions"><button type="submit" id="inbox-save" class="btn btn-primary btn-sm">' +
+    (b ? 'Save inbox' : 'Add inbox') + '</button><button type="button" class="btn btn-secondary btn-sm" onclick="closeInboxEditor()">Cancel</button></div></form>';
+  document.getElementById(b ? 'inbox-password' : 'inbox-email').focus({preventScroll: true});
+  editor.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+}
+
+function closeInboxEditor() {
+  const editor = document.getElementById('inbox-editor');
+  editor.replaceChildren();
+  editor.hidden = true;
+  _inboxEditing = null;
+  document.getElementById('inbox-add').focus({preventScroll: true});
+}
+
+async function saveInbox(event) {
+  event.preventDefault();
+  const button = document.getElementById('inbox-save');
+  if (button.disabled) return;
+  const val = id => document.getElementById('inbox-' + id).value;
+  const data = {email: val('email').trim(), name: val('name').trim(),
+    password: val('password'), daily_cap: Number(val('cap')), warmup_start: val('start') || null,
+    smtp_host: val('smtp-host').trim(), smtp_port: Number(val('smtp-port')) || 0,
+    imap_host: val('imap-host').trim(), imap_port: Number(val('imap-port')) || 0,
+    username: val('username').trim(), imap_username: val('imap-username').trim(),
+    enabled: document.getElementById('inbox-enabled').checked};
+  const activate = document.getElementById('inbox-activate');
+  if (activate) data.activate_smtp = activate.checked;
+  button.disabled = true;
+  const result = await getJSON('/api/settings/mailboxes' + (_inboxEditing ? '/' + encodeURIComponent(_inboxEditing) : ''), {
+    method: _inboxEditing ? 'PATCH' : 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data),
+  });
+  button.disabled = false;
+  if (!result.ok || !result.data.success) {
+    document.getElementById('inbox-form-error').textContent = result.data && result.data.message || 'Could not save. Try again.';
+    return;
+  }
+  closeInboxEditor();
+  document.getElementById('inbox-notice').textContent = result.data.restart_required
+    ? 'Inbox saved. Stop and start Mercury in Controls to apply the changes to the running agent.'
+    : 'Inbox saved. Changes apply on your next Mercury run; restart it if you run it outside this dashboard.';
+  await loadSettings();
+  _wu.key = null;
+  showToast('Inbox saved.', 'success');
+}
+
+async function testInbox(index, button) {
+  const b = _inboxSettings && _inboxSettings.inboxes[index];
+  if (!b) return;
+  const label = button.textContent;
+  button.disabled = true; button.textContent = 'Testing…';
+  const res = await getJSON('/api/settings/mailboxes/' + encodeURIComponent(b.email) + '/test', {method: 'POST'});
+  button.disabled = false; button.textContent = label;
+  document.getElementById('inbox-notice').textContent = res.data && res.data.message || 'Could not test the connection. Try again.';
 }
 
 function saveVerifiers() {
@@ -1440,8 +1557,7 @@ function renderMailboxes(mb, compact) {
   const summary = fmtN(mb.sent_24h) + ' of ' + fmtN(mb.capacity_today) + ' sent in the last 24 hours' + escHtml(capNote);
   if (compact) {
     return '<div class="mb-compact"><div class="mb-compact-head"><b>Rotation</b><span class="muted">' + summary + '</span></div>' +
-      table + '<p class="lede mb-hint">Mailboxes are listed under <span class="mono-sm">channels.email.mailboxes</span> in ' +
-      '<span class="mono-sm">mercury.local.yaml</span>; passwords live in <span class="mono-sm">.env</span>. ' +
+      table + '<p class="lede mb-hint">Manage addresses, passwords, and sending limits under Sending inboxes below. ' +
       '<button class="link-btn" onclick="goTab(\'warmup\')">Warm-up' + icon('arrow-right') + '</button></p></div>';
   }
   return '<section class="panel"><div class="panel-head"><div><h3>Sending mailboxes</h3><p>' + summary +
@@ -1653,11 +1769,10 @@ async function postJSON(path, body) {
 }
 
 // A read that can tell "the server is down" from "this server predates the view".
-async function getJSON(path) {
+async function getJSON(path, opts) {
   try {
-    const r = await fetch(path);
-    if (!r.ok) return { ok: false, status: r.status, data: null };
-    return { ok: true, status: r.status, data: await r.json() };
+    const r = await fetch(path, opts);
+    return { ok: r.ok, status: r.status, data: await r.json() };
   } catch {
     return { ok: false, status: 0, data: null };
   }
@@ -2911,8 +3026,8 @@ function wuSelect(i) {
 function wuConfigHint(open) {
   const hint = (_wu.data && _wu.data.config_hint) || '';
   return '<div class="wu-config">' +
-    '<p>' + icon('info') + '<span>Caps and start dates come from <span class="mono">mercury.yaml</span> &rarr; ' +
-      '<span class="mono">channels.email.mailboxes</span>. Edit them there; Mercury picks them up on the next cycle.</span></p>' +
+    '<p>' + icon('info') + '<span>Add inboxes, update passwords, and change caps or start dates in ' +
+      '<button class="link-btn" onclick="goTab(\'settings\')">Settings</button>. Restart a running Mercury agent after saving changes.</span></p>' +
     (hint ? '<details' + (open ? ' open' : '') + ' ontoggle="_wu.hint = this.open"><summary>Config snippet</summary>' +
       '<div class="wu-snippet"><pre>' + escHtml(hint) + '</pre>' +
       '<button class="btn-square xs ghost" title="Copy snippet" aria-label="Copy config snippet" data-copy="' + escHtml(hint) +

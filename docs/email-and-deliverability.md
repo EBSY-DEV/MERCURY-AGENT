@@ -85,6 +85,16 @@ Prompts can be ignored, so the last check before any email leaves is determinist
 
 One mailbox carrying all your cold volume is the fastest way to burn a domain. With the `smtp` provider you can list several mailboxes, usually one or two per secondary domain, each with its own cap and optional warm-up ramp.
 
+Use **Settings → Sending inboxes → Add inbox** to add an address, password/app password, daily cap, and warm-up start date. Expand **Server settings** to override the shared SMTP/IMAP hosts, ports, or login. New inboxes default to warming up from today; omit the password if you need to finish setup later.
+
+**Edit inbox** changes the password or sending settings. A blank password field keeps the saved credential. **Test connection** checks SMTP and IMAP login without sending an email. Turn off **Use this inbox for new outreach** to finish existing threads and continue reading replies without starting new ones. Addresses cannot be renamed because existing threads reference them.
+
+Passwords stay in the private `.env` file and are never returned by the settings API. When starting from the tracked `mercury.yaml` template, the dashboard saves inbox configuration to `mercury.local.yaml`; existing private or explicitly selected configurations are updated in place. The first additional inbox preserves any existing single SMTP sender. Adding SMTP inboxes while using another email provider requires an explicit provider-switch confirmation.
+
+The dashboard reflects changes immediately. Restart a running `mercury run` agent to apply the new configuration and credentials. All inboxes still share `max_daily_sends`.
+
+Manual configuration remains supported:
+
 ```yaml
 channels:
   email:
@@ -121,6 +131,8 @@ MAILBOX_SAM_PASSWORD=...
 
 `password_env` must name a `MAILBOX_*` variable, `SMTP_PASSWORD` or `IMAP_PASSWORD`. Anything else resolves to an empty password, so a typo cannot hand an API key to an SMTP server. A mailbox without a password is skipped for sending and polling.
 
+For an existing mailbox with separate IMAP credentials, `imap_username` and `imap_password_env` can override its SMTP login and password. The dashboard preserves those overrides when converting a single inbox to rotation.
+
 **Picking a mailbox for a new thread.** Among mailboxes that have credentials, accept new threads and have cap left today, Mercury picks the one with the fewest sends this cycle, then the largest share of its daily cap still unused, then list order. A warming mailbox at cap 5 and a warm one at cap 30 both drain at their own pace instead of the warm one doing all the work.
 
 **Thread pinning.** Only step 1 rotates. Follow-ups go out from the mailbox the opener used, and replies go out from the inbox the prospect's message arrived in. A prospect never gets "Re:" mail from a stranger, and their answers land in the inbox that holds the conversation.
@@ -154,7 +166,7 @@ With the defaults (`warmup_initial_cap: 5`, `warmup_weekly_increase: 5`) and `da
 
 The mailbox reaches full volume on day 35. The Warm-up tab plots each mailbox's planned cap per day against what it actually sent.
 
-The ramp is configuration, not dashboard state: caps and start dates live only in `channels.email.mailboxes`. The Warm-up tab can pause and resume a mailbox and keeps a checklist and notes, nothing else.
+The ramp is stored in `channels.email.mailboxes`; edit caps and start dates through **Settings → Sending inboxes** or your private configuration file. Restart a running Mercury agent after saving. The Warm-up tab handles pause/resume, monitoring, the checklist, and notes.
 
 Mercury does not run a "warm-up network" that trades fake emails with other inboxes. It does the parts that move reputation for a new mailbox: authenticate the domain, start small, ramp slowly, and stop when bounces climb.
 

@@ -679,6 +679,26 @@ td a:hover { text-decoration: underline; }
 .form-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
 .form-row .form-group { flex: 1; min-width: 130px; }
 
+/* Inbox setup follows the existing settings typography and form controls. */
+.inbox-settings { border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 12px; }
+.inbox-settings-head, .inbox-setting-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.inbox-settings-head h3 { font-size: 14px; font-weight: 650; }
+.inbox-settings-head .lede { margin: 4px 0 0; }
+.inbox-setting-row { padding: 14px 0; border-bottom: 1px solid var(--border); }
+.inbox-setting-info { min-width: 0; overflow-wrap: anywhere; }
+.inbox-setting-info b { font-size: 13px; font-weight: 600; }
+.inbox-setting-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; font-size: 12px; color: var(--text-2); }
+.inbox-setting-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.inbox-limit-note, .inbox-field-hint { font-size: 12px; line-height: 1.6; margin: 8px 0 12px; }
+#inbox-editor { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 16px; }
+#inbox-editor h4 { font-size: 14px; margin-bottom: 16px; }
+.inbox-servers { margin: 16px 0; }
+.inbox-servers summary { cursor: pointer; font-size: 13px; font-weight: 600; margin-bottom: 12px; }
+.inbox-servers p { margin-bottom: 12px; font-size: 12px; }
+.inbox-checkbox { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+.inbox-form-error { color: var(--s-bad); margin: 10px 0; font-size: 13px; }
+#inbox-notice:not(:empty) { background: var(--accent-soft); padding: 10px 12px; border-radius: 6px; margin-top: 12px; font-size: 13px; }
+
 .test-result { font-size: 12.5px; margin-top: 10px; padding: 9px 12px; border-radius: var(--r-sm); border: 1px solid transparent; }
 .test-result.success { background: var(--s-good-bg); color: var(--s-good); border-color: var(--s-good-line); }
 .test-result.error   { background: var(--s-bad-bg);  color: var(--s-bad);  border-color: var(--s-bad-line); }

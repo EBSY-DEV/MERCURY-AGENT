@@ -124,11 +124,15 @@ Each entry in `mailboxes`:
 | `smtp_port` | `0` | `0` uses `SMTP_PORT`. |
 | `imap_host` | `""` | Empty uses `IMAP_HOST`, then the SMTP host. |
 | `imap_port` | `0` | `0` uses `IMAP_PORT`. |
+| `imap_username` | `""` | Empty uses the SMTP login. Set when IMAP uses a different username. |
+| `imap_password_env` | `""` | Empty uses this mailbox's SMTP password. Otherwise names a mailbox password variable using the same allowlist as `password_env`. |
 | `daily_cap` | `30` | Steady-state ceiling once warm-up is done. Must be >= 0. |
 | `warmup_start` | none | First day this mailbox sends cold mail (`YYYY-MM-DD`). Omit for an already-warm mailbox. A future date means it sends nothing until then. |
 | `enabled` | `true` | `false`: start no new threads here, but keep reading its inbox and finishing its existing threads. |
 
 How rotation, warm-up and health gates use these is covered in [Email and deliverability](email-and-deliverability.md#mailbox-rotation).
+
+**Settings → Sending inboxes** manages these inboxes without editing YAML or `.env` manually. New configurations are saved to `mercury.local.yaml` by default; explicitly selected configs and existing private configs are updated in place. Restart a running agent after saving.
 
 ### `channels.linkedin`
 
