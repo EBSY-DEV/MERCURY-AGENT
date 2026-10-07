@@ -636,10 +636,11 @@ def cmd_personas(args):
                 if args.default:
                     p = await service.set_default(p["id"])
             else:
-                if not fields():
+                changes = fields()
+                if not changes:
                     raise PersonaError("invalid", "Nothing to change. Pass --tone, --instructions, --name ...")
                 before = await service.find(args.persona)
-                p = await service.update(args.persona, fields(), args.expected_revision)
+                p = await service.update(args.persona, changes, args.expected_revision)
                 if p["revision"] == before["revision"]:
                     print(f"\n  Updated {p['name']}. Writing unchanged, still v{p['revision']}.\n")
                     return
