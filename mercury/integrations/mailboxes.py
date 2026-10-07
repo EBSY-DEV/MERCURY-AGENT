@@ -4,7 +4,12 @@ One mailbox carrying all cold volume is the fastest way to burn a domain.
 The pool spreads sends over several mailboxes (usually one or two per
 secondary domain), each with its own daily cap and an optional warm-up ramp:
 
-    cap(day) = min(daily_cap, warmup_initial_cap + weeks_since_start * warmup_weekly_increase)
+    cap(week) = min(daily_cap, warmup_initial_cap + weeks_since_start * warmup_weekly_increase,
+                    2 * cap(week - 1))
+
+The last term is a hard ceiling: no week may more than double the one before,
+however large the configured weekly increase (a sudden jump is itself a
+spam signal). The ramp is keyed on the inbox's age (days since warmup_start).
 
 A thread stays on one mailbox. Step 1 picks a mailbox, and its follow-ups
 and Mercury's replies go out from the same address. Otherwise a prospect would
@@ -69,6 +74,18 @@ def local_today(config) -> date:
         return datetime.utcnow().date()
 
 
+def ramp_week_cap(week: int, daily_cap: int, initial: int, weekly_increase: int) -> int:
+    """The ramp's cap in inbox-age week ``week`` (0-based): the linear ramp
+    clamped by daily_cap, and never more than double the previous week's cap
+    (a zero previous week is exempt, so a ramp that starts at 0 can begin)."""
+    daily_cap, initial, inc = max(0, int(daily_cap)), max(0, int(initial)), max(0, int(weekly_increase))
+    cap = min(daily_cap, initial)
+    for w in range(1, max(0, int(week)) + 1):
+        nxt = min(daily_cap, initial + inc * w)
+        cap = min(nxt, cap * 2) if cap > 0 else nxt
+    return cap
+
+
 def warmup_cap(daily_cap: int, warmup_start: date | None, day: date,
                initial: int, weekly_increase: int) -> int:
     """A mailbox's cap on ``day``: daily_cap once warm, the ramp before."""
@@ -77,8 +94,21 @@ def warmup_cap(daily_cap: int, warmup_start: date | None, day: date,
     days = (day - warmup_start).days
     if days < 0:
         return 0  # warm-up has not started yet
-    ramp = int(initial) + (days // 7) * int(weekly_increase)
-    return max(0, min(int(daily_cap), ramp))
+    return ramp_week_cap(days // 7, daily_cap, initial, weekly_increase)
+
+
+def ramp_full_weeks(daily_cap: int, initial: int, weekly_increase: int) -> int | None:
+    """Whole weeks of age at which the ramp first reaches daily_cap; 0 when
+    it starts there, None when it never gets there."""
+    target = max(0, int(daily_cap))
+    if target <= max(0, int(initial)):
+        return 0
+    if int(weekly_increase) <= 0:
+        return None
+    for week in range(1, 1000):
+        if ramp_week_cap(week, target, initial, weekly_increase) >= target:
+            return week
+    return None
 
 
 def full_volume_on(daily_cap: int, warmup_start: date | None,
@@ -87,10 +117,93 @@ def full_volume_on(daily_cap: int, warmup_start: date | None,
     ramps (already warm, or a zero weekly increase)."""
     if warmup_start is None or daily_cap <= initial:
         return None
-    if weekly_increase <= 0:
+    weeks = ramp_full_weeks(daily_cap, initial, weekly_increase)
+    if not weeks:
         return None
-    weeks = -(-(int(daily_cap) - int(initial)) // int(weekly_increase))  # ceil
     return warmup_start + timedelta(days=7 * weeks)
+
+
+def cap_source(mb: "Mailbox", day: date, initial: int, weekly_increase: int,
+               gate: str = "") -> tuple[str, str]:
+    """Why a mailbox's cap today is what it is: (key, plain sentence).
+    Keys: paused, hold, scheduled, ramp, daily_cap."""
+    if gate == "paused":
+        return "paused", "Paused: sending is stopped until the inbox is resumed."
+    if gate == "hold":
+        return "hold", "Held at yesterday's level while the bounce rate is elevated."
+    if mb.warmup_start is not None:
+        if day < mb.warmup_start:
+            return "scheduled", f"Warm-up starts {mb.warmup_start.isoformat()}; nothing sends before then."
+        week = (day - mb.warmup_start).days // 7
+        cap = ramp_week_cap(week, mb.daily_cap, initial, weekly_increase)
+        if cap < mb.daily_cap:
+            linear = min(int(mb.daily_cap), int(initial) + week * int(weekly_increase))
+            if week > 0 and cap < linear:
+                why = "no week may more than double the one before"
+            else:
+                why = f"{int(initial)} to start, +{int(weekly_increase)} a week"
+            return "ramp", f"Warm-up week {week + 1}: {cap}/day ({why}) toward {mb.daily_cap}/day."
+        return "daily_cap", f"Warm-up done: at its daily cap of {mb.daily_cap}/day."
+    return "daily_cap", f"No warm-up date: fixed at its daily cap of {mb.daily_cap}/day."
+
+
+# Operator guidance for cold email at small scale. Warnings only: the
+# configured caps are never silently lowered.
+DEFAULT_MAX_INBOXES_PER_DOMAIN = 2
+DEFAULT_PROVIDER_CEILINGS = {"gmail": 30, "smtp": 15}
+MIN_WARMUP_DAYS = 14
+
+
+def inbox_limit_warnings(config, day: date | None = None) -> list[dict]:
+    """Lifecycle limits the configured mailboxes break, as a list of
+    ``{code, message, domain?, email?}``. Never changes a cap.
+
+    - ``domain_inboxes``: more than ``max_inboxes_per_domain`` (2) on a domain.
+    - ``cap_over_ceiling``: ``daily_cap`` above the provider's ceiling
+      (``provider_daily_ceilings``: gmail 30, smtp 15).
+    - ``young_inbox``: cold sends enabled less than 14 days after warmup_start.
+    """
+    email_cfg = config.channels.email
+    listed = list(getattr(email_cfg, "mailboxes", None) or [])
+    provider = (getattr(email_cfg, "provider", "") or "").strip().lower()
+    if not listed or provider == "instantly":
+        return []
+    day = day or local_today(config)
+    out: list[dict] = []
+
+    limit = int(getattr(email_cfg, "max_inboxes_per_domain", DEFAULT_MAX_INBOXES_PER_DOMAIN) or 0)
+    by_domain: dict[str, list[str]] = {}
+    for m in listed:
+        by_domain.setdefault(m.email.split("@")[-1], []).append(m.email)
+    if limit > 0:
+        for domain, emails in sorted(by_domain.items()):
+            if len(emails) > limit:
+                out.append({
+                    "code": "domain_inboxes", "domain": domain,
+                    "message": f"{domain} has {len(emails)} inboxes; more than {limit} on one "
+                               f"domain risks flagging the whole domain.",
+                })
+
+    configured_ceilings = getattr(email_cfg, "provider_daily_ceilings", None)
+    if configured_ceilings is None:
+        configured_ceilings = DEFAULT_PROVIDER_CEILINGS
+    ceilings = {str(k).lower(): int(v) for k, v in configured_ceilings.items()}
+    ceiling = ceilings.get(provider, 0)
+    for m in listed:
+        if ceiling > 0 and m.daily_cap > ceiling:
+            out.append({
+                "code": "cap_over_ceiling", "email": m.email,
+                "message": f"{m.email} daily_cap {m.daily_cap} is above the {provider} ceiling "
+                           f"of {ceiling}/day.",
+            })
+        start = m.warmup_start
+        if m.enabled and start is not None and 0 <= (day - start).days < MIN_WARMUP_DAYS:
+            out.append({
+                "code": "young_inbox", "email": m.email,
+                "message": f"{m.email} started warm-up {(day - start).days} day(s) ago; "
+                           f"wait {MIN_WARMUP_DAYS} days before cold mail (disable it until then).",
+            })
+    return out
 
 
 def rotation_configured(config) -> bool:
@@ -331,6 +444,7 @@ def mailbox_report(config, pool: MailboxPool | None, sent_by_mailbox: dict[str, 
         "require_approval": bool(getattr(email_cfg, "require_approval", True)),
         "auto_approve_followups": bool(getattr(email_cfg, "auto_approve_followups", False)),
         "spread_sends": bool(getattr(email_cfg, "spread_sends", False)),
+        "limit_warnings": inbox_limit_warnings(config, day),
     }
     if pool is None:  # instantly: the outbox numbers mean nothing here
         return {**base, "mailboxes": [], "legacy_email": "", "capacity_today": 0,
@@ -359,7 +473,11 @@ def mailbox_report(config, pool: MailboxPool | None, sent_by_mailbox: dict[str, 
         else:
             stage = "warm"
         from_name = getattr(mb.provider, "from_name", None)
+        src, src_why = cap_source(mb, day, pool.warmup_initial_cap,
+                                  pool.warmup_weekly_increase, gate)
         rows.append({
+            "cap_source": src,
+            "cap_reason": src_why,
             "email": mb.email,
             "name": (from_name if isinstance(from_name, str) else "")
                     or getattr(config.persona, "name", ""),

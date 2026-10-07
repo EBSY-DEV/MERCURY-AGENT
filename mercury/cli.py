@@ -124,8 +124,28 @@ def cmd_setup(args):
     asyncio.run(run_setup())
 
 
+def _print_limit_warnings() -> int:
+    """Print the inbox lifecycle warnings; returns how many there were."""
+    from mercury.config import load_config
+    from mercury.integrations.mailboxes import inbox_limit_warnings
+
+    warnings = inbox_limit_warnings(load_config())
+    for w in warnings:
+        print(f"  ! {w['message']}")
+    return len(warnings)
+
+
+def _refuse_strict() -> None:
+    print("\n  Refusing to continue under --strict. Fix mercury.yaml "
+          "(channels.email.mailboxes) or drop --strict.\n")
+    raise SystemExit(1)
+
+
 def cmd_run(args):
     """Start Mercury's heartbeat loop, or run a single cycle."""
+    # Without --strict the warnings are only logged at startup (main.py).
+    if getattr(args, "strict", False) and _print_limit_warnings():
+        _refuse_strict()
     if getattr(args, "once", False):
         from mercury.main import run_once_main
 
@@ -319,6 +339,14 @@ def cmd_mail(args):
     """
     from mercury.config import load_config, load_env
     from mercury.integrations.mailboxes import MailboxPool, local_today
+
+    if args.mail_action == "limits":
+        print()
+        if not _print_limit_warnings():
+            print("  No inbox limit warnings.\n")
+        elif getattr(args, "strict", False):
+            _refuse_strict()
+        sys.exit(0)
 
     config = load_config()
     env = load_env()
@@ -949,6 +977,12 @@ def main():
         help="Run a single cycle and exit (for cron/scheduled runs)",
     )
     sub.add_argument(
+        "--strict",
+        action="store_true",
+        help="Refuse to start when mailboxes break the inbox limits "
+             "(inboxes per domain, provider daily ceiling, 14-day warm-up)",
+    )
+    sub.add_argument(
         "--ignore-quiet-hours",
         action="store_true",
         help="With --once: run even during quiet hours",
@@ -1000,8 +1034,11 @@ def main():
     # mercury mail test
     sub = subparsers.add_parser("mail", help="Test the configured mail provider")
     sub.add_argument(
-        "mail_action", choices=["test"], help="test: verify send/receive credentials"
+        "mail_action", choices=["test", "limits"],
+        help="test: verify send/receive credentials; limits: check the inbox limits",
     )
+    sub.add_argument("--strict", action="store_true",
+                     help="With limits: exit 1 when any limit is broken")
     sub.set_defaults(func=cmd_mail)
 
     # mercury outbox
