@@ -183,6 +183,7 @@ function showTab(id, btn) {
   if (crumb) crumb.innerHTML = icon(meta[1]) + '<span>' + escHtml(meta[0]) + '</span>';
   document.title = meta[0] + ' · Mercury by EBSY';
   toggleSidebar(false);
+  document.querySelectorAll('.hm-tip').forEach(t => { t.hidden = true; });
   closeDrawer();
   closeMoveMenu();
   window.scrollTo(0, 0);
