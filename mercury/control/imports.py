@@ -23,8 +23,9 @@ from collections import Counter
 import aiosqlite
 
 from mercury.csv_import import (
-    DELIMITERS, FIELD_LABELS, FIELDS, MAX_BYTES, MAX_ROWS, ImportFileError, auto_mapping,
-    clean_row, fingerprint, ignored_status_columns, read_csv, resolve_mapping,
+    DELIMITERS, FIELD_LABELS, FIELDS, LINKEDIN_KEY_SQL, MAX_BYTES, MAX_ROWS, ImportFileError,
+    auto_mapping, clean_row, fingerprint, ignored_status_columns, linkedin_key, read_csv,
+    resolve_mapping,
 )
 from mercury.models.company import Company
 from mercury.models.prospect import Prospect
@@ -70,12 +71,12 @@ class ImportService:
     @staticmethod
     async def _existing(db, values: dict) -> tuple[dict | None, str]:
         """The contact this row already is, and why we think so."""
-        lookups = [("email", values["email"], "same email as an existing contact")]
+        lookups = [("email = ?", values["email"], "same email as an existing contact")]
         if values["linkedin_url"]:
-            lookups.append(("linkedin_url", values["linkedin_url"],
+            lookups.append((f"{LINKEDIN_KEY_SQL} = ?", linkedin_key(values["linkedin_url"]),
                             "same LinkedIn profile as an existing contact"))
-        for column, value, reason in lookups:
-            async with db.execute(f"SELECT * FROM prospects WHERE {column} = ?", (value,)) as cur:
+        for where, value, reason in lookups:
+            async with db.execute(f"SELECT * FROM prospects WHERE {where}", (value,)) as cur:
                 row = await cur.fetchone()
             if row:
                 return dict(row), reason
@@ -97,8 +98,8 @@ class ImportService:
             if not values.get(name) or (existing.get(column) or "").strip():
                 continue
             if name == "linkedin_url":
-                async with db.execute("SELECT 1 FROM prospects WHERE linkedin_url = ?",
-                                      (values[name],)) as cur:
+                async with db.execute(f"SELECT 1 FROM prospects WHERE {LINKEDIN_KEY_SQL} = ?",
+                                      (linkedin_key(values[name]),)) as cur:
                     if await cur.fetchone():
                         continue
             if name == "email":
@@ -132,9 +133,10 @@ class ImportService:
             elif v["email"] in seen_email:
                 item.update(outcome="duplicate", action="skip",
                             reason=f"same email as row {seen_email[v['email']]}")
-            elif v["linkedin_url"] and v["linkedin_url"] in seen_linkedin:
+            elif v["linkedin_url"] and linkedin_key(v["linkedin_url"]) in seen_linkedin:
                 item.update(outcome="duplicate", action="skip",
-                            reason=f"same LinkedIn profile as row {seen_linkedin[v['linkedin_url']]}")
+                            reason="same LinkedIn profile as row "
+                                   f"{seen_linkedin[linkedin_key(v['linkedin_url'])]}")
             else:
                 existing, why = await self._existing(db, v)
                 if existing:
@@ -155,11 +157,14 @@ class ImportService:
                 else:
                     item.update(outcome="incomplete" if clean.missing else "new", action="create",
                                 reason=("needs " + ", ".join(clean.missing)) if clean.missing else "")
-                seen_email.setdefault(v["email"], row_number)
-                if v["linkedin_url"]:
-                    seen_linkedin.setdefault(v["linkedin_url"], row_number)
             if row_number in exclude and item["action"] in ("create", "fill"):
                 item.update(action="exclude", reason="left out by you")
+            if item["action"] in ("create", "fill"):
+                # Only rows that will be written claim an identity, so a later
+                # row with the same email still imports when this one is left out.
+                seen_email.setdefault(v["email"], row_number)
+                if v["linkedin_url"]:
+                    seen_linkedin.setdefault(linkedin_key(v["linkedin_url"]), row_number)
             plan.append(item)
         return plan
 
@@ -357,11 +362,11 @@ class ImportService:
         async with self.state._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT * FROM import_batches WHERE id = ? OR id LIKE ? ORDER BY id LIMIT 2",
-                (batch_id, f"{batch_id}%"),
+                "SELECT * FROM import_batches WHERE substr(id, 1, ?) = ? ORDER BY id LIMIT 2",
+                (len(batch_id), batch_id),
             ) as cur:
                 found = [dict(r) for r in await cur.fetchall()]
-            if len(found) != 1:
+            if not batch_id or len(found) != 1:
                 raise ImportFileError("not_found", f"No single import matches {batch_id!r}.")
             batch = found[0]
             batch.pop("fingerprint", None)
@@ -448,7 +453,10 @@ class ImportService:
         remaining = len(await self._unverified(batch["id"], last_row, None))
         return {"batch_id": batch["id"], "checked": sum(results.values()),
                 "results": dict(results), "next_after_row": last_row,
-                "remaining": 0 if stopped else remaining, "stopped": stopped}
+                "remaining": 0 if stopped else remaining, "stopped": stopped,
+                # Still 'guess' after a provider looked: running Verify again
+                # would spend credits on these same addresses.
+                "unresolved": results.get("guess", 0)}
 
     # ── Release to outreach (explicit, separate) ──
 

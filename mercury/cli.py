@@ -737,9 +737,12 @@ def cmd_import(args):
     async def _run():
         data = sys.stdin.buffer.read() if args.file == "-" else Path(args.file).read_bytes()
         service = await ImportService(StateManager()).ready()
+        try:
+            exclude_rows = [int(x) for x in args.exclude_rows.split(",") if x.strip()]
+        except ValueError:
+            raise SystemExit(f"\n  --exclude-rows takes row numbers, got {args.exclude_rows!r}\n")
         options = dict(filename=Path(args.file).name, mapping=_import_mapping(args.map),
-                       delimiter=args.delimiter, policy=args.policy,
-                       exclude_rows=[int(x) for x in args.exclude_rows.split(",") if x.strip()])
+                       delimiter=args.delimiter, policy=args.policy, exclude_rows=exclude_rows)
         if args.dry_run:
             result = await service.preview(data, **options)
             if args.json:
@@ -829,7 +832,7 @@ def cmd_imports(args):
             if not estimate["addresses"]:
                 return print("\n  Every address in this batch is already verified or settled.\n")
             print(f"\n  {estimate['cost']}")
-            totals, after, results = 0, 0, {}
+            totals, after, results, unresolved = 0, 0, {}, 0
 
             async def progress(done, total):
                 print(f"\r  Verifying {totals + done}/{estimate['addresses']}", end="", flush=True)
@@ -838,13 +841,14 @@ def cmd_imports(args):
                 step = await service.verify(args.batch, limit=args.limit, after_row=after,
                                             progress=None if args.json else progress)
                 totals += step["checked"]
+                unresolved += step.get("unresolved", 0)
                 after = step["next_after_row"]
                 for k, v in step["results"].items():
                     results[k] = results.get(k, 0) + v
                 if step["stopped"] or not step["remaining"] or not step["checked"] or not args.all:
                     break
             summary = {"checked": totals, "results": results, "remaining": step["remaining"],
-                       "stopped": step["stopped"]}
+                       "unresolved": unresolved, "stopped": step["stopped"]}
             if args.json:
                 return print(json.dumps(summary, indent=2))
             print("\n  " + (", ".join(f"{v} {k}" for k, v in results.items()) or "nothing checked"))
@@ -852,6 +856,9 @@ def cmd_imports(args):
                 print(f"  {step['stopped']}")
             elif step["remaining"]:
                 print(f"  {step['remaining']} left. Run again, or pass --all.")
+            if unresolved:
+                print(f"  {unresolved} could not be settled and stay unverified. Verifying again "
+                      "spends credits on them again.")
             print(f"  Release the verified ones: mercury imports release {estimate['batch_id']}\n")
         elif action == "release":
             result = await service.release(args.batch, include_risky=args.include_risky)

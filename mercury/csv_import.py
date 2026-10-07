@@ -275,15 +275,42 @@ def valid_email(email: str) -> bool:
         and not local.endswith(".")
 
 
+def linkedin_key(url: str) -> str:
+    """One identity for every spelling of a LinkedIn URL: lowercase, no
+    scheme, no www., no query, no trailing slash. Matches LINKEDIN_KEY_SQL
+    exactly, so only ASCII is lowercased, as SQLite's lower() does."""
+    value = "".join(c.lower() if c.isascii() else c for c in (url or "").strip())
+    value = value.split("?", 1)[0]
+    value = re.sub(r"^https?://", "", value)
+    value = value[4:] if value.startswith("www.") else value
+    return value.rstrip("/")
+
+
+# The same normalisation in SQL, so rows stored in any spelling still match.
+# Built from explicit prefix checks: SQLite's ltrim() strips a character set,
+# which would mangle hosts like pt.linkedin.com.
+def _sql_strip_prefix(expr: str, prefix: str) -> str:
+    n = len(prefix)
+    return (f"CASE WHEN substr({expr}, 1, {n}) = '{prefix}' "
+            f"THEN substr({expr}, {n + 1}) ELSE {expr} END")
+
+
+def _sql_linkedin_key() -> str:
+    expr = "lower(linkedin_url)"
+    expr = f"CASE WHEN instr({expr}, '?') > 0 THEN substr({expr}, 1, instr({expr}, '?') - 1) ELSE {expr} END"
+    for prefix in ("https://", "http://", "www."):
+        expr = _sql_strip_prefix(expr, prefix)
+    return f"rtrim({expr}, '/')"
+
+
+LINKEDIN_KEY_SQL = _sql_linkedin_key()
+
+
 def _clean_linkedin(raw: str) -> str:
-    value = raw.strip()
-    if not value:
+    key = linkedin_key(raw)
+    if not key or "linkedin.com/" not in key:
         return ""
-    if "://" not in value:
-        value = "https://" + value
-    if "linkedin.com/" not in value.lower():
-        return ""
-    return value.split("?", 1)[0].rstrip("/")
+    return "https://www." + key
 
 
 def clean_row(row: int, values: dict[str, str], mapping: dict[str, str]) -> CleanRow:
@@ -304,7 +331,7 @@ def clean_row(row: int, values: dict[str, str], mapping: dict[str, str]) -> Clea
     if not email:
         out.errors.append("no email address")
     elif not valid_email(email):
-        out.errors.append(f"{email!r} is not a valid email address")
+        out.errors.append("not a valid email address")
     out.values["email"] = email
 
     first, last = raw.get("first_name", ""), raw.get("last_name", "")

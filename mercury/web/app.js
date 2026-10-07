@@ -1677,7 +1677,7 @@ async function loadProspects() {
         ' · row ' + escHtml(String(p.import_row)) + '</span>'
       : escHtml(p.source);
     html += '<tr><td>' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) +
-      (needs.length ? '<div class="chip">needs ' + escHtml(needs.join(', ')) + '</div>' : '') + '</td>' +
+      (needs.length ? '<div class="muted imp-needs">needs ' + escHtml(needs.join(', ')) + '</div>' : '') + '</td>' +
       '<td>' + escHtml(p.title) + '</td><td>' + escHtml(p.company) + '</td>' +
       '<td>' + emailV + '</td><td>' + phoneV + '</td><td>' + badge(p.status) + '</td>' +
       '<td class="muted">' + source + '</td><td class="muted">' + formatDate(p.created_at) + '</td>' +
@@ -1853,7 +1853,7 @@ async function impVerify(batchId) {
     copy: e.cost + ' Providers: ' + e.providers.map(p => p.name + ' (' + p.free_tier + ')').join(', ') + '.',
     ok: 'Verify' });
   if (!ok) return;
-  let after = 0, done = 0;
+  let after = 0, done = 0, unresolved = 0;
   const totals = {};
   _imp.verifying = batchId;
   while (true) {
@@ -1862,14 +1862,16 @@ async function impVerify(batchId) {
     const res = await impSend('/api/imports/' + encodeURIComponent(batchId) + '/verify', { limit: 10, after_row: after });
     if (!res.ok) { showToast(res.error.message, 'error'); break; }
     const s = res.data;
-    done += s.checked; after = s.next_after_row;
+    done += s.checked; after = s.next_after_row; unresolved += s.unresolved || 0;
     for (const [k, v] of Object.entries(s.results)) totals[k] = (totals[k] || 0) + v;
     if (s.stopped) { showToast(s.stopped, 'error'); break; }
     if (!s.remaining || !s.checked) break;
   }
   _imp.verifying = ''; _imp.verifyNote = '';
   const summary = Object.entries(totals).map(([k, v]) => v + ' ' + statusMeta(k).label.toLowerCase()).join(', ');
-  showToast(summary ? 'Verified: ' + summary : 'Nothing was checked.', 'success');
+  showToast((summary ? 'Verified: ' + summary + '.' : 'Nothing was checked.') +
+    (unresolved ? ' ' + unresolved + ' could not be settled and stay unverified; verifying again spends credits on them again.' : ''),
+    'success');
   loadImportBatches();
   loadProspects();
 }
