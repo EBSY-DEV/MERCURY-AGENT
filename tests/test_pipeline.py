@@ -11,12 +11,12 @@ import tempfile
 import pytest
 import pytest_asyncio
 
-from harvey import pipeline as P
-from harvey.collectors import discover as D
-from harvey.config import load_config
-from harvey.models import Company
-from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
-from harvey.state import StateManager
+from mercury import pipeline as P
+from mercury.collectors import discover as D
+from mercury.config import load_config
+from mercury.models import Company
+from mercury.signals import SIGNAL_CATALOG, seed_signal_catalog
+from mercury.state import StateManager
 
 
 @pytest_asyncio.fixture
@@ -118,7 +118,7 @@ def chain(monkeypatch):
                     collector="profile", value_text="wordpress")
             return len(companies), "run-x"
 
-        monkeypatch.setattr("harvey.collectors.profile.profile_companies",
+        monkeypatch.setattr("mercury.collectors.profile.profile_companies",
                             fake_profile)
         return seen
 
@@ -194,7 +194,7 @@ async def test_a_failing_profile_stage_does_not_lose_the_discovery(
 
     async def boom(state, companies):
         raise RuntimeError("network gone")
-    monkeypatch.setattr("harvey.collectors.profile.profile_companies", boom)
+    monkeypatch.setattr("mercury.collectors.profile.profile_companies", boom)
 
     report = await P.run_prospecting(state, config, "fake",
                                      [D.DiscoveryQuery(term="roofer")])

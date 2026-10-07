@@ -1,6 +1,6 @@
 """Dashboard API for the signal-confirmation gate, cohorts, and Today.
 
-These cover the contract the UI depends on: Harvey proposes signals, nothing
+These cover the contract the UI depends on: Mercury proposes signals, nothing
 is collected until a human confirms, and a confirmed set becomes a cohort
 query rather than a static list.
 """
@@ -11,18 +11,18 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-import harvey.dashboard as dash
-from harvey.signals import SIGNAL_CATALOG
-from harvey.state import StateManager
+import mercury.dashboard as dash
+from mercury.signals import SIGNAL_CATALOG
+from mercury.state import StateManager
 
 
 @pytest.fixture
 def client(monkeypatch):
     """A dashboard bound to a throwaway database."""
     with tempfile.TemporaryDirectory() as tmp:
-        db = Path(tmp) / "harvey.db"
+        db = Path(tmp) / "mercury.db"
         monkeypatch.setattr(dash, "DB_PATH", db)
-        monkeypatch.setattr(dash, "WEB_DIR", Path(__file__).resolve().parent.parent / "harvey" / "web")
+        monkeypatch.setattr(dash, "WEB_DIR", Path(__file__).resolve().parent.parent / "mercury" / "web")
         with TestClient(dash.app) as c:
             c.db_path = db
             yield c
@@ -32,7 +32,7 @@ def client(monkeypatch):
 
 
 def test_signals_seed_as_proposed_not_confirmed(client):
-    """Harvey proposes. Nothing is live until a human says so."""
+    """Mercury proposes. Nothing is live until a human says so."""
     data = client.get("/api/signals").json()
     assert data["total"] == len(SIGNAL_CATALOG)
     assert data["summary"]["proposed"] == len(SIGNAL_CATALOG)
@@ -106,9 +106,9 @@ def test_invalid_status_is_rejected(client):
 async def _seed_observations(db_path):
     state = StateManager(str(db_path))
     await state.init_db()
-    from harvey.signals import seed_signal_catalog
+    from mercury.signals import seed_signal_catalog
     await seed_signal_catalog(state)
-    from harvey.models import Company
+    from mercury.models import Company
 
     ids = []
     for n, name in enumerate(["Alpha Roofing", "Beta Roofing", "Gamma Roofing"]):
@@ -196,7 +196,7 @@ def test_dashboard_serves_its_files(client):
 
 
 def test_static_route_refuses_to_escape_the_web_directory(client):
-    assert client.get("/static/..%2f..%2fharvey.yaml").status_code == 404
+    assert client.get("/static/..%2f..%2fmercury.yaml").status_code == 404
     assert client.get("/static/nope.css").status_code == 404
 
 
@@ -204,7 +204,7 @@ def test_static_route_refuses_to_escape_the_web_directory(client):
 
 
 def test_cost_notes_are_machine_classifiable():
-    """`harvey signals --confirm free` and the dashboard's green/amber cost
+    """`mercury signals --confirm free` and the dashboard's green/amber cost
     chip both key off the cost note. A signal that costs credits must not
     read as free — that is how someone accidentally turns on paid collection.
     """
@@ -222,7 +222,7 @@ def test_cost_notes_are_machine_classifiable():
 
 
 def test_every_signal_has_a_category_the_ui_renders():
-    from harvey.dashboard import CATEGORY_ORDER
+    from mercury.dashboard import CATEGORY_ORDER
     for sig in SIGNAL_CATALOG:
         assert sig["category"] in CATEGORY_ORDER, (
             f"{sig['code']} is in category {sig['category']!r}, which the "

@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mercury by EBSY</title>
+<meta name="theme-color" content="#F7F5FD">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%229%22 fill=%22%237A5EDB%22/%3E%3Ctext x=%2216%22 y=%2222%22 text-anchor=%22middle%22 font-family=%22sans-serif%22 font-weight=%22600%22 font-size=%2217%22 fill=%22white%22%3EM%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<aside class="sidebar" id="sidebar">
+  <div class="brand">
+    <div class="mark" aria-hidden="true">M</div>
+    <div>
+      <h1>Mercury</h1>
+      <div class="tagline">by <b>EBSY</b></div>
+    </div>
+  </div>
+
+  <div class="side-cta">
+    <button class="btn btn-primary btn-block" onclick="goTab('discover')"><i data-ph="plus"></i>Find businesses</button>
+    <button class="btn-square" onclick="loadCurrentTab()" title="Refresh this page"><i data-ph="arrow-clockwise"></i></button>
+  </div>
+
+  <nav class="side-nav" aria-label="Main">
+    <div class="nav-group">
+      <button class="active" data-tab="today" onclick="showTab('today', this)"><i data-ph="squares-four"></i><span class="lbl">Today</span><span class="nav-count" id="nav-today"></span></button>
+    </div>
+    <div class="nav-group">
+      <div class="nav-label">Prospecting</div>
+      <button data-tab="signals" onclick="showTab('signals', this)"><i data-ph="funnel"></i><span class="lbl">Signals</span><span class="nav-count" id="nav-signals"></span></button>
+      <button data-tab="discover" onclick="showTab('discover', this)"><i data-ph="compass"></i><span class="lbl">Discover</span></button>
+      <button data-tab="companies" onclick="showTab('companies', this)"><i data-ph="buildings"></i><span class="lbl">Companies</span></button>
+      <button data-tab="prospects" onclick="showTab('prospects', this)"><i data-ph="address-book"></i><span class="lbl">Contacts</span></button>
+    </div>
+    <div class="nav-group">
+      <div class="nav-label">Outreach</div>
+      <button data-tab="pipeline" onclick="showTab('pipeline', this)"><i data-ph="kanban"></i><span class="lbl">Pipeline</span></button>
+      <button data-tab="calendar" onclick="showTab('calendar', this)"><i data-ph="calendar-blank"></i><span class="lbl">Calendar</span></button>
+      <button data-tab="campaigns" onclick="showTab('campaigns', this)"><i data-ph="megaphone"></i><span class="lbl">Campaigns</span></button>
+      <button data-tab="outbox" onclick="showTab('outbox', this)"><i data-ph="tray"></i><span class="lbl">Outbox</span><span class="nav-count" id="nav-outbox"></span></button>
+      <button data-tab="warmup" onclick="showTab('warmup', this)"><i data-ph="fire"></i><span class="lbl">Warm-up</span><span class="nav-flag" id="nav-warmup" hidden></span></button>
+      <button data-tab="conversations" onclick="showTab('conversations', this)"><i data-ph="chat-circle-text"></i><span class="lbl">Conversations</span></button>
+    </div>
+    <div class="nav-group">
+      <div class="nav-label">Workspace</div>
+      <button data-tab="activity" onclick="showTab('activity', this)"><i data-ph="pulse"></i><span class="lbl">Activity</span></button>
+      <button data-tab="usage" onclick="showTab('usage', this)"><i data-ph="gauge"></i><span class="lbl">Usage</span></button>
+      <button data-tab="settings" onclick="showTab('settings', this)"><i data-ph="gear-six"></i><span class="lbl">Settings</span></button>
+    </div>
+  </nav>
+
+  <div class="side-foot">
+    <button class="agent-card" onclick="goTab('controls')" id="header-status">
+      <span class="status-dot stopped" id="header-dot"></span>
+      <span class="agent-text">
+        <span class="agent-title" id="header-status-text">Checking…</span>
+        <span class="agent-sub">Open controls</span>
+      </span>
+      <i data-ph="caret-right"></i>
+    </button>
+    <button data-tab="help" onclick="showTab('help', this)"><i data-ph="question"></i><span class="lbl">Help</span></button>
+    <button class="side-link" id="theme-btn" onclick="cycleTheme()"
+            title="Appearance: follows your system until you pick one">auto</button>
+  </div>
+</aside>
+<div class="scrim" onclick="toggleSidebar(false)"></div>
+
+<div class="shell">
+<div class="topbar">
+  <button class="btn-square ghost" onclick="toggleSidebar()" title="Menu" aria-label="Toggle menu"><i data-ph="sidebar-simple"></i></button>
+  <span class="topbar-sep"></span>
+  <div class="crumb" id="crumb"><i data-ph="squares-four"></i><span>Today</span></div>
+</div>
+
+<main>
+
+<!-- Today: what needs a human -->
+<div id="today" class="section active">
+  <div class="section-head">
+    <h2>Today</h2>
+    <p>Anything waiting on you, then everything Mercury has built so far.</p>
+  </div>
+
+  <div class="kpis" id="today-figures"></div>
+  <div class="kpis kpis-3" id="today-rates" hidden></div>
+
+  <section class="panel" id="today-trend">
+    <div class="panel-head wrap">
+      <div><h3>Outreach trend</h3><p>Emails sent and replies per day.</p></div>
+      <div class="chart-controls">
+        <div class="legend" role="group" aria-label="Show series">
+          <button class="legend-btn on" data-series="sent" aria-pressed="true" onclick="trendToggle(this)"><span class="sw sw-sent"></span>Sent</button>
+          <button class="legend-btn on" data-series="replies" aria-pressed="true" onclick="trendToggle(this)"><span class="sw sw-replies"></span>Replies</button>
+          <button class="legend-btn on" data-series="bounces" aria-pressed="true" onclick="trendToggle(this)"><span class="sw sw-bounces"></span>Bounces</button>
+        </div>
+        <div class="segmented" role="group" aria-label="Range" id="trend-range">
+          <button data-days="7" onclick="trendRange(7)">7d</button>
+          <button data-days="30" class="on" onclick="trendRange(30)">30d</button>
+          <button data-days="90" onclick="trendRange(90)">90d</button>
+        </div>
+      </div>
+    </div>
+    <div class="chart-wrap" id="trend-chart"><div class="chart-note">Loading the trend…</div></div>
+    <div class="panel-foot">
+      <span id="trend-foot">&nbsp;</span>
+      <button class="link-btn" onclick="goTab('calendar')">View calendar<i data-ph="arrow-right"></i></button>
+    </div>
+  </section>
+
+  <section class="panel" id="today-heatmap">
+    <div class="panel-head">
+      <div><h3>Sending activity</h3><p>Outreach emails sent per day over the last year.</p></div>
+      <div class="hm-total" id="hm-total"></div>
+    </div>
+    <div class="panel-body"><div class="hm-wrap" id="hm-grid"><div class="chart-note">Loading activity…</div></div></div>
+    <div class="panel-foot">
+      <span class="hm-stats" id="hm-stats">&nbsp;</span>
+      <span class="hm-legend" aria-hidden="true">Less<i class="hm-c l0"></i><i class="hm-c l1"></i><i class="hm-c l2"></i><i class="hm-c l3"></i><i class="hm-c l4"></i>More</span>
+    </div>
+  </section>
+
+  <div class="grid-2-1">
+    <section class="panel">
+      <div class="panel-head">
+        <div><h3>Needs you</h3><p>Decisions only you can make, most blocking first.</p></div>
+      </div>
+      <div id="today-queue"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <div><h3>Quick actions</h3><p>Shortcuts to the usual next steps.</p></div>
+      </div>
+      <div class="quick-list">
+        <button class="quick" onclick="goTab('signals')"><i data-ph="funnel"></i><span><b>Confirm signals</b><small>Decide what defines a good prospect.</small></span><i data-ph="caret-right"></i></button>
+        <button class="quick" onclick="goTab('discover')"><i data-ph="compass"></i><span><b>Find businesses</b><small>Estimate first, then run a source.</small></span><i data-ph="caret-right"></i></button>
+        <button class="quick" onclick="goTab('outbox')"><i data-ph="tray"></i><span><b>Review the outbox</b><small>Approve emails before they send.</small></span><i data-ph="caret-right"></i></button>
+        <button class="quick" onclick="goTab('calendar')"><i data-ph="calendar-blank"></i><span><b>See what's scheduled</b><small>Every email and follow-up, by day.</small></span><i data-ph="caret-right"></i></button>
+        <button class="quick" onclick="window.location='/api/export/prospects.csv'"><i data-ph="download-simple"></i><span><b>Export prospects</b><small>Sequencer-ready CSV.</small></span><i data-ph="caret-right"></i></button>
+      </div>
+    </section>
+  </div>
+
+  <div class="grid-2-1">
+    <section class="panel">
+      <div class="panel-head">
+        <div><h3>Pipeline</h3><p>How far each business has made it through Mercury.</p></div>
+      </div>
+      <div class="panel-body" id="today-funnel"></div>
+    </section>
+    <div class="stack">
+      <div id="today-setup"></div>
+      <section class="panel" id="today-runs-block">
+        <div class="panel-head"><div><h3>Collector runs</h3><p>Latest discovery and profiling jobs.</p></div></div>
+        <div class="panel-body" id="today-runs"></div>
+      </section>
+    </div>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <div><h3>Recent activity</h3><p>Every action Mercury takes, newest first.</p></div>
+      <button class="link-btn" onclick="goTab('activity')">View all<i data-ph="arrow-right"></i></button>
+    </div>
+    <div class="panel-body" id="today-activity"></div>
+  </section>
+</div>
+
+<!-- Signals: the confirmation gate -->
+<div id="signals" class="section">
+  <div class="section-head">
+    <h2>Signals</h2>
+    <p>Mercury proposes what it knows how to look for. You decide what actually
+       defines a good prospect &mdash; nothing is collected until you confirm it.</p>
+  </div>
+  <div id="signals-summary"></div>
+  <div id="signals-groups"></div>
+
+  <div class="subhead">Cohort builder</div>
+  <div class="card">
+    <p class="lede">A prospect list is a query, not a file. Pick the signals a
+      good prospect must have &mdash; and any that disqualify them &mdash; and see
+      how many companies match right now.</p>
+    <div id="cohort-builder"></div>
+    <div id="cohort-result"></div>
+  </div>
+</div>
+
+<!-- Discover: the only stage that spends money -->
+<div id="discover" class="section">
+  <div class="section-head">
+    <h2>Discover</h2>
+    <p>Find businesses matching your ICP. Pick a source, see what it will cost,
+       then run it &mdash; nothing is called until you press the button.</p>
+  </div>
+  <div id="discover-providers"></div>
+
+  <div class="subhead">Run</div>
+  <div class="card">
+    <div class="form-row" style="margin-bottom:14px">
+      <div class="form-group" style="flex:2">
+        <label class="form-label">Cities</label>
+        <input class="form-input" id="disc-cities" placeholder="from your ICP — or override, one per line">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Results per query</label>
+        <input class="form-input" id="disc-limit" type="number" value="100" min="1" max="1000">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Search depth</label>
+        <input class="form-input" id="disc-depth" type="number" value="30" min="10" max="100" step="10">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Spend cap ($)</label>
+        <input class="form-input" id="disc-cap" type="number" value="1.00" min="0" step="0.25">
+      </div>
+    </div>
+    <div id="discover-estimate"></div>
+    <div class="btn-group">
+      <button class="btn btn-secondary" onclick="estimateDiscovery()">Estimate cost</button>
+      <button class="btn btn-primary" id="disc-run" onclick="runDiscovery()" disabled>
+        Estimate first</button>
+      <button class="btn btn-danger" id="disc-stop" onclick="stopDiscovery()" style="display:none">
+        Stop</button>
+    </div>
+  </div>
+  <div id="discover-result"></div>
+</div>
+
+<!-- Companies -->
+<div id="companies" class="section">
+  <div class="section-head"><h2>Companies</h2><p>Organizations Mercury has researched. Click a row to see its contacts.</p></div>
+  <div id="companies-list"></div>
+</div>
+
+<!-- Contacts -->
+<div id="prospects" class="section">
+  <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
+    <div><h2>Contacts</h2><p>People Mercury has found and verified.</p></div>
+    <div style="display:flex;gap:8px;flex-shrink:0">
+      <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv" download>Export deliverable CSV</a>
+      <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv?all=true" download>Export all</a>
+    </div>
+  </div>
+  <div id="prospects-table"></div>
+</div>
+
+<!-- Pipeline: every contact as a card, by how far they've got -->
+<div id="pipeline" class="section">
+  <div class="section-head">
+    <h2>Pipeline</h2>
+    <p>Every contact, by how far they've got. Mercury moves cards through the first
+       three columns itself; drag a card into the rest when a deal moves.</p>
+  </div>
+  <div class="toolbar">
+    <label class="search-field">
+      <i data-ph="magnifying-glass"></i>
+      <input type="search" id="pipe-search" placeholder="Search name, company or email"
+             autocomplete="off" oninput="pipeSearch(this.value)">
+    </label>
+    <span class="toolbar-note" id="pipe-summary"></span>
+  </div>
+  <div id="pipe-board"></div>
+</div>
+
+<!-- Calendar: every email Mercury has sent or will send -->
+<div id="calendar" class="section">
+  <div class="section-head">
+    <h2>Calendar</h2>
+    <p>Every email Mercury has sent or will send, including follow-ups, in your local time.</p>
+  </div>
+  <div class="toolbar cal-toolbar">
+    <div class="cal-nav">
+      <button class="btn-square" onclick="calShift(-1)" title="Previous month" aria-label="Previous month"><i data-ph="caret-left"></i></button>
+      <button class="btn-square" onclick="calShift(1)" title="Next month" aria-label="Next month"><i data-ph="caret-right"></i></button>
+      <button class="btn btn-secondary btn-sm" onclick="calToday()">Today</button>
+      <h3 class="cal-title" id="cal-title"></h3>
+    </div>
+    <div class="segmented" role="group" aria-label="View">
+      <button id="cal-v-month" onclick="calView('month')"><i data-ph="calendar-blank"></i>Month</button>
+      <button id="cal-v-agenda" onclick="calView('agenda')"><i data-ph="list-bullets"></i>Agenda</button>
+    </div>
+  </div>
+  <div class="cal-filters" id="cal-filters">
+    <label class="check"><input type="checkbox" data-f="sent" onchange="calFilter(this)" checked><span class="ce-ic s-sent"><i data-ph="check-circle"></i></span>Sent</label>
+    <label class="check"><input type="checkbox" data-f="approved" onchange="calFilter(this)" checked><span class="ce-ic s-approved"><i data-ph="clock"></i></span>Scheduled</label>
+    <label class="check"><input type="checkbox" data-f="pending_review" onchange="calFilter(this)" checked><span class="ce-ic s-pending_review"><i data-ph="clock"></i></span>Needs approval</label>
+    <label class="check"><input type="checkbox" data-f="cancelled" onchange="calFilter(this)"><span class="ce-ic s-cancelled"><i data-ph="prohibit"></i></span>Cancelled</label>
+    <label class="check"><input type="checkbox" data-f="failed" onchange="calFilter(this)"><span class="ce-ic s-failed"><i data-ph="warning-circle"></i></span>Failed</label>
+    <span class="toolbar-note" id="cal-summary"></span>
+  </div>
+  <div id="cal-body"></div>
+</div>
+
+<!-- Campaigns -->
+<div id="campaigns" class="section">
+  <div class="section-head"><h2>Campaigns</h2><p>Email sequences Mercury has written and deployed.</p></div>
+  <div id="campaigns-list"></div>
+</div>
+
+<!-- Outbox: the decisions desk -->
+<div id="outbox" class="section">
+  <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
+    <div>
+      <h2>Outbox</h2>
+      <p>Every outgoing email stops here. Read one, decide, move on &mdash;
+         <kbd>A</kbd> approve, <kbd>R</kbd> reject, <kbd>J</kbd>/<kbd>K</kbd> to move.</p>
+    </div>
+    <div style="display:flex;gap:8px;flex-shrink:0" id="outbox-actions"></div>
+  </div>
+  <div id="outbox-banner"></div>
+  <div id="outbox-desk"></div>
+  <div id="outbox-list"></div>
+</div>
+
+<!-- Warm-up: a new inbox earns its volume -->
+<div id="warmup" class="section">
+  <div class="section-head split">
+    <div>
+      <h2>Warm-up</h2>
+      <p>New inboxes start slow. Mercury enforces a daily send ramp, watches bounces,
+         and walks you through the setup that keeps you out of spam.</p>
+    </div>
+    <button class="btn btn-secondary btn-sm" id="wu-add-btn" onclick="wuOpenAdd()" hidden><i data-ph="plus"></i>Add inbox</button>
+  </div>
+  <div id="wu-switch"></div>
+  <div id="wu-body"><div class="loading-note">Loading warm-up…</div></div>
+</div>
+
+<!-- Conversations -->
+<div id="conversations" class="section">
+  <div class="section-head"><h2>Conversations</h2><p>Every reply, and how Mercury handled it.</p></div>
+  <div id="conversations-list"></div>
+</div>
+
+<!-- Activity -->
+<div id="activity" class="section">
+  <div class="section-head"><h2>Activity</h2><p>A running log of every action Mercury's agents have taken.</p></div>
+  <div id="activity-list"></div>
+</div>
+
+<!-- Usage -->
+<div id="usage" class="section">
+  <div class="section-head"><h2>Usage</h2><p>Actual Claude usage — your subscription quota, calls, and tokens per agent and task. Subscription plans aren't billed per token, so no dollar costs here.</p></div>
+  <div id="usage-quota" class="card" style="display:none"></div>
+  <div class="stats-grid" id="usage-stats"></div>
+  <div class="card" id="usage-daily" style="display:none"></div>
+  <div id="usage-tables"></div>
+</div>
+
+<!-- Settings -->
+<div id="settings" class="section">
+  <div class="section-head"><h2>Settings</h2><p>Credentials are stored locally in <span style="font-family:var(--mono);font-size:12px">.env</span> — never sent anywhere except the services themselves.</p></div>
+  <div class="card">
+    <h2>Email Provider</h2>
+    <p class="lede">How Mercury sends and reads replies. Active provider: <b id="active-provider">…</b> — change it by setting <span style="font-family:var(--mono);font-size:12px">channels.email.provider</span> in <span style="font-family:var(--mono);font-size:12px">mercury.yaml</span> to <span style="font-family:var(--mono);font-size:12px">gmail</span>, <span style="font-family:var(--mono);font-size:12px">smtp</span>, or <span style="font-family:var(--mono);font-size:12px">instantly</span>.</p>
+
+    <div style="border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px">
+      <div style="font-weight:650;margin-bottom:4px">Gmail / Google Workspace <span class="optional-tag">recommended</span> <span id="gmail-status" class="email-tag"></span></div>
+      <p class="lede" style="margin-top:4px">Use a mailbox on a dedicated secondary domain. Create an OAuth client (type "Desktop app") in Google Cloud Console → Gmail API, paste the id/secret, save, then run <span style="font-family:var(--mono);font-size:12px">mercury gmail auth</span> in your terminal.</p>
+      <div class="form-group"><label class="form-label" for="gmail-id">Client ID</label>
+        <input type="text" class="form-input" id="gmail-id" placeholder="xxxx.apps.googleusercontent.com" autocomplete="off"></div>
+      <div class="form-group"><label class="form-label" for="gmail-secret">Client Secret</label>
+        <div class="form-row"><div class="form-group" style="margin-bottom:0">
+          <input type="password" class="form-input" id="gmail-secret" placeholder="Enter client secret" autocomplete="off"></div>
+          <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('gmail-secret')">Show</button></div></div>
+      <button class="btn btn-primary btn-sm" onclick="saveGmail()">Save Gmail</button>
+    </div>
+
+    <div style="border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px">
+      <div style="font-weight:650;margin-bottom:4px">SMTP + IMAP mailbox</div>
+      <p class="lede" style="margin-top:4px">Any real mailbox (AgentMail, Fastmail, a Workspace app password). IMAP defaults to the SMTP host/login if left blank.</p>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label" for="smtp-host">SMTP host</label>
+          <input type="text" class="form-input" id="smtp-host" placeholder="smtp.example.com" autocomplete="off"></div>
+        <div class="form-group" style="max-width:120px"><label class="form-label" for="smtp-port">Port</label>
+          <input type="text" class="form-input" id="smtp-port" placeholder="587" autocomplete="off"></div>
+      </div>
+      <div class="form-group"><label class="form-label" for="smtp-user">Username</label>
+        <input type="text" class="form-input" id="smtp-user" placeholder="you@example.com" autocomplete="off"></div>
+      <div class="form-group"><label class="form-label" for="smtp-pass">Password</label>
+        <div class="form-row"><div class="form-group" style="margin-bottom:0">
+          <input type="password" class="form-input" id="smtp-pass" placeholder="Enter password / app password" autocomplete="off"></div>
+          <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('smtp-pass')">Show</button></div></div>
+      <button class="btn btn-primary btn-sm" onclick="saveSmtp()">Save SMTP</button>
+    </div>
+
+    <div style="border:1px solid var(--border);border-radius:10px;padding:16px">
+      <div style="font-weight:650;margin-bottom:4px">Instantly <span class="optional-tag">legacy</span></div>
+      <p class="lede" style="margin-top:4px">Get your API key from <a href="https://app.instantly.ai/app/settings/integrations" target="_blank" rel="noopener">Instantly Settings → Integrations</a> (Growth plan+ for API).</p>
+      <div class="form-group"><div class="form-row"><div class="form-group" style="margin-bottom:0">
+        <input type="password" class="form-input" id="instantly-key" placeholder="Enter your Instantly API key" autocomplete="off"></div>
+        <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('instantly-key')">Show</button>
+        <button class="btn btn-secondary btn-sm" onclick="testInstantly()">Test</button></div>
+        <div id="instantly-test-result"></div></div>
+      <button class="btn btn-primary btn-sm" onclick="saveInstantly()">Save Instantly</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Email Verification <span class="optional-tag">strongly recommended</span></h2>
+    <p class="lede">Add at least one so found emails get verified. Without any, addresses stay <span class="email-tag guess">guess</span> and are never sent. Reoon has the best free tier (600/mo).</p>
+    <div class="form-group"><label class="form-label" for="reoon-key">Reoon API key <span id="reoon-status" class="email-tag"></span></label>
+      <div class="form-row"><div class="form-group" style="margin-bottom:0">
+        <input type="password" class="form-input" id="reoon-key" placeholder="600 free/mo — reoon.com/email-verifier" autocomplete="off"></div>
+        <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('reoon-key')">Show</button></div></div>
+    <div class="form-group"><label class="form-label" for="zerobounce-key">ZeroBounce API key <span id="zerobounce-status" class="email-tag"></span></label>
+      <input type="password" class="form-input" id="zerobounce-key" placeholder="100 free/mo — best for M365/Workspace catch-alls" autocomplete="off"></div>
+    <div class="form-group"><label class="form-label" for="hunter-key">Hunter API key <span id="hunter-status" class="email-tag"></span></label>
+      <input type="password" class="form-input" id="hunter-key" placeholder="50 free/mo + email-pattern lookup" autocomplete="off"></div>
+    <button class="btn btn-primary btn-sm" onclick="saveVerifiers()">Save verification keys</button>
+  </div>
+
+  <div class="card">
+    <h2>LinkedIn <span class="optional-tag">optional</span></h2>
+    <p class="lede">For automated LinkedIn prospecting. Mercury logs in and searches like a human.</p>
+    <div class="form-group">
+      <label class="form-label" for="linkedin-email">Email / Username</label>
+      <input type="text" class="form-input" id="linkedin-email" placeholder="your@email.com" autocomplete="off">
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="linkedin-password">Password</label>
+      <input type="password" class="form-input" id="linkedin-password" placeholder="Enter password" autocomplete="new-password">
+    </div>
+    <button class="btn btn-primary" onclick="saveLinkedIn()">Save</button>
+  </div>
+
+  <div class="card">
+    <h2>Cloudflare <span class="optional-tag">optional</span></h2>
+    <p class="lede">For deep website crawling with JavaScript rendering during product training. ~$5/month.</p>
+    <div class="form-group">
+      <label class="form-label" for="cf-account-id">Account ID</label>
+      <input type="text" class="form-input" id="cf-account-id" placeholder="Your Cloudflare Account ID" autocomplete="off">
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="cf-api-token">API Token</label>
+      <input type="password" class="form-input" id="cf-api-token" placeholder="Your Cloudflare API Token" autocomplete="off">
+    </div>
+    <button class="btn btn-primary" onclick="saveCloudflare()">Save</button>
+  </div>
+</div>
+
+<!-- Controls -->
+<div id="controls" class="section">
+  <div class="section-head"><h2>Controls</h2><p>Start and stop Mercury's heartbeat loop, and watch what it's doing.</p></div>
+  <div class="control-panel">
+    <div class="card">
+      <h2>Agent</h2>
+      <div class="status-big" id="control-status">
+        <div class="dot stopped" id="control-dot"></div>
+        <span class="label stopped" id="control-label">Stopped</span>
+      </div>
+      <div class="status-meta" id="control-meta"></div>
+      <div class="btn-group">
+        <button class="btn btn-primary" id="btn-start" onclick="startMercury()">Start Mercury</button>
+        <button class="btn btn-danger" id="btn-stop" onclick="stopMercury()" style="display:none">Stop Mercury</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Recent Logs</h2>
+      <div class="log-viewer" id="log-viewer">No logs yet. Start Mercury to see activity.</div>
+      <div class="btn-group">
+        <button class="btn btn-secondary btn-sm" onclick="loadLogs()">Refresh Logs</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Help -->
+<div id="help" class="section">
+  <div class="section-head"><h2>Help</h2><p>What Mercury is, how it works, and how to fix the usual problems.</p></div>
+
+  <div class="help-section">
+    <h2>What is Mercury?</h2>
+    <p>Mercury is an autonomous AI sales agent. Once set up, Mercury runs on its own: finds people who match your ideal customer, writes personalized cold emails, sends them through your email platform, reads every reply, handles objections, and works toward booking a meeting. You review everything through this dashboard.</p>
+    <p>Mercury runs on your Claude Max subscription, so there are no extra AI costs. Everything stays on your machine in one folder.</p>
+  </div>
+
+  <div class="help-section">
+    <h2>Getting Started</h2>
+    <p>There are four things to do:</p>
+    <pre>1. Settings: connect an email provider (Gmail recommended) and a verifier key
+2. Train Mercury on your product (mercury train &lt;your-site&gt;)
+3. Signals: confirm what defines a good prospect
+4. Open controls from the sidebar and click Start</pre>
+    <p>The Setup card on Today shows exactly what's done and what still needs to happen.</p>
+  </div>
+
+  <div class="help-section">
+    <h2>Where Everything Lives</h2>
+    <p>Everything Mercury needs is inside this one project folder. Nothing is stored elsewhere.</p>
+    <div class="table-card" style="padding:6px 4px">
+    <table class="file-table">
+      <tr><td>.env</td><td>Your API keys and credentials (never shared or committed)</td></tr>
+      <tr><td>mercury.yaml</td><td>Your product info, target customers, and behavior settings</td></tr>
+      <tr><td>skills/</td><td>Sales knowledge files. Edit these to change how Mercury writes and sells.</td></tr>
+      <tr><td>skills/product_knowledge.md</td><td>Everything Mercury knows about your product (auto-generated from training)</td></tr>
+      <tr><td>prompts/</td><td>Prompt templates for each agent. Advanced customization.</td></tr>
+      <tr><td>data/mercury.db</td><td>Database with all prospects, campaigns, and conversations</td></tr>
+      <tr><td>data/mercury.log</td><td>Log file showing what Mercury is doing</td></tr>
+    </table>
+    </div>
+  </div>
+
+  <div class="help-section">
+    <h2>Getting Your API Keys</h2>
+
+    <details>
+      <summary>Instantly API Key (required)</summary>
+      <div class="faq-body">
+        <p>Instantly is the email platform Mercury uses to send campaigns.</p>
+        <p>1. Sign up at <a href="https://instantly.ai" target="_blank" rel="noopener">instantly.ai</a> (you need the Growth plan for API access)</p>
+        <p>2. Go to Settings &gt; Integrations</p>
+        <p>3. Copy your API key</p>
+        <p>4. Paste it in the Settings tab here</p>
+      </div>
+    </details>
+
+    <details>
+      <summary>LinkedIn Credentials (optional)</summary>
+      <div class="faq-body">
+        <p>If you want Mercury to find prospects on LinkedIn, enter your LinkedIn email and password. Mercury uses a real browser to search LinkedIn like a human would, with random delays and rate limits to avoid detection.</p>
+        <p>If you skip this, Mercury will find prospects through Google searches and company website scraping instead.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary>Cloudflare Browser Rendering (optional)</summary>
+      <div class="faq-body">
+        <p>This is only used during product training (when Mercury crawls your website to learn about your product). It handles JavaScript-heavy websites that a basic crawler can't read.</p>
+        <p>1. Sign up at <a href="https://dash.cloudflare.com" target="_blank" rel="noopener">Cloudflare</a> (paid Workers plan, ~$5/month)</p>
+        <p>2. Go to Workers &amp; Pages &gt; Browser Rendering</p>
+        <p>3. Create an API token with Browser Rendering Edit permissions</p>
+        <p>4. Enter your Account ID and API Token in the Settings tab</p>
+        <p>Without this, Mercury uses a built-in crawler that works fine for most websites but can't render JavaScript.</p>
+      </div>
+    </details>
+  </div>
+
+  <div class="help-section">
+    <h2>Common Issues</h2>
+
+    <details>
+      <summary>"command not found: mercury"</summary>
+      <div class="faq-body">You need to activate the virtual environment first: <code>source .venv/bin/activate</code></div>
+    </details>
+
+    <details>
+      <summary>Instantly API returns 401</summary>
+      <div class="faq-body">Your API key is wrong, or you need the Growth plan (the free plan doesn't include API access). Double-check the key in Settings &gt; Integrations in your Instantly dashboard.</div>
+    </details>
+
+    <details>
+      <summary>Claude headless mode fails</summary>
+      <div class="faq-body">Make sure you've run <code>claude login</code> in your terminal and have an active Claude Max subscription. Mercury uses your existing subscription, not a separate API key.</div>
+    </details>
+
+    <details>
+      <summary>Mercury isn't finding prospects</summary>
+      <div class="faq-body">Check that your ICP (ideal customer profile) in mercury.yaml has realistic titles, industries, and geography. If LinkedIn is set up, check that the credentials are correct. Check the Activity tab to see what Mercury has been trying to do.</div>
+    </details>
+  </div>
+</div>
+
+</main>
+
+</div><!-- /.shell -->
+
+<!-- Shared right-hand drawer (Pipeline cards, Calendar events) -->
+<div class="drawer-scrim" id="drawer-scrim" onclick="closeDrawer()"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true">
+  <div class="drawer-head">
+    <div class="drawer-titles">
+      <div class="drawer-kicker" id="drawer-kicker"></div>
+      <h3 id="drawer-title"></h3>
+      <div class="drawer-sub" id="drawer-sub"></div>
+    </div>
+    <button class="btn-square ghost" onclick="closeDrawer()" title="Close (Esc)" aria-label="Close"><i data-ph="x"></i></button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<!-- Small confirm dialog -->
+<div class="modal-wrap" id="modal" aria-hidden="true">
+  <div class="modal-scrim" onclick="closeModal(false)"></div>
+  <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-copy">
+    <h3 id="modal-title"></h3>
+    <p id="modal-copy"></p>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-sm" onclick="closeModal(false)">Cancel</button>
+      <button class="btn btn-primary btn-sm" id="modal-ok" onclick="closeModal(true)">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add a warm-up inbox -->
+<div class="modal-wrap" id="wu-modal" aria-hidden="true">
+  <div class="modal-scrim" onclick="wuCloseAdd()"></div>
+  <form class="modal" role="dialog" aria-modal="true" aria-labelledby="wu-modal-title" onsubmit="wuSubmitAdd(event)" novalidate>
+    <h3 id="wu-modal-title">Add an inbox to warm up</h3>
+    <p>Mercury caps what this inbox sends each day and raises the cap over four weeks.</p>
+    <div class="form-group">
+      <label class="form-label" for="wu-new-email">Email address</label>
+      <input class="form-input" id="wu-new-email" type="email" placeholder="you@yourdomain.co" autocomplete="off" required>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label" for="wu-new-start">Start date <span class="optional-tag">optional</span></label>
+        <input class="form-input" id="wu-new-start" type="date">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="wu-new-target">Target per day</label>
+        <input class="form-input" id="wu-new-target" type="number" min="5" max="500" step="1" placeholder="40">
+      </div>
+    </div>
+    <div class="form-error" id="wu-new-error" hidden></div>
+    <div class="modal-actions">
+      <button type="button" class="btn btn-secondary btn-sm" onclick="wuCloseAdd()">Cancel</button>
+      <button type="submit" class="btn btn-primary btn-sm" id="wu-new-ok">Add inbox</button>
+    </div>
+  </form>
+</div>
+
+<div class="menu" id="move-menu" role="menu" hidden></div>
+
+<script src="/static/icons.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

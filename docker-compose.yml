@@ -1,18 +1,18 @@
 services:
-  harvey:
+  mercury:
     build: .
     env_file: .env
     volumes:
       # Persist database across restarts
       - ./data:/app/data
       # Mount config for easy editing without rebuild
-      - ./harvey.yaml:/app/harvey.yaml:ro
+      - ./mercury.yaml:/app/mercury.yaml:ro
       - ./prompts:/app/prompts:ro
       - ./skills:/app/skills
       # Mount Claude auth (required for Max plan usage).
       # Not read-only: the CLI refreshes OAuth tokens in place.
-      # The container runs as non-root user "harvey" (uid 1000).
-      - ~/.claude:/home/harvey/.claude
+      # The container runs as non-root user "mercury" (uid 1000).
+      - ~/.claude:/home/mercury/.claude
     restart: unless-stopped
     init: true
     logging:
