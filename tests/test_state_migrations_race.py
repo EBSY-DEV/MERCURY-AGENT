@@ -49,7 +49,7 @@ def _columns(conn, table):
 def test_migration_order_mailbox_v9_then_warmup_v10():
     # Production DBs are stamped 9 by origin/main's outbox.mailbox migration;
     # it must stay v9 and the warm-up overlay must come after it.
-    assert len(MIGRATIONS) == 10
+    assert len(MIGRATIONS) >= 10
     assert "ALTER TABLE outbox ADD COLUMN mailbox" in MIGRATIONS[8]
     assert "CREATE TABLE IF NOT EXISTS warmup_inboxes" in MIGRATIONS[9]
     assert "warmup_inboxes" not in MIGRATIONS[8]
@@ -71,7 +71,7 @@ async def test_production_v9_db_upgrades_to_v10(tmp_path):
     await StateManager(db).init_db()
 
     conn = sqlite3.connect(db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
     assert {"email", "status", "tasks_json", "notes", "paused_at", "pause_reason",
             "resumed_at"} <= _columns(conn, "warmup_inboxes")
     assert conn.execute("SELECT mailbox FROM outbox WHERE id = 'o1'").fetchone()[0] == "me@x.co"
@@ -86,6 +86,6 @@ async def test_pre_merge_dev_db_gets_the_mailbox_column(tmp_path):
     _apply(db, MIGRATIONS[:8] + [MIGRATIONS[9]])
     await StateManager(db).init_db()
     conn = sqlite3.connect(db)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 10
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
     assert "mailbox" in _columns(conn, "outbox")
     conn.close()

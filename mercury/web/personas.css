@@ -1,0 +1,51 @@
+/* Writing voices use the dashboard's existing tokens and controls. */
+.voice-nav { display:flex; gap:4px; border-bottom:1px solid var(--border); margin-bottom:24px; }
+.voice-nav button { border:0; background:none; color:var(--text-2); padding:12px 16px; font:500 13px var(--sans); cursor:pointer; border-bottom:2px solid transparent; }
+.voice-nav button.active { color:var(--accent-deep); border-bottom-color:var(--accent); }
+.voice-nav button:focus-visible { outline:2px solid var(--accent); outline-offset:-3px; border-radius:var(--r-sm); }
+.voice-layout { display:grid; grid-template-columns:minmax(230px,310px) minmax(0,1fr); gap:24px; align-items:start; }
+.persona-row { display:flex; gap:12px; width:100%; text-align:left; background:var(--panel); border:1px solid var(--border); border-radius:var(--r-md); padding:15px; margin-bottom:10px; color:var(--text); font-family:var(--sans); cursor:pointer; }
+.persona-row:hover { border-color:var(--accent-line); }
+.persona-row.selected { border-color:var(--accent); background:var(--accent-soft); }
+.persona-row.archived { opacity:.65; }
+.persona-row strong { display:block; font-size:14px; overflow-wrap:anywhere; }
+.persona-row p { font-size:12px; color:var(--text-2); margin:5px 0; line-height:1.5; }
+.persona-row small { color:var(--text-3); font-size:11.5px; }
+.persona-avatar { width:48px; height:48px; border-radius:var(--r-md); flex:none; background:var(--panel-raised); object-fit:contain; }
+.persona-avatar.large { width:84px; height:84px; }
+.persona-avatar.tiny { width:26px; height:26px; border-radius:7px; }
+.persona-heading { display:flex; align-items:center; gap:18px; margin-bottom:22px; }
+.persona-heading h3 { font-size:18px; margin-bottom:5px; }
+.voice-copy { color:var(--text-2); font-size:13px; line-height:1.65; }
+.voice-copy small { font-size:12px; }
+.voice-error { color:var(--s-bad); font-size:13px; padding:10px 0; }
+.voice-help { font-size:12px; color:var(--text-3); line-height:1.6; margin:7px 0 16px; }
+.voice-editor textarea { resize:vertical; line-height:1.6; }
+.voice-editor .form-group { margin-bottom:18px; }
+.voice-two { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+.voice-editor-footer { display:flex; align-items:center; gap:10px; flex-wrap:wrap; border-top:1px solid var(--border); padding-top:18px; margin-top:24px; }
+.voice-editor-footer .spacer { flex:1; }
+.voice-details { margin:18px 0; border-top:1px solid var(--border); padding-top:16px; }
+.voice-details summary { cursor:pointer; font-size:13px; font-weight:500; color:var(--text); }
+.voice-details > :not(summary) { margin-top:14px; }
+.avatar-picker { display:grid; grid-template-columns:repeat(8,minmax(0,1fr)); gap:8px; }
+.avatar-choice { border:2px solid transparent; background:var(--panel-raised); border-radius:var(--r-sm); padding:2px; cursor:pointer; }
+.avatar-choice img { display:block; width:100%; aspect-ratio:1; }
+.avatar-choice.selected, .avatar-choice:focus-visible { border-color:var(--accent); outline:none; }
+.voice-code { white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.65 var(--mono); color:var(--text-2); background:var(--panel-raised); border:1px solid var(--border); border-radius:var(--r-sm); padding:16px; max-height:480px; overflow:auto; }
+.voice-code.long { max-height:65vh; }
+.voice-sample { border-top:1px solid var(--border); padding-top:20px; margin-top:20px; }
+.voice-sample h4 { font-size:15px; margin:14px 0; }
+.voice-email { white-space:pre-wrap; font:14px/1.8 var(--sans); overflow-wrap:anywhere; }
+.voice-version { border-top:1px solid var(--border); padding:12px 0; }
+.voice-version p { font-size:12px; color:var(--text-2); margin-top:5px; }
+.persona-chip { display:inline-flex; align-items:center; gap:7px; border:0; background:none; padding:0; color:var(--accent-deep); font:12px var(--sans); cursor:pointer; text-align:left; white-space:nowrap; }
+.persona-chip:hover span { text-decoration:underline; }
+.desk-persona { display:flex; align-items:center; gap:12px; font-size:12px; margin-bottom:14px; }
+.voice-history { margin-top:22px; }
+.voice-history h4 { font-size:13px; margin:12px 0; }
+.voice-config-value { white-space:pre-wrap; overflow-wrap:anywhere; }
+#voice-loading { color:var(--text-3); font-size:13px; padding:18px 0; }
+.voice-view[hidden], #voice-loading[hidden] { display:none; }
+@media(max-width:850px) { .voice-layout { grid-template-columns:1fr; } #persona-list { display:grid; grid-template-columns:1fr 1fr; gap:10px; } .persona-row { margin-bottom:0; } }
+@media(max-width:560px) { .voice-two, #persona-list { grid-template-columns:1fr; } .voice-nav button { padding:10px 8px; font-size:12px; } .avatar-picker { grid-template-columns:repeat(6,minmax(0,1fr)); } .persona-heading { align-items:flex-start; } }

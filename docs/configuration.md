@@ -37,6 +37,19 @@ Who the emails come from. All fields are required.
 | `linkedin` | LinkedIn profile URL, used in prompts. |
 | `tone` | Free text, e.g. `professional, consultative, confident`. |
 
+The **Voice & Personas** dashboard tab imports `persona.tone` into a saved
+**Workspace voice** on first use. After that, the saved default persona supplies
+the writing tone; edit it in the tab. Sender name, company, role and email still
+come from this YAML section. Persona changes take effect on the next generation
+without restarting the agent. YAML business settings still require a restart.
+
+Tone, writing preferences and style examples are versioned. Names, descriptions
+and Critters avatars are visual metadata and do not create a writing version.
+Campaign sequences and their personalized openers keep their originating persona
+version. Regenerations and replies retain their email/thread's saved voice.
+Shared prompts and knowledge continue to load from disk on each generation;
+each email's history stores the exact assembled prompt that was used.
+
 ### `product`
 
 | Key | Required | Default | Description |

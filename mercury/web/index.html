@@ -7,6 +7,7 @@
 <meta name="theme-color" content="#F7F5FD">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%229%22 fill=%22%237A5EDB%22/%3E%3Ctext x=%2216%22 y=%2222%22 text-anchor=%22middle%22 font-family=%22sans-serif%22 font-weight=%22600%22 font-size=%2217%22 fill=%22white%22%3EM%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/personas.css">
 </head>
 <body>
 
@@ -40,6 +41,7 @@
       <button data-tab="pipeline" onclick="showTab('pipeline', this)"><i data-ph="kanban"></i><span class="lbl">Pipeline</span></button>
       <button data-tab="calendar" onclick="showTab('calendar', this)"><i data-ph="calendar-blank"></i><span class="lbl">Calendar</span></button>
       <button data-tab="campaigns" onclick="showTab('campaigns', this)"><i data-ph="megaphone"></i><span class="lbl">Campaigns</span></button>
+      <button data-tab="personas" onclick="showTab('personas', this)"><i data-ph="sparkle"></i><span class="lbl">Voice &amp; Personas</span></button>
       <button data-tab="outbox" onclick="showTab('outbox', this)"><i data-ph="tray"></i><span class="lbl">Outbox</span><span class="nav-count" id="nav-outbox"></span></button>
       <button data-tab="warmup" onclick="showTab('warmup', this)"><i data-ph="fire"></i><span class="lbl">Warm-up</span><span class="nav-flag" id="nav-warmup" hidden></span></button>
       <button data-tab="conversations" onclick="showTab('conversations', this)"><i data-ph="chat-circle-text"></i><span class="lbl">Conversations</span></button>
@@ -294,6 +296,25 @@
     <span class="toolbar-note" id="cal-summary"></span>
   </div>
   <div id="cal-body"></div>
+</div>
+
+<!-- Voice & Personas -->
+<div id="personas" class="section">
+  <div class="section-head split">
+    <div><h2>Voice &amp; Personas</h2><p>Give your outreach a voice. See the instructions behind it, and keep its history with every email.</p></div>
+    <button class="btn btn-primary" onclick="newPersona()"><i data-ph="plus"></i>New persona</button>
+  </div>
+  <div class="voice-nav" aria-label="Voice views">
+    <button class="active" data-voice-view="profiles" onclick="voiceView('profiles')">Personas</button>
+    <button data-voice-view="prompt" onclick="voiceView('prompt')">Prompt &amp; preview</button>
+    <button data-voice-view="config" onclick="voiceView('config')">Current configuration</button>
+  </div>
+  <div id="voice-loading" role="status">Loading your writing profiles…</div>
+  <div id="voice-profiles" class="voice-view" hidden>
+    <div class="voice-layout"><div id="persona-list"></div><div id="persona-editor"></div></div>
+  </div>
+  <div id="voice-prompt" class="voice-view" hidden></div>
+  <div id="voice-config" class="voice-view" hidden></div>
 </div>
 
 <!-- Campaigns -->
@@ -643,5 +664,6 @@
 
 <script src="/static/icons.js"></script>
 <script src="/static/app.js"></script>
+<script src="/static/personas.js"></script>
 </body>
 </html>

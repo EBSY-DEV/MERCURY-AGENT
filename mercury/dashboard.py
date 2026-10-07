@@ -24,6 +24,7 @@ from fastapi.responses import (
 logger = logging.getLogger("mercury.dashboard")
 
 from mercury.paths import PROJECT_ROOT  # noqa: E402
+from mercury.personas_api import router as personas_router  # noqa: E402
 # MERCURY_DB_PATH points the dashboard at another database (e.g. the demo
 # DB from scripts/seed_demo.py) without touching the real one.
 DB_PATH = Path(os.environ.get("MERCURY_DB_PATH") or (PROJECT_ROOT / "data" / "mercury.db"))
@@ -33,6 +34,7 @@ PID_FILE = PROJECT_ROOT / "data" / "mercury.pid"
 LOG_FILE = PROJECT_ROOT / "data" / "mercury.log"
 
 app = FastAPI(title="Mercury Dashboard")
+app.include_router(personas_router)
 
 # Mercury process tracking
 _mercury_process: subprocess.Popen | None = None
@@ -670,6 +672,8 @@ async def get_outbox_api():
                 state, await state.get_outbox(status="pending_review", limit=100), legacy, known),
             "approved": await _with_from_mailbox(
                 state, await state.get_outbox(status="approved", limit=50), legacy, known),
+            "sending": await _with_from_mailbox(
+                state, await state.get_outbox(status="sending", limit=50), legacy, known),
             "sent": await _with_from_mailbox(state, await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
                 "ORDER BY sent_at DESC LIMIT 25"), legacy),
@@ -722,7 +726,8 @@ async def _with_from_mailbox(state, rows: list[dict], legacy_email: str = "",
         # the sender (never re-routed); say so in the UI.
         r["from_removed"] = bool(fm and known is not None and fm not in known
                                  and r.get("status") != "sent")
-    return rows
+    from mercury.personas import PersonaStore
+    return await PersonaStore(state).enrich(rows)
 
 
 async def _promote_followups_if_enabled(state, item: dict | None = None) -> int:
@@ -891,7 +896,9 @@ async def outbox_edit(item_id: str, request: Request):
             return JSONResponse({"success": False,
                                  "message": "only pending or approved drafts can be edited"},
                                 status_code=409)
-        await state.update_outbox_item(item_id, subject=subject, body=text)
+        if not await state.edit_outbox_item(item_id, subject=subject, body=text, manually_edited=1):
+            return JSONResponse({"success": False, "message": "this draft has started sending"},
+                                status_code=409)
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -926,7 +933,9 @@ async def outbox_reschedule(item_id: str, request: Request):
             return JSONResponse(
                 {"success": False, "error": "send_at is in the past"}, status_code=400)
         normalized = when.isoformat(timespec="seconds")
-        await state.update_outbox_item(item_id, send_at=normalized)
+        if not await state.edit_outbox_item(item_id, send_at=normalized):
+            return JSONResponse({"success": False, "error": "this draft has started sending"},
+                                status_code=409)
         try:
             await state.log_action("outbox_reschedule", "dashboard", {
                 "outbox_id": item_id, "from": item.get("send_at"), "to": normalized,
@@ -1275,16 +1284,34 @@ async def outbox_regenerate(item_id: str, request: Request):
         from mercury.brain import Brain
         from mercury.config import load_config, load_env
 
-        writer = Writer(Brain(state), state, load_config(), load_env())
-        draft = await writer.regenerate_email(item, prospect, instruction)
+        from mercury.personas import PersonaStore
+        if item.get("kind") == "reply":
+            from mercury.agents.handler import Handler
+            convo = await state.get_conversation(item.get("conversation_id") or "")
+            if not convo:
+                return JSONResponse({"success": False, "message": "conversation not found"}, status_code=404)
+            config = load_config()
+            handler = Handler(Brain(state), state, config, load_env())
+            profile = await PersonaStore(state).for_generation(config, item.get("generation_id", ""))
+            latest = next((m.content for m in reversed(convo.thread) if not m.is_ours), "")
+            response = await handler._generate_response(
+                convo.intent, latest, prospect, convo, instruction=instruction, profile=profile,
+            )
+            draft = {"subject": item["subject"], "body": response,
+                     "generation_id": handler._response_generation_id} if response else None
+        else:
+            writer = Writer(Brain(state), state, load_config(), load_env())
+            draft = await writer.regenerate_email(item, prospect, instruction)
         if not draft:
             return JSONResponse({"success": False, "message": "the writer returned nothing; try again"},
                                 status_code=502)
         # A regenerated draft is unread: back to the review queue.
-        await state.update_outbox_item(
-            item_id, subject=draft["subject"], body=draft["body"], status="pending_review",
-        )
-        return {"success": True, "subject": draft["subject"], "body": draft["body"]}
+        try:
+            await PersonaStore(state).replace_draft(item_id, draft)
+        except ValueError as error:
+            return JSONResponse({"success": False, "message": str(error)}, status_code=409)
+        updated = await PersonaStore(state).enrich([await state.get_outbox_item(item_id)])
+        return {"success": True, **updated[0]}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
