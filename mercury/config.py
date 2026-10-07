@@ -103,6 +103,10 @@ class MailboxConfig(BaseModel):
     smtp_port: int = 0
     imap_host: str = ""
     imap_port: int = 0
+    imap_username: str = ""
+    # Preserve a legacy inbox with separate IMAP credentials when rotation
+    # is enabled from the dashboard. Empty uses its SMTP password.
+    imap_password_env: str = ""
     # Steady-state ceiling once warm-up has run its course.
     daily_cap: int = 30
     # First day this mailbox sent cold mail. The cap starts at
@@ -370,7 +374,7 @@ def load_env(values=None) -> EnvConfig:
     """Load credentials: .env merged into the process environment, or the
     mapping ``values`` (read as-is, without touching os.environ)."""
     if values is None:
-        load_dotenv()
+        load_dotenv(interpolate=False)
         values = os.environ
     getenv = lambda key, default="": (values.get(key) or default)  # noqa: E731
     env = EnvConfig(

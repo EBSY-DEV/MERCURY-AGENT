@@ -390,6 +390,17 @@
       <div id="settings-mailboxes"></div>
     </div>
 
+    <section class="inbox-settings" aria-labelledby="inbox-settings-title">
+      <div class="inbox-settings-head">
+        <div><h3 id="inbox-settings-title">Sending inboxes</h3>
+          <p class="lede">Add inboxes, update passwords, and set each inbox's sending limit. Restart a running Mercury agent after saving.</p></div>
+        <button type="button" class="btn btn-primary btn-sm" id="inbox-add" onclick="openInboxEditor()" disabled>Add inbox</button>
+      </div>
+      <div id="inbox-notice" role="status" aria-live="polite"></div>
+      <div id="inbox-list"><p class="muted">Loading inboxes…</p></div>
+      <div id="inbox-editor" hidden></div>
+    </section>
+
     <div style="border:1px solid var(--border);border-radius:10px;padding:16px">
       <div style="font-weight:650;margin-bottom:4px">Instantly <span class="optional-tag">legacy</span></div>
       <p class="lede" style="margin-top:4px">Get your API key from <a href="https://app.instantly.ai/app/settings/integrations" target="_blank" rel="noopener">Instantly Settings → Integrations</a> (Growth plan+ for API).</p>
