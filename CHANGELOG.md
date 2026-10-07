@@ -16,6 +16,16 @@ minor versions can still change behaviour.
   The Writer's subject stays in the row for review; the Outbox and
   `mercury outbox` show the subject the recipient sees. Off sends each step as
   a new email, as before.
+- **Out-of-office pauses.** On native providers a vacation reply pauses that
+  contact's cold sequence until the day they are back, read deterministically
+  from the reply in English or Spanish and resolved in the configured
+  timezone. Unclear, ambiguous or past dates pause with "needs a return date"
+  instead of guessing. On return only the next step goes, later steps keep
+  their gaps, and approvals are never changed. A human reply, opt-out, bounce
+  or closure ends the pause. Receipts and acknowledgements are kept as records
+  and change nothing; none of them count as replies. Outbox **Away** section,
+  Today items and `mercury paused` to correct a date or resume.
+
 - **Exclusions and company limits.** Exact-address and domain exclusions
   (subdomains only when you ask), with a reason, a source and an append-only
   history. Opt-outs and bounces are recorded as exclusions on the address, so

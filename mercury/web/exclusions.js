@@ -6,7 +6,7 @@ const _ex = { kind: 'email', q: '', view: 'active', rules: [], timer: null };
 const POLICY_LABEL = {
   excluded: 'Excluded', blocked: 'Blocked', company_hold: 'Company on hold',
   company_daily_limit: 'Company limit', company_active_limit: 'Company limit',
-  company_unknown: 'Company unknown',
+  company_unknown: 'Company unknown', ooo_pause: 'Out of office',
 };
 
 // A queued email's policy verdict as a badge plus its reason, or '' when it

@@ -629,6 +629,69 @@ MIGRATIONS: list[str] = [
     ALTER TABLE outbox ADD COLUMN thread_references TEXT DEFAULT '';
     ALTER TABLE outbox ADD COLUMN thread_subject TEXT DEFAULT '';
     """,
+    # ── v17: out-of-office pauses and the automatic replies behind them ──
+    """
+    -- A temporary stop on one contact's cold sequence while they are away.
+    -- Kept apart from prospects.status (their pipeline place does not move)
+    -- and from company_holds (it is about one person, and it ends by itself
+    -- at resume_at). One active pause per contact; rows are never deleted:
+    -- ending one stamps ended_at with 'resumed' or 'superseded'.
+    --   review_state  'scheduled' (resume_at is set) or 'needs_review' (no
+    --                 usable date: a person sets one or resumes by hand)
+    --   message_key / message_at  the vacation reply that set the date
+    --   manual_override  a person set the date; only a vacation reply sent
+    --                 after override_at may change it again
+    CREATE TABLE sequence_pauses (
+        id TEXT PRIMARY KEY,
+        prospect_id TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT 'out_of_office',
+        status TEXT NOT NULL DEFAULT 'active'
+            CHECK (status IN ('active', 'resumed', 'superseded')),
+        review_state TEXT NOT NULL CHECK (review_state IN ('scheduled', 'needs_review')),
+        review_reason TEXT DEFAULT '',
+        message_key TEXT DEFAULT '',
+        message_at TIMESTAMP,
+        confidence REAL DEFAULT 0,
+        return_text TEXT DEFAULT '',
+        resume_at TIMESTAMP,
+        timezone TEXT DEFAULT '',
+        manual_override INTEGER NOT NULL DEFAULT 0,
+        override_at TIMESTAMP,
+        override_by TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ended_at TIMESTAMP,
+        ended_by TEXT DEFAULT '',
+        ended_reason TEXT DEFAULT ''
+    );
+    CREATE UNIQUE INDEX uq_sequence_pauses_active
+        ON sequence_pauses(prospect_id) WHERE ended_at IS NULL;
+    CREATE INDEX idx_sequence_pauses_due
+        ON sequence_pauses(review_state, resume_at) WHERE ended_at IS NULL;
+    CREATE INDEX idx_sequence_pauses_prospect ON sequence_pauses(prospect_id, ended_at);
+
+    -- Every automatic message from a contact (vacation reply, receipt,
+    -- acknowledgement), kept as a record. They never open a conversation and
+    -- never count as replies. The primary key is what makes a re-polled
+    -- message a no-op instead of a second pause update.
+    CREATE TABLE auto_replies (
+        message_key TEXT PRIMARY KEY,
+        prospect_id TEXT DEFAULT '',
+        from_email TEXT DEFAULT '',
+        mailbox TEXT DEFAULT '',
+        kind TEXT NOT NULL,
+        detected_by TEXT DEFAULT '',
+        subject TEXT DEFAULT '',
+        excerpt TEXT DEFAULT '',
+        received_at TIMESTAMP,
+        return_text TEXT DEFAULT '',
+        parsed_resume_at TIMESTAMP,
+        pause_id TEXT DEFAULT '',
+        outcome TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX idx_auto_replies_prospect ON auto_replies(prospect_id, received_at);
+    """,
 ]
 
 # ── Exclusion matching and company capacity (shared SQL) ──
@@ -787,6 +850,12 @@ async def _claim_verdict(db, item: dict, company_id: str, max_new: int, max_acti
     if rules:
         return "suppressed", {"rule": rules[0],
                               "error": "excluded: " + describe_rule(rules[0])}
+    # An away contact's sequence waits, even when the due scan predates the
+    # pause. The sender resumes due pauses before it claims anything.
+    if item.get("kind") == "sequence" and item.get("prospect_id"):
+        pause = await _active_pause(db, item["prospect_id"])
+        if pause:
+            return "ooo_pause", {"pause": pause}
     if item.get("kind") != "sequence" or not company_id:
         return "claimed", {}
     if respect_holds:
@@ -806,6 +875,30 @@ async def _claim_verdict(db, item: dict, company_id: str, max_new: int, max_acti
     if max_active and usage["active"] >= max_active:
         return "company_active_limit", {**usage, "limit": max_active}
     return "claimed", {}
+
+
+async def _active_pause(db, prospect_id: str) -> dict | None:
+    db.row_factory = aiosqlite.Row
+    async with db.execute(
+        "SELECT * FROM sequence_pauses WHERE prospect_id = ? AND ended_at IS NULL",
+        (prospect_id,),
+    ) as cur:
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+def _parse_ts(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace(" ", "T"))
+    except ValueError:
+        return None
+
+
+# Queued sequence mail a pause holds and a resume reschedules. 'blocked'
+# waits on an exclusion decision instead, and keeps its own schedule.
+_PAUSE_HELD = ("pending_review", "approved")
 
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -1894,6 +1987,270 @@ class StateManager:
             except BaseException:
                 await db.execute("ROLLBACK")
                 raise
+
+    # ── Out-of-office pauses (see mercury/ooo.py) ──
+
+    async def record_auto_reply(
+        self, *, message_key: str, kind: str, received_at: str, prospect_id: str = "",
+        from_email: str = "", mailbox: str = "", subject: str = "", excerpt: str = "",
+        detected_by: str = "", parsed: dict | None = None, can_pause: bool = True,
+        now: str | None = None,
+    ) -> tuple[str, dict | None]:
+        """Keep one automatic message, and pause the contact's sequence when it
+        is a vacation reply. One transaction. Returns (outcome, active pause):
+
+          duplicate  this message was recorded before; nothing changes
+          recorded   not a vacation reply (receipt, acknowledgement)
+          ignored    a vacation reply that must not pause: the contact is out
+                     of the sequence, or the message is older than a pause
+                     that already ended
+          paused     a new pause
+          updated    a newer vacation reply changed the active pause
+          kept       the active pause stays as it is: the message is not newer
+                     than the one that set it (or than a person's correction),
+                     or it has no usable date while the pause already has one
+        """
+        now = now or _utcnow().isoformat()
+        parsed = parsed or {}
+        async with aiosqlite.connect(
+            self.db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
+        ) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    """INSERT OR IGNORE INTO auto_replies
+                       (message_key, prospect_id, from_email, mailbox, kind, detected_by,
+                        subject, excerpt, received_at, return_text, parsed_resume_at, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (message_key, prospect_id, _norm(from_email), _norm(mailbox), kind,
+                     detected_by, subject[:300], excerpt[:1000], received_at,
+                     parsed.get("text", ""), parsed.get("resume_at"), now))
+                if not cursor.rowcount:
+                    pause = await _active_pause(db, prospect_id) if prospect_id else None
+                    await db.execute("COMMIT")
+                    return "duplicate", pause
+                outcome, pause = "recorded", None
+                if kind == "out_of_office" and prospect_id:
+                    outcome, pause = await self._apply_pause(
+                        db, prospect_id, message_key, received_at, parsed, can_pause, now)
+                await db.execute(
+                    "UPDATE auto_replies SET outcome = ?, pause_id = ? WHERE message_key = ?",
+                    (outcome, (pause or {}).get("id", ""), message_key))
+                await db.execute("COMMIT")
+                return outcome, pause
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    async def _apply_pause(db, prospect_id: str, message_key: str, received_at: str,
+                           parsed: dict, can_pause: bool, now: str):
+        if not can_pause:
+            return "ignored", None
+        scheduled = bool(parsed.get("resume_at"))
+        fields = {
+            "review_state": "scheduled" if scheduled else "needs_review",
+            "review_reason": "" if scheduled else (parsed.get("review_reason") or "no_date"),
+            "message_key": message_key, "message_at": received_at,
+            "confidence": float(parsed.get("confidence") or 0.0),
+            "return_text": parsed.get("text", ""), "resume_at": parsed.get("resume_at"),
+            "timezone": parsed.get("timezone", ""),
+        }
+        active = await _active_pause(db, prospect_id)
+        if active is None:
+            async with db.execute(
+                "SELECT MAX(ended_at) FROM sequence_pauses "
+                "WHERE prospect_id = ? AND ended_at IS NOT NULL", (prospect_id,),
+            ) as cur:
+                (last_end,) = await cur.fetchone()
+            if last_end and received_at <= str(last_end):
+                return "ignored", None
+            pause = {"id": _new_id(), "prospect_id": prospect_id, **fields}
+            await db.execute(
+                f"INSERT INTO sequence_pauses ({', '.join(pause)}, created_at, updated_at) "
+                f"VALUES ({', '.join('?' for _ in pause)}, ?, ?)",
+                (*pause.values(), now, now))
+            return "paused", await _active_pause(db, prospect_id)
+
+        newer = received_at > str(active.get("message_at") or "")
+        if active["manual_override"] and received_at <= str(active.get("override_at") or ""):
+            newer = False
+        if not newer or (not scheduled and active["review_state"] == "scheduled"):
+            return "kept", active
+        await db.execute(
+            f"UPDATE sequence_pauses SET {', '.join(f'{k} = ?' for k in fields)}, "
+            "manual_override = 0, updated_at = ? WHERE id = ?",
+            (*fields.values(), now, active["id"]))
+        return "updated", await _active_pause(db, prospect_id)
+
+    async def get_active_pause(self, prospect_id: str) -> dict | None:
+        if not prospect_id:
+            return None
+        async with self._connect() as db:
+            return await _active_pause(db, prospect_id)
+
+    async def get_pause(self, pause_id: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM sequence_pauses WHERE id = ?", (pause_id,)
+            ) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def paused_prospect_ids(self) -> set[str]:
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT prospect_id FROM sequence_pauses WHERE ended_at IS NULL"
+            ) as cur:
+                return {row[0] for row in await cur.fetchall()}
+
+    async def due_pauses(self, now: str) -> list[dict]:
+        """Active pauses whose return time has come."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM sequence_pauses WHERE ended_at IS NULL "
+                "AND review_state = 'scheduled' AND resume_at IS NOT NULL AND resume_at <= ? "
+                "ORDER BY resume_at", (now,),
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def list_pauses(self, ended: bool = False, limit: int = 200) -> list[dict]:
+        """Pauses with who they are, and the cold mail each is holding."""
+        held = ", ".join(f"'{s}'" for s in _PAUSE_HELD)
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"""SELECT s.*, COALESCE(p.email, '') AS prospect_email,
+                       TRIM(COALESCE(p.first_name, '') || ' ' || COALESCE(p.last_name, ''))
+                           AS prospect_name,
+                       COALESCE(p.company, '') AS company,
+                       COALESCE(p.status, '') AS prospect_status,
+                       COALESCE(p.email_status, '') AS prospect_email_status,
+                       (SELECT COUNT(*) FROM outbox o WHERE o.prospect_id = s.prospect_id
+                          AND o.kind = 'sequence' AND o.status IN ({held})) AS queued,
+                       (SELECT MIN(o.send_at) FROM outbox o WHERE o.prospect_id = s.prospect_id
+                          AND o.kind = 'sequence' AND o.status IN ({held})) AS next_send_at
+                    FROM sequence_pauses s
+                    LEFT JOIN prospects p ON p.id = s.prospect_id
+                    WHERE s.ended_at IS {'NOT ' if ended else ''}NULL
+                    ORDER BY {'s.ended_at DESC' if ended else
+                              "s.review_state = 'scheduled', COALESCE(s.resume_at, s.created_at)"}
+                    LIMIT ?""",
+                (int(limit),),
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def auto_replies_for(self, prospect_id: str, limit: int = 20) -> list[dict]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM auto_replies WHERE prospect_id = ? "
+                "ORDER BY received_at DESC LIMIT ?", (prospect_id, int(limit)),
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def set_pause_resume_at(self, pause_id: str, resume_at: str, *, actor: str = "",
+                                  now: str | None = None) -> tuple[dict, dict] | None:
+        """A person sets (or corrects) the return time. Returns (before, after),
+        or None when the pause is not active. Approval status is untouched."""
+        now = now or _utcnow().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            before = await self.get_pause(pause_id)
+            if not before or before["ended_at"]:
+                return None
+            cursor = await db.execute(
+                "UPDATE sequence_pauses SET resume_at = ?, review_state = 'scheduled', "
+                "review_reason = '', manual_override = 1, override_at = ?, override_by = ?, "
+                "updated_at = ? WHERE id = ? AND ended_at IS NULL",
+                (resume_at, now, actor, now, pause_id))
+            await db.commit()
+            if not cursor.rowcount:
+                return None
+        return before, await self.get_pause(pause_id)
+
+    async def resume_pause(self, pause_id: str, *, start_at: str, actor: str = "",
+                           reason: str = "", now: str | None = None) -> tuple[dict | None, int]:
+        """End a pause and move the held sequence so it restarts at ``start_at``.
+
+        Per campaign, the next unsent step moves to ``start_at`` (never
+        earlier than it was already due) and every later step moves by the
+        same amount, so the gaps between steps stay what the sequence said.
+        Only send_at changes: a draft waiting for review still waits.
+        Returns (ended pause, rows rescheduled), or (None, 0) when the pause
+        was not active.
+        """
+        now = now or _utcnow().isoformat()
+        start = _parse_ts(start_at) or _parse_ts(now)
+        marks = ", ".join("?" for _ in _PAUSE_HELD)
+        async with aiosqlite.connect(
+            self.db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
+        ) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT * FROM sequence_pauses WHERE id = ? AND ended_at IS NULL",
+                    (pause_id,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if not row:
+                    await db.execute("ROLLBACK")
+                    return None, 0
+                pause = dict(row)
+                async with db.execute(
+                    f"SELECT id, campaign_id, step, send_at FROM outbox "
+                    f"WHERE prospect_id = ? AND kind = 'sequence' AND status IN ({marks}) "
+                    f"ORDER BY campaign_id, step",
+                    (pause["prospect_id"], *_PAUSE_HELD),
+                ) as cur:
+                    rows = [dict(r) for r in await cur.fetchall()]
+                threads: dict[str, list[dict]] = {}
+                for r in rows:
+                    threads.setdefault(r["campaign_id"] or r["id"], []).append(r)
+                moved = 0
+                for thread in threads.values():
+                    base = _parse_ts(thread[0]["send_at"]) or start
+                    shift = start - base
+                    if shift <= timedelta(0):
+                        continue
+                    for r in thread:
+                        new = (_parse_ts(r["send_at"]) or base) + shift
+                        await db.execute(
+                            f"UPDATE outbox SET send_at = ?, updated_at = ? "
+                            f"WHERE id = ? AND status IN ({marks})",
+                            (new.isoformat(), now, r["id"], *_PAUSE_HELD))
+                        moved += 1
+                await db.execute(
+                    "UPDATE sequence_pauses SET status = 'resumed', ended_at = ?, ended_by = ?, "
+                    "ended_reason = ?, updated_at = ? WHERE id = ?",
+                    (now, actor, reason, now, pause_id))
+                await db.execute("COMMIT")
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+        return {**pause, "status": "resumed", "ended_at": now, "ended_by": actor,
+                "ended_reason": reason}, moved
+
+    async def end_pause(self, prospect_id: str, *, reason: str, actor: str = "",
+                        now: str | None = None) -> dict | None:
+        """Supersede a contact's pause: they replied, opted out, bounced or
+        were closed, so the sequence must not come back. Its queued mail is
+        left to the rules that apply to it (stop-on-reply, exclusions)."""
+        now = now or _utcnow().isoformat()
+        async with self._connect() as db:
+            pause = await _active_pause(db, prospect_id)
+            if not pause:
+                return None
+            await db.execute(
+                "UPDATE sequence_pauses SET status = 'superseded', ended_at = ?, ended_by = ?, "
+                "ended_reason = ?, updated_at = ? WHERE id = ? AND ended_at IS NULL",
+                (now, actor, reason, now, pause["id"]))
+            await db.commit()
+        return {**pause, "status": "superseded", "ended_at": now, "ended_reason": reason}
 
     # ── Signal vocabulary (governed; user-confirmed before collection) ──
 
