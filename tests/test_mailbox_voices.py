@@ -53,7 +53,13 @@ def test_archived_assignment_falls_back_to_default(client):
     pid = create(client)
     run(voices.assign("harvey@one.example", pid))
     client.post(f"/api/personas/{pid}/archive", json={"archived": True})
-    assert run(voices.assignments())[0]["persona"]["id"] == "workspace"
+    harvey = run(voices.assignments())[0]
+    assert harvey["persona"]["id"] == "workspace"
+    assert harvey["persona_id"] == "" and harvey["follows_default"]
+    # Saving a sign-off from the UI re-posts the reported persona id, so the
+    # stale archived one must not come back and be rejected.
+    r = client.post("/api/voices/harvey@one.example", json={"persona_id": harvey["persona_id"], "sign_name": "Harv"})
+    assert r.status_code == 200 and r.json()["signer"] == "Harv"
 
 
 def test_rotation_stays_at_send_time_until_mailboxes_differ(client):

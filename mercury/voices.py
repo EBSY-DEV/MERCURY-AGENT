@@ -50,12 +50,15 @@ class MailboxVoices:
         for mailbox in configured_mailboxes(self.config, self.env):
             row = stored.get(mailbox["email"], {})
             chosen = row.get("persona_id") or ""
-            # An assigned persona that was archived falls back to the default.
-            persona = personas.get(chosen) if chosen and not personas.get(chosen, {}).get("archived", True) else None
-            persona = persona or personas[default_id]
+            # An assigned persona that was archived or deleted falls back to the
+            # default, and the mailbox reports that it follows the default so an
+            # edit saved from the UI or CLI does not re-post the stale id.
+            if chosen and personas.get(chosen, {}).get("archived", True):
+                chosen = ""
+            persona = personas[chosen] if chosen else personas[default_id]
             sign_name = row.get("sign_name") or ""
             suggested = persona.get("sign_name") or self.config.persona.name
-            result.append(mailbox | {"persona_id": chosen, "follows_default": persona["id"] == default_id and not chosen,
+            result.append(mailbox | {"persona_id": chosen, "follows_default": not chosen,
                                      "persona": persona, "sign_name": sign_name, "suggested": suggested,
                                      "signer": sign_name or suggested})
         return result
