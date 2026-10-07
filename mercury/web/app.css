@@ -1074,6 +1074,10 @@ details[open] summary::before { content: '– '; }
 .resched-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .resched-row .form-input { width: auto; flex: 1; min-width: 200px; max-width: 260px; padding: 6px 10px; }
 
+/* Paused-for-out-of-office table: a date field and two buttons per contact. */
+.pause-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pause-actions .form-input { width: auto; padding: 5px 9px; font-family: var(--mono); font-size: 12px; }
+
 @media (max-width: 700px) {
   .drawer { top: 0; right: 0; bottom: 0; width: 100vw; border-radius: 0; border: none; }
 }
