@@ -2057,7 +2057,8 @@ async def update_warmup_inbox(email: str, request: Request):
 WEB_DIR = (Path(__file__).resolve().parent / "web")
 
 
-TEXT_TYPES = {".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml"}
+TEXT_TYPES = {".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml",
+              ".webmanifest": "application/manifest+json"}
 BINARY_TYPES = {".woff2": "font/woff2", ".woff": "font/woff", ".png": "image/png"}
 
 
