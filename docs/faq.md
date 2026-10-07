@@ -79,7 +79,7 @@ Check in this order:
 mercury sending pause
 ```
 
-Or press **Pause all sending** on the Outbox tab. Nothing leaves the outbox until you resume; drafts keep accumulating for review. `mercury sending resume` (or **Resume sending**) turns it back on and resets the bounce counter. Mercury pauses itself the same way when bounces pass `max_bounce_rate`.
+Or press **Pause all sending** on the Outbox tab. Nothing leaves the outbox until you resume; drafts keep accumulating for review. `mercury sending resume` (or **Resume sending**) turns it back on and resets the bounce counter. Mercury pauses itself the same way when bounces pass `max_bounce_rate` (default 2%) or when sender and reputation blocks pass 20% of bounces.
 
 ## How do I resume a paused mailbox?
 
