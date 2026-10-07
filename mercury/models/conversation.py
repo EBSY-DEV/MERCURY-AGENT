@@ -11,10 +11,19 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+# Messages we wrote. Threads recorded before the Harvey -> Mercury rename
+# carry sender "harvey"; they are still ours.
+OWN_SENDERS = frozenset({"mercury", "harvey"})
+
+
 class Message(BaseModel):
-    sender: str  # "mercury" or "prospect"
+    sender: str  # "mercury" (or legacy "harvey") or "prospect"
     content: str
     timestamp: datetime = Field(default_factory=_utcnow)
+
+    @property
+    def is_ours(self) -> bool:
+        return (self.sender or "").strip().lower() in OWN_SENDERS
 
 
 # Sales stages: tracks where the deal is in the pipeline

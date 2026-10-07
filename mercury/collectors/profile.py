@@ -342,7 +342,15 @@ class ProfileCollector:
         home = await self._get(site)
         if not home:
             # A failure IS an observation — silent failures look like clean results.
+            # And it has to be *written* as one: the queue picks "never profiled"
+            # by the latest profile observation, so a miss that leaves no row
+            # gets re-read every single cycle, forever.
             logger.info(f"profile: {domain} unreachable")
+            obs.append({
+                "signal_code": "PROFILE_UNREACHABLE", "company_id": company_id,
+                "collector": "profile", "value_num": 1.0, "value_text": "",
+                "confidence": 1.0, "evidence_url": site,
+            })
             return obs
 
         # Ads (they are spending TODAY — the strongest budget signal here)

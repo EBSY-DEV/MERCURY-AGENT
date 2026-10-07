@@ -47,6 +47,10 @@ Changelog = "https://github.com/ethanplusai/harvey/blob/main/CHANGELOG.md"
 
 [project.scripts]
 mercury = "mercury.cli:main"
+# Deprecated alias from before the Harvey -> Mercury rename. Deployed systemd
+# units still run `.venv/bin/harvey run` / `harvey dashboard`; keep this until
+# they are switched to `mercury`.
+harvey = "mercury.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["mercury*"]

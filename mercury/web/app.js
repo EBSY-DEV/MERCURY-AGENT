@@ -1348,8 +1348,10 @@ async function loadConversations() {
   for (const c of data) {
     let threadHtml = '';
     for (const msg of (c.thread || [])) {
-      const cls = msg.sender === 'mercury' ? 'sent' : 'received';
-      threadHtml += '<div class="thread-msg ' + cls + '"><div class="sender">' + escHtml(msg.sender) +
+      // 'harvey' = threads recorded before the rename; still our side.
+      const ours = msg.sender === 'mercury' || msg.sender === 'harvey';
+      const cls = ours ? 'sent' : 'received';
+      threadHtml += '<div class="thread-msg ' + cls + '"><div class="sender">' + escHtml(ours ? 'mercury' : msg.sender) +
         ' &middot; ' + formatDate(msg.timestamp) + '</div>' + escHtml(msg.content) + '</div>';
     }
     const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || 'Unknown';

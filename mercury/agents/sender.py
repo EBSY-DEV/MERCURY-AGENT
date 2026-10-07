@@ -12,7 +12,9 @@ Native flow:
 
 import asyncio
 import logging
+import math
 import random
+import time
 import re
 from datetime import date, datetime, timedelta, timezone
 
@@ -21,6 +23,12 @@ from mercury.config import MercuryConfig, EnvConfig
 from mercury.gate import pre_send_check
 from mercury.integrations.instantly import InstantlyClient
 from mercury.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from mercury.integrations.mailboxes import (
+    MailboxPool,
+    build_rotation_pool,
+    local_today,
+    rotation_configured,
+)
 from mercury.state import StateManager
 
 logger = logging.getLogger("mercury.sender")
@@ -28,10 +36,51 @@ logger = logging.getLogger("mercury.sender")
 # Max sends drained per heartbeat cycle — spreads volume through the day
 # instead of bursting the daily cap in one minute.
 MAX_SENDS_PER_CYCLE = 8
+# Due approved rows examined per cycle (ordering + pinning happen in Python).
+DUE_SCAN_LIMIT = 2000
 SEND_JITTER_SECONDS = (4, 15)
 
 # Prospect pipeline statuses that mean "stop emailing this person".
 STOP_STATUSES = {"replied", "opted_out", "lost", "meeting", "closed"}
+
+
+def _smtp_error_is_transient(err: str) -> bool:
+    """Connection trouble and 4xx deferrals deserve a retry; 5xx verdicts do not."""
+    e = (err or "").lower()
+    if any(m in e for m in ("timed out", "timeout", "connect", "disconnected",
+                            "connection", "temporarily", "try again", "greylist",
+                            "too many", "rate limit", "throttl")):
+        return True
+    import re
+    m = re.search(r"\b([245]\d\d)\b", e)
+    return bool(m) and m.group(1).startswith("4")
+
+
+def _retry_attempt(prev_error: str) -> int:
+    import re
+    m = re.match(r"retry (\d)/3", prev_error or "")
+    return int(m.group(1)) + 1 if m else 1
+
+
+def spread_budget(remaining: int, now_local: datetime, quiet_start: str,
+                  interval_minutes: int) -> int:
+    """Sends for this cycle so that ``remaining`` lasts until quiet hours:
+    ceil(remaining / cycles left before quiet_start). The rounding front-loads
+    the day; whatever MAX_SENDS_PER_CYCLE cuts off in the last cycles simply
+    stays queued for the next morning.
+    """
+    if remaining <= 0:
+        return 0
+    try:
+        hh, mm = (int(x) for x in (quiet_start or "22:00").split(":")[:2])
+    except ValueError:
+        hh, mm = 22, 0
+    stop = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if stop <= now_local:
+        stop += timedelta(days=1)
+    minutes_left = (stop - now_local).total_seconds() / 60
+    cycles_left = max(1, math.ceil(minutes_left / max(1, int(interval_minutes or 15))))
+    return math.ceil(remaining / cycles_left)
 
 KILL_SWITCH_KEY = "sending_paused"
 BOUNCE_COUNT_KEY = "bounce_count"
@@ -61,9 +110,17 @@ class Sender:
         self.state = state
         self.config = config
         self.instantly = InstantlyClient(env.instantly_api_key)
-        self.provider = get_mail_provider(config, env)
+        # Several mailboxes (channels.email.mailboxes) or None. Without a
+        # rotation pool the drain wraps self.provider in a one-mailbox pool,
+        # so tests and single-mailbox setups run the same code path.
+        self.mailboxes: MailboxPool | None = build_rotation_pool(config, env)
+        self.provider = (
+            self.mailboxes.primary.provider if self.mailboxes
+            else get_mail_provider(config, env)
+        )
         # Disabled in tests to skip inter-send sleeps.
         self.send_pacing = True
+        self._last_drain_at: float | None = None  # monotonic, for spread_sends
 
     @property
     def is_native(self) -> bool:
@@ -329,7 +386,36 @@ class Sender:
             except Exception as e:
                 logger.error(f"Sender: staging '{campaign.name}' failed: {e}")
 
+        if getattr(self.config.channels.email, "auto_approve_followups", False):
+            await self._promote_followups()
+
         await self._drain_due()
+
+    async def _promote_followups(self):
+        """auto_approve_followups: a follow-up rides on its approved opener.
+        Repeats so a whole chain is promoted in one cycle (bounded, since
+        each pass only promotes steps whose previous step qualifies)."""
+        promoted = 0
+        for _ in range(10):
+            n = await self.state.approve_ready_followups()
+            if not n:
+                break
+            promoted += n
+        if promoted:
+            logger.info(f"Sender: auto-approved {promoted} follow-up(s) of approved openers.")
+
+    def _pool(self) -> MailboxPool | None:
+        if self.mailboxes is not None:
+            return self.mailboxes
+        if rotation_configured(self.config):
+            return None  # mailboxes listed but the pool failed to build: hold
+        if self.provider is None:
+            return None
+        return MailboxPool.single(
+            self.provider,
+            self.config.channels.email.max_daily_sends,
+            getattr(self.config.persona, "email", "") or "",
+        )
 
     def _render(self, text: str, prospect) -> str:
         """Fill merge variables. The pre-send gate rejects any leftovers."""
@@ -344,6 +430,24 @@ class Sender:
             text = text.replace("{{" + key + "}}", value or "")
             text = text.replace("{{ " + key + " }}", value or "")
         return text.strip()
+
+    # Stopword counts decide the footer language; drafts are ES or EN.
+    _ES_MARKERS = (" el ", " la ", " de ", " que ", " para ", " los ", " las ",
+                   " una ", " con ", " por ", " tu ", " su ", " está ", " cómo ")
+    _EN_MARKERS = (" the ", " and ", " you ", " your ", " with ", " for ",
+                   " that ", " on ", " is ", " are ", " to ", " of ")
+
+    def _with_legal_footer(self, body: str) -> str:
+        """Append company + postal address + opt-out line (CAN-SPAM) in the
+        language of the email. Kept out of the draft so the writer never
+        rewrites or drops it."""
+        c = self.config.compliance
+        padded = f" {body.lower()} "
+        es = sum(padded.count(m) for m in self._ES_MARKERS)
+        en = sum(padded.count(m) for m in self._EN_MARKERS)
+        opt_out = c.opt_out_line_es if es > en else c.opt_out_line_en
+        company = self.config.persona.company
+        return f"{body.rstrip()}\n\n{company} · {c.postal_address.strip()}\n{opt_out}"
 
     async def _stage_campaign_native(self, campaign):
         """Render + schedule a draft campaign's emails into the outbox."""
@@ -417,51 +521,80 @@ class Sender:
                 details={"campaign": campaign.name, "staged": staged, "mode": mode},
             )
 
-    async def _effective_daily_cap(self) -> int:
-        """The configured daily cap, lowered (never raised) by an active
-        inbox warm-up — see mercury/warmup.py."""
-        configured = self.config.channels.email.max_daily_sends
-        try:
-            from mercury.warmup import sender_daily_cap
-            warm_cap = await sender_daily_cap(self.state, self.config)
-        except Exception as e:
-            logger.warning(f"Sender: warm-up cap lookup failed ({e}); using the configured cap.")
-            return configured
-        if warm_cap is None:
-            return configured
-        if warm_cap < configured:
-            logger.info(f"Sender: warm-up limits today to {warm_cap} sends "
-                        f"(configured cap {configured}).")
-        return min(configured, warm_cap)
-
     async def _drain_due(self):
-        """Send due, approved outbox items through the provider."""
-        if not self.provider.is_configured():
+        """Send due, approved outbox items, rotating over the mailbox pool."""
+        pool = self._pool()
+        if pool is None:
+            logger.error(
+                "Sender: channels.email.mailboxes is set but no mailbox could be "
+                "built. Outbox is holding; check the mailbox config."
+            )
+            return
+        if not pool.configured():
             logger.warning(
-                f"Sender: mail provider '{self.provider.name}' is not configured "
-                "yet — outbox is holding. See CLAUDE.md → provider setup."
+                f"Sender: mail provider '{self.provider.name if self.provider else '?'}' "
+                "is not configured yet — outbox is holding. See CLAUDE.md → provider setup."
             )
             return
 
-        max_daily = await self._effective_daily_cap()
+        compliance = getattr(self.config, "compliance", None)
+        if compliance is None or not compliance.postal_address.strip():
+            logger.error(
+                "Sender: compliance hold — compliance.postal_address is empty in "
+                "mercury.local.yaml. CAN-SPAM requires a physical postal address and "
+                "an opt-out line in every commercial email; the outbox is holding "
+                "until it is set."
+            )
+            return
+
+        email_cfg = self.config.channels.email
+        max_daily = email_cfg.max_daily_sends
+        today = local_today(self.config)
         sent_today = await self.state.count_outbox_sent_today()
-        budget = min(MAX_SENDS_PER_CYCLE, max_daily - sent_today)
+        by_mailbox = await self.state.count_outbox_sent_today_by_mailbox()
+        remaining = pool.remaining(by_mailbox, today)
+        global_left = max(0, max_daily - sent_today)
+        # Cold mail (openers, follow-ups) is bound by the mailboxes' caps and
+        # paced; a reply to a person only by max_daily_sends.
+        cold_left = min(global_left, sum(max(0, n) for n in remaining.values()))
+        cold_budget = min(MAX_SENDS_PER_CYCLE, cold_left)
+        if cold_budget > 0 and getattr(email_cfg, "spread_sends", False):
+            cold_budget = min(cold_budget, self._spread(cold_left))
+        budget = min(MAX_SENDS_PER_CYCLE, global_left)
         if budget <= 0:
-            logger.info(f"Sender: daily send cap reached ({sent_today}/{max_daily}).")
+            capacity = min(max_daily, pool.capacity_on(today))
+            logger.info(f"Sender: daily send cap reached ({sent_today}/{capacity}).")
             return
 
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        # The whole due set, not a budget-sized slice: rows pinned to a
+        # mailbox at its cap are skipped below, and a slice of the oldest
+        # rows could be nothing but those while other mailboxes sat idle.
         due = await self.state.get_outbox(
-            status="approved", due_before=now, limit=budget * 3
+            status="approved", due_before=now, limit=DUE_SCAN_LIMIT
         )
         if not due:
             return
+        # Replies first (a person is waiting), then follow-ups, then new
+        # first touches. Follow-ups carry 55-65% of replies and lose their
+        # "3 days later" meaning when they wait; ordered by send_at alone, a
+        # backlog of older first emails starved every step 2.
+        def _rank(i):
+            if i.get("kind") == "reply":
+                return 0
+            return 1 if int(i.get("step") or 1) > 1 else 2
+        due.sort(key=lambda i: (_rank(i), i.get("send_at") or ""))
 
-        allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
-        sent = 0
+        allow_risky = getattr(email_cfg, "send_to_risky", False)
+        sent = cold_sent = 0
+        sent_this_cycle: dict[str, int] = {}
         for item in due:
             if sent >= budget:
                 break
+            if item["kind"] != "reply" and cold_sent >= cold_budget:
+                if cold_budget == 0 and not sent:
+                    logger.info("Sender: mailbox caps reached for today; only replies may go.")
+                break  # replies sort first, so nothing sendable is left
 
             prospect = await self.state.get_prospect(item["prospect_id"])
             if prospect is None:
@@ -476,6 +609,50 @@ class Sender:
                     item["id"], status="cancelled",
                     error=f"prospect status '{prospect.status}'",
                 )
+                continue
+
+            # Sequence order: step N never leaves before step N-1 was sent.
+            # If the earlier step is dead (rejected, cancelled, failed) this
+            # one dies with it, so it cannot sit 'approved' forever and crowd
+            # the due queue. If the earlier step is merely not sent yet, hold.
+            prev = None
+            if item["kind"] == "sequence" and item["step"] > 1:
+                prev = await self.state.get_previous_outbox_step(
+                    item["campaign_id"], item["prospect_id"], item["step"]
+                )
+                prev_status = prev["status"] if prev else "missing"
+                if prev_status in ("rejected", "cancelled", "failed"):
+                    await self.state.update_outbox_item(
+                        item["id"], status="cancelled",
+                        error=f"previous step is '{prev_status}'",
+                    )
+                    logger.info(
+                        f"Sender: cancelled step {item['step']} to {item['to_email']}: "
+                        f"previous step is '{prev_status}'."
+                    )
+                    continue
+                if prev_status != "sent":
+                    logger.info(
+                        f"Sender: holding step {item['step']} to {item['to_email']}: "
+                        f"previous step is '{prev_status}', not sent."
+                    )
+                    continue
+                # "3 days later" means 3 days after the previous email really
+                # went out. send_at was fixed when the sequence was staged, so
+                # an opener approved a week late would otherwise drag its
+                # follow-ups out right behind it.
+                earliest = await self._followup_earliest(item, prev)
+                if earliest and earliest > now:
+                    await self.state.update_outbox_item(item["id"], send_at=earliest)
+                    logger.info(
+                        f"Sender: step {item['step']} to {item['to_email']} rescheduled "
+                        f"to {earliest[:16]} (its delay after the previous step)."
+                    )
+                    continue
+
+            mailbox, _verdict = self._mailbox_for(item, prev, pool, remaining,
+                                                  sent_this_cycle, today)
+            if mailbox is None:
                 continue
 
             gate = pre_send_check(
@@ -493,22 +670,53 @@ class Sender:
                 )
                 continue
 
-            result = await self.provider.send_email(
-                item["to_email"], item["subject"], item["body"],
+            body_out = item["body"]
+            if item["kind"] != "reply":
+                body_out = self._with_legal_footer(body_out)
+            result = await mailbox.provider.send_email(
+                item["to_email"], item["subject"], body_out,
                 thread_ref=item.get("thread_ref", ""),
                 in_reply_to=item.get("in_reply_to", ""),
             )
             if not result.ok:
-                await self.state.update_outbox_item(
-                    item["id"], status="failed", error=result.error[:300]
-                )
+                err = result.error or ""
+                attempt = _retry_attempt(item.get("error") or "")
+                if attempt <= 3 and _smtp_error_is_transient(err):
+                    # A connection hiccup or a 4xx deferral is not a verdict
+                    # on the address: keep the row approved and try later.
+                    retry_at = datetime.fromtimestamp(
+                        datetime.now(timezone.utc).timestamp() + 1800 * attempt,
+                        tz=timezone.utc,
+                    ).replace(tzinfo=None).isoformat()
+                    await self.state.update_outbox_item(
+                        item["id"], send_at=retry_at,
+                        error=f"retry {attempt}/3: {err[:250]}",
+                    )
+                    logger.warning(
+                        f"Sender: transient SMTP error to {item['to_email']} "
+                        f"via {mailbox.email or mailbox.provider.name} "
+                        f"(attempt {attempt}/3), retrying at {retry_at[:16]}: {err[:120]}"
+                    )
+                else:
+                    await self.state.update_outbox_item(
+                        item["id"], status="failed", error=err[:300]
+                    )
+                    logger.error(
+                        f"Sender: giving up on {item['to_email']} "
+                        f"(prospect {item['prospect_id']}): {err[:160]}"
+                    )
                 continue
 
             sent += 1
+            if item["kind"] != "reply":
+                cold_sent += 1
+            remaining[mailbox.email] = remaining.get(mailbox.email, 0) - 1
+            sent_this_cycle[mailbox.email] = sent_this_cycle.get(mailbox.email, 0) + 1
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             await self.state.update_outbox_item(
-                item["id"], status="sent", sent_at=now_iso,
+                item["id"], status="sent", sent_at=now_iso, body=body_out,
                 message_id=result.message_id, thread_ref=result.thread_ref,
+                mailbox=mailbox.email,
             )
             if prospect.status in ("new", "queued"):
                 await self.state.update_prospect_status(prospect.id, "contacted")
@@ -532,18 +740,108 @@ class Sender:
                 agent="sender",
                 details={
                     "to": item["to_email"], "step": item["step"],
-                    "kind": item["kind"], "provider": self.provider.name,
+                    "kind": item["kind"], "provider": mailbox.provider.name,
+                    "mailbox": mailbox.email,
                 },
             )
-            logger.info(
-                f"Sender: sent step {item['step']} to {item['to_email']} "
-                f"via {self.provider.name}."
-            )
+            via = mailbox.email or mailbox.provider.name
+            logger.info(f"Sender: sent step {item['step']} to {item['to_email']} via {via}.")
             # Human-ish pacing BETWEEN sends (not after the last, and never
             # in tests where pacing is disabled).
             if self.send_pacing and sent < budget:
                 await asyncio.sleep(random.uniform(*SEND_JITTER_SECONDS))
 
         if sent:
+            capacity = min(max_daily, pool.capacity_on(today))
             logger.info(f"Sender: {sent} email(s) sent this cycle "
-                        f"({sent_today + sent}/{max_daily} today).")
+                        f"({sent_today + sent}/{capacity} today).")
+
+    def _mailbox_for(self, item, prev, pool, remaining, sent_this_cycle, today):
+        """(mailbox, verdict): verdict is "send" or "hold" (try a later cycle).
+
+        A thread keeps its mailbox: a reply answers from the inbox the message
+        arrived in, and a follow-up comes from the address its opener used.
+        Only a new thread (step 1) rotates, and only onto mailboxes that take
+        new threads. A thread whose mailbox was removed from the config is
+        held, never moved to another address.
+        """
+        pinned_value = None
+        if item.get("mailbox"):
+            pinned_value = item["mailbox"]
+        elif item["kind"] == "reply":
+            pinned_value = ""  # queued before tracking: the legacy mailbox
+        elif prev is not None:
+            pinned_value = prev.get("mailbox") or ""
+
+        if pinned_value is None:
+            mailbox = pool.pick(remaining, sent_this_cycle, today)
+            return mailbox, ("send" if mailbox else "hold")
+
+        mailbox = pool.resolve(pinned_value)
+        if mailbox is None:
+            # Never re-route: the old inbox is not read, so a reply or an
+            # opt-out sent there would go unseen. Holding is reversible (put
+            # the mailbox back, or reject the email in the dashboard).
+            logger.warning(
+                f"Sender: holding {item['kind']} to {item['to_email']}: its thread's "
+                f"mailbox {pinned_value} is not in channels.email.mailboxes. Add it "
+                "back (enabled: false is enough) or reject the email."
+            )
+            return None, "hold"
+        if not mailbox.provider.is_configured():
+            logger.warning(
+                f"Sender: holding email to {item['to_email']}: its thread's mailbox "
+                f"{mailbox.email or mailbox.provider.name} has no credentials."
+            )
+            return None, "hold"
+        # A person who wrote back is not cold volume: a reply may go past its
+        # mailbox's warm-up cap (the global max_daily_sends still applies).
+        if item["kind"] != "reply" and remaining.get(mailbox.email, 0) <= 0:
+            logger.debug(
+                f"Sender: holding email to {item['to_email']}: "
+                f"{mailbox.email or 'mailbox'} is at today's cap."
+            )
+            return None, "hold"
+        return mailbox, "send"
+
+    async def _followup_earliest(self, item, prev) -> str | None:
+        """Earliest send time for a follow-up: the previous step's actual
+        sent_at plus this step's delay_days. None when unknown."""
+        sent_at = (prev or {}).get("sent_at")
+        if not sent_at:
+            return None
+        try:
+            prev_sent = datetime.fromisoformat(str(sent_at).replace(" ", "T"))
+        except ValueError:
+            return None
+        delay = await self.state.get_sequence_delay_days(item.get("campaign_id") or "",
+                                                         int(item["step"]))
+        if delay is None:
+            # No campaign row to read the delay from. send_at values get
+            # rewritten (retries, this rescheduling), so a gap derived from
+            # them drifts; keep the staged send_at instead.
+            return None
+        return (prev_sent + timedelta(days=delay)).isoformat()
+
+    def _spread(self, left_today: int) -> int:
+        usage = getattr(self.config, "usage", None)
+        quiet = getattr(usage, "quiet_hours", None)
+        tz_name = getattr(quiet, "timezone", "UTC") or "UTC"
+        try:
+            import pytz
+
+            now_local = datetime.now(pytz.timezone(tz_name)).replace(tzinfo=None)
+        except Exception:
+            now_local = datetime.utcnow()
+        # A cycle is its own run time plus the sleep, so the configured
+        # interval overstates how many cycles are left. Use the gap actually
+        # observed since the previous drain (bounded to 1-3 intervals).
+        interval = max(1, int(getattr(usage, "heartbeat_interval_minutes", 15) or 15))
+        observed = interval
+        mono = time.monotonic()
+        if self._last_drain_at is not None:
+            gap = (mono - self._last_drain_at) / 60
+            observed = min(max(gap, interval), 3 * interval)
+        self._last_drain_at = mono
+        return spread_budget(left_today, now_local, getattr(quiet, "start", "22:00"),
+                             math.ceil(observed))
