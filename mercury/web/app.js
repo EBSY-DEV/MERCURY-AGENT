@@ -1862,10 +1862,11 @@ function pipeCard(it) {
   if (it.email_status) meta.push(badge(it.email_status));
   if (next) {
     meta.push('<span class="pc-fact" title="Next email: ' + escHtml(fullWhen(next)) + '">' + icon('clock') +
-      'Next: ' + escHtml(next < new Date() ? 'due now' : relWhen(next)) + '</span>');
+      escHtml(next < new Date() ? 'Due now' : relWhen(next)) + '</span>');
   }
   if (sent) meta.push('<span class="pc-fact">' + icon('paper-plane-tilt') + sent + ' sent</span>');
-  const hasScore = it.score !== null && it.score !== undefined && it.score !== '';
+  // A score of 0 means "not scored yet"; showing it on every card is noise.
+  const hasScore = it.score !== null && it.score !== undefined && it.score !== '' && Number(it.score) > 0;
 
   return '<article class="pipe-card" draggable="true" tabindex="0" data-id="' + id + '" ' +
       'aria-label="' + escHtml(name) + (it.company ? ', ' + escHtml(it.company) : '') + '. Enter to open, M to move.">' +
@@ -3343,7 +3344,7 @@ function renderHeatmap(data) {
       '<div class="hm-months">' + months + '</div>' +
       '<div class="hm-days"><span></span><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span></div>' +
       '<div class="hm-grid" role="img" aria-label="' + data.total_sent + ' emails sent in the last year">' + cells + '</div>' +
-    '</div><div class="hm-tip" hidden></div>';
+    '</div>';
 
   // Narrow screens scroll; start at the most recent week, like GitHub.
   grid.scrollLeft = grid.scrollWidth;
@@ -3364,22 +3365,32 @@ function renderHeatmap(data) {
 (function wireHeatmapTip() {
   const wrap = document.getElementById('hm-grid');
   if (!wrap) return;
+  // The tooltip lives on <body>: the grid scrolls sideways on small screens,
+  // and a scroll container would clip anything that pokes out of it.
+  const tip = document.createElement('div');
+  tip.className = 'hm-tip';
+  tip.hidden = true;
+  document.body.appendChild(tip);
+  const hide = () => { tip.hidden = true; };
   wrap.addEventListener('mouseover', e => {
     const c = e.target.closest('.hm-grid .hm-c');
-    const tip = wrap.querySelector('.hm-tip');
-    if (!c || !tip) return;
+    if (!c) return;
     const n = Number(c.dataset.n), r = Number(c.dataset.r);
     tip.innerHTML = '<b>' + (n ? n + ' email' + (n === 1 ? '' : 's') + ' sent' : 'No emails sent') + '</b>' +
       (r ? '<span>' + r + ' repl' + (r === 1 ? 'y' : 'ies') + '</span>' : '') +
       '<small>' + hmDate(c.dataset.d, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }) + '</small>';
     tip.hidden = false;
-    const wr = wrap.getBoundingClientRect(), cr = c.getBoundingClientRect();
-    let x = cr.left - wr.left + wrap.scrollLeft + cr.width / 2;
-    x = Math.max(tip.offsetWidth / 2 + 4, Math.min(x, wrap.scrollWidth - tip.offsetWidth / 2 - 4));
+    const cr = c.getBoundingClientRect();
+    const half = tip.offsetWidth / 2;
+    const x = Math.max(half + 8, Math.min(cr.left + cr.width / 2, window.innerWidth - half - 8));
+    let y = cr.top - tip.offsetHeight - 8;
+    if (y < 8) y = cr.bottom + 8;          // no room above: show below
     tip.style.left = x + 'px';
-    tip.style.top = (cr.top - wr.top - tip.offsetHeight - 8) + 'px';
+    tip.style.top = y + 'px';
   });
-  wrap.addEventListener('mouseleave', () => { const t = wrap.querySelector('.hm-tip'); if (t) t.hidden = true; });
+  wrap.addEventListener('mouseleave', hide);
+  wrap.addEventListener('scroll', hide, { passive: true });
+  window.addEventListener('scroll', hide, { passive: true });
 })();
 
 // ── Init & live refresh ──
