@@ -60,7 +60,8 @@ minor versions can still change behaviour.
   (English and Spanish: "until October 20", "hasta el 20 de octubre", "back
   Monday", "for two weeks") against the time the message arrived in your
   `usage.quiet_hours.timezone`, and resumes at the end of quiet hours on that
-  day (Monday if it falls on a weekend). A missing, ambiguous, impossible or
+  day (Monday if it falls on a weekend), or `channels.email.ooo_resume_buffer_days`
+  business days later if you set one. A missing, ambiguous, impossible or
   past date pauses the contact into a "return date needs review" state that
   never resumes by itself. The pause is stored in the new `sequence_pauses`
   table (migration v14), survives restarts, leaves approvals and drafts alone,
