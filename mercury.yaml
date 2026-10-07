@@ -54,6 +54,7 @@ channels:
     max_bounce_rate: 0.05       # pause all sending if bounces exceed this
     auto_approve_followups: false  # approving a first email also approves its follow-ups
     spread_sends: false         # pace the day's sends until quiet hours, not in bursts
+    ooo_resume_buffer_days: 0   # out-of-office: resume N business days after their return date
     # smtp only: rotate cold email over several mailboxes on secondary domains.
     # Each thread stays on the mailbox it started from. Passwords go in .env
     # under the name given in password_env (MAILBOX_* or SMTP_PASSWORD).

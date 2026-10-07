@@ -167,12 +167,23 @@ class EmailChannelConfig(BaseModel):
     # Pace the day's remaining sends evenly over the cycles left before
     # quiet hours, instead of sending up to MAX_SENDS_PER_CYCLE at once.
     spread_sends: bool = False
+    # Out-of-office replies: resume the sequence this many business days
+    # after the return date they gave. 0 resumes the morning they are back.
+    # A date you set by hand on the Outbox tab is used as is.
+    ooo_resume_buffer_days: int = 0
 
     @field_validator("max_daily_sends")
     @classmethod
     def _sends_non_negative(cls, v: int) -> int:
         if v < 0:
             raise ValueError("max_daily_sends must be >= 0")
+        return v
+
+    @field_validator("ooo_resume_buffer_days")
+    @classmethod
+    def _buffer_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("ooo_resume_buffer_days must be >= 0")
         return v
 
     @field_validator("warmup_initial_cap", "warmup_weekly_increase")

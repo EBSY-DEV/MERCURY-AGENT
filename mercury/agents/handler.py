@@ -628,7 +628,8 @@ class Handler:
         tz_name, quiet_end = operator_clock(self.config)
         found = extract_return_date(f"{subject}. {own}" if subject else own, received, tz_name)
         if found.ok:
-            state, resume = "paused", resume_time(found.date, tz_name, quiet_end)
+            buffer = getattr(getattr(self.config.channels, "email", None), "ooo_resume_buffer_days", 0)
+            state, resume = "paused", resume_time(found.date, tz_name, quiet_end, buffer)
         else:
             state, resume = "needs_review", None
         result = await self.state.record_ooo_pause(
