@@ -19,6 +19,7 @@ from mercury.integrations.mail_provider import NATIVE_PROVIDERS
 from mercury.models.campaign import Campaign, EmailStep
 from mercury.state import StateManager
 from mercury.personas import PersonaStore, voice_instructions
+from mercury.voices import MailboxVoices
 
 logger = logging.getLogger("mercury.writer")
 
@@ -44,9 +45,15 @@ class Writer:
         self.config = config
         self.env = env
         self.personas = PersonaStore(state)
+        self.voices = MailboxVoices(state, config, env)
 
     def _base_prompt(self, profile: dict) -> str:
         return "".join(text for _key, _label, text in self._base_sections(profile))
+
+    def _sign_off_rule(self, profile: dict) -> str:
+        name = profile.get("signer") or self.config.persona.name
+        return (f"Sign off with this name and no other: {name}. "
+                "Never sign with a persona, team or company name instead.")
 
     def _base_sections(self, profile: dict) -> list[tuple[str, str, str]]:
         """Template, knowledge and voice, as labelled pieces that join into the base prompt."""
@@ -56,12 +63,12 @@ class Writer:
             product_description=self.config.product.description,
             product_benefits="\n".join(f"- {b}" for b in self.config.product.key_benefits),
             product_pricing=self.config.product.pricing,
-            persona_name=self.config.persona.name,
+            persona_name=profile.get("signer") or self.config.persona.name,
             persona_company=self.config.persona.company,
             persona_role=self.config.persona.role,
             persona_tone=profile["tone"],
         ) or (
-            f"You are {self.config.persona.name}, {self.config.persona.role} "
+            f"You are {profile.get('signer') or self.config.persona.name}, {self.config.persona.role} "
             f"at {self.config.persona.company}.\nProduct: {self.config.product.name}\n"
             f"Description: {self.config.product.description}\nPricing: {self.config.product.pricing}\n"
             "Benefits:\n" + "\n".join(f"- {b}" for b in self.config.product.key_benefits)
@@ -109,17 +116,30 @@ class Writer:
         # Batch prospects into campaign groups (by industry/title for relevance)
         batches = self._group_prospects(prospects_with_email)
 
+        # Each mailbox can write in its own voice and sign with its own name.
+        # When they differ, every new thread gets its mailbox now, so the
+        # draft, its follow-ups and the From address all agree.
+        plan = await self.voices.plan() if self.is_native else {"pinned": False, "profile": None}
+        groups = []
         for batch_name, prospects in batches.items():
             if not prospects:
                 continue
+            if not plan["pinned"]:
+                groups.append((batch_name, prospects, "", plan["profile"]))
+                continue
+            picks = await self.voices.spread(len(prospects), plan["mailboxes"])
+            for mailbox in dict.fromkeys(picks):
+                group = [p for p, pick in zip(prospects, picks) if pick == mailbox]
+                groups.append((f"{batch_name} · {mailbox}", group, mailbox, await self.voices.profile_for(mailbox)))
 
+        for batch_name, prospects, mailbox, profile in groups:
             logger.info(
                 f"Writer: Creating campaign '{batch_name}' for "
                 f"{len(prospects)} prospects."
             )
 
             # Generate the email sequence
-            sequence = await self._write_sequence(prospects)
+            sequence = await self._write_sequence(prospects, profile)
             if not sequence:
                 logger.warning(f"Writer: Failed to generate sequence for {batch_name}")
                 continue
@@ -132,6 +152,7 @@ class Writer:
                 sequence=sequence,
                 prospect_ids=[p.id for p in prospects],
                 status="draft",
+                mailbox=mailbox,
             )
             campaign_id = await self.state.add_campaign(campaign)
 
@@ -143,7 +164,7 @@ class Writer:
             # a per-prospect draft grounded in that company's actual facts.
             if self.is_native:
                 profile = await self.personas.for_generation(self.config, sequence[0].generation_id)
-                await self._personalize_first_emails(campaign_id, prospects, profile)
+                await self._personalize_first_emails(campaign_id, prospects, profile, mailbox)
 
             await self.state.log_action(
                 action_type="write_campaign",
@@ -160,7 +181,7 @@ class Writer:
                 f"{len(sequence)} emails for {len(prospects)} prospects."
             )
 
-    async def _personalize_first_emails(self, campaign_id: str, prospects: list, profile=None):
+    async def _personalize_first_emails(self, campaign_id: str, prospects: list, profile=None, mailbox: str = ""):
         """Draft a grounded, per-prospect email 1 and stage it in the outbox.
 
         The outbox unique index means the sender's later template staging
@@ -195,6 +216,7 @@ class Writer:
                 status=status,
                 provider=provider,
                 generation_id=draft.get("generation_id", ""),
+                mailbox=mailbox,
             )
             if item_id:
                 drafted += 1
@@ -283,6 +305,7 @@ Requirements:
 - Write the actual text (no merge variables — you know their name/company).
 - Subject: lowercase, 2-4 words, reads like an internal note.
 - Language and register: {lang_line}
+- {self._sign_off_rule(profile)}
 - Follow every STRICT EMAIL RULE and the EVIDENCE-BACKED RULES above.{instruction_line}{recent_line}
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
@@ -418,7 +441,7 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
                 "Dominican Republic or a Dominican client; say \"a local business "
                 "like yours\".")
 
-    async def _write_sequence(self, prospects: list) -> list[EmailStep]:
+    async def _write_sequence(self, prospects: list, profile=None) -> list[EmailStep]:
         """Ask the brain to write a 3-email sequence."""
         lang_line = await self._market_lang(prospects)
         # Build context about the prospects
@@ -428,7 +451,7 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             for p in prospects[:5]  # Show sample for context
         )
 
-        profile = await self.personas.resolve(self.config)
+        profile = profile or await self.personas.resolve(self.config)
         prompt = self._base_prompt(profile)
 
         prompt += f"""
@@ -451,6 +474,7 @@ Requirements:
 - Never be pushy or salesy. Be consultative and value-driven.
 - Subject lines: lowercase, 2-4 words, like an internal note; no salesy words.
 - Language and register: {lang_line}
+- {self._sign_off_rule(profile)}
 - Follow every rule in the STRICT EMAIL RULES above. No exceptions.
 
 Return ONLY a JSON array (no markdown fences, no commentary):
