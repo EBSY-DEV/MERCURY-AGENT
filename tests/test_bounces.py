@@ -597,9 +597,19 @@ async def test_resume_resets_every_counter(state):
 
 @pytest.mark.asyncio
 async def test_kill_switch_keeps_the_first_reason(state):
+    await state.set_setting("sending_paused", "first cause")
+    assert await bounces.engage_kill_switch(state, "something else")
+    assert await state.get_setting("sending_paused") == "first cause"
+
+
+@pytest.mark.asyncio
+async def test_an_operator_pause_does_not_hide_the_kill_switch(state):
+    # A legacy operator pause in the shared key moves aside first, so the
+    # health hold is recorded rather than swallowed by it.
     await state.set_setting("sending_paused", "paused manually")
     assert await bounces.engage_kill_switch(state, "something else")
-    assert await state.get_setting("sending_paused") == "paused manually"
+    assert await state.get_setting("sending_paused") == "something else"
+    assert await state.get_setting("operator_pause") == "paused manually"
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,7 @@ which client, with which scopes) and raises ControlError subclasses
 Unavailable), each with a stable ``code``.
 
   outbox     list, get, approve, reject, batch, edit, reschedule, regenerate
-  sending    the global send switch: status, pause, resume
+  sending    operator pause vs. health holds: status, pause, resume, clear_hold
   discovery  provider menu, plan/estimate, background run, profile, stop
   runtime    the agent process: status, start, stop, log tail
   settings   the allowlisted mercury.yaml fields (secrets are refused)
