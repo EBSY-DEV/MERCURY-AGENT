@@ -7,11 +7,24 @@ won, lost), conversations at several stages, and outbox rows: sequence steps
 (sent / approved / pending_review / cancelled) plus two replies.
 
 On top of that: ~60 days of outreach history (sends, replies, positive
-replies, bounces) so the Trends chart has 30/90-day shape, and an inbox
-warm-up — alex@tryebsy.com warming since 9 days ago with part of the
-checklist done, plus a second, not-started inbox. The demo config is the
-untrained template, so /api/warmup treats the first warming inbox as the
-sender; set MERCURY_SENDER_EMAIL to force a different one.
+replies, bounces) so the Trends chart has 30/90-day shape, spread over three
+sending mailboxes through ``outbox.mailbox``:
+
+* jordan@getebsy.com — already warm (30/day), carries the older history and
+  owns pre-rotation rows; a 4% bounce rate this week puts it on *hold*.
+* alex@tryebsy.com  — warming since 16 days ago (week 3 of a 5 → 30 ramp),
+  with part of the checklist ticked and notes.
+* sam@tryebsy.com   — scheduled: its ramp starts in three days.
+
+Which inboxes exist, their caps and start dates come from the mail config,
+not the database (see mercury/warmup.py). So next to the database the seed
+writes a demo config, ``<db>.mercury.yaml`` (data/demo.mercury.yaml by
+default — data/ is gitignored), with those three SMTP mailboxes and dates
+relative to today. It holds no secrets: every mailbox reads its password from
+MAILBOX_DEMO_PASSWORD, which you set to any dummy value so the dashboard
+treats the mailboxes as configured. Nothing is ever sent (the dashboard does
+not send, and smtp.invalid never resolves). Your own mercury.local.yaml is
+never touched; MERCURY_CONFIG points the dashboard at the demo config instead.
 
 The target database is DELETED and rebuilt on every run. It refuses to touch
 the real data/mercury.db.
@@ -23,21 +36,28 @@ Usage (from the repo root):
 
 Then point the dashboard at it:
 
-    MERCURY_DB_PATH=data/demo.db env -u APPIMAGE .venv/bin/mercury dashboard
+    MERCURY_DB_PATH=data/demo.db MERCURY_CONFIG=data/demo.mercury.yaml \
+    MAILBOX_DEMO_PASSWORD=demo env -u APPIMAGE .venv/bin/mercury dashboard
+
+Don't run ``mercury run`` with that environment: it is a dashboard demo.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import random
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from mercury.integrations.mailboxes import warmup_cap  # noqa: E402
 from mercury.models.campaign import Campaign, EmailStep  # noqa: E402
 from mercury.models.company import Company  # noqa: E402
 from mercury.models.conversation import Conversation, Message  # noqa: E402
@@ -123,13 +143,14 @@ async def seed(db_path: Path) -> dict:
 
     counts = {"prospects": 0, "conversations": 0, "outbox": 0}
     idx = 0
+    thread_box: dict[str, str] = {}
 
-    async def outbox(p, pid, company, step, status, send_at, sent_at=None, error=""):
+    async def outbox(p, pid, company, step, status, send_at, sent_at=None, error="", mailbox=""):
         s = SEQUENCE[step - 1]
         item = await sm.add_outbox_item(
             prospect_id=pid, to_email=p.email, subject=render(s.subject, p, company),
             body=render(s.body, p, company), send_at=iso(send_at), status=status,
-            campaign_id=campaign.id, step=step, provider="gmail",
+            campaign_id=campaign.id, step=step, provider="smtp", mailbox=mailbox,
         )
         fields = {}
         if sent_at:
@@ -192,16 +213,21 @@ async def seed(db_path: Path) -> dict:
                                  "pending_review" if k % 2 else "approved", at)
                 continue
 
-            # Everyone else got step 1.
-            await outbox(p, pid, cname, 1, "sent", start, start + timedelta(minutes=3))
+            # Everyone else got step 1, from whichever mailbox rotation picked
+            # (alex only once its ramp had started). The thread stays on it.
+            box = (MB_WARM if start.date() < ALEX_START or idx % 2 else MB_ALEX)
+            thread_box[pid] = box
+            await outbox(p, pid, cname, 1, "sent", start, start + timedelta(minutes=3), mailbox=box)
             step2 = start + timedelta(days=4)
             step3 = start + timedelta(days=9)
 
             if column == "contacted":
                 for step, at in ((2, step2), (3, step3)):
                     if at < NOW:
-                        await outbox(p, pid, cname, step, "sent", at, at + timedelta(minutes=2))
+                        await outbox(p, pid, cname, step, "sent", at, at + timedelta(minutes=2),
+                                     mailbox=box)
                     else:
+                        # Queued follow-ups inherit the thread's mailbox when sent.
                         await outbox(p, pid, cname, step,
                                      "approved" if step == 2 else "pending_review",
                                      at + timedelta(days=rnd.randint(0, 8)))
@@ -237,7 +263,8 @@ async def seed(db_path: Path) -> dict:
     replied = await sm.get_prospects_by_status("replied")
     for i, p in enumerate(replied[:2]):
         item_id = await sm.add_outbox_item(
-            prospect_id=p.id, to_email=p.email, kind="reply", step=1, provider="gmail",
+            prospect_id=p.id, to_email=p.email, kind="reply", step=1, provider="smtp",
+            mailbox=thread_box.get(p.id, MB_WARM),  # answered from the inbox it came to
             subject=f"Re: {p.company} on page two",
             body=f"Hi {p.first_name}, happy to walk through it. Does Tuesday or Wednesday morning work?",
             send_at=iso(NOW - timedelta(days=1) if i == 0 else NOW + timedelta(hours=3)),
@@ -252,15 +279,64 @@ async def seed(db_path: Path) -> dict:
     return counts
 
 
+# ── The demo mail config (mailboxes come from config, not the DB) ──
+
+MB_WARM = "jordan@getebsy.com"      # warm, persona email -> owns pre-rotation rows
+MB_ALEX = "alex@tryebsy.com"        # warming
+MB_SAM = "sam@tryebsy.com"          # scheduled
+ALEX_START_DAYS_AGO = 16            # day 17: week 3 of the ramp (15/day)
+SAM_START_IN_DAYS = 3
+DAILY_CAP = 30
+INITIAL_CAP, WEEKLY_INCREASE = 5, 5
+DEMO_PASSWORD_ENV = "MAILBOX_DEMO_PASSWORD"
+
+TODAY = NOW.date()
+ALEX_START = TODAY - timedelta(days=ALEX_START_DAYS_AGO)
+
+
+def demo_config(template: Path) -> dict:
+    """The tracked template with a demo persona and three SMTP mailboxes."""
+    cfg = yaml.safe_load(template.read_text()) or {}
+    cfg.setdefault("persona", {}).update({
+        "name": "Jordan Hale", "company": "EBSY", "email": MB_WARM,
+    })
+    email = cfg.setdefault("channels", {}).setdefault("email", {})
+    email.update({
+        "provider": "smtp", "max_daily_sends": 50, "require_approval": True,
+        "auto_approve_followups": True,
+        "warmup_initial_cap": INITIAL_CAP, "warmup_weekly_increase": WEEKLY_INCREASE,
+        "mailboxes": [
+            {"email": MB_WARM, "name": "Jordan | EBSY", "password_env": DEMO_PASSWORD_ENV,
+             "smtp_host": "smtp.invalid", "daily_cap": DAILY_CAP},
+            {"email": MB_ALEX, "name": "Alex | EBSY", "password_env": DEMO_PASSWORD_ENV,
+             "smtp_host": "smtp.invalid", "daily_cap": DAILY_CAP,
+             "warmup_start": ALEX_START.isoformat()},
+            {"email": MB_SAM, "name": "Sam | EBSY", "password_env": DEMO_PASSWORD_ENV,
+             "smtp_host": "smtp.invalid", "daily_cap": DAILY_CAP,
+             "warmup_start": (TODAY + timedelta(days=SAM_START_IN_DAYS)).isoformat()},
+        ],
+    })
+    cfg["compliance"] = {"postal_address": "1550 Wewatta St, Denver, CO 80202"}
+    cfg.setdefault("usage", {}).setdefault("quiet_hours", {})["timezone"] = "UTC"
+    return cfg
+
+
+def write_demo_config(db_path: Path) -> Path:
+    path = db_path.with_suffix(".mercury.yaml")
+    protected = {(ROOT / n).resolve() for n in ("mercury.yaml", "mercury.local.yaml",
+                                                "harvey.local.yaml")}
+    if path.resolve() in protected:
+        raise SystemExit(f"Refusing to overwrite {path}.")
+    header = ("# Demo mail config written by scripts/seed_demo.py. No secrets:\n"
+              f"# every mailbox reads {DEMO_PASSWORD_ENV}. Dates are relative to the\n"
+              "# day it was seeded; re-run the seed to refresh them.\n")
+    path.write_text(header + yaml.safe_dump(demo_config(ROOT / "mercury.yaml"),
+                                            sort_keys=False, allow_unicode=True))
+    return path
+
+
 # ── Trends history + warm-up ─────────────────────────────────────────
 
-# The demo's sending identity. mercury.yaml in a fresh checkout is the
-# untrained template (a placeholder persona email), so /api/warmup falls back
-# to the first warming inbox — this one. MERCURY_SENDER_EMAIL forces it.
-DEMO_SENDER = "alex@tryebsy.com"
-DEMO_SECOND_INBOX = "sam@tryebsy.com"
-WARMUP_START_DAYS_AGO = 9          # today is plan day 10 (week 2)
-DEMO_TARGET = 40
 HISTORY_DAYS = 60
 
 HIST_PREFIX = ["summit", "peak", "ridge", "canyon", "aspen", "granite", "mesa", "pine",
@@ -269,93 +345,114 @@ HIST_TRADE = ["roofing", "hvac", "exteriors", "heating", "mechanical", "roofco",
 HIST_FIRST = ["owner", "info", "mike", "sarah", "dave", "jen", "tom", "kate", "luis", "amy"]
 
 
+def _alex_cap(day: date) -> int:
+    return warmup_cap(DAILY_CAP, ALEX_START, day, INITIAL_CAP, WEEKLY_INCREASE)
+
+
 async def seed_history(sm: StateManager) -> dict:
     """~60 days of outreach so /api/trends 30 and 90 have something to show.
 
-    Earlier history comes from a finished campaign; the last ten days are
-    topped up on the warming inbox but kept under its ramp caps (warm-up is
-    enforced in the real sender, so the demo shouldn't show it broken).
+    Earlier history comes from a finished campaign on the warm mailbox; since
+    alex@'s ramp started it carries a share too, kept under its ramp caps
+    (the sender enforces them, so the demo shouldn't show them broken).
     History rows reference archived prospect ids that aren't on the board,
     so the pipeline stays exactly as seeded above.
     """
-    from mercury import warmup
-
     rnd = random.Random(11)
     archived = Campaign(id="", name="Front Range trades — spring list", sequence=SEQUENCE,
                         status="completed", created_at=NOW - timedelta(days=HISTORY_DAYS + 2))
     archived.id = await sm.add_campaign(archived)
 
-    today = NOW.date()
-    start = today - timedelta(days=WARMUP_START_DAYS_AGO)
-    caps = warmup.ramp_plan(DEMO_TARGET)
-
     async with sm._connect() as db:
         async with db.execute(
-            "SELECT date(sent_at), COUNT(*) FROM outbox WHERE status = 'sent' GROUP BY 1"
+            "SELECT date(sent_at), COALESCE(mailbox, ''), COUNT(*) FROM outbox "
+            "WHERE status = 'sent' GROUP BY 1, 2"
         ) as cur:
-            existing = {d: n for d, n in await cur.fetchall()}
+            existing = {(d, m): n for d, m, n in await cur.fetchall()}
 
     outbox_rows, events = [], []
+    week_rows: list[tuple[str, str, str]] = []     # (pid, email, sent_at) on jordan@, last 7 days
     n = 0
     for days_ago in range(HISTORY_DAYS - 1, -1, -1):
-        day = today - timedelta(days=days_ago)
+        day = TODAY - timedelta(days=days_ago)
         weekend = day.weekday() >= 5
-        if day >= start:
-            cap = caps[(day - start).days]
-            share = 0.4 if day == today else rnd.uniform(0.75, 0.95)
-            target = int(cap * share)
-        else:
-            progress = 1 - days_ago / HISTORY_DAYS
-            target = rnd.randint(0, 3) if weekend else int(rnd.uniform(8, 13) + 8 * progress)
-        volume = max(0, target - existing.get(day.isoformat(), 0))
-        # Reply rate improves over the period (copy got better), bounces fall.
         progress = 1 - days_ago / HISTORY_DAYS
+        # Caps are enforced over a rolling 24 hours, so yesterday evening and
+        # today together stay under each mailbox's cap.
+        last_two = days_ago <= 1
+        share = 0.4 if last_two else rnd.uniform(0.75, 0.95)
+        plan = {MB_WARM: rnd.randint(0, 3) if weekend else int(rnd.uniform(8, 13) + 8 * progress)}
+        if day >= ALEX_START:
+            plan[MB_ALEX] = int(_alex_cap(day) * share)
+        if last_two:
+            plan[MB_WARM] = min(plan[MB_WARM], 10)
+        # Reply rate improves over the period (copy got better), bounces fall.
         p_reply = 0.05 + 0.035 * progress
         p_bounce = 0.028 - 0.016 * progress
 
-        for i in range(volume):
-            n += 1
-            pid = f"hist{n:05d}"
-            email = (f"{rnd.choice(HIST_FIRST)}@{rnd.choice(HIST_PREFIX)}"
-                     f"{rnd.choice(HIST_TRADE)}{n % 97}.com")
-            sent_at = datetime.combine(day, datetime.min.time()) + timedelta(
-                hours=rnd.randint(14, 22), minutes=rnd.randint(0, 59))
-            if sent_at > NOW:
-                # Today's sends happened between midnight (UTC) and now.
-                midnight = datetime.combine(day, datetime.min.time())
-                elapsed = max(0, int((NOW - midnight).total_seconds()))
-                sent_at = midnight + timedelta(seconds=rnd.randint(0, elapsed))
-            step = rnd.choice([1, 1, 1, 2, 2, 3])
-            s = SEQUENCE[step - 1]
-            outbox_rows.append((
-                pid + "-o", archived.id, pid, step, email,
-                s.subject.replace("{{company}}", "your shop"),
-                s.body.replace("{{first_name}}", "there").replace("{{company}}", "your shop"),
-                iso(sent_at), iso(sent_at),
-            ))
+        for mailbox, target in plan.items():
+            volume = max(0, target - existing.get((day.isoformat(), mailbox), 0))
+            for i in range(volume):
+                n += 1
+                pid = f"hist{n:05d}"
+                email = (f"{rnd.choice(HIST_FIRST)}@{rnd.choice(HIST_PREFIX)}"
+                         f"{rnd.choice(HIST_TRADE)}{n % 97}.com")
+                sent_at = datetime.combine(day, datetime.min.time()) + timedelta(
+                    hours=rnd.randint(14, 22), minutes=rnd.randint(0, 59))
+                if sent_at > NOW:
+                    # Today's sends happened between midnight (UTC) and now.
+                    midnight = datetime.combine(day, datetime.min.time())
+                    elapsed = max(0, int((NOW - midnight).total_seconds()))
+                    sent_at = midnight + timedelta(seconds=rnd.randint(0, elapsed))
+                step = rnd.choice([1, 1, 1, 2, 2, 3])
+                s = SEQUENCE[step - 1]
+                outbox_rows.append((
+                    pid + "-o", archived.id, pid, step, email,
+                    s.subject.replace("{{company}}", "your shop"),
+                    s.body.replace("{{first_name}}", "there").replace("{{company}}", "your shop"),
+                    iso(sent_at), iso(sent_at), mailbox,
+                ))
+                recent = NOW - sent_at < timedelta(days=6, hours=20)
+                if recent and mailbox == MB_WARM:
+                    week_rows.append((pid, email, iso(sent_at)))
+                # Bounces in the health window are placed below on purpose.
+                if not recent and rnd.random() < p_bounce:
+                    at = min(sent_at + timedelta(minutes=rnd.randint(1, 40)), NOW)
+                    events.append(("bounce", {"prospect": email, "prospect_id": pid,
+                                              "mailbox": mailbox}, iso(at)))
+                    continue
+                if rnd.random() < p_reply:
+                    at = min(sent_at + timedelta(hours=rnd.randint(1, 60)), NOW)
+                    roll = rnd.random()
+                    intent = ("interested" if roll < 0.38 else "ooo" if roll < 0.48 else
+                              "question" if roll < 0.68 else "objection" if roll < 0.82
+                              else "not_interested")
+                    events.append(("reply_received",
+                                   {"prospect_id": pid, "prospect_email": email,
+                                    "intent": intent, "mailbox": mailbox}, iso(at)))
 
-            # Bounces in the last week are kept rare on purpose: the warm-up
-            # health gate reads them, and the demo inbox should be healthy.
-            bounce = rnd.random() < p_bounce if days_ago >= 7 else (days_ago == 5 and i == 0)
-            if bounce:
-                at = min(sent_at + timedelta(minutes=rnd.randint(1, 40)), NOW)
-                events.append(("bounce", {"prospect": email, "prospect_id": pid}, iso(at)))
-                continue
-            if rnd.random() < p_reply:
-                at = min(sent_at + timedelta(hours=rnd.randint(1, 60)), NOW)
-                roll = rnd.random()
-                intent = ("interested" if roll < 0.38 else "ooo" if roll < 0.48 else
-                          "question" if roll < 0.68 else "objection" if roll < 0.82
-                          else "not_interested")
-                events.append(("reply_received",
-                               {"prospect_id": pid, "prospect_email": email, "intent": intent},
-                               iso(at)))
+    # jordan@ this week: ~4% bounces — over the 3% hold line, under the 5%
+    # pause line — so the demo shows a mailbox on hold. alex@ stays clean.
+    async with sm._connect() as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND kind = 'sequence' "
+            "AND mailbox = ? AND datetime(sent_at) >= datetime('now', '-7 days')", (MB_WARM,)
+        ) as cur:
+            already = (await cur.fetchone())[0]
+    week_total = already + len(week_rows)
+    k = max(1, math.floor(week_total * 0.04))
+    while k / max(1, week_total) <= 0.03:
+        k += 1
+    for pid, email, sent_at in rnd.sample(week_rows, min(k, len(week_rows))):
+        at = min(datetime.fromisoformat(sent_at) + timedelta(minutes=12), NOW)
+        events.append(("bounce", {"prospect": email, "prospect_id": pid,
+                                  "mailbox": MB_WARM}, iso(at)))
 
     async with sm._connect() as db:
         await db.executemany(
             """INSERT INTO outbox (id, campaign_id, prospect_id, step, kind, to_email,
-                                   subject, body, status, send_at, sent_at, provider)
-               VALUES (?, ?, ?, ?, 'sequence', ?, ?, ?, 'sent', ?, ?, 'gmail')""",
+                                   subject, body, status, send_at, sent_at, provider, mailbox)
+               VALUES (?, ?, ?, ?, 'sequence', ?, ?, ?, 'sent', ?, ?, 'smtp', ?)""",
             outbox_rows,
         )
         await db.commit()
@@ -365,14 +462,18 @@ async def seed_history(sm: StateManager) -> dict:
 
 
 async def seed_warmup(sm: StateManager) -> dict:
-    start = (NOW.date() - timedelta(days=WARMUP_START_DAYS_AGO)).isoformat()
-    await sm.add_warmup_inbox(DEMO_SENDER, status="warming", start_date=start, target_daily=DEMO_TARGET,
-                              notes="Google Workspace on the secondary domain, bought for outreach.")
+    """The overlay: checklist progress and notes. Caps and dates are config."""
+    await sm.add_warmup_inbox(MB_ALEX, notes="Google Workspace on the secondary domain, bought for outreach.")
     done = ["secondary_domain", "domain_redirect", "profile", "personal_emails",
-            "newsletters", "verified_only", "reply_same_day", "plain_text"]
-    await sm.update_warmup_inbox(DEMO_SENDER, tasks_json=json.dumps({k: True for k in done}))
-    await sm.add_warmup_inbox(DEMO_SECOND_INBOX, notes="Second inbox for when alex@ hits target.")
-    return {"warmup_inboxes": 2}
+            "newsletters", "verified_only", "reply_same_day", "plain_text", "bounce_check"]
+    await sm.update_warmup_inbox(MB_ALEX, tasks_json=json.dumps({k: True for k in done}))
+    await sm.add_warmup_inbox(MB_WARM, notes="The original inbox. Warm since spring.")
+    await sm.update_warmup_inbox(MB_WARM, tasks_json=json.dumps(
+        {k: True for k in ("secondary_domain", "profile", "verified_only", "postmaster")}))
+    await sm.add_warmup_inbox(MB_SAM, notes="Second Workspace seat; ramp starts in three days.")
+    await sm.update_warmup_inbox(MB_SAM, tasks_json=json.dumps({"secondary_domain": True,
+                                                                 "profile": True}))
+    return {"warmup_inboxes": 3}
 
 
 def main(argv: list[str]) -> int:
@@ -383,12 +484,15 @@ def main(argv: list[str]) -> int:
         return 2
     target.parent.mkdir(parents=True, exist_ok=True)
     counts = asyncio.run(seed(target))
+    config_path = write_demo_config(target)
     print(f"Seeded {target}: {counts['prospects']} prospects, "
           f"{len(COMPANIES)} companies, {counts['conversations']} conversations, "
           f"{counts['outbox']} outbox rows, {counts['history_sends']} historical sends, "
           f"{counts['history_events']} reply/bounce events, "
-          f"{counts['warmup_inboxes']} warm-up inboxes.")
-    print(f"Run: MERCURY_DB_PATH={target} env -u APPIMAGE .venv/bin/mercury dashboard")
+          f"{counts['warmup_inboxes']} warm-up overlays.")
+    print(f"Demo mail config: {config_path}")
+    print(f"Run: MERCURY_DB_PATH={target} MERCURY_CONFIG={config_path} "
+          f"{DEMO_PASSWORD_ENV}=demo env -u APPIMAGE .venv/bin/mercury dashboard")
     return 0
 
 
