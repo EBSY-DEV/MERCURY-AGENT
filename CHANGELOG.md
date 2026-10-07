@@ -1,9 +1,34 @@
 # Changelog
 
-Notable changes to Harvey. Dates are release dates; the format follows
+Notable changes to Mercury (formerly Harvey). Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely and versions
-follow [semver](https://semver.org/), with the caveat that Harvey is pre-1.0 and
+follow [semver](https://semver.org/), with the caveat that Mercury is pre-1.0 and
 minor versions can still change behaviour.
+
+## [Unreleased]
+
+### Changed
+
+- **Harvey is now Mercury by EBSY.** The package (`mercury/`), CLI
+  (`mercury ...`), config (`mercury.yaml`, `mercury.local.yaml`) and database
+  (`data/mercury.db`) are renamed. Existing checkouts migrate automatically:
+  `harvey.local.yaml` and `data/harvey.db*` / `harvey.log` are renamed in place
+  on first start, never overwriting a newer file. Re-run `pip install -e .`
+  so the `mercury` command exists.
+- **Dashboard redesign.** Light, lavender-tinted theme with a single violet
+  accent; dark mode re-tokenised as deep aubergine. Sans-only type (Geist +
+  Geist Mono). Tokens live in `mercury/web/app.css`; the matching Pencil
+  source is `design/mercury-brand.pen` (rebuild with
+  `design/build_brand_pen.py`).
+
+### Fixed
+
+- **Fresh databases could get stuck on "duplicate column name".** The
+  dashboard's parallel first-load requests each ran schema migrations at
+  once; a half-applied migration left the schema version behind for good.
+  Migrations now take the write lock first and apply atomically.
+- The usage tab's daily bar chart referenced undefined colour tokens and
+  rendered invisible bars.
 
 ## [0.2.0] — 2026-09-13
 

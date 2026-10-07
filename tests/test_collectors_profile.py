@@ -6,10 +6,10 @@ import tempfile
 import pytest
 import pytest_asyncio
 
-from harvey.collectors.profile import ProfileCollector, title_looks_like_role, _strip_code
-from harvey.models.company import Company
-from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
-from harvey.state import StateManager
+from mercury.collectors.profile import ProfileCollector, title_looks_like_role, _strip_code
+from mercury.models.company import Company
+from mercury.signals import SIGNAL_CATALOG, seed_signal_catalog
+from mercury.state import StateManager
 
 
 @pytest_asyncio.fixture
@@ -105,8 +105,8 @@ def test_tech_and_ads_detection():
               <link href="/wp-content/themes/x.css">
               <script src="https://connect.facebook.net/en_US/fbevents.js"></script>"""
     assert "WordPress" in c.detect_tech(html)
-    assert c._any(html, __import__("harvey.collectors.profile", fromlist=["GOOGLE_ADS"]).GOOGLE_ADS)
-    assert c._any(html, __import__("harvey.collectors.profile", fromlist=["META_PIXEL"]).META_PIXEL)
+    assert c._any(html, __import__("mercury.collectors.profile", fromlist=["GOOGLE_ADS"]).GOOGLE_ADS)
+    assert c._any(html, __import__("mercury.collectors.profile", fromlist=["META_PIXEL"]).META_PIXEL)
 
 
 def test_clean_page_has_no_false_tech():
