@@ -9,6 +9,8 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **`mercury run` opens with a banner.** The dot and the name, in the brand accent, printed only
+  to a terminal (not to a log file or a service journal, and not for `--once`). `NO_COLOR` turns the colour off.
 - **Harvey is now Mercury Agent.** The package (`mercury/`), CLI
   (`mercury ...`), config (`mercury.yaml`, `mercury.local.yaml`) and database
   (`data/mercury.db`) are renamed. Existing checkouts migrate automatically:
