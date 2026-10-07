@@ -78,8 +78,11 @@ class MailProvider(ABC):
         body: str,
         thread_ref: str = "",
         in_reply_to: str = "",
+        references: str = "",
     ) -> SendResult:
-        """Send one plain-text email. Reply threading when refs are given."""
+        """Send one plain-text email. Reply threading when refs are given:
+        ``references`` is the space-separated Message-ID chain for the
+        References header (defaults to ``in_reply_to``)."""
 
     @abstractmethod
     async def get_replies(self, limit: int = 50) -> list[InboundMessage]:

@@ -347,7 +347,7 @@ def cmd_mail(args):
 
 def cmd_outbox(args):
     """Review and approve queued outgoing emails."""
-    from mercury.state import StateManager
+    from mercury.state import StateManager, wire_subject
 
     async def _outbox():
         state = StateManager()
@@ -374,13 +374,22 @@ def cmd_outbox(args):
 
         pending = await state.get_outbox(status="pending_review", limit=50)
         approved = await state.get_outbox(status="approved", limit=10)
+        try:
+            from mercury.config import load_config
+            threaded = load_config().channels.email.thread_followups
+        except Exception:
+            threaded = True
         print(f"\n  Outbox — {len(pending)} awaiting approval, "
               f"{len(approved)}+ approved/scheduled")
         print("  " + "=" * 60)
         for item in pending:
             print(f"\n  [{item['id']}] step {item['step']} ({item['kind']}) "
                   f"→ {item['to_email']}  (send {item['send_at'][:16]})")
-            print(f"  Subject: {item['subject']}")
+            subject = wire_subject(item, threaded)
+            print(f"  Subject: {subject}")
+            if subject != item["subject"]:
+                # A threaded follow-up: the writer's subject stays for review.
+                print(f"  (reply in the first email's thread; drafted subject: {item['subject']})")
             body_preview = (item["body"][:200] + "...") if len(item["body"]) > 200 else item["body"]
             for line in body_preview.splitlines():
                 print(f"    {line}")
