@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -320,6 +321,10 @@ def cmd_mail(args):
     from mercury.config import load_config, load_env
     from mercury.integrations.mailboxes import MailboxPool, local_today
 
+    if args.mail_action == "placement":
+        cmd_mail_placement(args)
+        return
+
     config = load_config()
     env = load_env()
     pool = MailboxPool.from_config(config, env)
@@ -343,6 +348,143 @@ def cmd_mail(args):
         sys.exit(0 if all_ok else 1)
 
     asyncio.run(_test())
+
+
+def _placement_json(rep):
+    """A placement report without non-serializable bits, for --json."""
+    return json.loads(json.dumps(rep, default=str)) if rep else None
+
+
+def cmd_mail_placement(args):
+    """Inbox placement test: send email 1 to seed inboxes, read where it landed."""
+    from mercury import placement
+    from mercury.config import load_config, load_env
+    from mercury.integrations.mailboxes import MailboxPool
+    from mercury.state import StateManager
+
+    config = load_config()
+    env = load_env()
+    action = args.placement_action or "run"
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        await placement.ensure_schema(state.db_path)
+
+        if action in ("show", "check", "mark"):
+            run_id = await placement.resolve_run(state, args.run_id)
+            if not run_id:
+                print("\n  No placement test found"
+                      + (f" matching '{args.run_id}'." if args.run_id else
+                         ". Run one with: mercury mail placement") + "\n")
+                sys.exit(1)
+            if action == "check":
+                readers = placement.default_readers(placement.seeds_from_config(config, env))
+                await placement.check(state, run_id, readers)
+                await placement.finish(state, run_id)
+            elif action == "mark":
+                if not (args.seed and args.sender and args.folder):
+                    print("\n  mark needs --seed, --sender (an address, or 'control') and --folder.\n")
+                    sys.exit(2)
+                try:
+                    n = await placement.mark(state, run_id, args.seed, args.sender, args.folder)
+                except placement.PlacementError as e:
+                    print(f"\n  {e}\n")
+                    sys.exit(2)
+                if not n:
+                    print(f"\n  No copy from {args.sender} to {args.seed} in run {run_id}.\n")
+                    sys.exit(1)
+            rep = await placement.report(state, run_id)
+            if args.json:
+                print(json.dumps(_placement_json(rep), indent=2))
+            else:
+                print(placement.format_report(rep))
+            return
+
+        pool = MailboxPool.from_config(config, env)
+        if args.subject or args.body_file:
+            if not (args.subject and args.body_file):
+                print("\n  --subject and --body-file go together.\n")
+                sys.exit(2)
+            with open(args.body_file, encoding="utf-8") as f:
+                email = {"id": "", "subject": args.subject, "body": f.read()}
+        else:
+            email = await placement.pick_email(state, args.outbox_id)
+        if not email:
+            print("\n  No email 1 to test" + (f" matching '{args.outbox_id}'" if args.outbox_id else "")
+                  + ". Draft a campaign first, or pass --subject and --body-file.\n")
+            sys.exit(1)
+
+        p = placement.plan(config, env, pool, args.mailbox)
+        print("\n  Placement test")
+        print("  " + "=" * 52)
+        print(f"  Email:   {email['subject']!r}"
+              + (f"  (outbox {email['id'][:8]})" if email.get("id") else ""))
+        for f in p["fleet"]:
+            print(f"  From:    {f['email']}" + ("" if f["configured"] else "  (no password, skipped)"))
+        if p["control"]:
+            c = p["control"]
+            print(f"  Control: {c['email']}" + ("" if c["configured"] else "  (not ready, skipped)"))
+        else:
+            print("  Control: none configured (a spam result will be read as the copy)")
+        for s in p["seeds"]:
+            print(f"  Seed:    {s.email}  ({s.provider}"
+                  + (", read over IMAP)" if s.readable else ", record by hand)"))
+        senders = sum(1 for f in p["fleet"] if f["configured"]) + (
+            1 if p["control"] and p["control"]["configured"] else 0)
+        print(f"  {senders * len(p['seeds'])} test emails. None of them touch the outbox or a daily cap.")
+        if p["problems"]:
+            print()
+            for problem in p["problems"]:
+                print(f"  ✗ {problem}")
+            print()
+            sys.exit(1)
+        if args.dry_run:
+            print("\n  Dry run: nothing sent.\n")
+            return
+        print()
+        try:
+            res = await placement.run(
+                state, config, env, pool, subject=email["subject"], body=email["body"],
+                only=args.mailbox, wait_seconds=args.wait,
+                progress=lambda msg: print(f"  {msg}"),
+            )
+        except placement.PlacementError as e:
+            print(f"\n  ✗ {e}\n")
+            sys.exit(1)
+        rep = await placement.report(state, res["run_id"])
+        if args.json:
+            print(json.dumps(_placement_json(rep), indent=2))
+        else:
+            print(placement.format_report(rep))
+
+    asyncio.run(_run())
+
+
+def cmd_health(args):
+    """Deliverability health: a verdict per sending domain."""
+    from mercury import deliverability, placement
+    from mercury.config import load_config, load_env
+    from mercury.integrations.mailboxes import MailboxPool
+    from mercury.state import StateManager
+
+    config = load_config()
+    try:
+        pool = MailboxPool.from_config(config, load_env())
+    except Exception:
+        pool = None
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        report = await deliverability.domain_report(state, config, pool)
+        last = await placement.report(state)
+        if args.json:
+            print(json.dumps({**report, "placement": _placement_json(last)}, indent=2))
+        else:
+            print(deliverability.format_report(report, last))
+
+    asyncio.run(_run())
 
 
 def cmd_outbox(args):
@@ -996,12 +1138,38 @@ def main():
                      help="auth: one-time OAuth; test: verify connection")
     sub.set_defaults(func=cmd_gmail)
 
-    # mercury mail test
-    sub = subparsers.add_parser("mail", help="Test the configured mail provider")
+    # mercury mail test | mercury mail placement [run|show|check|mark] [RUN]
+    sub = subparsers.add_parser(
+        "mail", help="Test the mail provider, or run an inbox placement test")
     sub.add_argument(
-        "mail_action", choices=["test"], help="test: verify send/receive credentials"
+        "mail_action", choices=["test", "placement"],
+        help="test: verify send/receive credentials; placement: send email 1 to your "
+             "seed inboxes and read where it landed",
     )
+    sub.add_argument("placement_action", nargs="?", default="run",
+                     choices=["run", "show", "check", "mark"],
+                     help="placement: run a test (default), show a result, check the "
+                          "seeds again, or mark a folder by hand")
+    sub.add_argument("run_id", nargs="?", default="", help="Placement run id (default: the last)")
+    sub.add_argument("--dry-run", action="store_true", help="Show who would send to whom; send nothing")
+    sub.add_argument("--mailbox", action="append", metavar="EMAIL_OR_DOMAIN",
+                     help="Only test these mailboxes or domains (repeatable)")
+    sub.add_argument("--outbox-id", default="", help="Test this outbox email instead of the newest email 1")
+    sub.add_argument("--subject", default="", help="Test this subject (with --body-file)")
+    sub.add_argument("--body-file", default="", help="Test the body in this file (with --subject)")
+    sub.add_argument("--wait", type=int, default=None,
+                     help="Seconds to look for the emails in the seeds (default: placement.wait_seconds)")
+    sub.add_argument("--seed", default="", help="mark: the seed inbox")
+    sub.add_argument("--sender", default="", help="mark: the address it came from, or 'control'")
+    sub.add_argument("--folder", default="", help="mark: primary, inbox, promotions, other_tab, spam, missing")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
     sub.set_defaults(func=cmd_mail)
+
+    # mercury health
+    sub = subparsers.add_parser(
+        "health", help="Deliverability verdict per sending domain (the 1%% rule)")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub.set_defaults(func=cmd_health)
 
     # mercury outbox
     sub = subparsers.add_parser("outbox", help="Review/approve queued emails")
