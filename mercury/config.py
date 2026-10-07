@@ -266,6 +266,55 @@ class ComplianceConfig(BaseModel):
     opt_out_line_es: str = '¿No es para ti? Responde "baja" y no te escribo más.'
 
 
+DEMO_KINDS = ("voice", "website")
+
+
+class OfferDefinition(BaseModel):
+    """One offer a prospect can be routed to.
+
+    Only what the demo gate needs lives here today: the key that campaigns
+    and outbox rows carry (``offer_key``), and whether the offer promises
+    something already built for that business. Routing rules, offer text and
+    CTAs belong to the offer router (#57) and extend this model.
+    """
+    key: str
+    # true: no sequence email of this offer leaves until a demo for that
+    # prospect is marked ready (`mercury demos ready`).
+    requires_demo: bool = False
+    # What the demo is: voice (an answering line) or website (a draft site).
+    demo_kind: str = ""
+
+    @field_validator("key")
+    @classmethod
+    def _valid_key(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if not v or not all(ch.isalnum() or ch in "_-" for ch in v):
+            raise ValueError("offer key must be letters, digits, '-' or '_' (e.g. 'voice')")
+        return v
+
+    @field_validator("demo_kind")
+    @classmethod
+    def _valid_kind(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if v and v not in DEMO_KINDS:
+            raise ValueError(f"demo_kind must be one of {', '.join(DEMO_KINDS)}")
+        return v
+
+
+class DemosConfig(BaseModel):
+    # A ready demo is retired this many days after the last email to a
+    # prospect who never replied. The break-up email's "stays ready for N
+    # days" must quote this number. 0 keeps demos until retired by hand.
+    retire_after_days: int = 14
+
+    @field_validator("retire_after_days")
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("retire_after_days must be >= 0")
+        return v
+
+
 class MercuryConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
@@ -273,6 +322,18 @@ class MercuryConfig(BaseModel):
     channels: ChannelsConfig = ChannelsConfig()
     usage: UsageConfig = UsageConfig()
     compliance: ComplianceConfig = ComplianceConfig()
+    offers: list[OfferDefinition] = []
+    demos: DemosConfig = DemosConfig()
+
+    @field_validator("offers")
+    @classmethod
+    def _unique_offers(cls, v: list[OfferDefinition]) -> list[OfferDefinition]:
+        seen: set[str] = set()
+        for offer in v:
+            if offer.key in seen:
+                raise ValueError(f"offer {offer.key} is listed twice")
+            seen.add(offer.key)
+        return v
 
 
 class EnvConfig(BaseModel):

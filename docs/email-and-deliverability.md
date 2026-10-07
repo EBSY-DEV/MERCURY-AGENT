@@ -52,6 +52,17 @@ With `require_approval: false`, rows start as `approved`.
 
 At most 8 emails leave per cycle, with 4 to 15 seconds of random delay between sends. `max_daily_sends` caps all native sends in a rolling 24-hour window. With `spread_sends: true`, the day's remaining cold budget is divided over the cycles left before quiet hours.
 
+**Demo gate.** Some offers promise something already built for that one business: a phone line that answers in its name, a draft homepage with its photos. Sent before the demo exists, that email makes a false claim. Give such an offer `requires_demo: true` under `offers:` in mercury.yaml, and every sequence email that carries its key (`offer_key`, on the outbox row or its campaign) waits until the prospect's demo is marked ready. The row stays approved and shows "Waiting for demo" in the Outbox; nothing is cancelled. The gate fails closed: an offer key missing from `offers:`, a row with no contact, or an error while checking holds the email. Rows with no offer key are not gated.
+
+```bash
+mercury demos                                   # who is waiting, and every demo
+mercury demos ready EMAIL --url https://...     # or --recording PATH, --agent-id ID, --by NAME
+mercury demos request EMAIL --offer voice       # register one to build
+mercury demos retire EMAIL                      # its emails wait for a new demo
+```
+
+The Outbox tab has the same: a **Waiting for a demo** list and a **Mark ready** drawer to attach the link or recording. A demo that is ready is retired `demos.retire_after_days` (default 14) after the last email to a contact who never replied, once nothing is queued for them. A break-up email that says the demo "stays ready" should quote that number. Instantly deploys a whole sequence at once, so there a demo offer's campaign stays in draft until every contact in it has a ready demo. Building the demo itself is not Mercury's job; this is the bookkeeping and the gate.
+
 Temporary failures (timeouts, connection errors, 4xx deferrals, rate limiting) keep the row approved and retry up to 3 times, 30, 60 and 90 minutes later. Permanent errors mark it `failed`.
 
 **Reviewing.** In the dashboard's Outbox tab you can, for each pending draft:

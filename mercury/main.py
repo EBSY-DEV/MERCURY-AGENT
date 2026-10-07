@@ -361,6 +361,15 @@ async def run_cycle(rt: Runtime) -> str:
     except Exception as e:
         logger.warning(f"Could not recover stale outbox rows: {e}")
 
+    # Retire demos nobody answered (demos.retire_after_days). One query, no
+    # model call.
+    try:
+        from mercury.demos import retire_stale_demos
+
+        await retire_stale_demos(rt.state, config)
+    except Exception as e:
+        logger.warning(f"Could not retire stale demos: {e}")
+
     # 1. Check usage budget (real subscription quota when readable, else
     # Mercury's own call counter)
     over_budget = not await rt.brain.is_within_budget(

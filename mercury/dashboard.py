@@ -26,6 +26,7 @@ logger = logging.getLogger("mercury.dashboard")
 from mercury.paths import PROJECT_ROOT  # noqa: E402
 from mercury.personas_api import router as personas_router  # noqa: E402
 from mercury.imports_api import router as imports_router  # noqa: E402
+from mercury.demos_api import router as demos_router  # noqa: E402
 # MERCURY_DB_PATH points the dashboard at another database (e.g. the demo
 # DB from scripts/seed_demo.py) without touching the real one.
 DB_PATH = Path(os.environ.get("MERCURY_DB_PATH") or (PROJECT_ROOT / "data" / "mercury.db"))
@@ -37,6 +38,7 @@ LOG_FILE = PROJECT_ROOT / "data" / "mercury.log"
 app = FastAPI(title="Mercury Dashboard")
 app.include_router(personas_router)
 app.include_router(imports_router)
+app.include_router(demos_router)
 
 # Mercury process tracking
 _mercury_process: subprocess.Popen | None = None
@@ -668,12 +670,17 @@ async def get_outbox_api():
             known = {mb.email for mb in pool.mailboxes} if pool else None
         except Exception:
             legacy, known = "", None
+        from mercury.demos import annotate_outbox, waiting_for_demo
+
+        config = _demo_config()
+        pending = await state.get_outbox(status="pending_review", limit=100)
+        approved = await state.get_outbox(status="approved", limit=50)
+        await annotate_outbox(state, config, pending + approved)
         return {
             "paused": await state.get_setting("sending_paused"),
-            "pending": await _with_from_mailbox(
-                state, await state.get_outbox(status="pending_review", limit=100), legacy, known),
-            "approved": await _with_from_mailbox(
-                state, await state.get_outbox(status="approved", limit=50), legacy, known),
+            "pending": await _with_from_mailbox(state, pending, legacy, known),
+            "approved": await _with_from_mailbox(state, approved, legacy, known),
+            "waiting_demo": await waiting_for_demo(state, config),
             "sending": await _with_from_mailbox(
                 state, await state.get_outbox(status="sending", limit=50), legacy, known),
             "sent": await _with_from_mailbox(state, await query_db(
@@ -685,6 +692,18 @@ async def get_outbox_api():
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+def _demo_config():
+    """The config the demo gate reads, or None when it can't be loaded. The
+    gate fails closed on None: every email that carries an offer shows held."""
+    try:
+        from mercury.config import load_config
+
+        return load_config()
+    except Exception as e:
+        logger.warning(f"Demo gate: could not load the config: {e}")
+        return None
 
 
 def _mail_context():
@@ -1686,6 +1705,21 @@ async def get_today():
                           else f"{len(pending)} emails waiting for approval"),
                 "detail": "Nothing sends until you approve it. Read them one at a time.",
                 "action": "Open the decisions desk", "tab": "outbox",
+            })
+
+        from mercury.demos import waiting_for_demo
+
+        waiting_demo = await waiting_for_demo(state, _demo_config())
+        stats["waiting_demo"] = len(waiting_demo)
+        if waiting_demo:
+            n = len(waiting_demo)
+            items.append({
+                "key": "demos", "tone": "warn",
+                "title": (f"{n} contact waiting for a demo" if n == 1
+                          else f"{n} contacts waiting for a demo"),
+                "detail": ("Their emails say something was already built for them, so "
+                           "they wait until you mark the demo ready."),
+                "action": "See who is waiting", "tab": "outbox",
             })
 
         if open_convos:
