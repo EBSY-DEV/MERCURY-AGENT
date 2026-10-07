@@ -829,7 +829,7 @@ async function loadSettings() {
   if (dfsl) dfsl.value = data.dataforseo_login || '';
   api('/api/mailboxes').then(mb => {
     const el = document.getElementById('settings-mailboxes');
-    if (el) el.innerHTML = mb && !mb.error && mb.rotation ? renderMailboxes(mb, true) : '';
+    if (el) el.innerHTML = mb && !mb.error && mb.rotation ? renderMailboxRotation(mb, true) : '';
   });
   await loadInboxSettings();
   savedPh('linkedin-password', data.linkedin_password_set, 'Enter password');
@@ -1286,7 +1286,7 @@ async function loadOutbox() {
   if (mboxEl) mboxEl.innerHTML = mbox && mbox.error
     ? '<section class="panel"><div class="panel-head"><div><h3 class="icon-title">' + icon('warning-circle') +
         'Mailbox settings unreadable</h3><p>' + escHtml(mbox.error) + '</p></div></div></section>'
-    : (_mailboxes && _mailboxes.rotation ? renderMailboxes(_mailboxes) : '');
+    : (_mailboxes && _mailboxes.rotation ? renderMailboxRotation(_mailboxes) : '');
   const banner = document.getElementById('outbox-banner');
   const desk = document.getElementById('outbox-desk');
   const list = document.getElementById('outbox-list');
@@ -1554,7 +1554,7 @@ function mailboxStage(m) {
   return h;
 }
 
-function renderMailboxes(mb, compact) {
+function renderMailboxRotation(mb, compact) {
   if (!mb || !mb.mailboxes || !mb.mailboxes.length) return '';
   const flags = [];
   if (mb.require_approval) flags.push(mb.auto_approve_followups
