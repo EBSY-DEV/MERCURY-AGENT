@@ -39,6 +39,21 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Out-of-office pauses** (#4). A vacation auto-reply no longer lets the
+  follow-ups keep landing while the person is away. On the native Gmail/SMTP
+  path Mercury pauses that contact's remaining cold steps, reads the return date
+  (English and Spanish: "until October 20", "hasta el 20 de octubre", "back
+  Monday", "for two weeks") against the time the message arrived in your
+  `usage.quiet_hours.timezone`, and resumes at the end of quiet hours on that
+  day (Monday if it falls on a weekend). A missing, ambiguous, impossible or
+  past date pauses the contact into a "return date needs review" state that
+  never resumes by itself. The pause is stored in the new `sequence_pauses`
+  table (migration v14), survives restarts, leaves approvals and drafts alone,
+  and is ended by a human reply, opt-out, bounce or closing the contact.
+  Paused contacts show on the Outbox tab, where you can set a date or resume
+  them. Acknowledgements, ticket replies and read receipts are recorded as
+  `auto_reply` events and change nothing. The Instantly path cannot pause a
+  remote sequence and says so in the activity log.
 - **CSV contact import** (#3). Dashboard (Contacts → Import CSV), `mercury import`
   share one service. It has a read-only preview
   with per-row outcomes (new, needs enrichment, duplicate, invalid), column

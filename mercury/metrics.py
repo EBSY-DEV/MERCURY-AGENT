@@ -12,7 +12,9 @@ warm-up health gate, so both read the same definitions:
   (timestamped, carries prospect_id + intent). Prospects with NO such event
   — conversations recorded before the event existed — fall back to the
   conversation's ``created_at`` (the handler creates a conversation on the
-  first reply). Out-of-office auto-replies (intent ``ooo``) are not replies.
+  first reply). Out-of-office auto-replies are not replies: the handler records
+  them as ``auto_reply`` / ``sequence_paused`` events, never ``reply_received``,
+  and the intent ``ooo`` is excluded here as well for older rows.
 * **positive** — the same events where intent is ``interested``.
 * **bounces** — the ``bounce`` event the handler logs, one per prospect per
   day (unmatched bounces count individually).
