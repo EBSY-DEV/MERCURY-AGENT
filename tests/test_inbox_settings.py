@@ -203,3 +203,72 @@ def test_setup_status_recognizes_per_inbox_credentials(client):
     checks = client.get("/api/setup-status").json()
     # This route's setup check uses the same mailbox pool as the sender.
     assert next(c for c in checks["checks"] if c["id"] == "email_provider")["done"]
+
+
+def test_save_preserves_yaml_comments_and_key_order(client):
+    text = "# Top comment stays\n" + yaml.safe_dump(client.raw, sort_keys=False)
+    text = text.replace("persona:\n", "persona:  # inline comment\n", 1) + "unrelated:\n  nested: {keep: 1}\n"
+    client.config_path.write_text(text)
+    order = [k for k in client.raw] + ["unrelated"]
+    assert client.post("/api/settings/mailboxes", json={"email": "a@example.com"}).status_code == 200
+    out = client.local_path.read_text()
+    assert out.startswith("# Top comment stays\n") and "persona:  # inline comment" in out
+    positions = [out.index(f"\n{k}:") if not out.startswith(f"{k}:") else 0 for k in order]
+    assert positions == sorted(positions)
+    saved = yaml.safe_load(out)
+    assert saved["unrelated"] == {"nested": {"keep": 1}}
+    assert saved["persona"] == client.raw["persona"]
+    assert saved["channels"]["email"]["mailboxes"][0]["email"] == "a@example.com"
+
+
+def test_save_handles_bare_channels_key(client):
+    raw = dict(client.raw)
+    raw["channels"] = None
+    client.config_path.write_text(yaml.safe_dump(raw, sort_keys=False).replace("channels: null", "channels:"))
+    res = client.post("/api/settings/mailboxes", json={"email": "a@example.com", "activate_smtp": True})
+    assert res.status_code == 200, res.text
+    assert load_config(str(client.local_path)).channels.email.mailboxes[0].email == "a@example.com"
+
+
+def test_write_env_replaces_first_duplicate_and_drops_the_rest(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("A='1'\n# keep\nA='2'\nB='x'\nA='3'\n")
+    inbox_settings.write_env(env, {"A": "new"})
+    text = env.read_text()
+    assert text == "A='new'\n# keep\nB='x'\n"
+    assert dotenv_values(env, interpolate=False)["A"] == "new"
+
+
+def test_password_rotation_on_legacy_inbox_moves_imap_to_the_new_secret(client):
+    inbox_settings.write_env(client.env_path, {"SMTP_USERNAME": "original@example.com",
+                                             "SMTP_PASSWORD": "old", "IMAP_PASSWORD": "imap-old"})
+    res = client.patch("/api/settings/mailboxes/original@example.com", json={"password": "rotated"})
+    assert res.status_code == 200, res.text
+    assert "rotated" not in res.text and "imap_password_env" not in res.text
+    cfg, pool = dash._mail_context()
+    box = pool.resolve("original@example.com")
+    assert box.provider.smtp_pass == "rotated" and box.provider.imap_pass == "rotated"
+    saved = cfg.channels.email.mailboxes[0]
+    assert saved.imap_password_env == saved.password_env and saved.password_env.startswith("MAILBOX_")
+    assert dotenv_values(client.env_path, interpolate=False)["IMAP_PASSWORD"] == "imap-old"
+
+
+def test_separate_imap_password_gets_its_own_env_key(client):
+    client.post("/api/settings/mailboxes", json={"email": "a@example.com", "password": "smtp-pw"})
+    res = client.patch("/api/settings/mailboxes/a@example.com", json={"imap_password": "imap-pw"})
+    assert res.status_code == 200, res.text
+    assert "imap-pw" not in res.text and "imap_password_env" not in res.text
+    assert res.json()["inbox"]["imap_password_set"] is True
+    cfg, pool = dash._mail_context()
+    box = pool.resolve("a@example.com")
+    assert box.provider.smtp_pass == "smtp-pw" and box.provider.imap_pass == "imap-pw"
+    saved = cfg.channels.email.mailboxes[0]
+    assert saved.imap_password_env.startswith("MAILBOX_") and saved.imap_password_env.endswith("_IMAP_PASSWORD")
+    assert saved.imap_password_env != saved.password_env
+    assert "imap-pw" not in client.local_path.read_text()
+    # Rotating the SMTP password afterwards leaves the explicit IMAP secret alone.
+    client.patch("/api/settings/mailboxes/a@example.com", json={"password": "smtp-2"})
+    _, pool = dash._mail_context()
+    box = pool.resolve("a@example.com")
+    assert box.provider.smtp_pass == "smtp-2" and box.provider.imap_pass == "imap-pw"
+    assert client.patch("/api/settings/mailboxes/a@example.com", json={"imap_password": "a\nb"}).status_code == 400

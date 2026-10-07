@@ -47,9 +47,12 @@ async def service() -> ImportService:
 
 async def call(command):
     """Run one service command; an ImportFileError becomes an HTTP error whose
-    detail carries the code and anything the UI needs to offer a fix."""
+    detail carries the code and anything the UI needs to offer a fix.
+    ``command`` may be a coroutine or a zero-argument callable that builds
+    one, so errors raised while preparing the call (a bad upload) are caught
+    the same way."""
     try:
-        return await command
+        return await (command() if callable(command) else command)
     except ImportFileError as error:
         raise HTTPException(HTTP_STATUS.get(error.code, 422),
                             {"code": error.code, "message": str(error), **error.details}) from error
@@ -63,14 +66,14 @@ def _options(body: ImportInput) -> dict:
 @router.post("/api/imports/preview")
 async def preview(body: ImportInput):
     svc = await service()
-    return await call(svc.preview(decode_upload(body.content_b64), **_options(body)))
+    return await call(lambda: svc.preview(decode_upload(body.content_b64), **_options(body)))
 
 
 @router.post("/api/imports/commit")
 async def commit(body: CommitInput):
     svc = await service()
-    return await call(svc.commit(decode_upload(body.content_b64), skip_invalid=body.skip_invalid,
-                                 origin="dashboard", **_options(body)))
+    return await call(lambda: svc.commit(decode_upload(body.content_b64), skip_invalid=body.skip_invalid,
+                                         origin="dashboard", **_options(body)))
 
 
 @router.get("/api/imports")

@@ -925,7 +925,9 @@ function openInboxEditor(index) {
     '<div class="form-row">' + host('imap-host', 'IMAP host', defaults.imap_host) +
     input('imap-port', 'IMAP port', 'number', b && b.imap_port || '', 'min="1" max="65535" placeholder="' + (defaults.imap_port || 993) + '"') + '</div>' +
     input('username', 'SMTP login', 'text', b ? b.username : '', 'autocomplete="off" placeholder="Defaults to the inbox email"') +
-    input('imap-username', 'IMAP login', 'text', b ? b.imap_username : '', 'autocomplete="off" placeholder="Defaults to the SMTP login"') + '</details>' +
+    input('imap-username', 'IMAP login', 'text', b ? b.imap_username : '', 'autocomplete="off" placeholder="Defaults to the SMTP login"') +
+    input('imap-password', b && b.imap_password_set ? 'Change IMAP password' : 'IMAP password', 'password', '',
+      'autocomplete="new-password" placeholder="' + (b && b.imap_password_set ? 'Leave blank to keep the saved password' : 'Leave blank to use the SMTP password') + '"') + '</details>' +
     '<label class="inbox-checkbox"><input type="checkbox" id="inbox-enabled"' + (!b || b.enabled ? ' checked' : '') + '>Use this inbox for new outreach</label>' +
     '<p class="muted inbox-field-hint">Turning this off keeps replies and existing follow-ups on this inbox.</p>' +
     (_inboxSettings.provider !== 'smtp' ? '<label class="inbox-checkbox"><input type="checkbox" id="inbox-activate" required>Switch email sending from ' +
@@ -955,6 +957,7 @@ async function saveInbox(event) {
     smtp_host: val('smtp-host').trim(), smtp_port: Number(val('smtp-port')) || 0,
     imap_host: val('imap-host').trim(), imap_port: Number(val('imap-port')) || 0,
     username: val('username').trim(), imap_username: val('imap-username').trim(),
+    imap_password: val('imap-password'),
     enabled: document.getElementById('inbox-enabled').checked};
   const activate = document.getElementById('inbox-activate');
   if (activate) data.activate_smtp = activate.checked;
@@ -1733,8 +1736,21 @@ async function impSend(path, body) {
     try { data = await r.json(); } catch { /* not JSON */ }
     if (r.ok) return { ok: true, data };
     const d = data && data.detail;
-    const error = d && typeof d === 'object' ? d
-      : { code: 'http', message: typeof d === 'string' ? d : 'Request failed (' + r.status + ')' };
+    const fallback = 'Request failed (' + r.status + ').';
+    let error;
+    if (Array.isArray(d)) {
+      // Pydantic validation: one entry per bad field, each with loc and msg.
+      const parts = d.map(x => {
+        if (!x || !x.msg) return '';
+        const field = Array.isArray(x.loc) ? x.loc.filter(l => l !== 'body').join('.') : '';
+        return (field ? field + ': ' : '') + x.msg;
+      }).filter(Boolean);
+      error = { code: 'validation', message: parts.length ? parts.join('. ') + '.' : fallback };
+    } else if (d && typeof d === 'object') {
+      error = d;
+    } else {
+      error = { code: 'http', message: typeof d === 'string' ? d : fallback };
+    }
     return { ok: false, error };
   } catch {
     return { ok: false, error: { code: 'offline', message: 'Can\'t reach the dashboard server.' } };
@@ -2222,6 +2238,33 @@ function openDrawer(kicker, title, subHtml, bodyHtml) {
   document.getElementById('drawer-scrim').classList.add('open');
   const close = d.querySelector('.drawer-head > .btn-square');
   if (close) close.focus({preventScroll: true});
+}
+
+// Re-render an open drawer without resetting its scroll position or moving
+// focus. Used by quiet background refreshes and in-drawer toggles, where
+// openDrawer's scroll-to-top and focus-the-close-button would get in the way.
+function updateDrawer(kicker, title, subHtml, bodyHtml) {
+  if (!drawerOpen()) { openDrawer(kicker, title, subHtml, bodyHtml); return; }
+  const body = document.getElementById('drawer-body');
+  const top = body.scrollTop;
+  const active = document.activeElement;
+  const activeId = active && body.contains(active) ? active.id : '';
+  const selStart = active && typeof active.selectionStart === 'number' ? active.selectionStart : null;
+  const selEnd = active && typeof active.selectionEnd === 'number' ? active.selectionEnd : null;
+  document.getElementById('drawer-kicker').textContent = kicker || '';
+  document.getElementById('drawer-title').textContent = title || '';
+  document.getElementById('drawer-sub').innerHTML = subHtml || '';
+  body.innerHTML = bodyHtml || '';
+  body.scrollTop = top;
+  if (activeId) {
+    const again = document.getElementById(activeId);
+    if (again) {
+      again.focus({ preventScroll: true });
+      if (selStart !== null && typeof again.setSelectionRange === 'function') {
+        try { again.setSelectionRange(selStart, selEnd); } catch { /* not a text control */ }
+      }
+    }
+  }
 }
 
 function closeDrawer() {
@@ -3325,7 +3368,7 @@ let _mb = {
 
 const MB_FILTERS = [['all', 'All'], ['needs', 'Needs you'], ['warming', 'Warming'], ['soon', 'Starting soon'], ['warm', 'Warm']];
 const mbEnc = email => encodeURIComponent(email);
-const mbDomainOf = email => String(email || '').split('@')[1] || '';
+const mbDomainOf = email => (String(email || '').split('@')[1] || '').toLowerCase();
 const mbList = () => (_mb.data && _mb.data.inboxes) || [];
 const mbFind = email => mbList().find(b => b.email === email) || null;
 const mbDns = domain => ((_mb.data && _mb.data.domains) || {})[domain] || null;
@@ -3536,7 +3579,7 @@ function renderMbTable() {
     return;
   }
   const byDomain = {};
-  shown.forEach(b => (byDomain[b.domain || mbDomainOf(b.email)] ||= []).push(b));
+  shown.forEach(b => (byDomain[String(b.domain || mbDomainOf(b.email)).toLowerCase()] ||= []).push(b));
   const domainNeeds = dm => (byDomain[dm] || []).some(mbNeeds) || mbDnsFails(dm);
   const domains = Object.keys(byDomain).sort((a, b) => (domainNeeds(b) - domainNeeds(a)) || a.localeCompare(b));
   const filtering = !!_mb.q.trim() || _mb.filter !== 'all';
@@ -3577,7 +3620,7 @@ function renderMbTable() {
       const h = b.health || {};
       const br = h.bounce_rate;
       const brCls = br === null || br === undefined ? ' muted' : br >= 0.05 ? ' is-bad' : br >= 0.03 ? ' is-wait' : '';
-      return '<tr class="mb-row' + (_mb.view && _mb.view.email === b.email ? ' sel' : '') + '" tabindex="0" ' +
+      return '<tr class="mb-row' + (_mb.view && _mb.view.email === b.email ? ' sel' : '') + '" tabindex="0" data-email="' + escHtml(b.email) + '" ' +
         'onclick="mbOpenInbox(' + mbArg(b.email) + ')" onkeydown="if(event.key===\'Enter\'){event.preventDefault();mbOpenInbox(' + mbArg(b.email) + ')}">' +
         '<td class="mb-c-inbox"><span class="mono">' + escHtml(b.email) + '</span></td>' +
         '<td>' + toneBadge(st.tone, st.label) + '</td>' +
@@ -3612,7 +3655,7 @@ function mbDrawerActions(html) {
   if (el) el.innerHTML = html || '';
 }
 
-function mbOpenInbox(email, mode) {
+function mbOpenInbox(email, mode, inPlace) {
   const b = mbFind(email);
   if (!b) return;
   _mb.view = { kind: 'inbox', email, mode: mode || 'overview' };
@@ -3623,7 +3666,7 @@ function mbOpenInbox(email, mode) {
   const sub = toneBadge(st.tone, st.label) +
     (b.ramp_days && b.day ? '<span class="mb-sub-t">Day ' + fmtN(Math.min(b.day, b.ramp_days)) + ' of ' + fmtN(b.ramp_days) + '</span>'
       : st.key === 'soon' ? '<span class="mb-sub-t">Ramp starts ' + escHtml(shortDay(b.start_date)) + '</span>' : '');
-  openDrawer(escHtml(b.domain) + (peers.length > 1 ? ' · ' + (idx + 1) + ' of ' + peers.length : ''), b.email, sub, mbInboxBody(b));
+  (inPlace ? updateDrawer : openDrawer)(escHtml(b.domain) + (peers.length > 1 ? ' · ' + (idx + 1) + ' of ' + peers.length : ''), b.email, sub, mbInboxBody(b));
   const nav = peers.length > 1
     ? '<button class="btn-square xs" title="Previous inbox" aria-label="Previous inbox" onclick="mbStep(-1)">' + icon('caret-up') + '</button>' +
       '<button class="btn-square xs" title="Next inbox" aria-label="Next inbox" onclick="mbStep(1)">' + icon('caret-down') + '</button>' : '';
@@ -3634,7 +3677,7 @@ function mbOpenInbox(email, mode) {
     '<button class="btn-square" title="Inbox settings" aria-label="Inbox settings" onclick="mbOpenSettings(' + mbArg(b.email) + ')">' + icon('gear-six') + '</button>');
   const wrap = document.getElementById('mb-ramp');
   if (wrap) { mbDrawRamp(); observeWidth(wrap, mbDrawRamp); }
-  document.querySelectorAll('#mb-table .mb-row').forEach(r => r.classList.toggle('sel', r.textContent.startsWith(b.email)));
+  document.querySelectorAll('#mb-table .mb-row').forEach(r => r.classList.toggle('sel', r.dataset.email === b.email));
 }
 
 function mbStep(dir) {
@@ -3648,8 +3691,8 @@ function mbStep(dir) {
 
 function mbRefreshDrawer() {
   if (!drawerOpen() || !_mb.view || mbBusy()) return;
-  if (_mb.view.kind === 'inbox' && _mb.view.mode === 'overview') mbOpenInbox(_mb.view.email);
-  else if (_mb.view.kind === 'domain') mbOpenDomain(_mb.view.domain);
+  if (_mb.view.kind === 'inbox' && _mb.view.mode === 'overview') mbOpenInbox(_mb.view.email, undefined, true);
+  else if (_mb.view.kind === 'domain') mbOpenDomain(_mb.view.domain, true);
 }
 
 function mbInboxBody(b) {
@@ -3743,7 +3786,7 @@ async function mbToggleTask(key, done) {
     showToast('Couldn\'t save that: ' + res.error, 'error');
   }
   _mb.key = JSON.stringify(_mb.data);
-  mbOpenInbox(b.email);
+  mbOpenInbox(b.email, undefined, true);
   renderMbTable();
 }
 
@@ -3915,6 +3958,9 @@ async function mbOpenSettings(email) {
           input('imap-port', 'IMAP port', 'number', v('imap_port') || '', 'min="1" max="65535" placeholder="' + (defaults.imap_port || 993) + '"') + '</div>' +
         '<div class="form-row">' + input('username', 'SMTP login', 'text', v('username'), 'placeholder="Defaults to the inbox email"') +
           input('imap-username', 'IMAP login', 'text', v('imap_username'), 'placeholder="Defaults to the SMTP login"') + '</div>' +
+        input('imap-password', b && b.imap_password_set ? 'Change IMAP password' : 'IMAP password', 'password', '',
+          'autocomplete="new-password" placeholder="' + (b && b.imap_password_set ? 'Saved. Leave blank to keep it.' : 'Leave blank to use the SMTP password') + '"',
+          'Only needed when the mailbox reads replies with a different password.') +
       '</details></div>' +
     '<div class="drawer-section"><h4>Sending</h4><div class="form-row">' +
       input('cap', 'Daily limit at full volume', 'number', v('daily_cap', 30), 'required min="0" step="1"',
@@ -3957,6 +4003,7 @@ async function mbSaveSettings(event) {
     smtp_host: val('smtp-host').trim(), smtp_port: Number(val('smtp-port')) || 0,
     imap_host: val('imap-host').trim(), imap_port: Number(val('imap-port')) || 0,
     username: val('username').trim(), imap_username: val('imap-username').trim(),
+    imap_password: val('imap-password'),
     enabled: status !== 'replies',
   };
   const activate = document.getElementById('mbs-activate');
@@ -3975,8 +4022,20 @@ async function mbSaveSettings(event) {
   const target = email || data.email.toLowerCase();
   const live = mbFind(target);
   const wasPaused = !!live && live.status === 'paused';
-  if (email && status === 'paused' && !wasPaused) await postJSON('/api/warmup/inboxes/' + mbEnc(target) + '/action', { action: 'pause' });
-  if (email && status !== 'paused' && wasPaused) await postJSON('/api/warmup/inboxes/' + mbEnc(target) + '/action', { action: 'resume' });
+  const followUp = !email ? null
+    : status === 'paused' && !wasPaused ? 'pause'
+    : status !== 'paused' && wasPaused ? 'resume' : null;
+  if (followUp) {
+    const action = await postJSON('/api/warmup/inboxes/' + mbEnc(target) + '/action', { action: followUp });
+    if (!action.ok) {
+      showToast('Inbox settings saved, but the inbox could not be ' + (followUp === 'pause' ? 'paused' : 'resumed') +
+        ': ' + action.error + '. Use the ' + (followUp === 'pause' ? 'Pause' : 'Resume') + ' button to try again.', 'error');
+      _mb.key = '';
+      await loadMailboxes();
+      if (mbFind(target)) mbOpenInbox(target); else closeDrawer();
+      return;
+    }
+  }
   showToast(result.data.restart_required
     ? 'Inbox saved. Stop and start Mercury in Controls to apply it to the running agent.'
     : 'Inbox saved. It applies on Mercury\'s next run.', 'success');
@@ -4015,10 +4074,10 @@ function agoShort(d) {
   return relWhen(d);
 }
 
-function mbOpenDomain(domain) {
+function mbOpenDomain(domain, inPlace) {
   _mb.view = { kind: 'domain', domain };
   const boxes = mbList().filter(b => b.domain === domain);
-  openDrawer('Domain', domain, mbDomainSub(domain),
+  (inPlace ? updateDrawer : openDrawer)('Domain', domain, mbDomainSub(domain),
     '<div class="drawer-section"><div class="mb-sec-head"><h4>DNS records</h4>' +
       '<button class="link-btn" id="mb-dns-recheck" onclick="mbLoadDns(' + mbArg(domain) + ', true)">' + icon('arrow-clockwise') + 'Re-check</button></div>' +
       '<p class="drawer-note">Add these at your domain registrar. One fix covers every inbox on ' + escHtml(domain) + '.</p>' +

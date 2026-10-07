@@ -2,6 +2,7 @@
 # Prefer `pip install -e .` for development; this file exists for Docker
 # and quick installs. Upper bounds guard against breaking major releases.
 pyyaml>=6.0.1,<7
+ruamel.yaml>=0.18,<1
 python-dotenv>=1.0.1,<2
 httpx>=0.27.0,<1
 playwright>=1.40,<2

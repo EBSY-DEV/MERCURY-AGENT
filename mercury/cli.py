@@ -568,9 +568,15 @@ def cmd_signals(args):
 
 def _persona_text(value, path):
     """A long field from a flag, a file, or stdin when the file is '-'."""
-    if path:
-        return sys.stdin.read() if path == "-" else Path(path).read_text()
-    return value
+    from mercury.personas import PersonaError
+    if not path:
+        return value
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        return Path(path).read_text()
+    except OSError as error:
+        raise PersonaError("invalid", f"Cannot read {path}: {error.strerror or error}") from error
 
 
 def cmd_personas(args):
@@ -583,6 +589,8 @@ def cmd_personas(args):
     from mercury.state import StateManager
 
     def fields():
+        if args.instructions_file == "-" and args.examples_file == "-":
+            raise PersonaError("invalid", "stdin can only be used for one of --instructions-file/--examples-file")
         changes = {"name": args.name, "description": args.description, "tone": args.tone,
                    "instructions": _persona_text(args.instructions, args.instructions_file),
                    "examples": _persona_text(args.examples, args.examples_file),
@@ -693,7 +701,7 @@ def cmd_personas(args):
     try:
         asyncio.run(_run())
     except PersonaError as error:
-        print(f"\n  {error}\n")
+        print(f"\n  {error}\n", file=sys.stderr)
         sys.exit(1)
 
 
@@ -731,11 +739,27 @@ def cmd_import(args):
     import json
 
     from mercury.control.imports import ImportService
-    from mercury.csv_import import ImportFileError
+    from mercury.csv_import import MAX_BYTES, ImportFileError
     from mercury.state import StateManager
 
+    def read_file():
+        if args.file == "-":
+            return sys.stdin.buffer.read()
+        path = Path(args.file)
+        try:
+            size = path.stat().st_size
+        except OSError as error:
+            raise SystemExit(f"\n  Cannot read {args.file}: {error.strerror or error}\n")
+        if size > MAX_BYTES:
+            raise SystemExit(f"\n  {args.file} is {size / 1048576:.1f} MB, over the "
+                             f"{MAX_BYTES // 1048576} MB limit; split it and import the parts.\n")
+        try:
+            return path.read_bytes()
+        except OSError as error:
+            raise SystemExit(f"\n  Cannot read {args.file}: {error.strerror or error}\n")
+
     async def _run():
-        data = sys.stdin.buffer.read() if args.file == "-" else Path(args.file).read_bytes()
+        data = read_file()
         service = await ImportService(StateManager()).ready()
         try:
             exclude_rows = [int(x) for x in args.exclude_rows.split(",") if x.strip()]

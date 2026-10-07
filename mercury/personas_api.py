@@ -28,9 +28,11 @@ class PromptInput(BaseModel):
 
 
 class MailboxVoiceInput(BaseModel):
+    """A field left out keeps its current value; an explicit "" clears it
+    (persona_id "" means follow the default, sign_name "" means the suggestion)."""
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-    persona_id: str = Field(default="", max_length=100)
-    sign_name: str = Field(default="", max_length=80, pattern=r"^[^\r\n]*$")
+    persona_id: str | None = Field(default=None, max_length=100)
+    sign_name: str | None = Field(default=None, max_length=80, pattern=r"^[^\r\n]*$")
 
 
 class ArchiveInput(BaseModel):
@@ -86,7 +88,9 @@ async def create_persona(body: PersonaInput):
 @router.post("/api/personas/{persona_id}/save")
 async def save_persona(persona_id: str, body: PersonaInput):
     *_, service = await context()
-    fields = body.model_dump(include=set(EDITABLE))
+    # Only fields the client actually sent change; the rest keep their saved
+    # value, so a client that omits sign_name (or avatar_seed) does not clear it.
+    fields = body.model_dump(include=set(EDITABLE), exclude_unset=True)
     await call(service.update(persona_id, fields, body.expected_revision))
     return {"success": True, "id": persona_id}
 
@@ -144,7 +148,14 @@ async def mailbox_voices():
 @router.post("/api/voices/{email}")
 async def assign_mailbox_voice(email: str, body: MailboxVoiceInput):
     *_, service = await context()
-    return await call(service.assign_mailbox(email, body.persona_id, body.sign_name))
+    persona_id, sign_name = body.persona_id, body.sign_name
+    if persona_id is None or sign_name is None:
+        current = next((m for m in await service.mailboxes() if m["email"] == email.strip().lower()), {})
+        if persona_id is None:
+            persona_id = current.get("persona_id") or ""
+        if sign_name is None:
+            sign_name = current.get("sign_name") or ""
+    return await call(service.assign_mailbox(email, persona_id, sign_name))
 
 
 @router.get("/api/outbox/{item_id}/generation-history")

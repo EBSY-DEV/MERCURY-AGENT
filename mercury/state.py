@@ -12,7 +12,7 @@ upgrade cleanly in place.
 import json
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -1091,6 +1091,27 @@ class StateManager:
             )
             await db.commit()
             return bool(cursor.rowcount)
+
+    async def recover_stale_outbox(self, max_age_minutes: int = 30) -> int:
+        """Put rows stuck in 'sending' back to 'approved'.
+
+        A row is claimed ('sending') right before the provider call. If the
+        process dies mid-send, nothing ever moves it on, and the email is
+        neither sent nor retried. Anything still 'sending' after
+        ``max_age_minutes`` is treated as interrupted and re-queued with its
+        original send_at, so the next drain picks it up. Returns the count.
+        """
+        cutoff = (_utcnow() - timedelta(minutes=max(0, int(max_age_minutes)))).isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'approved', "
+                "error = 'recovered: send interrupted', updated_at = ? "
+                "WHERE status = 'sending' AND "
+                "(updated_at IS NULL OR REPLACE(updated_at, ' ', 'T') <= ?)",
+                (_utcnow().isoformat(), cutoff),
+            )
+            await db.commit()
+            return int(cursor.rowcount or 0)
 
     async def approve_outbox(self, item_id: str | None = None) -> int:
         """Approve one pending item, or ALL pending when item_id is None."""

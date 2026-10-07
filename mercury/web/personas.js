@@ -389,7 +389,8 @@ async function restoreVersion(revision) {
   if (!v || _voiceBusy || !await voiceKeepEdits('Restoring replaces the unsaved changes in the editor.')) return;
   _voiceBusy = true;
   const res = await postJSON('/api/personas/' + encodeURIComponent(p.id) + '/save', {name: p.name, description: p.description || '',
-    avatar_seed: p.avatar_seed, tone: v.tone, instructions: v.instructions || '', examples: v.examples || '', expected_revision: p.revision});
+    sign_name: p.sign_name || '', avatar_seed: p.avatar_seed, tone: v.tone, instructions: v.instructions || '', examples: v.examples || '',
+    expected_revision: p.revision});
   _voiceBusy = false;
   if (!res.ok) { showToast(res.error, 'error'); return; }
   showToast('Restored v' + revision + ' as v' + (p.revision + 1) + '.', 'success');
@@ -404,6 +405,32 @@ function previewVersion(revision) {
 }
 
 // ── Prompt preview ──
+const PREVIEW_TIMEOUT_MS = 120000;
+
+// postJSON with a deadline, so a slow model call cannot hold the editor forever.
+async function postJSONWithTimeout(path, body, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal});
+    let data = null;
+    try { data = await r.json(); } catch { /* empty or non-JSON body */ }
+    const ok = r.ok && !(data && data.success === false);
+    let error = '';
+    if (!ok) {
+      const why = data && (data.error || data.message || data.detail);
+      error = typeof why === 'string' ? why : 'request failed (' + r.status + ')';
+    }
+    return {ok, status: r.status, data, error};
+  } catch (e) {
+    if (e && e.name === 'AbortError') return {ok: false, status: 0, data: null, error: 'The preview timed out. Try again in a moment.', timedOut: true};
+    return {ok: false, status: 0, data: null, error: 'can\'t reach the dashboard server'};
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 
 function openVoicePreview() {
   _voicePrompt = {..._voicePrompt, persona: _personaEdit.id, version: _voiceDirty && voiceChanges().writing ? 'unsaved' : ''};
@@ -479,10 +506,11 @@ async function runVoicePreview(generate) {
   const inspected = await postJSON('/api/personas/prompt', body);
   if (request === _voiceRequest && promptEl && document.contains(promptEl)) renderPromptSections(promptEl, inspected);
   if (!generate) return;
-  const res = await postJSON('/api/personas/preview', body);
+  const res = await postJSONWithTimeout('/api/personas/preview', body, PREVIEW_TIMEOUT_MS);
   _voiceBusy = false;
   const button = document.getElementById('voice-generate');
   if (button) button.disabled = false;
+  if (res.timedOut) showToast(res.error, 'error');
   if (!document.contains(sampleEl)) return;
   if (!res.ok) { sampleEl.innerHTML = '<div class="panel-head"><div><h3>Sample email</h3><p class="voice-error" role="alert">' + escHtml(res.error) + '</p></div></div>'; return; }
   renderSample(sampleEl, res.data);
