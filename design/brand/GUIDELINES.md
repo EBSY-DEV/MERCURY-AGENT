@@ -15,7 +15,7 @@ Masters: `final/`. Ready-to-use files: `kit/` (see `kit/README.md`).
 ## 2. Clear space
 Unit **x = the dot's radius**. Keep **2x (one dot) clear on every side** of the symbol and of every lockup.
 It scales with the logo. In the horizontal lockup, the space between the symbol and the name is also 2x.
-Inside a tile (sidebar, favicon, app icon) the tile is the clear space.
+Inside a tile (favicon, app icon) the tile is the clear space. The dashboard sidebar uses the bare small cut in the accent colour, with no tile.
 
 ## 3. Minimum size
 | Version | Screen | Print |
