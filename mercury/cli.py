@@ -125,7 +125,14 @@ def cmd_setup(args):
 
 
 def cmd_run(args):
-    """Start Mercury's heartbeat loop."""
+    """Start Mercury's heartbeat loop, or run a single cycle."""
+    if getattr(args, "once", False):
+        from mercury.main import run_once_main
+
+        raise SystemExit(
+            run_once_main(ignore_quiet_hours=getattr(args, "ignore_quiet_hours", False))
+        )
+
     from mercury.main import main
 
     main()
@@ -302,6 +309,42 @@ def cmd_gmail(args):
         asyncio.run(_test())
 
 
+def cmd_mail(args):
+    """Test whichever mail provider is configured.
+
+    `mercury gmail test` only ever builds a GmailProvider, so an SMTP
+    deployment had no way to check its credentials before trusting the
+    pipeline with them -- even though test_connection() is on the base
+    class and both providers implement it.
+    """
+    from mercury.config import load_config, load_env
+    from mercury.integrations.mailboxes import MailboxPool, local_today
+
+    config = load_config()
+    env = load_env()
+    pool = MailboxPool.from_config(config, env)
+    if pool is None:
+        name = config.channels.email.provider or "(unset)"
+        print(f"\n  ✗ No native mail provider for '{name}'.")
+        print("    Set channels.email.provider to 'gmail' or 'smtp'.\n")
+        sys.exit(1)
+
+    async def _test():
+        today = local_today(config)
+        all_ok = True
+        print()
+        for mb in pool.mailboxes:
+            ok, detail = await mb.provider.test_connection()
+            all_ok = all_ok and ok
+            cap = pool.cap_on(mb, today)
+            label = f"{mb.email}  (cap today: {cap})  " if len(pool.mailboxes) > 1 else ""
+            print(f"  {'✓' if ok else '✗'} {label}{detail}")
+        print()
+        sys.exit(0 if all_ok else 1)
+
+    asyncio.run(_test())
+
+
 def cmd_outbox(args):
     """Review and approve queued outgoing emails."""
     from mercury.state import StateManager
@@ -319,8 +362,9 @@ def cmd_outbox(args):
             print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
             return
         if args.reject:
-            await state.update_outbox_item(args.reject, status="rejected")
-            print("\n  Rejected.\n")
+            n = await state.reject_outbox_item(args.reject)
+            print(f"\n  Rejected {n} email(s), later steps of the same sequence included.\n"
+                  if n else "\n  No queued item with that id.\n")
             return
 
         paused = await state.get_setting("sending_paused")
@@ -563,6 +607,16 @@ def main():
 
     # mercury run
     sub = subparsers.add_parser("run", help="Start Mercury's heartbeat loop")
+    sub.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single cycle and exit (for cron/scheduled runs)",
+    )
+    sub.add_argument(
+        "--ignore-quiet-hours",
+        action="store_true",
+        help="With --once: run even during quiet hours",
+    )
     sub.set_defaults(func=cmd_run)
 
     # mercury train <url>
@@ -606,6 +660,13 @@ def main():
     sub.add_argument("gmail_action", choices=["auth", "test"],
                      help="auth: one-time OAuth; test: verify connection")
     sub.set_defaults(func=cmd_gmail)
+
+    # mercury mail test
+    sub = subparsers.add_parser("mail", help="Test the configured mail provider")
+    sub.add_argument(
+        "mail_action", choices=["test"], help="test: verify send/receive credentials"
+    )
+    sub.set_defaults(func=cmd_mail)
 
     # mercury outbox
     sub = subparsers.add_parser("outbox", help="Review/approve queued emails")

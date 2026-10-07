@@ -22,7 +22,11 @@ already learned.
 
 import asyncio
 import base64
+import csv
+import io
+import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
@@ -63,12 +67,20 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     # infrastructure that is never a prospect
     r"(^|\.)(google|bing|yahoo|duckduckgo|amazon|apple|microsoft)\.",
     r"(wordpress|wix|squarespace|shopify|godaddy|weebly|webflow)\.com$",
+    # aggregators, messaging links and expo/exhibitor sites seen in practice
+    r"^(wa\.link|wa\.me|whatsapp\.com|t\.me|telegram\.org)$",
+    r"(^|\.)(f6s|emis|startupgrind|startupblink|crunchbase|zoominfo|dnb|kompass)\.",
+    r"(^|\.)(rxglobal|reedexpo|expoferretera\w*)\.",
 ))
 
 # Names that mean the row is a category page or an aggregator, not a business.
 JUNK_NAME_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"^\s*(top|best|\d+)\s+\d*\s*(best\s+)?\w+.*\b(in|near|of)\b",
     r"\b(directory|listings?|reviews? of|compare|find a)\b",
+    r"^\s*(cookie|privacy) policy\b",
+    r"^\s*(join our|discover more|see all|view all|read more)\b",
+    r"\bexhibitors?\b",
+    r"^\s*[\d\s()+-]{7,}\s*$",   # a phone number pretending to be a name
 ))
 
 
@@ -208,6 +220,7 @@ class DiscoveryQuery:
     coordinate: str = ""             # "lat,lng,radius_km" for listings providers
     depth: int = 30                  # SERP depth; ignored by listings providers
     limit: int = 100                 # max records to take from one query
+    lang: str = ""                   # "es"/"en" for providers that localise results
 
     def keyword(self) -> str:
         return f"{self.term} {self.location}".strip()
@@ -428,7 +441,7 @@ class Serper(DiscoveryProvider):
             "https://google.serper.dev/search",
             headers={"X-API-KEY": env["serper_api_key"],
                      "Content-Type": "application/json"},
-            json={"q": query.keyword(), "num": min(query.depth, 100)},
+            json={"q": query.keyword(), "num": min(query.depth, 10)},  # >10 = HTTP 400 on free tier
         )
         r.raise_for_status()
         data = r.json()
@@ -588,12 +601,262 @@ class OpenStreetMap(DiscoveryProvider):
         return out
 
 
+class SemrushCompetitors(DiscoveryProvider):
+    """Find a sector by asking who competes with one business in it.
+
+    Listings providers enumerate premises; this enumerates competitors, which
+    is the only thing that works in a market OpenStreetMap never mapped. It
+    seeds itself from a normal search, then asks Semrush who else ranks for the
+    same keywords. Every row arrives carrying organic traffic, so qualification
+    is free: a site with almost no traffic is exactly the business that needs
+    the work.
+    """
+
+    key = "semrush_competitors"
+    label = "Semrush (organic competitors)"
+    kind = "serp"
+    blurb = ("Seeds from one search, then returns the rest of the sector with "
+             "real organic traffic per domain. Works where listings data is "
+             "thin, and qualifies every row for free.")
+    cost_note = "~1,200 API units per sector, plus one Serper search for the seed"
+    free_tier = "whatever your Semrush plan includes; no separate free tier"
+    signup_url = "https://www.semrush.com/api-analytics/"
+    env_keys = ("semrush_api_key",)
+    caveat = ("Needs a seed, so it finds sectors rather than cities, and the "
+              "competitor list mixes in foreign domains worth filtering.")
+
+    _DB_BY_PLACE = {
+        "santo domingo": "do", "santiago": "do",
+        "santiago de los caballeros": "do",
+        "republica dominicana": "do", "rep\u00fablica dominicana": "do",
+        "dominican republic": "do",
+    }
+
+    def _database(self, location: str) -> str:
+        return self._DB_BY_PLACE.get((location or "").strip().lower(), "us")
+
+    async def _seed(self, client, env, query) -> str:
+        """One normal search; take the first result that looks like a business."""
+        key = env.get("serper_api_key") or ""
+        if not key:
+            return ""
+        r = await client.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": key, "Content-Type": "application/json"},
+            json={"q": query.keyword()},
+        )
+        r.raise_for_status()
+        for item in (r.json().get("organic") or []):
+            domain = normalize_domain(item.get("link") or "")
+            if domain and not is_junk(domain, item.get("title") or ""):
+                return domain
+        return ""
+
+    async def fetch(self, client, env, query):
+        seed = await self._seed(client, env, query)
+        if not seed:
+            return []
+
+        r = await client.get(
+            "https://api.semrush.com/",
+            params={
+                "type": "domain_organic_organic",
+                "key": env["semrush_api_key"],
+                "domain": seed,
+                "database": self._database(query.location),
+                "display_limit": min(query.limit, 50),
+                "export_columns": "domain,common_keywords,organic_keywords,organic_traffic",
+            },
+        )
+        # Never let the response object surface the URL: the v3 API takes the
+        # key as a query parameter, so an unguarded raise_for_status() prints
+        # the secret into the logs.
+        if r.status_code >= 400:
+            raise RuntimeError(
+                f"Semrush HTTP {r.status_code}. Check that SEMRUSH_API_KEY is "
+                f"the v3 analytics key from your profile, not the v4 token."
+            )
+        body = (r.text or "").strip()
+        # Semrush reports failures as plain text, not as an HTTP status.
+        if not body or body.upper().startswith("ERROR"):
+            detail = body[:120] or "empty response"
+            raise RuntimeError("Semrush: " + detail)
+
+        lines = body.splitlines()
+        if len(lines) < 2:
+            return []
+
+        out = []
+        for line in lines[1:]:
+            parts = line.split(";")
+            if len(parts) < 4:
+                continue
+            domain = normalize_domain(parts[0])
+            if not domain or is_junk(domain):
+                continue
+            try:
+                traffic = int(float(parts[3]))
+            except ValueError:
+                traffic = None
+            out.append(Business(
+                name=domain,
+                domain=domain,
+                website="https://" + domain,
+                location=query.location,
+                category=query.term,
+                has_website=True,
+                rank=traffic,
+                external_id=self.key + ":" + domain,
+                source_url="https://www.semrush.com/analytics/overview/?q=" + domain,
+                provider=self.key,
+            ))
+        return out
+
+
+class GoogleMaps(DiscoveryProvider):
+    """Google Maps listings through a self-hosted gosom/google-maps-scraper.
+
+    The scraper runs as a local container and exposes a small job API.
+    Every listing carries phone, website, category, rating and review count
+    — the fields the ICP filters on — which makes it the one free source
+    that works for markets OpenStreetMap barely covers (Dominican Republic).
+    """
+
+    key = "google_maps"
+    label = "Google Maps (self-hosted scraper)"
+    kind = "listings"
+    blurb = ("Google Maps results from a scraper container on this server: "
+             "phone, website, category, rating and review count per listing. "
+             "Best coverage for the Dominican Republic.")
+    cost_note = "Free — runs on this server. Google throttles large jobs without proxies."
+    free_tier = "unlimited (self-hosted)"
+    signup_url = "https://github.com/gosom/google-maps-scraper"
+    env_keys = ()
+    caveat = ("Scraping Google Maps is against Google's terms of service. Keep "
+              "jobs small and spaced out; no proxies are configured.")
+
+    DEFAULT_URL = "http://127.0.0.1:8085"
+    POLL_SECONDS = 10
+    MAX_WAIT_SECONDS = 900
+    PER_SCROLL = 20          # listings Google loads per scroll ("depth")
+    MIN_REVIEWS = 3          # ICP: a business with no reviews cannot pay for this
+
+    def base_url(self, env: dict) -> str:
+        return (env.get("gmaps_scraper_url") or os.environ.get("GMAPS_SCRAPER_URL")
+                or self.DEFAULT_URL).rstrip("/")
+
+    async def fetch(self, client, env, query):
+        if not query.coordinate:
+            # Country-level entries have no usable centre; skipping them is
+            # correct, so say so instead of raising.
+            logger.warning("google_maps: %r has no coordinates — skipped "
+                           "(country names cannot be searched, use cities)",
+                           query.keyword())
+            return []
+        lat, lng, radius_km = (query.coordinate.split(",") + ["", "", ""])[:3]
+        payload = {
+            "name": f"mercury: {query.keyword()}",
+            "keywords": [query.keyword()],
+            "lang": query.lang or "en",
+            "zoom": 13,
+            "lat": str(lat),
+            "lon": str(lng),
+            "radius": int(float(radius_km or 25) * 1000),
+            "depth": max(1, min(5, -(-query.limit // self.PER_SCROLL))),
+            "fast_mode": False,   # fast mode returns pins without category or rating
+            "max_time": self.MAX_WAIT_SECONDS,
+        }
+        base = self.base_url(env)
+        try:
+            r = await client.post(f"{base}/api/v1/jobs", json=payload)
+        except httpx.HTTPError as e:
+            raise RuntimeError(
+                f"Google Maps scraper is not reachable at {base} ({e}). "
+                f"Start it with: docker start gmaps") from e
+        if r.status_code >= 300:
+            raise RuntimeError(f"Google Maps scraper HTTP {r.status_code}: {r.text[:200]}")
+        job_id = (r.json() or {}).get("id") or ""
+        if not job_id:
+            raise RuntimeError(f"Google Maps scraper returned no job id: {r.text[:200]}")
+
+        waited = 0
+        while True:
+            await asyncio.sleep(self.POLL_SECONDS)
+            waited += self.POLL_SECONDS
+            s = await client.get(f"{base}/api/v1/jobs/{job_id}")
+            status = str((s.json() or {}).get("Status", "")).lower()
+            if status == "ok":
+                break
+            if status in ("failed", "error"):
+                raise RuntimeError(f"Google Maps scraper job failed for {query.keyword()!r}")
+            if waited >= self.MAX_WAIT_SECONDS:
+                raise RuntimeError(
+                    f"Google Maps scraper job for {query.keyword()!r} did not finish "
+                    f"in {self.MAX_WAIT_SECONDS}s")
+
+        d = await client.get(f"{base}/api/v1/jobs/{job_id}/download")
+        d.raise_for_status()
+        rows = list(csv.DictReader(io.StringIO(d.text)))
+        try:
+            await client.delete(f"{base}/api/v1/jobs/{job_id}")
+        except httpx.HTTPError:
+            pass
+
+        out, thin = [], 0
+        for row in rows:
+            name = (row.get("title") or "").strip()
+            if not name:
+                continue
+            try:
+                count = int(float(row.get("review_count") or 0))
+            except ValueError:
+                count = 0
+            if count < self.MIN_REVIEWS:
+                thin += 1
+                continue
+            try:
+                rating = float(row.get("review_rating") or 0)
+            except ValueError:
+                rating = 0.0
+            try:
+                addr = json.loads(row.get("complete_address") or "{}") or {}
+            except ValueError:
+                addr = {}
+            site = (row.get("website") or "").strip()
+            city = ", ".join(x for x in (addr.get("city"), addr.get("state")) if x)
+            stable = row.get("place_id") or row.get("data_id") or row.get("cid") or ""
+            out.append(Business(
+                name=name,
+                domain=normalize_domain(site),
+                website=site,
+                phone=(row.get("phone") or "").strip(),
+                address=(row.get("address") or "").strip(),
+                location=city or query.location,
+                category=(row.get("category") or "").strip(),
+                rating=rating or None,
+                review_count=count,
+                has_website=bool(site),
+                external_id=f"gmaps:{stable}" if stable else "",
+                source_url=(row.get("link") or "").strip(),
+                provider=self.key,
+            ))
+            if len(out) >= query.limit:
+                break
+        if thin:
+            logger.info("google_maps: %r — %d listings kept, %d dropped with fewer "
+                        "than %d reviews", query.keyword(), len(out), thin,
+                        self.MIN_REVIEWS)
+        return out
+
+
 PROVIDERS: dict[str, DiscoveryProvider] = {
     p.key: p for p in (
         OpenStreetMap(),
+        GoogleMaps(),
         DataForSEOListings(),
         DataForSEOSerp(),
         Serper(),
+        SemrushCompetitors(),
     )
 }
 
@@ -667,9 +930,25 @@ def build_queries(config, cities: list[str] | None = None,
     radius, not a place name.
     """
     icp = config.icp
+    coords = getattr(icp, "geo_coordinates", {}) or {}
+
+    # Market-aware: each market searches its own terms in its own places, in
+    # its own language. A cities filter keeps the matching places; when it
+    # matches none of them, fall through to the plain industries x cities.
+    wanted = {c.strip().lower() for c in cities} if cities else None
+    by_market = [
+        DiscoveryQuery(term=term, location=place, depth=depth, limit=limit,
+                       coordinate=coords.get(place, ""), lang=market.lang)
+        for market in (getattr(icp, "markets", None) or [])
+        for place in market.places
+        if wanted is None or place.strip().lower() in wanted
+        for term in market.terms
+    ]
+    if by_market:
+        return by_market
+
     terms = list(icp.industries) or [config.product.name]
     places = cities if cities is not None else list(icp.geography) or [""]
-    coords = getattr(icp, "geo_coordinates", {}) or {}
 
     return [
         DiscoveryQuery(term=term, location=place, depth=depth, limit=limit,

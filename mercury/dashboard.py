@@ -11,6 +11,7 @@ import sys
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+import pathlib
 
 import aiosqlite
 import yaml
@@ -167,9 +168,14 @@ async def get_setup_status():
 
     # 5. Config valid
     config_valid = False
-    if CONFIG_FILE.exists():
+    try:
+        from mercury.config import _find_config_file
+        _cfg_path = pathlib.Path(_find_config_file())
+    except Exception:
+        _cfg_path = CONFIG_FILE
+    if _cfg_path.exists():
         try:
-            with open(CONFIG_FILE) as f:
+            with open(_cfg_path) as f:
                 cfg = yaml.safe_load(f)
             company = cfg.get("persona", {}).get("company", "")
             product = cfg.get("product", {}).get("name", "")
@@ -227,9 +233,19 @@ async def get_setup_status():
 
 
 def _current_provider() -> str:
-    """Read channels.email.provider from mercury.yaml (best-effort)."""
+    """Read channels.email.provider from the ACTIVE config (best-effort).
+
+    Resolve it the way the rest of Mercury does: mercury.local.yaml wins when
+    present. Reading the tracked template instead reports the wrong provider
+    and declares a configured deployment unconfigured.
+    """
     try:
-        with open(CONFIG_FILE) as f:
+        try:
+            from mercury.config import _find_config_file
+            cfg_path = _find_config_file()
+        except Exception:
+            cfg_path = CONFIG_FILE
+        with open(cfg_path) as f:
             cfg = yaml.safe_load(f) or {}
         return ((cfg.get("channels") or {}).get("email") or {}).get("provider", "instantly")
     except Exception:
@@ -247,6 +263,8 @@ async def get_settings():
         "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
         "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
         "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY",
+        "SERPER_API_KEY", "TAVILY_API_KEY", "SEMRUSH_API_KEY",
+        "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD", "TREG_TOKEN",
     ]
     for key in all_keys:
         if key not in env_vars:
@@ -279,6 +297,12 @@ async def get_settings():
         "reoon_api_key_set": is_set("REOON_API_KEY"),
         "zerobounce_api_key_set": is_set("ZEROBOUNCE_API_KEY"),
         "hunter_api_key_set": is_set("HUNTER_API_KEY"),
+        "serper_api_key_set": is_set("SERPER_API_KEY"),
+        "tavily_api_key_set": is_set("TAVILY_API_KEY"),
+        "semrush_api_key_set": is_set("SEMRUSH_API_KEY"),
+        "treg_token_set": is_set("TREG_TOKEN"),
+        "dataforseo_login": env_vars.get("DATAFORSEO_LOGIN", ""),
+        "dataforseo_password_set": is_set("DATAFORSEO_PASSWORD"),
     }
 
 
@@ -298,7 +322,9 @@ async def save_env_settings(request: Request):
                      "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
                      "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
                      "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
-                     "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY"]:
+                     "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY",
+                     "SERPER_API_KEY", "TAVILY_API_KEY", "SEMRUSH_API_KEY",
+                     "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD", "TREG_TOKEN"]:
             if key in data and data[key] is not None:
                 # Strip newlines so a crafted value can't inject extra .env entries
                 updates[key] = str(data[key]).replace("\n", " ").replace("\r", " ").strip()
@@ -633,13 +659,21 @@ async def get_outbox_api():
     try:
         state = _state()
         await state.init_db()
+        try:
+            _cfg, pool = _mail_context()
+            legacy = pool.legacy.email if pool else ""
+            known = {mb.email for mb in pool.mailboxes} if pool else None
+        except Exception:
+            legacy, known = "", None
         return {
             "paused": await state.get_setting("sending_paused"),
-            "pending": await state.get_outbox(status="pending_review", limit=100),
-            "approved": await state.get_outbox(status="approved", limit=50),
-            "sent": (await query_db(
+            "pending": await _with_from_mailbox(
+                state, await state.get_outbox(status="pending_review", limit=100), legacy, known),
+            "approved": await _with_from_mailbox(
+                state, await state.get_outbox(status="approved", limit=50), legacy, known),
+            "sent": await _with_from_mailbox(state, await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
-                "ORDER BY sent_at DESC LIMIT 25")),
+                "ORDER BY sent_at DESC LIMIT 25"), legacy),
             "failed": (await query_db(
                 "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
                 "ORDER BY updated_at DESC LIMIT 25")),
@@ -648,12 +682,97 @@ async def get_outbox_api():
         return {"error": str(e)}
 
 
+def _mail_context():
+    """(config, pool) built exactly as the sender builds them. Re-reads .env
+    on each call, so a password added by hand shows up without a restart."""
+    from mercury.config import load_config, load_env
+    from mercury.integrations.mailboxes import MailboxPool
+
+    from dotenv import dotenv_values
+
+    # Read .env over a copy of the environment; never mutate os.environ
+    # here (the agent the dashboard starts inherits it).
+    values = dict(os.environ)
+    if ENV_FILE.exists():
+        values.update({k: v for k, v in dotenv_values(str(ENV_FILE)).items() if v is not None})
+    config = load_config()
+    return config, MailboxPool.from_config(config, load_env(values))
+
+
+async def _with_from_mailbox(state, rows: list[dict], legacy_email: str = "",
+                             known: set[str] | None = None) -> list[dict]:
+    """Add ``from_mailbox``: the address an email goes (or went) out from,
+    resolved the way the sender resolves it. A follow-up inherits its
+    opener's mailbox, '' on an old thread means the legacy mailbox, and a
+    new thread whose opener has not gone out yet stays '' (it rotates)."""
+    need = [r.get("campaign_id") or "" for r in rows
+            if not r.get("mailbox") and r.get("kind") == "sequence"
+            and int(r.get("step") or 1) > 1]
+    threads = await state.get_thread_mailboxes(need)
+    for r in rows:
+        fm = r.get("mailbox") or ""
+        if not fm:
+            if r.get("status") == "sent" or r.get("kind") == "reply":
+                fm = legacy_email
+            elif r.get("kind") == "sequence" and int(r.get("step") or 1) > 1:
+                key = (r.get("campaign_id") or "", r.get("prospect_id") or "")
+                if key in threads:
+                    fm = threads[key] or legacy_email
+        r["from_mailbox"] = fm
+        # Queued mail pinned to a mailbox no longer configured is held by
+        # the sender (never re-routed); say so in the UI.
+        r["from_removed"] = bool(fm and known is not None and fm not in known
+                                 and r.get("status") != "sent")
+    return rows
+
+
+async def _promote_followups_if_enabled(state, item: dict | None = None) -> int:
+    """auto_approve_followups: promote right away on approval, so the
+    follow-ups leave the review desk instead of waiting for the next cycle."""
+    try:
+        from mercury.config import load_config
+
+        if not getattr(load_config().channels.email, "auto_approve_followups", False):
+            return 0
+    except Exception:
+        return 0
+    thread = {}
+    if item and item.get("campaign_id"):
+        thread = {"campaign_id": item["campaign_id"], "prospect_id": item.get("prospect_id") or ""}
+    total = 0
+    for _ in range(10):
+        n = await state.approve_ready_followups(**thread)
+        if not n:
+            break
+        total += n
+    return total
+
+
+@app.get("/api/mailboxes")
+async def get_mailboxes():
+    """Sending capacity per mailbox, computed with the sender's own pool and
+    rules: today's cap, warm-up stage, sends in the rolling 24 hours.
+    Presence flags only; no secret leaves the box."""
+    try:
+        from mercury.integrations.mailboxes import mailbox_report
+
+        config, pool = _mail_context()
+        state = _state()
+        await state.init_db()
+        return mailbox_report(config, pool, await state.count_outbox_sent_today_by_mailbox())
+    except Exception as e:
+        logger.error(f"/api/mailboxes: {e}")
+        return {"error": f"Could not read the mail configuration: {type(e).__name__}. "
+                         "Check mercury.local.yaml (channels.email) and the dashboard log."}
+
+
 @app.post("/api/outbox/approve-all")
 async def outbox_approve_all():
     try:
         state = _state()
         await state.init_db()
         n = await state.approve_outbox()
+        await _promote_followups_if_enabled(state)
         return {"success": True, "approved": n}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -665,7 +784,11 @@ async def outbox_approve(item_id: str):
         state = _state()
         await state.init_db()
         n = await state.approve_outbox(item_id)
-        return {"success": bool(n)}
+        followups = 0
+        if n:
+            followups = await _promote_followups_if_enabled(
+                state, await state.get_outbox_item(item_id))
+        return {"success": bool(n), "followups_approved": followups}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
@@ -675,7 +798,30 @@ async def outbox_reject(item_id: str):
     try:
         state = _state()
         await state.init_db()
-        await state.update_outbox_item(item_id, status="rejected")
+        n = await state.reject_outbox_item(item_id)
+        return {"success": True, "rejected": n}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.put("/api/outbox/{item_id}")
+async def outbox_edit(item_id: str, request: Request):
+    """The reviewer edits a draft in place. Approved mail stays approved."""
+    try:
+        body = await request.json()
+        subject = str(body.get("subject") or "").strip()[:200]
+        text = str(body.get("body") or "").strip()[:4000]
+        if not subject or not text:
+            return JSONResponse({"success": False, "message": "subject and body are required"},
+                                status_code=400)
+        state = _state()
+        await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if not item or item.get("status") not in ("pending_review", "approved"):
+            return JSONResponse({"success": False,
+                                 "message": "only pending or approved drafts can be edited"},
+                                status_code=409)
+        await state.update_outbox_item(item_id, subject=subject, body=text)
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -1021,6 +1167,43 @@ async def get_calendar(start: str | None = None, end: str | None = None):
             "body": r.get("body") or "",
         })
     return {"start": start, "end": end, "items": items}
+
+
+@app.post("/api/outbox/{item_id}/regenerate")
+async def outbox_regenerate(item_id: str, request: Request):
+    """Ask the Writer for a new draft of this email, optionally with an instruction."""
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        instruction = str((body or {}).get("instruction") or "").strip()[:500]
+        state = _state()
+        await state.init_db()
+        item = await state.get_outbox_item(item_id)
+        if not item or item.get("status") not in ("pending_review", "approved"):
+            return JSONResponse({"success": False,
+                                 "message": "only pending or approved drafts can be regenerated"},
+                                status_code=409)
+        prospect = await state.get_prospect(item["prospect_id"])
+        if not prospect:
+            return JSONResponse({"success": False, "message": "prospect not found"}, status_code=404)
+        from mercury.agents.writer import Writer
+        from mercury.brain import Brain
+        from mercury.config import load_config, load_env
+
+        writer = Writer(Brain(state), state, load_config(), load_env())
+        draft = await writer.regenerate_email(item, prospect, instruction)
+        if not draft:
+            return JSONResponse({"success": False, "message": "the writer returned nothing; try again"},
+                                status_code=502)
+        # A regenerated draft is unread: back to the review queue.
+        await state.update_outbox_item(
+            item_id, subject=draft["subject"], body=draft["body"], status="pending_review",
+        )
+        return {"success": True, "subject": draft["subject"], "body": draft["body"]}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
 @app.post("/api/sending/{action}")

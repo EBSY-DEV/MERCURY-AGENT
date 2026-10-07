@@ -21,6 +21,25 @@ minor versions can still change behaviour.
   source is `design/mercury-brand.pen` (rebuild with
   `design/build_brand_pen.py`).
 
+### Added
+
+- **Mailbox rotation.** `channels.email.mailboxes` lists several SMTP
+  mailboxes, each with its own daily cap and an optional warm-up ramp
+  (`warmup_start`, `warmup_initial_cap`, `warmup_weekly_increase`).
+  `max_daily_sends` still caps the total. A thread keeps its mailbox: the
+  first email rotates, follow-ups go out from the same address, and replies
+  from the inbox they answer. Every inbox is polled, and one unreachable
+  inbox no longer hides the others. `enabled: false` stops new threads but
+  keeps reading the inbox. Mail of a thread whose mailbox was removed from
+  the config is held, never re-routed to another address.
+- **`auto_approve_followups`.** Approving a first email approves its
+  follow-ups, in the dashboard immediately and in the agent loop each cycle.
+- **`spread_sends`.** Paces the day's remaining sends over the cycles left
+  before quiet hours.
+- **Dashboard.** A Sending mailboxes card on the Outbox (sends in the last 24
+  hours against today's cap, warm-up stage, missing passwords), and the From
+  address on every queued and sent email. `mercury mail` tests every mailbox.
+
 ### Fixed
 
 - **Fresh databases could get stuck on "duplicate column name".** The
@@ -29,6 +48,12 @@ minor versions can still change behaviour.
   Migrations now take the write lock first and apply atomically.
 - The usage tab's daily bar chart referenced undefined colour tokens and
   rendered invisible bars.
+
+- A follow-up waits its delay after the previous email actually went out,
+  not after the day the sequence was staged. Approving an old opener no
+  longer sends its follow-ups right behind it.
+- Replies are sent before follow-ups and first emails, and are not held by a
+  mailbox's warm-up cap.
 
 ## [0.2.0] — 2026-09-13
 

@@ -216,54 +216,6 @@ def test_hold_freezes_at_yesterdays_cap(sm):
     assert v["today_cap"] == warmup.ramp_plan(50)[8]  # day 9's cap
 
 
-# ── Sender enforcement ──
-
-
-def _drain(sm):
-    provider = FakeProvider()
-    sender = make_sender(sm, provider)
-    _run(sender._drain_due())
-    return len(provider.sent)
-
-
-def test_sender_uses_warmup_cap(sm):
-    _run(sm.add_warmup_inbox(Cfg.persona.email, status="warming",
-                             start_date=_today().isoformat()))
-    _queue(sm, 8)
-    assert _drain(sm) == 5           # day-1 cap, below configured 50
-
-
-def test_sender_paused_inbox_sends_nothing(sm):
-    _run(sm.add_warmup_inbox(Cfg.persona.email, status="paused",
-                             start_date=_today().isoformat()))
-    _queue(sm, 3)
-    assert _drain(sm) == 0
-
-
-def test_warmup_never_raises_configured_cap(sm, monkeypatch):
-    monkeypatch.setattr(Cfg.channels.email, "max_daily_sends", 2)
-    start = (_today() - timedelta(days=20)).isoformat()   # plan cap ~33
-    _run(sm.add_warmup_inbox(Cfg.persona.email, status="warming", start_date=start))
-    _queue(sm, 6)
-    assert _drain(sm) == 2
-
-
-def test_sender_unaffected_without_warming_inbox(sm):
-    _run(sm.add_warmup_inbox(Cfg.persona.email, status="not_started"))
-    _run(sm.add_warmup_inbox("someone@else.co", status="paused",
-                             start_date=_today().isoformat()))
-    _queue(sm, 7)
-    assert _drain(sm) == 7
-
-
-def test_sender_counts_todays_sends_against_warmup_cap(sm):
-    _run(sm.add_warmup_inbox(Cfg.persona.email, status="warming",
-                             start_date=_today().isoformat()))
-    _sent(sm, 4)
-    _queue(sm, 5)
-    assert _drain(sm) == 1
-
-
 # ── Endpoints ──
 
 
