@@ -167,6 +167,11 @@ class EmailChannelConfig(BaseModel):
     # follow-ups (steps 2+), so a sequence you signed off on is not stuck
     # waiting for a second and third click. Replies still need approval.
     auto_approve_followups: bool = False
+    # Native providers: send sequence follow-ups (steps 2+) as replies in
+    # the opener's thread (In-Reply-To / References, Gmail threadId, and a
+    # "Re: <first subject>" subject). Off sends each step as a new email
+    # with its own subject.
+    thread_followups: bool = True
     # Pace the day's remaining sends evenly over the cycles left before
     # quiet hours, instead of sending up to MAX_SENDS_PER_CYCLE at once.
     spread_sends: bool = False

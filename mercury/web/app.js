@@ -834,7 +834,7 @@ async function loadSettings() {
     const el = document.getElementById('settings-mailboxes');
     if (el) el.innerHTML = mb && !mb.error && mb.rotation ? renderMailboxRotation(mb, true) : '';
   });
-  await loadInboxSettings();
+  await Promise.all([loadInboxSettings(), loadEmailOptions()]);
   savedPh('linkedin-password', data.linkedin_password_set, 'Enter password');
   savedPh('cf-api-token', data.cloudflare_api_token_set, 'Your Cloudflare API Token');
 
@@ -871,6 +871,36 @@ function saveSmtp() {
   const pass = document.getElementById('smtp-pass').value;
   if (pass) payload.SMTP_PASSWORD = pass;
   saveEnv(payload, 'SMTP settings saved.').then(loadSettings);
+}
+
+// On/off sending switches under channels.email, saved to the Mercury config.
+async function loadEmailOptions() {
+  const input = document.getElementById('thread-followups');
+  if (!input) return;
+  const res = await getJSON('/api/settings/email-options');
+  const ok = res.ok && res.data && !res.data.error;
+  input.disabled = !ok;
+  if (ok) input.checked = !!res.data.thread_followups;
+  document.getElementById('email-options-notice').textContent = ok ? ''
+    : 'Could not read this setting. Check the configuration and reload Settings.';
+}
+
+async function saveThreadFollowups(input) {
+  const notice = document.getElementById('email-options-notice');
+  input.disabled = true;
+  const res = await getJSON('/api/settings/email-options', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({thread_followups: input.checked}),
+  });
+  input.disabled = false;
+  if (!res.ok || !res.data || !res.data.success) {
+    input.checked = !input.checked;
+    notice.textContent = (res.data && res.data.message) || 'Could not save. Try again.';
+    return;
+  }
+  notice.textContent = res.data.restart_required
+    ? 'Saved. Stop and start Mercury in Controls to apply it to the running agent.'
+    : 'Saved. It applies on Mercury\'s next run.';
 }
 
 // Inbox configuration is separate from the rotation's live capacity report.
@@ -1339,19 +1369,19 @@ async function loadOutbox() {
 
   list.innerHTML =
     table('Sending', data.sending, [
-      ['To', r => r.to_email], ['Subject', r => r.subject],
+      ['To', r => r.to_email], ['Subject', r => outSubject(r)],
       ['From', r => r.from_mailbox || r.mailbox || '—', true],
       ['Persona', r => personaChip(r), false, true],
       ['Started', r => formatDate(r.updated_at), true],
     ]) +
     table('Approved &amp; scheduled', data.approved, [
-      ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
+      ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => outSubject(r)],
       ['From', r => fromCell(r), true, true],
       ['Persona', r => personaChip(r), false, true],
       ['Sends', r => formatDate(r.send_at) + policyNote(r.policy), true, true],
     ]) +
     table('Blocked by an exclusion', data.blocked, [
-      ['To', r => r.to_email], ['Subject', r => r.subject],
+      ['To', r => r.to_email], ['Subject', r => outSubject(r)],
       ['Why', r => policyNote(r.policy), false, true],
       ['', r => '<button class="btn btn-secondary btn-sm" onclick="exRequeue(\'' + escAttr(r.id) +
         '\').then(loadOutbox)">Send back to review</button> ' +
@@ -1359,7 +1389,7 @@ async function loadOutbox() {
         '\')">Discard</button>', false, true],
     ]) +
     table('Recently sent', data.sent, [
-      ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
+      ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => outSubject(r)],
       ['From', r => r.from_mailbox || r.mailbox || '—', true],
       ['Persona', r => personaChip(r), false, true],
       ['Sent', r => formatDate(r.sent_at), true],
@@ -1375,7 +1405,7 @@ function renderDesk(items, i) {
   const rail = items.map((it, n) =>
     '<div class="desk-item ' + (n === i ? 'active' : '') + '" onclick="deskGo(' + n + ')">' +
       '<div class="to">' + escHtml(it.to_email) + '</div>' +
-      '<div class="sub">' + escHtml(it.subject || '(no subject)') + '</div>' +
+      '<div class="sub">' + escHtml(outSubject(it) || '(no subject)') + '</div>' +
     '</div>').join('');
 
   return '<div class="desk">' +
@@ -1387,6 +1417,7 @@ function renderDesk(items, i) {
         (_mailboxes && _mailboxes.rotation ? ' &middot; from <b>' + escHtml(fromLabel(cur)) + '</b>' : '') +
         '</div>' +
       followupNote(cur) +
+      threadNote(cur) +
       (policyNote(cur.policy, true) ? '<div class="desk-policy">' + policyNote(cur.policy, true) + '</div>' : '') +
       '<div class="desk-persona">' + personaChip(cur) +
         (cur.manually_edited ? '<span class="muted">Edited before sending</span>' : '') + '</div>' +
@@ -1543,6 +1574,19 @@ function fromCell(r) {
 function autoFollowups(it) {
   return !!(_mailboxes && _mailboxes.auto_approve_followups &&
             it.kind === 'sequence' && Number(it.step) === 1);
+}
+
+// The subject the recipient sees: a follow-up threaded under its opener
+// goes out as "Re: <first subject>" (channels.email.thread_followups).
+function outSubject(r) {
+  return r.wire_subject || r.subject;
+}
+
+function threadNote(it) {
+  if (!it.wire_subject || it.wire_subject === it.subject) return '';
+  return '<div class="desk-note">' + icon('arrow-bend-up-left') +
+    '<span>Sends as a reply in the first email\'s thread, as <b>' + escHtml(it.wire_subject) +
+    '</b>. The drafted subject below is kept for your records.</span></div>';
 }
 
 function followupNote(it) {

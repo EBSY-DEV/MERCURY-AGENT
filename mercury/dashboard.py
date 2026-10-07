@@ -665,12 +665,13 @@ async def get_outbox_api():
         state = _state()
         await state.init_db()
         try:
-            _cfg, pool = _mail_context()
+            cfg, pool = _mail_context()
             legacy = pool.legacy.email if pool else ""
             known = {mb.email for mb in pool.mailboxes} if pool else None
+            threaded = cfg.channels.email.thread_followups
         except Exception:
-            legacy, known = "", None
-        return {
+            legacy, known, threaded = "", None, True
+        return _with_wire_subject(threaded, {
             "paused": await state.get_setting("sending_paused"),
             "pending": await _with_policy(state, await _with_from_mailbox(
                 state, await state.get_outbox(status="pending_review", limit=100), legacy, known)),
@@ -686,9 +687,21 @@ async def get_outbox_api():
             "failed": (await query_db(
                 "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
                 "ORDER BY updated_at DESC LIMIT 25")),
-        }
+        })
     except Exception as e:
         return {"error": str(e)}
+
+
+def _with_wire_subject(threaded: bool, data: dict) -> dict:
+    """Add ``wire_subject`` to every row: what the recipient sees. A
+    follow-up threaded under its opener goes out as "Re: <first subject>"."""
+    from mercury.state import wire_subject
+
+    for rows in data.values():
+        if isinstance(rows, list):
+            for r in rows:
+                r["wire_subject"] = wire_subject(r, threaded)
+    return data
 
 
 def _mail_context():
@@ -809,6 +822,52 @@ async def get_inbox_settings():
                             status_code=400)
 
 
+def _config_targets(found: str) -> tuple[Path, Path | None]:
+    """(config read, private file written instead or None). Saving from the
+    tracked template goes to mercury.local.yaml so real settings stay out of
+    the repository."""
+    source = Path(found)
+    private = (source.with_name("mercury.local.yaml")
+               if source.name == "mercury.yaml" and not os.getenv("MERCURY_CONFIG") else None)
+    return source, private
+
+
+@app.get("/api/settings/email-options")
+async def get_email_options():
+    from mercury.config import _find_config_file
+    from mercury.inbox_settings import email_options
+
+    try:
+        return email_options(Path(_find_config_file()))
+    except Exception:
+        return JSONResponse({"error": "Could not read the sending settings. Check your Mercury configuration."},
+                            status_code=400)
+
+
+@app.post("/api/settings/email-options")
+async def save_email_options_api(request: Request):
+    """On/off sending switches under channels.email (thread_followups)."""
+    from mercury.config import _find_config_file
+    from mercury.inbox_settings import InboxError, save_email_options
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
+    async with _env_lock:
+        try:
+            source, private = _config_targets(_find_config_file())
+            result = save_email_options(source, data, private)
+            result["restart_required"] = _check_mercury_pid() is not None
+            return result
+        except InboxError as e:
+            return JSONResponse({"success": False, "message": str(e)}, status_code=e.status)
+        except Exception:
+            logger.warning("Could not save sending settings", exc_info=False)
+            return JSONResponse({"success": False, "message": "Could not save the setting. Check file permissions and configuration."},
+                                status_code=500)
+
+
 async def _save_inbox(request: Request, email: str | None = None):
     from mercury.config import _find_config_file
     from mercury.inbox_settings import InboxError, save
@@ -819,9 +878,7 @@ async def _save_inbox(request: Request, email: str | None = None):
         return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
     async with _env_lock:
         try:
-            source = Path(_find_config_file())
-            private = (source.with_name("mercury.local.yaml")
-                       if source.name == "mercury.yaml" and not os.getenv("MERCURY_CONFIG") else None)
+            source, private = _config_targets(_find_config_file())
             result = save(source, ENV_FILE, data, email, private)
             result["restart_required"] = _check_mercury_pid() is not None
             return result

@@ -618,6 +618,17 @@ MIGRATIONS: list[str] = [
     ALTER TABLE outbox ADD COLUMN requires_manual_review INTEGER NOT NULL DEFAULT 0;
     UPDATE outbox SET requires_manual_review = 1 WHERE status = 'blocked';
     """,
+    # ── v16: follow-ups thread under their opener ──
+    """
+    -- A follow-up sent as a reply inherits in_reply_to / thread_ref from the
+    -- step sent before it. thread_references is the whole chain of
+    -- Message-IDs before this email (step 1, then step 2 for step 3), space
+    -- separated, for the SMTP References header. thread_subject is the
+    -- subject of the opener. The wire subject is "Re: " + it, and subject
+    -- keeps the text the writer drafted, for review.
+    ALTER TABLE outbox ADD COLUMN thread_references TEXT DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN thread_subject TEXT DEFAULT '';
+    """,
 ]
 
 # ── Exclusion matching and company capacity (shared SQL) ──
@@ -645,6 +656,48 @@ SOURCE_LABELS = {
     "manual": "excluded by you",
     "import": "excluded by an import",
 }
+
+
+# ── Follow-up threading (channels.email.thread_followups) ──
+
+THREAD_FIELDS = ("in_reply_to", "thread_ref", "thread_references", "thread_subject")
+
+
+def reply_subject(subject: str) -> str:
+    """``Re: <subject>``, never ``Re: Re: ...``."""
+    s = (subject or "").strip()
+    return s if s.lower().startswith("re:") else f"Re: {s}"
+
+
+def thread_headers(parent: dict | None) -> dict:
+    """What a follow-up inherits from the sequence step sent before it, or {}
+    when that step has no Message-ID to reply to. References carries the
+    whole chain: step 1's id for step 2, then step 1's and step 2's for step 3."""
+    parent = parent or {}
+    message_id = (parent.get("message_id") or "").strip()
+    if not message_id:
+        return {}
+    chain = (parent.get("thread_references") or "").split()
+    if message_id not in chain:
+        chain.append(message_id)
+    return {
+        "in_reply_to": message_id,
+        "thread_ref": parent.get("thread_ref") or "",
+        "thread_references": " ".join(chain),
+        "thread_subject": parent.get("thread_subject") or parent.get("subject") or "",
+    }
+
+
+def wire_subject(item: dict, thread_followups: bool = True) -> str:
+    """The subject an outbox row goes (or went) out with. A threaded
+    follow-up replies under its opener's subject. ``subject`` keeps the
+    writer's own text for review. A sent row records whether it was threaded,
+    so the setting only decides for mail still queued."""
+    threaded = (item.get("kind") == "sequence" and int(item.get("step") or 1) > 1
+                and item.get("in_reply_to") and item.get("thread_subject"))
+    if threaded and (thread_followups or item.get("status") == "sent"):
+        return reply_subject(item["thread_subject"])
+    return item.get("subject") or ""
 
 
 def describe_rule(rule: dict) -> str:
@@ -1283,7 +1336,7 @@ class StateManager:
     _OUTBOX_COLUMNS = frozenset({
         "status", "error", "message_id", "thread_ref", "sent_at",
         "subject", "body", "send_at", "provider", "mailbox", "manually_edited",
-        "company_id",
+        "company_id", "in_reply_to", "thread_references", "thread_subject",
     })
 
     async def update_outbox_item(self, item_id: str, **kwargs):
@@ -1439,6 +1492,38 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    async def thread_followups(self, campaign_id: str, prospect_id: str) -> int:
+        """Copy the thread headers of the latest sent step of a sequence onto
+        its later steps that are still queued, so they go out (and show in
+        review) as replies in that thread. Only subject/body are ever edited
+        or regenerated, so the headers survive both. A sequence whose opener
+        never went out has no sent step and keeps empty headers.
+        Returns the number of rows updated."""
+        if not campaign_id:
+            return 0
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE campaign_id = ? AND prospect_id = ? "
+                "AND kind = 'sequence' AND status = 'sent' AND message_id != '' "
+                "ORDER BY step DESC LIMIT 1",
+                (campaign_id, prospect_id),
+            ) as cursor:
+                parent = await cursor.fetchone()
+            headers = thread_headers(dict(parent) if parent else None)
+            if not headers:
+                return 0
+            cursor = await db.execute(
+                "UPDATE outbox SET in_reply_to = ?, thread_ref = ?, thread_references = ?, "
+                "thread_subject = ? WHERE campaign_id = ? AND prospect_id = ? "
+                "AND kind = 'sequence' AND step > ? "
+                "AND status IN ('pending_review', 'approved', 'blocked')",
+                (*(headers[f] for f in THREAD_FIELDS), campaign_id, prospect_id,
+                 int(parent["step"])),
+            )
+            await db.commit()
+            return int(cursor.rowcount or 0)
 
     async def reject_outbox_item(self, item_id: str) -> int:
         """Reject one queued item. For a sequence step, every LATER step of
