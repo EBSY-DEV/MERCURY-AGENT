@@ -520,7 +520,240 @@ MIGRATIONS: list[str] = [
     ALTER TABLE prospects ADD COLUMN import_row INTEGER DEFAULT 0;
     CREATE INDEX idx_prospects_import_batch ON prospects(import_batch_id);
     """,
+    # ── v14: exclusions, company holds, and the company on each outbox row ──
+    """
+    -- An exclusion is a rule about an address, not a prospect, so deleting
+    -- or re-importing a contact never lifts it. kind 'email' matches one
+    -- address; kind 'domain' matches that exact domain, plus its subdomains
+    -- only when include_subdomains is set. source keeps unrelated rules
+    -- apart: removing a manual rule never clears the same person's opt-out
+    -- (one active row per kind, value and source). Rows are never deleted:
+    -- removal stamps removed_at, and every change lands in the event log.
+    CREATE TABLE suppressions (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('email', 'domain')),
+        value TEXT NOT NULL,
+        include_subdomains INTEGER DEFAULT 0,
+        source TEXT NOT NULL,
+        reason TEXT DEFAULT '',
+        prospect_id TEXT DEFAULT '',
+        created_by TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        removed_at TIMESTAMP,
+        removed_by TEXT DEFAULT '',
+        removed_note TEXT DEFAULT ''
+    );
+    CREATE UNIQUE INDEX uq_suppressions_active
+        ON suppressions(kind, value, source) WHERE removed_at IS NULL;
+    CREATE INDEX idx_suppressions_value ON suppressions(value);
+    CREATE TRIGGER trg_suppressions_no_delete BEFORE DELETE ON suppressions
+    BEGIN
+        SELECT RAISE(ABORT, 'suppressions are removed by stamping removed_at, never deleted');
+    END;
+
+    CREATE TABLE suppression_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        suppression_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        actor TEXT DEFAULT '',
+        note TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX idx_suppression_events_rule ON suppression_events(suppression_id);
+    CREATE TRIGGER trg_suppression_events_no_update BEFORE UPDATE ON suppression_events
+    BEGIN
+        SELECT RAISE(ABORT, 'suppression_events is append-only');
+    END;
+    CREATE TRIGGER trg_suppression_events_no_delete BEFORE DELETE ON suppression_events
+    BEGIN
+        SELECT RAISE(ABORT, 'suppression_events is append-only');
+    END;
+
+    -- Opt-outs recorded before this table existed become rules now.
+    INSERT INTO suppressions (id, kind, value, source, reason, prospect_id, created_by)
+        SELECT lower(hex(randomblob(6))), 'email', email, 'opt_out',
+               'opted out (recorded before exclusions existed)', MIN(id), 'migration'
+        FROM prospects WHERE status = 'opted_out' AND email != '' GROUP BY email;
+    INSERT INTO suppression_events (suppression_id, action, actor, note)
+        SELECT id, 'added', 'migration', reason FROM suppressions;
+
+    -- A temporary pause on cold mail to one company. Not an exclusion: it
+    -- ends when someone resumes it, and replies are never held by it.
+    CREATE TABLE company_holds (
+        id TEXT PRIMARY KEY,
+        company_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        prospect_id TEXT DEFAULT '',
+        note TEXT DEFAULT '',
+        created_by TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        released_at TIMESTAMP,
+        released_by TEXT DEFAULT '',
+        released_note TEXT DEFAULT ''
+    );
+    CREATE UNIQUE INDEX uq_company_holds_active
+        ON company_holds(company_id) WHERE released_at IS NULL;
+
+    -- The company an email counts against for the per-company limits, set
+    -- when it is staged and refreshed when it is claimed. '' = unknown
+    -- company, which no company limit applies to.
+    ALTER TABLE outbox ADD COLUMN company_id TEXT DEFAULT '';
+    UPDATE outbox SET company_id = COALESCE(
+        (SELECT p.company_id FROM prospects p
+         JOIN companies c ON c.id = p.company_id
+         WHERE p.id = outbox.prospect_id), '');
+    -- Contacts with no company_id belong to the company whose domain is
+    -- their email's (shared providers never are a company's domain).
+    UPDATE outbox SET company_id = COALESCE(
+        (SELECT c.id FROM companies c
+         WHERE c.domain != '' AND c.domain = substr(outbox.to_email, instr(outbox.to_email, '@') + 1)
+           AND c.domain NOT IN ('gmail.com', 'googlemail.com', 'yahoo.com', 'hotmail.com',
+                                'outlook.com', 'live.com', 'aol.com', 'icloud.com')), '')
+        WHERE company_id = '';
+    CREATE INDEX idx_outbox_company ON outbox(company_id, kind, step, status);
+    """,
+    # ── v15: excluded mail needs a fresh human decision after requeue ──
+    """
+    ALTER TABLE outbox ADD COLUMN requires_manual_review INTEGER NOT NULL DEFAULT 0;
+    UPDATE outbox SET requires_manual_review = 1 WHERE status = 'blocked';
+    """,
 ]
+
+# ── Exclusion matching and company capacity (shared SQL) ──
+# One definition of "this rule covers this address", used by the sender's
+# claim, the dashboard and imports alike. A domain rule matches the exact
+# domain; a subdomain matches only when the rule says include_subdomains.
+
+_RULE_COVERS_ADDRESS = """
+    removed_at IS NULL AND (
+        (kind = 'email' AND value = :email)
+        OR (kind = 'domain' AND (
+            value = :domain
+            OR (include_subdomains = 1 AND length(:domain) > length(value)
+                AND substr(:domain, -length(value) - 1) = '.' || value))))"""
+
+_OUTBOX_DOMAIN = "substr(to_email, instr(to_email, '@') + 1)"
+
+# Mail an exclusion stops: everything still queued. 'sending' is already
+# with the provider and cannot be recalled.
+_BLOCKABLE = ("pending_review", "approved")
+
+SOURCE_LABELS = {
+    "opt_out": "opted out",
+    "bounce": "bounced",
+    "manual": "excluded by you",
+    "import": "excluded by an import",
+}
+
+
+def describe_rule(rule: dict) -> str:
+    """One plain sentence: what the rule matches and why it exists."""
+    if rule["kind"] == "email":
+        what = rule["value"]
+    elif rule.get("include_subdomains"):
+        what = f"{rule['value']} and its subdomains"
+    else:
+        what = f"the domain {rule['value']}"
+    why = SOURCE_LABELS.get(rule["source"], rule["source"])
+    return f"{what} ({why})"
+
+
+async def _matching_rules(db, email: str) -> list[dict]:
+    email = _norm(email)
+    domain = email.rsplit("@", 1)[-1]
+    async with db.execute(
+        f"SELECT * FROM suppressions WHERE {_RULE_COVERS_ADDRESS} "
+        "ORDER BY CASE source WHEN 'opt_out' THEN 0 WHEN 'bounce' THEN 1 ELSE 2 END, "
+        "created_at",
+        {"email": email, "domain": domain},
+    ) as cur:
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def _rule_event(db, rule_id: str, action: str, actor: str, note: str = ""):
+    await db.execute(
+        "INSERT INTO suppression_events (suppression_id, action, actor, note, created_at) "
+        "VALUES (?, ?, ?, ?, ?)", (rule_id, action, actor, note, _utcnow().isoformat()))
+
+
+async def _block_queued(db, rule: dict, now: str) -> int:
+    """Block queued outbox rows a new rule covers. Returns how many."""
+    if rule["kind"] == "email":
+        match, params = "to_email = ?", [rule["value"]]
+    else:
+        match = f"({_OUTBOX_DOMAIN} = ?"
+        params = [rule["value"]]
+        if rule["include_subdomains"]:
+            match += (f" OR (length({_OUTBOX_DOMAIN}) > length(?) AND "
+                      f"substr({_OUTBOX_DOMAIN}, -length(?) - 1) = '.' || ?)")
+            params += [rule["value"]] * 3
+        match += ")"
+    marks = ", ".join("?" for _ in _BLOCKABLE)
+    cursor = await db.execute(
+        f"UPDATE outbox SET status = 'blocked', requires_manual_review = 1, "
+        f"error = ?, updated_at = ? "
+        f"WHERE status IN ({marks}) AND {match}",
+        ("excluded: " + describe_rule(rule), now, *_BLOCKABLE, *params))
+    return cursor.rowcount
+
+
+# A sequence is unfinished while any of its emails is still queued, being
+# sent, or blocked waiting on a decision. It occupies a company slot once its
+# first email is out (or on its way out).
+_UNFINISHED = "('pending_review', 'approved', 'sending', 'blocked')"
+
+
+async def _company_usage(db, company_id: str, exclude_campaign: str = "",
+                         exclude_prospect: str = "") -> dict:
+    async with db.execute(
+        """SELECT COUNT(DISTINCT prospect_id) FROM outbox
+           WHERE company_id = ? AND kind = 'sequence' AND step = 1 AND prospect_id != ?
+             AND (status = 'sending' OR (status = 'sent' AND replace(sent_at, 'T', ' ') >=
+                  strftime('%Y-%m-%d %H:%M:%S', 'now', '-24 hours')))""",
+        (company_id, exclude_prospect),
+    ) as cur:
+        (new_today,) = await cur.fetchone()
+    async with db.execute(
+        f"""SELECT COUNT(DISTINCT prospect_id) FROM (
+              SELECT campaign_id, prospect_id FROM outbox
+              WHERE company_id = ? AND kind = 'sequence' AND campaign_id != ''
+                AND prospect_id != ?
+              GROUP BY campaign_id, prospect_id
+              HAVING SUM(step = 1 AND status IN ('sent', 'sending')) > 0
+                 AND SUM(status IN {_UNFINISHED}) > 0)""",
+        (company_id, exclude_prospect),
+    ) as cur:
+        (active,) = await cur.fetchone()
+    return {"new_today": new_today, "active": active}
+
+
+async def _claim_verdict(db, item: dict, company_id: str, max_new: int, max_active: int,
+                         respect_holds: bool) -> tuple[str, dict]:
+    rules = await _matching_rules(db, item["to_email"])
+    if rules:
+        return "suppressed", {"rule": rules[0],
+                              "error": "excluded: " + describe_rule(rules[0])}
+    if item.get("kind") != "sequence" or not company_id:
+        return "claimed", {}
+    if respect_holds:
+        async with db.execute(
+            "SELECT * FROM company_holds WHERE company_id = ? AND released_at IS NULL",
+            (company_id,),
+        ) as cur:
+            hold = await cur.fetchone()
+        if hold:
+            return "company_hold", {"hold": dict(hold)}
+    if int(item.get("step") or 1) != 1 or not (max_new or max_active):
+        return "claimed", {}
+    usage = await _company_usage(db, company_id, item.get("campaign_id") or "",
+                                 item["prospect_id"])
+    if max_new and usage["new_today"] >= max_new:
+        return "company_daily_limit", {**usage, "limit": max_new}
+    if max_active and usage["active"] >= max_active:
+        return "company_active_limit", {**usage, "limit": max_active}
+    return "claimed", {}
+
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
 _CAMPAIGN_COLUMNS = frozenset({
@@ -985,6 +1218,7 @@ class StateManager:
         in_reply_to: str = "",
         mailbox: str = "",
         generation_id: str = "",
+        company_id: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard."""
@@ -994,13 +1228,13 @@ class StateManager:
                 """INSERT OR IGNORE INTO outbox
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
-                    thread_ref, in_reply_to, mailbox, generation_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    thread_ref, in_reply_to, mailbox, generation_id, company_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
                     status, send_at, provider, thread_ref, in_reply_to,
-                    _norm(mailbox), generation_id,
+                    _norm(mailbox), generation_id, company_id,
                 ),
             )
             inserted = cursor.rowcount > 0
@@ -1049,6 +1283,7 @@ class StateManager:
     _OUTBOX_COLUMNS = frozenset({
         "status", "error", "message_id", "thread_ref", "sent_at",
         "subject", "body", "send_at", "provider", "mailbox", "manually_edited",
+        "company_id",
     })
 
     async def update_outbox_item(self, item_id: str, **kwargs):
@@ -1080,17 +1315,9 @@ class StateManager:
             return bool(cursor.rowcount)
 
     async def claim_outbox_item(self, item: dict, mailbox: str) -> bool:
-        """Freeze the validated snapshot before sending; reject stale or claimed rows."""
-        columns = ("subject", "body", "generation_id", "send_at", "mailbox", "manually_edited")
-        matches = " AND ".join(f"{column} = ?" for column in columns)
-        async with self._connect() as db:
-            cursor = await db.execute(
-                "UPDATE outbox SET status = 'sending', mailbox = ?, updated_at = ? "
-                f"WHERE id = ? AND status = 'approved' AND {matches}",
-                (mailbox, _utcnow().isoformat(), item["id"], *(item[column] for column in columns)),
-            )
-            await db.commit()
-            return bool(cursor.rowcount)
+        """Freeze the validated snapshot before sending; reject stale or claimed
+        rows, and excluded recipients. See claim_for_send for company limits."""
+        return (await self.claim_for_send(item, mailbox))[0] == "claimed"
 
     async def recover_stale_outbox(self, max_age_minutes: int = 30) -> int:
         """Put rows stuck in 'sending' back to 'approved'.
@@ -1118,13 +1345,13 @@ class StateManager:
         async with self._connect() as db:
             if item_id:
                 cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
+                    "UPDATE outbox SET status = 'approved', requires_manual_review = 0, updated_at = ? "
                     "WHERE id = ? AND status = 'pending_review'",
                     (_utcnow().isoformat(), item_id),
                 )
             else:
                 cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
+                    "UPDATE outbox SET status = 'approved', requires_manual_review = 0, updated_at = ? "
                     "WHERE status = 'pending_review'",
                     (_utcnow().isoformat(),),
                 )
@@ -1137,11 +1364,13 @@ class StateManager:
         is already approved or sent: the reviewer signed off on the opener,
         so the sequence it belongs to may run. A follow-up of a still-pending
         or rejected opener stays put. One step per pass, so a 3-step chain
-        whose opener was approved is fully promoted within two cycles."""
+        whose opener was approved is fully promoted within two cycles.
+        Requeued exclusions always need another explicit approval."""
         async with self._connect() as db:
             cursor = await db.execute(
                 """UPDATE outbox SET status = 'approved', updated_at = ?
                    WHERE status = 'pending_review' AND kind = 'sequence'
+                     AND requires_manual_review = 0
                      AND step > 1 AND campaign_id != ''
                      AND (
                        SELECT prev.status FROM outbox AS prev
@@ -1223,7 +1452,7 @@ class StateManager:
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'rejected', updated_at = ? "
-                "WHERE id = ? AND status IN ('pending_review', 'approved')",
+                "WHERE id = ? AND status IN ('pending_review', 'approved', 'blocked')",
                 (now, item_id),
             )
             n = cursor.rowcount
@@ -1231,7 +1460,7 @@ class StateManager:
                 cursor = await db.execute(
                     "UPDATE outbox SET status = 'rejected', error = ?, updated_at = ? "
                     "WHERE campaign_id = ? AND prospect_id = ? AND kind = 'sequence' "
-                    "AND step > ? AND status IN ('pending_review', 'approved')",
+                    "AND step > ? AND status IN ('pending_review', 'approved', 'blocked')",
                     (f"step {item['step']} rejected", now,
                      item["campaign_id"], item["prospect_id"], int(item["step"])),
                 )
@@ -1246,7 +1475,7 @@ class StateManager:
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
-                "WHERE prospect_id = ? AND status IN ('pending_review', 'approved')",
+                "WHERE prospect_id = ? AND status IN ('pending_review', 'approved', 'blocked')",
                 (reason, _utcnow().isoformat(), prospect_id),
             )
             await db.commit()
@@ -1292,6 +1521,294 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    # ── Exclusions (suppressions) ──
+
+    async def find_suppressions(self, email: str) -> list[dict]:
+        """Every active rule that covers this address, opt-outs first."""
+        email = _norm(email)
+        if "@" not in email:
+            return []
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            return await _matching_rules(db, email)
+
+    async def add_suppression(
+        self, kind: str, value: str, *, source: str, reason: str = "",
+        include_subdomains: bool = False, prospect_id: str = "", actor: str = "",
+    ) -> tuple[dict, bool]:
+        """Add a rule, or return the active one with the same kind, value and
+        source (so a second opt-out from one person is one rule). Queued mail
+        the rule covers is blocked in the same transaction: it leaves the
+        approval queue and needs an explicit decision to come back.
+        Returns (rule, created)."""
+        subdomains = 1 if (kind == "domain" and include_subdomains) else 0
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT * FROM suppressions WHERE kind = ? AND value = ? AND source = ? "
+                    "AND removed_at IS NULL", (kind, value, source),
+                ) as cur:
+                    found = await cur.fetchone()
+                if found:
+                    rule, created = dict(found), False
+                    if subdomains and not rule["include_subdomains"]:
+                        await db.execute(
+                            "UPDATE suppressions SET include_subdomains = 1, updated_at = ? "
+                            "WHERE id = ?", (now, rule["id"]))
+                        await _rule_event(db, rule["id"], "widened", actor,
+                                          "now also matches subdomains")
+                        rule["include_subdomains"] = 1
+                else:
+                    rule = {
+                        "id": _new_id(), "kind": kind, "value": value,
+                        "include_subdomains": subdomains, "source": source,
+                        "reason": reason, "prospect_id": prospect_id,
+                        "created_by": actor, "created_at": now, "updated_at": now,
+                        "removed_at": None, "removed_by": "", "removed_note": "",
+                    }
+                    await db.execute(
+                        """INSERT INTO suppressions (id, kind, value, include_subdomains, source,
+                           reason, prospect_id, created_by, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (rule["id"], kind, value, subdomains, source, reason, prospect_id,
+                         actor, now, now))
+                    await _rule_event(db, rule["id"], "added", actor, reason)
+                    created = True
+                rule["blocked"] = await _block_queued(db, rule, now)
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+        return rule, created
+
+    async def remove_suppression(self, rule_id: str, *, actor: str = "",
+                                 note: str = "") -> dict | None:
+        """Lift one rule. Other rules for the same address stay, and mail it
+        blocked stays blocked until someone sends it back for review."""
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "UPDATE suppressions SET removed_at = ?, removed_by = ?, removed_note = ?, "
+                "updated_at = ? WHERE id = ? AND removed_at IS NULL",
+                (now, actor, note, now, rule_id))
+            if not cursor.rowcount:
+                return None
+            await _rule_event(db, rule_id, "removed", actor, note)
+            await db.commit()
+            async with db.execute("SELECT * FROM suppressions WHERE id = ?", (rule_id,)) as cur:
+                return dict(await cur.fetchone())
+
+    async def get_suppression(self, rule_id: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM suppressions WHERE id = ?", (rule_id,)) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def list_suppressions(self, query: str = "", source: str = "",
+                                removed: bool = False, limit: int = 500) -> list[dict]:
+        where = ["removed_at IS NOT NULL" if removed else "removed_at IS NULL"]
+        params: list = []
+        if query:
+            where.append("(value LIKE ? ESCAPE '\\' OR reason LIKE ? ESCAPE '\\')")
+            like = "%" + _norm(query).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            params += [like, like]
+        if source:
+            where.append("source = ?")
+            params.append(source)
+        params.append(int(limit))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"SELECT * FROM suppressions WHERE {' AND '.join(where)} "
+                "ORDER BY COALESCE(removed_at, created_at) DESC LIMIT ?", params,
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def suppression_events(self, rule_id: str) -> list[dict]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM suppression_events WHERE suppression_id = ? ORDER BY id",
+                (rule_id,),
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def requeue_blocked_outbox(self, item_id: str) -> str:
+        """Send a blocked email back to review: 'requeued', 'excluded' (a
+        rule still covers it), or 'not_blocked'. Never approves it."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                async with db.execute(
+                    "SELECT to_email FROM outbox WHERE id = ? AND status = 'blocked'",
+                    (item_id,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if not row:
+                    await db.rollback()
+                    return "not_blocked"
+                if await _matching_rules(db, row["to_email"]):
+                    await db.rollback()
+                    return "excluded"
+                await db.execute(
+                    "UPDATE outbox SET status = 'pending_review', requires_manual_review = 1, "
+                    "error = '', updated_at = ? "
+                    "WHERE id = ?", (_utcnow().isoformat(), item_id))
+                await db.commit()
+                return "requeued"
+            except BaseException:
+                await db.rollback()
+                raise
+
+    # ── Company holds and per-company sending capacity ──
+
+    async def hold_company(self, company_id: str, *, reason: str, prospect_id: str = "",
+                           note: str = "", actor: str = "") -> tuple[dict, bool]:
+        """Pause cold mail to a company. One active hold per company; a second
+        reason while it is held returns the existing hold. (hold, created)."""
+        now = _utcnow().isoformat()
+        hold_id = _new_id()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """INSERT OR IGNORE INTO company_holds
+                   (id, company_id, reason, prospect_id, note, created_by, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (hold_id, company_id, reason, prospect_id, note, actor, now))
+            created = bool(cursor.rowcount)
+            await db.commit()
+            async with db.execute(
+                "SELECT * FROM company_holds WHERE company_id = ? AND released_at IS NULL",
+                (company_id,),
+            ) as cur:
+                return dict(await cur.fetchone()), created
+
+    async def release_company_hold(self, hold_id: str, *, actor: str = "",
+                                   note: str = "") -> dict | None:
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "UPDATE company_holds SET released_at = ?, released_by = ?, released_note = ? "
+                "WHERE id = ? AND released_at IS NULL", (now, actor, note, hold_id))
+            await db.commit()
+            if not cursor.rowcount:
+                return None
+            async with db.execute("SELECT * FROM company_holds WHERE id = ?", (hold_id,)) as cur:
+                return dict(await cur.fetchone())
+
+    async def get_company_hold(self, company_id: str) -> dict | None:
+        if not company_id:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM company_holds WHERE company_id = ? AND released_at IS NULL",
+                (company_id,),
+            ) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def list_company_holds(self, released: bool = False, limit: int = 200) -> list[dict]:
+        """Holds with the company name, who triggered them, and how much cold
+        mail each is holding right now."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"""SELECT h.*, COALESCE(c.name, '') AS company_name,
+                       COALESCE(c.domain, '') AS company_domain,
+                       COALESCE(p.email, '') AS prospect_email,
+                       TRIM(COALESCE(p.first_name, '') || ' ' || COALESCE(p.last_name, ''))
+                           AS prospect_name,
+                       (SELECT COUNT(*) FROM outbox o
+                          LEFT JOIN prospects op ON op.id = o.prospect_id
+                          WHERE (o.company_id = h.company_id OR (o.company_id = ''
+                                 AND (op.company_id = h.company_id
+                                      OR (COALESCE(op.company_id, '') = '' AND c.domain != ''
+                                          AND substr(o.to_email, instr(o.to_email, '@') + 1)
+                                              = c.domain))))
+                          AND o.kind = 'sequence'
+                          AND o.status IN ('pending_review', 'approved')) AS queued
+                    FROM company_holds h
+                    LEFT JOIN companies c ON c.id = h.company_id
+                    LEFT JOIN prospects p ON p.id = h.prospect_id
+                    WHERE h.released_at IS {'NOT ' if released else ''}NULL
+                    ORDER BY COALESCE(h.released_at, h.created_at) DESC LIMIT ?""",
+                (int(limit),),
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def company_contact_usage(self, company_id: str, *, exclude_campaign: str = "",
+                                    exclude_prospect: str = "") -> dict:
+        """(new contacts in the last 24 hours, contacts with an unfinished
+        sequence) at one company, leaving out one person across all campaigns
+        when asked. A contact occupies at most one slot."""
+        async with self._connect() as db:
+            return await _company_usage(db, company_id, exclude_campaign, exclude_prospect)
+
+    async def claim_for_send(self, item: dict, mailbox: str, *, company_id: str = "",
+                             max_new_per_day: int = 0, max_active: int = 0,
+                             respect_holds: bool = True) -> tuple[str, dict]:
+        """Claim one approved email for sending, re-checking every policy under
+        the write lock. Returns ("claimed", {}) or (code, detail):
+
+          suppressed            an exclusion covers the recipient; the row is
+                                now 'blocked' (any kind of email)
+          company_hold          cold mail to this company is paused
+          company_daily_limit   the company had its new contacts for 24 hours
+          company_active_limit  the company has its unfinished sequences
+          stale                 the row changed since the due scan
+
+        A claimed first email is status 'sending' until the provider answers,
+        so it already counts against its company: two senders cannot both see
+        the same free slot. A send that fails goes back to 'approved' or to
+        'failed' and frees the slot; a sent one counts once, as one contact.
+        """
+        columns = ("subject", "body", "generation_id", "send_at", "mailbox", "manually_edited")
+        now = _utcnow().isoformat()
+        async with aiosqlite.connect(
+            self.db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
+        ) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                verdict = await _claim_verdict(db, item, company_id, max_new_per_day,
+                                               max_active, respect_holds)
+                if verdict[0] == "suppressed":
+                    await db.execute(
+                        "UPDATE outbox SET status = 'blocked', requires_manual_review = 1, "
+                        "error = ?, updated_at = ? "
+                        "WHERE id = ? AND status = 'approved'",
+                        (verdict[1]["error"], now, item["id"]))
+                if verdict[0] != "claimed":
+                    await db.execute("COMMIT")
+                    return verdict
+                matches = " AND ".join(f"{column} = ?" for column in columns)
+                cursor = await db.execute(
+                    "UPDATE outbox SET status = 'sending', mailbox = ?, company_id = ?, "
+                    f"updated_at = ? WHERE id = ? AND status = 'approved' AND {matches}",
+                    (mailbox, company_id, now, item["id"], *(item[c] for c in columns)))
+                if not cursor.rowcount:
+                    await db.execute("ROLLBACK")
+                    return "stale", {}
+                if item.get("kind") == "sequence" and item.get("campaign_id"):
+                    # The rest of the thread counts against the same company.
+                    await db.execute(
+                        "UPDATE outbox SET company_id = ? WHERE campaign_id = ? "
+                        "AND prospect_id = ? AND kind = 'sequence' AND company_id != ?",
+                        (company_id, item["campaign_id"], item["prospect_id"], company_id))
+                await db.execute("COMMIT")
+                return "claimed", {}
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
 
     # ── Signal vocabulary (governed; user-confirmed before collection) ──
 

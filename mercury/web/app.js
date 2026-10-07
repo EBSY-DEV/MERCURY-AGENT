@@ -74,6 +74,7 @@ const STATUS = {
   objection:      ['Objection', 'waiting'],
   // outbox
   pending_review: ['Waiting on you', 'waiting'],
+  blocked:        ['Blocked', 'bad'],
   approved:       ['Approved', 'good'],
   sending:        ['Sending', 'active'],
   scheduled:      ['Scheduled', 'active'],
@@ -169,6 +170,7 @@ const TAB_META = {
   companies: ['Companies', 'buildings'], prospects: ['Contacts', 'address-book'],
   pipeline: ['Pipeline', 'kanban'], calendar: ['Calendar', 'calendar-blank'],
   campaigns: ['Campaigns', 'megaphone'], outbox: ['Outbox', 'tray'], mailboxes: ['Mailboxes', 'envelope-simple'],
+  exclusions: ['Exclusions', 'prohibit'],
   personas: ['Voice & Personas', 'sparkle'],
   conversations: ['Conversations', 'chat-circle-text'], activity: ['Activity', 'pulse'],
   usage: ['Usage', 'gauge'], settings: ['Settings', 'gear-six'], controls: ['Controls', 'power'],
@@ -213,6 +215,7 @@ function loadCurrentTab() {
     case 'campaigns': loadCampaigns(); break;
     case 'personas': loadPersonas(); break;
     case 'outbox': loadOutbox(); break;
+    case 'exclusions': loadExclusions(); break;
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
@@ -1297,6 +1300,7 @@ async function loadOutbox() {
   _desk.items = pending;
   if (_desk.i >= pending.length) _desk.i = Math.max(0, pending.length - 1);
   navCount('nav-outbox', pending.length);
+  navCount('nav-exclusions', (data.blocked || []).length);
 
   actions.innerHTML =
     (pending.length && !data.paused
@@ -1344,7 +1348,15 @@ async function loadOutbox() {
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
       ['From', r => fromCell(r), true, true],
       ['Persona', r => personaChip(r), false, true],
-      ['Sends', r => formatDate(r.send_at), true],
+      ['Sends', r => formatDate(r.send_at) + policyNote(r.policy), true, true],
+    ]) +
+    table('Blocked by an exclusion', data.blocked, [
+      ['To', r => r.to_email], ['Subject', r => r.subject],
+      ['Why', r => policyNote(r.policy), false, true],
+      ['', r => '<button class="btn btn-secondary btn-sm" onclick="exRequeue(\'' + escAttr(r.id) +
+        '\').then(loadOutbox)">Send back to review</button> ' +
+        '<button class="btn btn-secondary btn-sm" onclick="exDiscard(\'' + escAttr(r.id) +
+        '\')">Discard</button>', false, true],
     ]) +
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
@@ -1375,6 +1387,7 @@ function renderDesk(items, i) {
         (_mailboxes && _mailboxes.rotation ? ' &middot; from <b>' + escHtml(fromLabel(cur)) + '</b>' : '') +
         '</div>' +
       followupNote(cur) +
+      (policyNote(cur.policy, true) ? '<div class="desk-policy">' + policyNote(cur.policy, true) + '</div>' : '') +
       '<div class="desk-persona">' + personaChip(cur) +
         (cur.manually_edited ? '<span class="muted">Edited before sending</span>' : '') + '</div>' +
       '<label class="sr-only" for="desk-subject">Subject</label>' +
@@ -1533,6 +1546,8 @@ function autoFollowups(it) {
 }
 
 function followupNote(it) {
+  if (it.requires_manual_review) return '<div class="desk-note">' + icon('info') +
+    'This email was blocked by an exclusion and needs your approval again.</div>';
   return autoFollowups(it)
     ? '<div class="desk-note">' + icon('info') + 'Approving this also approves its follow-ups.</div>' : '';
 }
@@ -1618,7 +1633,9 @@ async function showCompanyContacts(index) {
   const el = document.getElementById('companies-list');
   const data = await api('/api/companies/' + encodeURIComponent(company.id) + '/contacts');
   let html = '<div class="card"><h2>' + escHtml(company.name) + ' — Contacts</h2>' +
-    '<button class="btn btn-secondary btn-sm" onclick="loadCompanies()" style="margin-bottom:16px">&larr; Back to Companies</button>';
+    '<div class="toolbar"><button class="btn btn-secondary btn-sm" onclick="loadCompanies()">&larr; Back to Companies</button>' +
+    '<button class="btn btn-secondary btn-sm" data-id="' + escAttr(company.id) + '" data-name="' + escAttr(company.name || company.domain || 'this company') +
+      '" onclick="exHoldCompany(this)">' + icon('pause-circle') + 'Pause cold mail</button></div>';
   if (!data || !data.length) {
     html += '<p style="color:var(--text-3);font-size:13px">No contacts found at this company yet.</p></div>';
   } else {
@@ -1908,8 +1925,9 @@ function impCounts(c) {
   const tile = (k, n, label) => '<div class="sig-stat imp-' + k + '"><div class="n">' + n + '</div><div class="k">' + label + '</div></div>';
   return '<div class="sig-summary imp-summary">' +
     tile('new', c.new, 'new') + tile('incomplete', c.incomplete, 'needs enrichment') +
-    tile('duplicate', c.duplicate, 'duplicate' + (c.suppressed ? ' (' + c.suppressed + ' opted out or invalid)' : '')) +
-    tile('invalid', c.invalid, 'invalid') + '</div>';
+    tile('duplicate', c.duplicate, 'duplicate') +
+    tile('invalid', c.invalid, 'invalid') +
+    (c.suppressed ? tile('excluded', c.suppressed, 'excluded, opted out or invalid') : '') + '</div>';
 }
 
 function impRowsTable(rows, committed) {

@@ -170,12 +170,27 @@ class EmailChannelConfig(BaseModel):
     # Pace the day's remaining sends evenly over the cycles left before
     # quiet hours, instead of sending up to MAX_SENDS_PER_CYCLE at once.
     spread_sends: bool = False
+    # Company contact policy (native providers). 0 = no limit. A company is
+    # a known company record: a prospect's company_id, or a company whose
+    # domain is the email's domain. Shared providers (gmail.com, ...) never
+    # make one company, and a contact with no known company gets no limit.
+    # New contacts per company: first emails in a rolling 24 hours, the same
+    # window as max_daily_sends, so it does not depend on a timezone.
+    max_new_contacts_per_company_per_day: int = 0
+    # Contacts per company with an unfinished cold sequence (first email
+    # sent, later steps still queued). A paused sequence keeps its slot
+    # until its remaining steps are rejected or cancelled.
+    max_active_contacts_per_company: int = 0
+    # When someone at a company replies (a person, not an auto-responder or
+    # a bounce), hold cold mail to their colleagues until you resume it.
+    pause_company_on_reply: bool = True
 
-    @field_validator("max_daily_sends")
+    @field_validator("max_daily_sends", "max_new_contacts_per_company_per_day",
+                     "max_active_contacts_per_company")
     @classmethod
-    def _sends_non_negative(cls, v: int) -> int:
+    def _sends_non_negative(cls, v: int, info) -> int:
         if v < 0:
-            raise ValueError("max_daily_sends must be >= 0")
+            raise ValueError(f"{info.field_name} must be >= 0")
         return v
 
     @field_validator("warmup_initial_cap", "warmup_weekly_increase")
