@@ -316,6 +316,8 @@ mercury personas mailboxes    # Each sending mailbox's voice and sign-off; chang
 mercury discover              # Find businesses; --providers / --estimate / --provider <key>
 mercury mail limits [--strict] # Inbox limit warnings (2 per domain, provider ceilings, 14-day warm-up); `mercury run --strict` refuses to start on any
 mercury sending pause|resume  # Kill switch for all outbound
+mercury health                # Deliverability verdict per sending domain (too young / not enough data / keep / cancel candidate)
+mercury mail placement        # Send email 1 to your seed inboxes and read where it landed; --dry-run, show / check / mark
 mercury demos                 # Demo gate: who waits for a demo; ready / request / retire EMAIL_OR_ID
 ```
 
