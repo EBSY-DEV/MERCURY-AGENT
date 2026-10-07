@@ -411,7 +411,15 @@ def _find_config_file() -> str:
     carry a real product configuration (trained on an actual company) while
     the tracked ``mercury.yaml`` stays an untrained template — nobody
     publishes their positioning, pricing, and prospect targeting by accident.
+
+    ``MERCURY_CONFIG`` names a config file explicitly and wins over both
+    (scripts/seed_demo.py uses it to point a demo dashboard at a demo config).
     """
+    explicit = os.environ.get("MERCURY_CONFIG", "").strip()
+    if explicit:
+        if Path(explicit).is_file():
+            return explicit
+        raise ConfigFileNotFoundError(f"MERCURY_CONFIG={explicit} does not exist.")
     candidates = [
         Path.cwd() / "mercury.local.yaml",
         PROJECT_ROOT / "mercury.local.yaml",
