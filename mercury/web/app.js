@@ -1354,7 +1354,9 @@ async function loadOutbox() {
       ['To', r => r.to_email], ['Subject', r => r.subject],
       ['Why', r => policyNote(r.policy), false, true],
       ['', r => '<button class="btn btn-secondary btn-sm" onclick="exRequeue(\'' + escAttr(r.id) +
-        '\').then(loadOutbox)">Send back to review</button>', false, true],
+        '\').then(loadOutbox)">Send back to review</button> ' +
+        '<button class="btn btn-secondary btn-sm" onclick="exDiscard(\'' + escAttr(r.id) +
+        '\')">Discard</button>', false, true],
     ]) +
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
@@ -1544,6 +1546,8 @@ function autoFollowups(it) {
 }
 
 function followupNote(it) {
+  if (it.requires_manual_review) return '<div class="desk-note">' + icon('info') +
+    'This email was blocked by an exclusion and needs your approval again.</div>';
   return autoFollowups(it)
     ? '<div class="desk-note">' + icon('info') + 'Approving this also approves its follow-ups.</div>' : '';
 }
