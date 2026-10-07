@@ -1480,6 +1480,10 @@ details[open] summary::before { content: '– '; }
 /* Summary: a stacked bar of stages, quiet issue list in the foot */
 .mb-stack { display: flex; gap: 2px; height: 6px; margin: 0 16px 16px; border-radius: 99px; overflow: hidden; }
 .mb-stack > span { min-width: 4px; }
+.mb-limits:not(:empty) { margin-top: 16px; }
+.mb-limit-list { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--text-2); }
+.mb-limit-list > div { display: flex; gap: 12px; align-items: center; }
+.mb-limit-list .badge { white-space: nowrap; }
 .mb-issues { display: flex; flex-direction: column; gap: 3px; }
 .mb-issues .badge { white-space: normal; }
 
