@@ -318,6 +318,20 @@ def test_a_weekend_return_resumes_on_monday():
     assert resume_time(date(2026, 10, 19), NY, "07:00") == datetime(2026, 10, 19, 11, 0)   # Monday
 
 
+def test_resume_time_buffer_counts_business_days():
+    # Tuesday + 1 business day = Wednesday.
+    assert resume_time(date(2026, 10, 20), NY, "07:00", 1) == datetime(2026, 10, 21, 11, 0)
+    # Friday + 1 skips the weekend to Monday.
+    assert resume_time(date(2026, 10, 16), NY, "07:00", 1) == datetime(2026, 10, 19, 11, 0)
+    # A Saturday return moves to Monday first, then the buffer adds Tuesday.
+    assert resume_time(date(2026, 10, 17), NY, "07:00", 1) == datetime(2026, 10, 20, 11, 0)
+    # Thursday + 2 = Monday.
+    assert resume_time(date(2026, 10, 15), NY, "07:00", 2) == datetime(2026, 10, 19, 11, 0)
+    # 0 and negative values mean no buffer.
+    assert resume_time(date(2026, 10, 20), NY, "07:00", 0) == datetime(2026, 10, 20, 11, 0)
+    assert resume_time(date(2026, 10, 20), NY, "07:00", -3) == datetime(2026, 10, 20, 11, 0)
+
+
 def test_resume_time_follows_daylight_saving():
     # DST ends Sunday Nov 1 2026: Nov 3 07:00 is EST = 12:00 UTC.
     assert resume_time(date(2026, 11, 3), NY, "07:00") == datetime(2026, 11, 3, 12, 0)

@@ -558,11 +558,14 @@ def operator_clock(config) -> tuple[str, str]:
     return tz_name, end
 
 
-def resume_time(return_date: date, tz_name: str = "UTC", quiet_end: str = "07:00") -> datetime:
+def resume_time(return_date: date, tz_name: str = "UTC", quiet_end: str = "07:00",
+                buffer_days: int = 0) -> datetime:
     """First sending time on or after ``return_date``, as naive UTC.
 
     That is the moment quiet hours end in the operator's timezone, moved to
-    Monday when the date falls on a weekend.
+    Monday when the date falls on a weekend. ``buffer_days`` pushes it that
+    many business days later, so the first email does not land on a full
+    inbox the morning they are back.
     """
     import pytz
 
@@ -577,5 +580,9 @@ def resume_time(return_date: date, tz_name: str = "UTC", quiet_end: str = "07:00
     day = return_date
     while day.weekday() >= 5:
         day += timedelta(days=1)
+    for _ in range(max(0, int(buffer_days or 0))):
+        day += timedelta(days=1)
+        while day.weekday() >= 5:
+            day += timedelta(days=1)
     local = tz.localize(datetime.combine(day, at.replace(tzinfo=None)))
     return local.astimezone(pytz.UTC).replace(tzinfo=None)

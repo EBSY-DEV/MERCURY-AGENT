@@ -213,6 +213,26 @@ async def test_a_weekend_return_resumes_monday_morning(state):
 
 
 @pytest.mark.asyncio
+async def test_resume_buffer_setting_adds_business_days_after_the_return_date(state):
+    class BufferCfg(OooCfg):
+        class channels(OooCfg.channels):
+            class email(OooCfg.channels.email):
+                ooo_resume_buffer_days = 2
+
+    provider = FakeProvider()
+    pid, _c, _s = await started(state, provider)
+    back = local_day(utcnow(), 20)
+    while back.weekday() != 3:  # a Thursday, so the buffer crosses a weekend
+        back += timedelta(days=1)
+    provider.inbound = [auto_reply(f"I am out of the office until {phrase(back)}.")]
+    await make_handler(state, provider, cfg=BufferCfg())._run_native()
+    pause = await state.get_active_pause(pid)
+    monday = back + timedelta(days=4)
+    assert datetime.fromisoformat(pause["resume_at"]) == resume_time(monday, NY, "07:00")
+    assert datetime.fromisoformat(pause["resume_at"]) == resume_time(back, NY, "07:00", 2)
+
+
+@pytest.mark.asyncio
 async def test_resume_time_uses_the_configured_timezone_and_quiet_hours_end(state):
     class DrCfg(OooCfg):
         class usage:
