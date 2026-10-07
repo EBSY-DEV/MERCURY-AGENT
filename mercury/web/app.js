@@ -1065,13 +1065,13 @@ async function loadMercuryStatus() {
   const headerText = document.getElementById('header-status-text');
 
   if (!data) {
-    headerDot.className = 'status-dot offline';
+    headerDot.className = 'agent-mark offline';
     headerText.textContent = 'Offline';
     return;
   }
   const running = !!data.running;
 
-  headerDot.className = 'status-dot ' + (running ? 'running' : 'stopped');
+  headerDot.className = 'agent-mark ' + (running ? 'running' : 'stopped');
   headerText.textContent = running ? 'Mercury is running' : 'Mercury is stopped';
   document.getElementById('control-dot').className = 'dot ' + (running ? 'running' : 'stopped');
   const label = document.getElementById('control-label');

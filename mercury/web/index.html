@@ -4,7 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Mercury Agent</title>
-<meta name="theme-color" content="#F7F5FD">
+<meta name="theme-color" content="#F7F5FD" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14111E" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="/static/brand/site.webmanifest">
 <link rel="icon" href="/static/brand/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/static/brand/favicon-32.png" sizes="32x32" type="image/png">
 <link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
@@ -58,7 +60,7 @@
 
   <div class="side-foot">
     <button class="agent-card" onclick="goTab('controls')" id="header-status">
-      <span class="status-dot stopped" id="header-dot"></span>
+      <span class="agent-mark stopped" id="header-dot" aria-hidden="true"><svg viewBox="0 0 256 256"><defs><mask id="am-bite-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="256" height="256"><rect width="256" height="256" fill="#000"/><circle cx="122.18" cy="128" r="98.18" fill="#FFF"/><circle class="am-mv am-bite" cx="200.73" cy="128" r="58.91" fill="#000"/></mask></defs><circle class="am-disc" cx="122.18" cy="128" r="98.18" mask="url(#am-bite-mask)"/><circle class="am-mv am-dot" cx="200.73" cy="128" r="39.27"/></svg></span>
       <span class="agent-text">
         <span class="agent-title" id="header-status-text">Checking…</span>
         <span class="agent-sub">Open controls</span>
