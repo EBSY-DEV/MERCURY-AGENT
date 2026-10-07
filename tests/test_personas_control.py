@@ -1,6 +1,7 @@
 """The persona service shared by the dashboard, the CLI and MCP."""
 
 import asyncio
+import io
 import json
 import sys
 from pathlib import Path
@@ -130,6 +131,9 @@ def test_cli_round_trip(tmp_path, monkeypatch, capsys, config):
     assert "as v1" in mercury("create", "--name", "Alex", "--tone", "warm", "--avatar", "3", "--default")
     assert "as v2" in mercury("edit", "alex", "--examples-file", str(examples))
     assert "still v2" in mercury("edit", "Alex", "--description", "Founder")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("Keep it short."))
+    assert "as v3" in mercury("edit", "Alex", "--instructions-file", "-")
+    assert json.loads(mercury("show", "Alex", "--json"))["instructions"] == "Keep it short."
     listed = json.loads(mercury("list", "--json"))
     alex = next(p for p in listed["personas"] if p["name"] == "Alex")
     assert alex["is_default"] and alex["avatar_seed"] == AVATAR_SEEDS[2] and alex["examples"].startswith("Hi Maria")
