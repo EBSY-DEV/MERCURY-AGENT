@@ -27,6 +27,7 @@ from mercury.paths import PROJECT_ROOT  # noqa: E402
 from mercury.personas_api import router as personas_router  # noqa: E402
 from mercury.imports_api import router as imports_router  # noqa: E402
 from mercury.exclusions_api import router as exclusions_router  # noqa: E402
+from mercury.pauses_api import router as pauses_router  # noqa: E402
 # MERCURY_DB_PATH points the dashboard at another database (e.g. the demo
 # DB from scripts/seed_demo.py) without touching the real one.
 DB_PATH = Path(os.environ.get("MERCURY_DB_PATH") or (PROJECT_ROOT / "data" / "mercury.db"))
@@ -39,6 +40,7 @@ app = FastAPI(title="Mercury Dashboard")
 app.include_router(personas_router)
 app.include_router(imports_router)
 app.include_router(exclusions_router)
+app.include_router(pauses_router)
 
 # Mercury process tracking
 _mercury_process: subprocess.Popen | None = None
@@ -1730,6 +1732,28 @@ async def get_today():
                 "detail": ("Someone there replied or you paused it, so cold mail to their "
                            f"colleagues waits ({held_mail} queued). Replies still go out."),
                 "action": "Review holds", "tab": "exclusions",
+            })
+
+        pauses = await state.list_pauses()
+        undated = sum(1 for p in pauses if p["review_state"] == "needs_review")
+        if undated:
+            items.append({
+                "key": "away-review", "tone": "warn",
+                "title": (f"{undated} contact is away with no clear return date" if undated == 1
+                          else f"{undated} contacts are away with no clear return date"),
+                "detail": ("Their follow-ups wait until you set the day they are back "
+                           "or resume them. Mercury will not guess."),
+                "action": "Set return dates", "tab": "outbox",
+            })
+        if len(pauses) > undated:
+            n = len(pauses) - undated
+            items.append({
+                "key": "away", "tone": "good",
+                "title": (f"{n} contact is out of office" if n == 1
+                          else f"{n} contacts are out of office"),
+                "detail": ("Their follow-ups wait until they are back, then the sequence "
+                           "picks up with the next step."),
+                "action": "Review", "tab": "outbox",
             })
 
         if open_convos:
