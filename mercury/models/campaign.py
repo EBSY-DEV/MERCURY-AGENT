@@ -16,6 +16,7 @@ class EmailStep(BaseModel):
     subject: str
     body: str
     delay_days: int = 0  # days after previous step
+    generation_id: str = ""  # exact prompt + persona version that produced this step
 
 
 class Campaign(BaseModel):

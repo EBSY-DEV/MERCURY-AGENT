@@ -498,6 +498,7 @@ class Sender:
                     send_at=send_at.isoformat(),
                     status=initial_status,
                     provider=self.provider.name,
+                    generation_id=step.generation_id,
                 )
                 if item_id:
                     staged += 1
@@ -682,6 +683,10 @@ class Sender:
                 )
                 continue
 
+            # The reviewed text and its generation must stay together during
+            # the provider call. A stale due scan cannot send a replaced draft.
+            if not await self.state.claim_outbox_item(item, mailbox.email):
+                continue
             body_out = item["body"]
             if item["kind"] != "reply":
                 body_out = self._with_legal_footer(body_out)
@@ -701,7 +706,7 @@ class Sender:
                         tz=timezone.utc,
                     ).replace(tzinfo=None).isoformat()
                     await self.state.update_outbox_item(
-                        item["id"], send_at=retry_at,
+                        item["id"], status="approved", send_at=retry_at,
                         error=f"retry {attempt}/3: {err[:250]}",
                     )
                     logger.warning(

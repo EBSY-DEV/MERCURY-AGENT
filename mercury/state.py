@@ -427,6 +427,50 @@ MIGRATIONS: list[str] = [
         ON actions(action_type, created_at);
     CREATE INDEX IF NOT EXISTS idx_outbox_sent_at ON outbox(status, sent_at);
     """,
+    # ── v11: versioned writing personas and immutable generation history ──
+    """
+    CREATE TABLE personas (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        avatar_seed TEXT NOT NULL,
+        archived INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE persona_versions (
+        id TEXT PRIMARY KEY,
+        persona_id TEXT NOT NULL REFERENCES personas(id),
+        revision INTEGER NOT NULL,
+        tone TEXT NOT NULL,
+        instructions TEXT DEFAULT '',
+        examples TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(persona_id, revision)
+    );
+    CREATE TABLE email_generations (
+        id TEXT PRIMARY KEY,
+        persona_version_id TEXT NOT NULL REFERENCES persona_versions(id),
+        persona_json TEXT NOT NULL,
+        config_json TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        output_json TEXT NOT NULL,
+        task TEXT NOT NULL,
+        instruction TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE email_generation_history (
+        outbox_id TEXT NOT NULL REFERENCES outbox(id),
+        generation_id TEXT NOT NULL REFERENCES email_generations(id),
+        original_subject TEXT NOT NULL,
+        original_body TEXT NOT NULL,
+        attached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(outbox_id, generation_id)
+    );
+    ALTER TABLE outbox ADD COLUMN generation_id TEXT DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN manually_edited INTEGER DEFAULT 0;
+    CREATE INDEX idx_generation_version ON email_generations(persona_version_id);
+    """,
 ]
 
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
@@ -876,6 +920,7 @@ class StateManager:
         thread_ref: str = "",
         in_reply_to: str = "",
         mailbox: str = "",
+        generation_id: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard."""
@@ -885,17 +930,25 @@ class StateManager:
                 """INSERT OR IGNORE INTO outbox
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
-                    thread_ref, in_reply_to, mailbox)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    thread_ref, in_reply_to, mailbox, generation_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
                     status, send_at, provider, thread_ref, in_reply_to,
-                    _norm(mailbox),
+                    _norm(mailbox), generation_id,
                 ),
             )
+            inserted = cursor.rowcount > 0
+            if inserted and generation_id:
+                await db.execute(
+                    "INSERT INTO email_generation_history "
+                    "(outbox_id, generation_id, original_subject, original_body) "
+                    "VALUES (?, ?, ?, ?)",
+                    (item_id, generation_id, subject, body),
+                )
             await db.commit()
-            return item_id if cursor.rowcount > 0 else None
+            return item_id if inserted else None
 
     async def get_outbox(
         self,
@@ -931,7 +984,7 @@ class StateManager:
 
     _OUTBOX_COLUMNS = frozenset({
         "status", "error", "message_id", "thread_ref", "sent_at",
-        "subject", "body", "send_at", "provider", "mailbox",
+        "subject", "body", "send_at", "provider", "mailbox", "manually_edited",
     })
 
     async def update_outbox_item(self, item_id: str, **kwargs):
@@ -945,6 +998,35 @@ class StateManager:
                 (*fields.values(), _utcnow().isoformat(), item_id),
             )
             await db.commit()
+
+    async def edit_outbox_item(self, item_id: str, **kwargs) -> bool:
+        """Apply reviewer changes only while the draft is still editable."""
+        fields = {k: v for k, v in kwargs.items()
+                  if k in {"subject", "body", "send_at", "manually_edited"}}
+        if not fields:
+            return False
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        async with self._connect() as db:
+            cursor = await db.execute(
+                f"UPDATE outbox SET {sets}, updated_at = ? WHERE id = ? "
+                "AND status IN ('pending_review', 'approved')",
+                (*fields.values(), _utcnow().isoformat(), item_id),
+            )
+            await db.commit()
+            return bool(cursor.rowcount)
+
+    async def claim_outbox_item(self, item: dict, mailbox: str) -> bool:
+        """Freeze the validated snapshot before sending; reject stale or claimed rows."""
+        columns = ("subject", "body", "generation_id", "send_at", "mailbox", "manually_edited")
+        matches = " AND ".join(f"{column} = ?" for column in columns)
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'sending', mailbox = ?, updated_at = ? "
+                f"WHERE id = ? AND status = 'approved' AND {matches}",
+                (mailbox, _utcnow().isoformat(), item["id"], *(item[column] for column in columns)),
+            )
+            await db.commit()
+            return bool(cursor.rowcount)
 
     async def approve_outbox(self, item_id: str | None = None) -> int:
         """Approve one pending item, or ALL pending when item_id is None."""
