@@ -270,7 +270,7 @@ Per sending domain (every mailbox on it added together) it shows outreach sends,
 
 | Verdict | When |
 |---|---|
-| Cancel candidate | Bounce composition says the domain is burned (a 5.7.6xx reputation block). Needs classified bounces; until bounces carry an SMTP code this never fires. |
+| Cancel candidate | Bounce composition says the domain is burned (a 5.7.6xx reputation block). Reads the `BURNED` bucket the Handler stores on each bounce (see [bounces and the kill switch](#bounces-and-the-kill-switch)); bounces logged before classification never trigger it. |
 | Too young | Under 30 days of sending, or nothing sent yet. |
 | Keep | 200 or more sends and replies at 1% or above. |
 | Cancel candidate | 0 replies on 150 or more sends, or replies under 1% after 200 sends. |
@@ -280,7 +280,7 @@ A domain is never "keep" without evidence, and a cancel candidate is only a cand
 
 Definitions match the trends chart: a send is an outreach email (Mercury's own replies don't count), a reply is a human reply (out-of-office excluded, one per prospect per day), and a bounce is attributed to the mailbox that sent the bounced email. Events no send can be traced to are reported as unattributed and charged to no domain. **Sending age** counts from the domain's first outreach send or the earliest `warmup_start` of its mailboxes, whichever is older; it is not the registration date, so a domain warmed elsewhere reads young until Mercury has 30 days of its history.
 
-A high bounce rate is shown as a flag (over `max_bounce_rate`, after 50 sends) but does not change the verdict while bounces are unclassified: an unclassified bounce could be a bad address (a list problem) as easily as a blocked sender (a domain problem). The per-mailbox [health gates](#health-gates) already pause an inbox past 5%.
+A high bounce rate is shown as a flag (over `max_bounce_rate`, after 50 sends) but does not change the verdict on its own: a bounce could be a bad address (a list problem) as easily as a blocked sender (a domain problem). Only a `BURNED` bounce makes a domain a cancel candidate. The per-mailbox [health gates](#health-gates) already pause an inbox past 5%.
 
 ```bash
 mercury health          # the table, the reasons, the thresholds and the last placement test
