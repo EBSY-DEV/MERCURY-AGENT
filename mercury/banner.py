@@ -6,7 +6,8 @@ design/brand/final/mercury-symbol-small.svg) rather than drawn by hand, so it
 stays the same shape as the logo. Colour is the dark-mode accent (#B7A4F7) and
 is left out when NO_COLOR is set. Nothing is printed when output is not a
 terminal, so a log file or a service journal keeps only its own lines. On a
-narrow or non-UTF-8 terminal it falls back to the plain dot and the name.
+narrow terminal it falls back to the plain dot and the name. Terminals that
+cannot encode that text get an ASCII dot and separator instead.
 """
 
 import os
@@ -135,4 +136,13 @@ def print_banner(stream=None) -> None:
     stream = stream or sys.stdout
     if not hasattr(stream, "isatty") or not stream.isatty():
         return
-    print(render(colour=_wants_colour(stream), draw_mark=_can_draw(stream)), file=stream)
+    text = render(colour=_wants_colour(stream), draw_mark=_can_draw(stream))
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        text.encode(encoding)
+    except UnicodeEncodeError:
+        # Decorative text must never prevent the agent from starting. The
+        # folder or version can also contain characters this terminal lacks.
+        text = text.replace("●", ".").replace("·", "-")
+        text = text.encode(encoding, errors="replace").decode(encoding)
+    print(text, file=stream)
