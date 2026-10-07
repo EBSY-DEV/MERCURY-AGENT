@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "harvey"
+name = "mercury"
 version = "0.2.0"
-description = "Autonomous AI sales agent. Always Be Closing."
+description = "Mercury by EBSY: an autonomous AI sales agent."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -46,12 +46,16 @@ Issues = "https://github.com/ethanplusai/harvey/issues"
 Changelog = "https://github.com/ethanplusai/harvey/blob/main/CHANGELOG.md"
 
 [project.scripts]
-harvey = "harvey.cli:main"
+mercury = "mercury.cli:main"
+# Deprecated alias from before the Harvey -> Mercury rename. Deployed systemd
+# units still run `.venv/bin/harvey run` / `harvey dashboard`; keep this until
+# they are switched to `mercury`.
+harvey = "mercury.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["harvey*"]
+include = ["mercury*"]
 
 # The dashboard's HTML/CSS/JS are real files served from disk, and its fonts
 # are vendored so a local tool renders correctly with the network off.
 [tool.setuptools.package-data]
-harvey = ["web/*", "web/fonts/*"]
+mercury = ["web/*", "web/fonts/*"]

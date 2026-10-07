@@ -1,6 +1,6 @@
-# Running Harvey on a schedule in the cloud
+# Running Mercury on a schedule in the cloud
 
-Harvey is built as a daemon: `harvey run` loops forever, sleeping between
+Mercury is built as a daemon: `mercury run` loops forever, sleeping between
 heartbeats, keeping its pipeline in a SQLite file next to the checkout. That
 shape assumes a machine that stays up and a disk that stays put.
 
@@ -11,18 +11,18 @@ nowhere to live. Two pieces bridge the gap.
 ## 1. One cycle per firing
 
 ```bash
-harvey run --once                      # one cycle, then exit
-harvey run --once --ignore-quiet-hours # ...even inside quiet hours
+mercury run --once                      # one cycle, then exit
+mercury run --once --ignore-quiet-hours # ...even inside quiet hours
 ```
 
 `--once` runs exactly one heartbeat — budget check, decision, agents, logging —
-and returns an exit code. The scheduler owns the cadence; Harvey owns what
+and returns an exit code. The scheduler owns the cadence; Mercury owns what
 happens inside a cycle. The loop and the one-shot share `run_cycle()`, so the
 two paths cannot drift apart.
 
 Quiet hours still apply. A schedule that overlaps `usage.quiet_hours` no-ops
-rather than emailing people at 3am, which keeps `harvey.yaml` the single source
-of truth for when Harvey is allowed to be awake.
+rather than emailing people at 3am, which keeps `mercury.yaml` the single source
+of truth for when Mercury is allowed to be awake.
 
 Exit codes: `0` a cycle ran (or was skipped for quiet hours), `1` the
 configuration is unusable or the cycle crashed. `--once` never opens the
@@ -30,7 +30,7 @@ interactive setup wizard — there is no terminal to answer it.
 
 ## 2. A private state store
 
-Everything Harvey learns lives in `data/harvey.db`: companies, prospects,
+Everything Mercury learns lives in `data/mercury.db`: companies, prospects,
 observations, conversations, the outbox. Without it a scheduled run rediscovers
 the world from scratch every hour and re-emails people it already contacted.
 
@@ -39,17 +39,21 @@ store is a separate *private* repo, and `scripts/cloud_run.sh` treats it as the
 real home of the deployment:
 
 ```
-harvey-state/                        (private)
-  data/harvey.db                     the pipeline
+mercury-state/                        (private)
+  data/mercury.db                     the pipeline
   data/gmail_token.json              the refreshed OAuth token
-  harvey.local.yaml                  the trained config
-  skills/product_knowledge.md        what Harvey is selling
+  mercury.local.yaml                  the trained config
+  skills/product_knowledge.md        what Mercury is selling
   skills/competitive_intel.md
 ```
 
-`harvey.local.yaml` takes precedence over the tracked `harvey.yaml` template
+`mercury.local.yaml` takes precedence over the tracked `mercury.yaml` template
 (see `config._find_config_file`), which is how a public checkout runs a private
 business configuration without ever committing one.
+
+A state repo created before the Harvey → Mercury rename (with `harvey.local.yaml`
+and `data/harvey.db`) needs no manual step: both scripts rename those files
+inside the checkout on the next run, and the rename is pushed with it.
 
 Each firing: clone the state repo, symlink `data/` and the config files into
 the checkout, run one cycle, checkpoint the WAL, commit and push. A failed push
@@ -60,7 +64,7 @@ from the last commit that landed.
 
 ### a. Create the state repo
 
-Create a **private** repo (e.g. `harvey-state`) on GitHub and give the Claude
+Create a **private** repo (e.g. `mercury-state`) on GitHub and give the Claude
 GitHub App access to it, at
 <https://github.com/apps/claude/installations/select_target>. It can be empty;
 the script seeds its layout and `.gitignore` on first run.
@@ -70,28 +74,28 @@ the script seeds its layout and `.gitignore` on first run.
 Train locally, then move the generated files across:
 
 ```bash
-harvey train https://your-product.com
-mv harvey.yaml harvey.local.yaml        # keep the template tracked, the real one private
-git -C ../harvey-state add harvey.local.yaml skills/ && git -C ../harvey-state commit -m "Config"
+mercury train https://your-product.com
+mv mercury.yaml mercury.local.yaml        # keep the template tracked, the real one private
+git -C ../mercury-state add mercury.local.yaml skills/ && git -C ../mercury-state commit -m "Config"
 ```
 
 ### c. Set environment variables
 
-Harvey reads `os.environ` directly, so a cloud deployment needs no `.env` file
+Mercury reads `os.environ` directly, so a cloud deployment needs no `.env` file
 — set these in the environment's variable settings:
 
 | Variable | Why |
 |---|---|
-| `HARVEY_STATE_REPO` | **Required.** `https://github.com/<you>/harvey-state.git` |
+| `MERCURY_STATE_REPO` | **Required.** `https://github.com/<you>/mercury-state.git` (the old name `HARVEY_STATE_REPO` is still read when this is unset) |
 | `SERPER_API_KEY` | **Strongly recommended.** Google rate-limits datacenter IPs on the first request and DuckDuckGo serves a challenge, so free search is close to useless from a cloud container. Bing alone is thin. |
 | `REOON_API_KEY` / `ZEROBOUNCE_API_KEY` / `HUNTER_API_KEY` | Email verification. Without one, every address stays `guess` and is never sent. |
 | `DATAFORSEO_LOGIN` / `DATAFORSEO_PASSWORD` | Paid discovery. `DATAFORSEO_SANDBOX=1` routes to the free sandbox. |
-| Mail provider | `GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET`, or the `SMTP_*`/`IMAP_*` set. Verify either with `harvey mail test`. |
+| Mail provider | `GMAIL_CLIENT_ID`/`GMAIL_CLIENT_SECRET`, or the `SMTP_*`/`IMAP_*` set. Verify either with `mercury mail test`. |
 
 ### d. Run it
 
 ```bash
-HARVEY_STATE_REPO=https://github.com/<you>/harvey-state.git scripts/cloud_run.sh
+MERCURY_STATE_REPO=https://github.com/<you>/mercury-state.git scripts/cloud_run.sh
 ```
 
 The script installs dependencies on first use, so the first firing is slower
@@ -103,18 +107,18 @@ With `channels.email.require_approval: true` (the default) a scheduled run
 drafts and queues, but nothing leaves the building. Review it from your own machine:
 
 ```bash
-HARVEY_STATE_REPO=https://github.com/<you>/harvey-state.git scripts/local_dashboard.sh
+MERCURY_STATE_REPO=https://github.com/<you>/mercury-state.git scripts/local_dashboard.sh
 ```
 
 That pulls the state repo, points the dashboard at it (localhost:5555 → Outbox),
 and pushes your approvals back when you stop it, so the next cloud firing sends
-what you approved. `harvey outbox --approve-all` does the same from the terminal.
+what you approved. `mercury outbox --approve-all` does the same from the terminal.
 
 The dashboard is a local web UI. It cannot be reached from the scheduled cloud
 container, which has no exposed ports and is destroyed after each run — the
 state repo is what carries decisions between the two.
 
-Only set `require_approval: false` once you have read enough of Harvey's output
+Only set `require_approval: false` once you have read enough of Mercury's output
 to trust it unattended. A scheduled job sending cold email with nobody watching
 puts your sending domain's reputation on the line every hour.
 
@@ -139,15 +143,15 @@ reasoning about convenience alone:
   else. The OAuth browser step is a one-time annoyance run locally; the token
   then lives in the state repo and refreshes itself.
 - **`smtp` cannot send or read mail from such a container.** It needs raw TCP
-  on 587/465 to send and 993 to poll replies. `harvey mail test` reports this
+  on 587/465 to send and 993 to poll replies. `mercury mail test` reports this
   as a connection timeout, not an auth error.
 
-SMTP remains the better choice when Harvey runs somewhere with open mail ports
+SMTP remains the better choice when Mercury runs somewhere with open mail ports
 — a laptop, a VPS, a Docker host. It is simpler: pure environment variables, no
 OAuth, `IMAP_USERNAME`/`IMAP_PASSWORD` falling back to their SMTP equivalents,
 and STARTTLS or implicit TLS picked automatically from the port.
 
-Run `harvey mail test` on the machine that will actually do the sending, before
+Run `mercury mail test` on the machine that will actually do the sending, before
 trusting either. A timeout there means ports, not credentials.
 
 Whichever you choose, what governs whether mail *arrives* is the sending domain,
@@ -156,7 +160,7 @@ addresses, and a slow warmup.
 
 ## Gmail in a headless container
 
-`harvey gmail auth` opens a browser, which a container does not have. Run it
+`mercury gmail auth` opens a browser, which a container does not have. Run it
 once locally, then commit the resulting `data/gmail_token.json` to the state
 repo. The refresh token survives, and because `data/` is synced back after
 every cycle, a refreshed token persists automatically.
@@ -165,7 +169,7 @@ SMTP+IMAP avoids the problem entirely — it is pure environment variables.
 
 ## Root containers and the Claude CLI
 
-Harvey's brain shells out to `claude -p --dangerously-skip-permissions`. The
+Mercury's brain shells out to `claude -p --dangerously-skip-permissions`. The
 CLI refuses that flag when running as root unless `IS_SANDBOX` is set, and most
 hosted runners are root. `brain._cli_env()` sets it automatically when the
 effective uid is 0 — where the container *is* the sandbox. The project's own

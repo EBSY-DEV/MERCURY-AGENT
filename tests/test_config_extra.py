@@ -4,9 +4,9 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from harvey.config import (
+from mercury.config import (
     ConfigError,
-    HarveyConfig,
+    MercuryConfig,
     EnvConfig,
     QuietHoursConfig,
     load_config,
@@ -31,7 +31,7 @@ MINIMAL = {
 
 
 def test_load_config_from_yaml_file(tmp_path):
-    path = tmp_path / "harvey.yaml"
+    path = tmp_path / "mercury.yaml"
     path.write_text(yaml.safe_dump(MINIMAL))
     config = load_config(str(path))
     assert config.persona.name == "H"
@@ -44,7 +44,7 @@ def test_load_config_missing_file_raises(tmp_path):
 
 
 def test_load_config_malformed_yaml_raises(tmp_path):
-    path = tmp_path / "harvey.yaml"
+    path = tmp_path / "mercury.yaml"
     path.write_text("persona: [unclosed\n  - :bad")
     with pytest.raises(ConfigError):
         load_config(str(path))
@@ -53,21 +53,21 @@ def test_load_config_malformed_yaml_raises(tmp_path):
 def test_load_config_yaml_missing_sections_raises(tmp_path):
     # Invalid config must be rejected; the exact exception type has churned
     # between ConfigError and pydantic ValidationError, both are acceptable.
-    path = tmp_path / "harvey.yaml"
+    path = tmp_path / "mercury.yaml"
     path.write_text(yaml.safe_dump({"persona": MINIMAL["persona"]}))
     with pytest.raises((ConfigError, ValidationError)):
         load_config(str(path))
 
 
 def test_load_config_empty_file_raises(tmp_path):
-    path = tmp_path / "harvey.yaml"
+    path = tmp_path / "mercury.yaml"
     path.write_text("")
     with pytest.raises(ConfigError):
         load_config(str(path))
 
 
 def test_load_config_non_mapping_yaml_raises(tmp_path):
-    path = tmp_path / "harvey.yaml"
+    path = tmp_path / "mercury.yaml"
     path.write_text("- just\n- a\n- list\n")
     with pytest.raises(ConfigError):
         load_config(str(path))
@@ -78,7 +78,7 @@ def test_config_missing_required_persona_field():
     data["persona"] = dict(MINIMAL["persona"])
     del data["persona"]["email"]
     with pytest.raises(ValidationError):
-        HarveyConfig(**data)
+        MercuryConfig(**data)
 
 
 def test_config_wrong_type_raises():
@@ -88,7 +88,7 @@ def test_config_wrong_type_raises():
         "titles": [], "geography": [],
     }
     with pytest.raises(ValidationError):
-        HarveyConfig(**data)
+        MercuryConfig(**data)
 
 
 def test_usage_and_channel_overrides():
@@ -99,7 +99,7 @@ def test_usage_and_channel_overrides():
         "quiet_hours": {"start": "23:00", "end": "06:00", "timezone": "UTC"},
     }
     data["channels"] = {"email": {"enabled": False, "max_daily_sends": 10}}
-    config = HarveyConfig(**data)
+    config = MercuryConfig(**data)
     assert config.usage.max_daily_claude_percent == 50.0
     assert config.usage.heartbeat_interval_minutes == 5
     assert config.usage.quiet_hours.timezone == "UTC"
@@ -129,31 +129,31 @@ def test_usage_rejects_out_of_range_percent():
     data = dict(MINIMAL)
     data["usage"] = {"max_daily_claude_percent": 150}
     with pytest.raises(ValidationError):
-        HarveyConfig(**data)
+        MercuryConfig(**data)
     data["usage"] = {"max_daily_claude_percent": 0}
     with pytest.raises(ValidationError):
-        HarveyConfig(**data)
+        MercuryConfig(**data)
 
 
 def test_usage_rejects_zero_heartbeat():
     data = dict(MINIMAL)
     data["usage"] = {"heartbeat_interval_minutes": 0}
     with pytest.raises(ValidationError):
-        HarveyConfig(**data)
+        MercuryConfig(**data)
 
 
 def test_email_channel_rejects_negative_sends():
     data = dict(MINIMAL)
     data["channels"] = {"email": {"max_daily_sends": -5}}
     with pytest.raises(ValidationError):
-        HarveyConfig(**data)
+        MercuryConfig(**data)
 
 
 def test_offer_override():
     data = dict(MINIMAL)
     data["product"] = dict(MINIMAL["product"])
     data["product"]["offer"] = {"goal": "start_trial", "booking_url": "https://cal.com/x"}
-    config = HarveyConfig(**data)
+    config = MercuryConfig(**data)
     assert config.product.offer.goal == "start_trial"
     assert config.product.offer.booking_url == "https://cal.com/x"
     assert config.product.offer.meeting_duration == "15 minutes"
@@ -172,3 +172,17 @@ def test_load_env_reads_environment(monkeypatch):
 def test_env_config_rejects_non_string():
     with pytest.raises(ValidationError):
         EnvConfig(instantly_api_key=["not", "a", "string"])
+
+
+def test_mercury_config_env_names_the_config_file(tmp_path, monkeypatch):
+    import pytest as _pytest
+
+    from mercury.config import ConfigFileNotFoundError, _find_config_file
+
+    cfg = tmp_path / "demo.mercury.yaml"
+    cfg.write_text("persona: {}\n")
+    monkeypatch.setenv("MERCURY_CONFIG", str(cfg))
+    assert _find_config_file() == str(cfg)
+    monkeypatch.setenv("MERCURY_CONFIG", str(tmp_path / "missing.yaml"))
+    with _pytest.raises(ConfigFileNotFoundError):
+        _find_config_file()

@@ -1,16 +1,16 @@
-# Harvey
+# Mercury by EBSY
 
 **An autonomous sales agent that runs on your Claude Code subscription.**
 
-Harvey finds businesses worth selling to, learns something specific about each one, writes cold email that references it, sends it, reads the replies, and works the conversation toward a meeting. It runs on your machine, in a loop, on its own.
+Mercury finds businesses worth selling to, learns something specific about each one, writes cold email that references it, sends it, reads the replies, and works the conversation toward a meeting. It runs on your machine, in a loop, on its own.
 
-The unusual part: **there is no API bill.** Harvey drives the `claude` CLI in headless mode, so every decision, every email, every reply it handles is billed against the Claude Pro or Max subscription you already pay for. Not an API key. Not per-token. The subscription.
+The unusual part: **there is no API bill.** Mercury drives the `claude` CLI in headless mode, so every decision, every email, every reply it handles is billed against the Claude Pro or Max subscription you already pay for. Not an API key. Not per-token. The subscription.
 
 ```
-$ harvey run
+$ mercury run
 
 ============================================================
-Harvey is online. Always Be Closing.
+Mercury by EBSY is online.
 ============================================================
 Checking pipeline state...
 Decision: prospect (only 3 new prospects; pipeline needs leads)
@@ -27,14 +27,14 @@ And the dashboard it keeps, at `localhost:5555` — confirming a signal, buildin
 cohort out of the confirmed ones, pricing a discovery run before it spends
 anything, and approving mail one message at a time:
 
-![Harvey's dashboard: the Today queue, confirming a signal, the cohort builder counting matches live, a costed discovery estimate, and the outbox decisions desk — in light and dark](docs/dashboard.gif)
+![Mercury's dashboard: the Today queue, confirming a signal, the cohort builder counting matches live, a costed discovery estimate, and the outbox decisions desk — in light and dark](docs/dashboard.gif)
 
 ---
 
 ## Table of contents
 
 - [Why the subscription thing matters](#why-the-subscription-thing-matters)
-- [What Harvey actually does](#what-harvey-actually-does)
+- [What Mercury actually does](#what-mercury-actually-does)
 - [Quick start](#quick-start)
 - [You confirm what it looks for](#you-confirm-what-it-looks-for)
 - [The prospecting pipeline](#the-prospecting-pipeline)
@@ -56,13 +56,13 @@ anything, and approving mail one message at a time:
 
 Every other autonomous sales agent bills you per token. That is the whole reason they cost what they cost: an agent that thinks in a loop, all day, is an agent that burns API credits in a loop, all day. Vendors solve this by thinking less — shorter prompts, cheaper models, fewer passes.
 
-Harvey sidesteps it. It shells out to the `claude` CLI:
+Mercury sidesteps it. It shells out to the `claude` CLI:
 
 ```python
 claude -p "<prompt>" --output-format json --dangerously-skip-permissions
 ```
 
-That is the same subscription-billed path `claude` uses interactively. So Harvey can afford to think properly: full skills library in context, careful personalization per prospect, real reply handling.
+That is the same subscription-billed path `claude` uses interactively. So Mercury can afford to think properly: full skills library in context, careful personalization per prospect, real reply handling.
 
 **What this costs you:**
 
@@ -74,17 +74,17 @@ That is the same subscription-billed path `claude` uses interactively. So Harvey
 | Writing and sending | your subscription + a mailbox (~$7/mo Google Workspace) |
 | Prospecting tools | **none.** No Apollo, no ZoomInfo, no Clearbit, no Clay. |
 
-For comparison, the tools Harvey replaces start at $250–500/month — and they are weakest precisely where Harvey is strongest: small local businesses with 5–50 people, where single-provider contact coverage caps out around 30% and micro-businesses are frequently absent entirely.
+For comparison, the tools Mercury replaces start at $250–500/month — and they are weakest precisely where Mercury is strongest: small local businesses with 5–50 people, where single-provider contact coverage caps out around 30% and micro-businesses are frequently absent entirely.
 
-**Harvey also budgets itself.** It reads your live subscription quota the same way `/usage` does, and throttles so it always leaves headroom for your own interactive Claude work. Set `max_daily_claude_percent: 80` and Harvey will stop before it starts costing you your own rate limit.
+**Mercury also budgets itself.** It reads your live subscription quota the same way `/usage` does, and throttles so it always leaves headroom for your own interactive Claude work. Set `max_daily_claude_percent: 80` and Mercury will stop before it starts costing you your own rate limit.
 
-> **Honest caveat.** Running an agent against a subscription is a grey area worth understanding for yourself. Anthropic's terms permit personal automation of your own account; they prohibit reselling access or sharing credentials. Harvey runs locally as you, with your login. Don't turn it into a service for other people.
+> **Honest caveat.** Running an agent against a subscription is a grey area worth understanding for yourself. Anthropic's terms permit personal automation of your own account; they prohibit reselling access or sharing credentials. Mercury runs locally as you, with your login. Don't turn it into a service for other people.
 
 ---
 
-## What Harvey actually does
+## What Mercury actually does
 
-Harvey runs a heartbeat: wake up, check the budget, decide what most needs doing, do it, log it, sleep. Every 15 minutes by default.
+Mercury runs a heartbeat: wake up, check the budget, decide what most needs doing, do it, log it, sleep. Every 15 minutes by default.
 
 ```
                  ┌──────────────────────────────────────┐
@@ -116,48 +116,48 @@ Profiling and outbox draining ride along on **every** cycle regardless, because 
 
 ```bash
 git clone https://github.com/ethanplusai/harvey.git
-cd harvey
+cd mercury
 claude
 ```
 
-Then say: **"set up Harvey for me"**. The repo ships a `CLAUDE.md` that turns Claude Code into the setup wizard — it checks what state you're in, installs what's missing, asks what it needs, and trains Harvey on your product.
+Then say: **"set up Mercury for me"**. The repo ships a `CLAUDE.md` that turns Claude Code into the setup wizard — it checks what state you're in, installs what's missing, asks what it needs, and trains Mercury on your product.
 
 ### Or do it yourself
 
 ```bash
 # 1. Install — note python3.13, not python3. On macOS bare `python3` is the
-#    system 3.9, and a venv built from it can't run Harvey.
+#    system 3.9, and a venv built from it can't run Mercury.
 python3.13 -m venv .venv && source .venv/bin/activate && pip install -e .
 
 # 2. Configure — every variable is documented inline with where to get it
 cp .env.example .env && $EDITOR .env
 
 # 3. Learn your product from your website
-harvey train https://your-company.com
+mercury train https://your-company.com
 
 # 4. Choose what makes a good prospect (see below — this one matters)
-harvey signals --confirm free
+mercury signals --confirm free
 
 # 5. Find businesses. Free source, no account needed.
-harvey discover
+mercury discover
 
 # 6. Watch it work
-harvey dashboard          # http://localhost:5555
-harvey run
+mercury dashboard          # http://localhost:5555
+mercury run
 ```
 
 ---
 
 ## You confirm what it looks for
 
-This is the part that makes Harvey different from a black box, and it is deliberately not skippable.
+This is the part that makes Mercury different from a black box, and it is deliberately not skippable.
 
-Harvey knows how to collect **23 signals** about a business. It does not collect any of them until you say so. On first run it *proposes* the catalog; you confirm, skip, or reject each one in the dashboard or from the terminal:
+Mercury knows how to collect **23 signals** about a business. It does not collect any of them until you say so. On first run it *proposes* the catalog; you confirm, skip, or reject each one in the dashboard or from the terminal:
 
 ```bash
-harvey signals                       # review the catalog
-harvey signals --confirm free        # everything that costs nothing (21 of them)
-harvey signals --confirm SERP_RANK   # a paid one, opted into explicitly
+mercury signals                       # review the catalog
+mercury signals --confirm free        # everything that costs nothing (21 of them)
+mercury signals --confirm SERP_RANK   # a paid one, opted into explicitly
 ```
 
 Every signal shows what it is in plain language, **what it costs**, and how many companies already carry it.
@@ -186,7 +186,7 @@ Has a marketing agency  AND  running Google Ads  AND NOT  already has online boo
 → 23 companies
 ```
 
-That is a campaign with a reason behind it. You know exactly why each of those 23 is on the list, and so does the email Harvey writes them.
+That is a campaign with a reason behind it. You know exactly why each of those 23 is on the list, and so does the email Mercury writes them.
 
 ---
 
@@ -199,14 +199,14 @@ Four stages. Each one runs independently, re-runs safely, and states its cost.
 The only stage that spends money, so it always estimates first and never calls anything until you press go.
 
 ```bash
-harvey discover --providers   # the menu, with real prices
-harvey discover --estimate    # projected spend, then exits
-harvey discover               # go
+mercury discover --providers   # the menu, with real prices
+mercury discover --estimate    # projected spend, then exits
+mercury discover               # go
 ```
 
 | Source | Cost | Free tier | Best for |
 |---|---|---|---|
-| **OpenStreetMap** *(default)* | free | unlimited, no account | Trying the whole pipeline before paying anyone. Coverage is thin for businesses without a storefront: OSM maps premises, so whole trades are barely present (under 2,000 roofers and under 2,300 plumbers in the entire US). Harvey says so in the UI rather than quietly under-delivering. |
+| **OpenStreetMap** *(default)* | free | unlimited, no account | Trying the whole pipeline before paying anyone. Coverage is thin for businesses without a storefront: OSM maps premises, so whole trades are barely present (under 2,000 roofers and under 2,300 plumbers in the entire US). Mercury says so in the UI rather than quietly under-delivering. |
 | **DataForSEO Business Listings** | $0.372 / 1,000 | $1 credit | Local trades, clinics, contractors. Phone, domain, rating, claimed status — and it can filter for businesses with **no website at all**. |
 | **DataForSEO SERP** | $0.0018 / search | $1 credit + free sandbox | Rank as the buying signal. |
 | **Serper** | ~$0.30–1.00 / 1,000 | 2,500 free, no card | The easiest paid one to try. |
@@ -221,7 +221,7 @@ Cities geocode themselves (cached forever, one lookup each). Directories, aggreg
 
 Homepage, `robots.txt`, `sitemap.xml`, plus the team and careers pages when they exist — then regex over HTML already in hand. Out comes the incumbent agency, the ad pixels, the missing schema, the abandoned blog, the open roles, the named humans.
 
-Agency detection is the compounding one. Almost every agency credits itself in the footer, and Harvey scores the wording: *"Powered by"* / *"Website by"* → 0.9 confidence; a bare descriptive link → 0.75; an unlabelled link → 0.35 and **not recorded**. A wrong incumbent in an email is worse than saying nothing.
+Agency detection is the compounding one. Almost every agency credits itself in the footer, and Mercury scores the wording: *"Powered by"* / *"Website by"* → 0.9 confidence; a bare descriptive link → 0.75; an unlabelled link → 0.35 and **not recorded**. A wrong incumbent in an email is worse than saying nothing.
 
 ### 3. ENRICH — who decides
 
@@ -229,19 +229,19 @@ Free public registries first. Name plus title from the team page, confirmed agai
 
 ### 4. VERIFY — can you reach them
 
-Harvey learns each company's **address pattern** and verifies one candidate, rather than brute-forcing name variations. Raw SMTP probing is not viable from a laptop — outbound port 25 is usually blocked, and Google Workspace and Microsoft 365 accept everything from an unknown IP.
+Mercury learns each company's **address pattern** and verifies one candidate, rather than brute-forcing name variations. Raw SMTP probing is not viable from a laptop — outbound port 25 is usually blocked, and Google Workspace and Microsoft 365 accept everything from an unknown IP.
 
 Every address is tagged honestly: `verified` / `risky` (catch-all) / `guess` / `invalid`. **Only deliverable ones are ever sent to.** A guess is never treated as a win.
 
-> Harvey is worth running even if you never let it send. `harvey export` writes a sequencer-ready CSV of everything it found.
+> Mercury is worth running even if you never let it send. `mercury export` writes a sequencer-ready CSV of everything it found.
 
 ---
 
 ## The skills library
 
-Harvey's sales knowledge lives in `skills/` as **plain Markdown you can edit**. There is no fine-tuning, no vector store, no retrieval step. Before an agent runs, the skills it needs are concatenated straight into its prompt. Change a file, and the next heartbeat behaves differently — no restart, no code change.
+Mercury's sales knowledge lives in `skills/` as **plain Markdown you can edit**. There is no fine-tuning, no vector store, no retrieval step. Before an agent runs, the skills it needs are concatenated straight into its prompt. Change a file, and the next heartbeat behaves differently — no restart, no code change.
 
-This is the main way you shape Harvey. If its emails are too pushy, edit `email_frameworks.md`. If it mishandles a specific objection, edit `objection_handling.md` and add the response you'd actually give.
+This is the main way you shape Mercury. If its emails are too pushy, edit `email_frameworks.md`. If it mishandles a specific objection, edit `objection_handling.md` and add the response you'd actually give.
 
 ### What ships
 
@@ -253,7 +253,7 @@ This is the main way you shape Harvey. If its emails are too pushy, edit `email_
 
 **`lead_qualification.md`** — **BANT** for the first screen, ICP scoring 1–10 for prioritization, **MEDDIC** for anything complex. Includes explicit disqualification criteria, which matter more than the qualification ones.
 
-**`sales_methodology.md`** — The operating philosophy: the ABC loop, how a conversation should flow across stages, tone calibration, and the ethical lines Harvey does not cross.
+**`sales_methodology.md`** — The operating philosophy: the ABC loop, how a conversation should flow across stages, tone calibration, and the ethical lines Mercury does not cross.
 
 **`offer_strategy.md`** — The offer ladder by engagement level, and the rule that governs it: *never lead with an offer, never pitch in a cold email.* First contact exists to start a conversation. Offers come out only after genuine interest.
 
@@ -263,7 +263,7 @@ This is the main way you shape Harvey. If its emails are too pushy, edit `email_
 
 **`linkedin_outreach.md`** — Connection sequences and rate limits, opening with the risk section it should open with: automating LinkedIn violates their ToS, never use a fake identity, and if someone asks whether this is automated, say yes immediately.
 
-**Generated for your product by `harvey train <url>`:**
+**Generated for your product by `mercury train <url>`:**
 
 - **`product_knowledge.md`** — what you sell, the benefits, pricing, use cases, the pain you solve, buying triggers
 - **`competitive_intel.md`** — battle cards per competitor, differentiation angles, migration paths
@@ -272,7 +272,7 @@ This is the main way you shape Harvey. If its emails are too pushy, edit `email_
 
 ### Which agent gets which
 
-Defined in `harvey/brain.py` — edit the map to change it.
+Defined in `mercury/brain.py` — edit the map to change it.
 
 | Skill | Scout | Writer | Handler | Sender | LinkedIn |
 |---|:-:|:-:|:-:|:-:|:-:|
@@ -288,13 +288,13 @@ Defined in `harvey/brain.py` — edit the map to change it.
 | `product_knowledge` | ● | ● | ● | ● | ● |
 | `competitive_intel` | | ● | ● | | |
 
-Adding a skill: write the file, add its name to `skill_map` in `harvey/brain.py`. That's the whole process.
+Adding a skill: write the file, add its name to `skill_map` in `mercury/brain.py`. That's the whole process.
 
 ---
 
 ## The sub-agents
 
-Harvey feels like one agent. Underneath it's five, each loaded with different skills.
+Mercury feels like one agent. Underneath it's five, each loaded with different skills.
 
 | Agent | What it does |
 |---|---|
@@ -310,14 +310,14 @@ Conversation stages: `initial_outreach → engaged → qualifying → presenting
 
 ## Nothing sends without you
 
-By default **every outgoing email waits for your approval.** Harvey is a copilot until you decide otherwise.
+By default **every outgoing email waits for your approval.** Mercury is a copilot until you decide otherwise.
 
 The dashboard's Outbox is a decisions desk: one email fills the pane, the rest wait in a rail, and you work the queue with `A` approve, `R` reject, `J`/`K` to move. That shape is deliberate — a wall of stacked drafts invites a single approve-all reflex, which is exactly the review the approval ladder exists to force.
 
 ```bash
-harvey outbox                 # review from the terminal
-harvey outbox --approve-all
-harvey sending pause          # kill switch, stops everything mid-flight
+mercury outbox                 # review from the terminal
+mercury outbox --approve-all
+mercury sending pause          # kill switch, stops everything mid-flight
 ```
 
 Before anything leaves, a **deterministic pre-send gate** — no model involved — rejects: unrendered merge tags, banned phrases, emails over the length cap, too many links, HTML bodies, non-deliverable addresses, and any mismatch between the recipient and the database record.
@@ -329,17 +329,17 @@ When you trust it, set `channels.email.require_approval: false` for full autopil
 ## The dashboard
 
 ```bash
-harvey dashboard     # http://localhost:5555
+mercury dashboard     # http://localhost:5555
 ```
 
-Plain HTML, CSS and JavaScript served from `harvey/web/`. No build step, no framework, no bundler — edit `app.css` and reload. Fonts are vendored, so it renders correctly with the network off.
+Plain HTML, CSS and JavaScript served from `mercury/web/`. No build step, no framework, no bundler — edit `app.css` and reload. Fonts are vendored, so it renders correctly with the network off.
 
 - **Today** — an asymmetric two-column screen: anything waiting on a decision down the left with the activity feed beneath it, and a rail carrying pipeline figures, collector runs and setup. It opens here rather than on a setup checklist, because the question you actually have is "is anything waiting on me?" Setup lives in the rail and disappears entirely once it's done.
 - **Signals** — the confirmation gate and the cohort builder
 - **Discover** — the provider menu with prices side by side, an estimate, then a run
 - **Companies / Contacts** — everything found, with CSV export
 - **Outbox** — the decisions desk
-- **Conversations** — every reply and how Harvey handled it
+- **Conversations** — every reply and how Mercury handled it
 - **Usage** — real Claude quota gauges and per-agent token counts. No dollar figures: you're on a subscription, you aren't billed per token, and pretending otherwise would be theater.
 
 Three rules hold the interface together:
@@ -356,7 +356,7 @@ Appearance has three states, not two. `auto` follows your OS and is the default,
 
 ## How the data is stored
 
-SQLite at `data/harvey.db`. One idea drives the schema:
+SQLite at `data/mercury.db`. One idea drives the schema:
 
 > **Every fact is a row, never a column.**
 
@@ -386,7 +386,7 @@ Two files, both plain text.
 
 **`.env`** — credentials. Every variable documented inline with where to get it. The only required one is a mail provider; everything else is optional.
 
-**`harvey.yaml`** — who Harvey is and who it sells to:
+**`mercury.yaml`** — who Mercury is and who it sells to:
 
 ```yaml
 persona:      { name, company, role, email, tone }
@@ -398,36 +398,36 @@ channels:
 usage:        { max_daily_claude_percent, heartbeat_interval_minutes, quiet_hours }
 ```
 
-If `harvey.local.yaml` exists it wins. It's gitignored, so a fork can carry real product configuration while the tracked `harvey.yaml` stays a template — nobody publishes their positioning and pricing by accident.
+If `mercury.local.yaml` exists it wins. It's gitignored, so a fork can carry real product configuration while the tracked `mercury.yaml` stays a template — nobody publishes their positioning and pricing by accident.
 
 ### Commands
 
 ```bash
-harvey run                   # the heartbeat loop
-harvey dashboard             # web UI at localhost:5555
-harvey signals               # review/confirm what to prospect against
-harvey discover              # find businesses; --providers / --estimate
-harvey profile               # read discovered companies' sites (free)
-harvey train <url>           # learn a product from its website
-harvey status                # pipeline summary
-harvey usage                 # Claude quota + per-agent tokens
-harvey outbox                # review queued email
-harvey export                # deliverable prospects → CSV
-harvey sending pause|resume  # kill switch
-harvey gmail auth            # one-time Gmail OAuth
+mercury run                   # the heartbeat loop
+mercury dashboard             # web UI at localhost:5555
+mercury signals               # review/confirm what to prospect against
+mercury discover              # find businesses; --providers / --estimate
+mercury profile               # read discovered companies' sites (free)
+mercury train <url>           # learn a product from its website
+mercury status                # pipeline summary
+mercury usage                 # Claude quota + per-agent tokens
+mercury outbox                # review queued email
+mercury export                # deliverable prospects → CSV
+mercury sending pause|resume  # kill switch
+mercury gmail auth            # one-time Gmail OAuth
 ```
 
 ---
 
 ## Legal and deliverability
 
-Harvey automates outreach, but **you are the sender.** Cold email is legal in most places when done right and expensive when done wrong — CAN-SPAM penalties run to $53,088 per email. Harvey ships with compliant defaults. Keep them.
+Mercury automates outreach, but **you are the sender.** Cold email is legal in most places when done right and expensive when done wrong — CAN-SPAM penalties run to $53,088 per email. Mercury ships with compliant defaults. Keep them.
 
-**CAN-SPAM (US).** Truthful subject line and accurate from-address — Harvey's copywriting rules forbid fake "re:" threads and impersonation. A working opt-out, honored fast: Harvey treats any opt-out wording as immediate and permanent. Your physical mailing address in the footer — configure this before your first campaign.
+**CAN-SPAM (US).** Truthful subject line and accurate from-address — Mercury's copywriting rules forbid fake "re:" threads and impersonation. A working opt-out, honored fast: Mercury treats any opt-out wording as immediate and permanent. Your physical mailing address in the footer — configure this before your first campaign.
 
-**GDPR / PECR (EU & UK).** B2B cold email needs a defensible legitimate interest: the pitch must be genuinely relevant to that person's role, you must know where the data came from, and objecting must be effortless. If you can't say why a specific person would care, Harvey shouldn't email them — and its qualification rules say so.
+**GDPR / PECR (EU & UK).** B2B cold email needs a defensible legitimate interest: the pitch must be genuinely relevant to that person's role, you must know where the data came from, and objecting must be effortless. If you can't say why a specific person would care, Mercury shouldn't email them — and its qualification rules say so.
 
-**Bot disclosure.** Some jurisdictions require disclosing automation. Harvey is instructed to answer truthfully, always, if a prospect asks whether they're talking to an AI. Never configure it otherwise.
+**Bot disclosure.** Some jurisdictions require disclosing automation. Mercury is instructed to answer truthfully, always, if a prospect asks whether they're talking to an AI. Never configure it otherwise.
 
 **LinkedIn.** Browser automation violates LinkedIn's ToS and can get the account restricted. Off by default. If you turn it on, use an account you can afford to lose.
 
@@ -437,7 +437,7 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 2. Set up **SPF, DKIM and DMARC** on it. Without all three, Gmail junks you.
 3. **Warm up for 2–4 weeks** before real volume.
 4. **Ramp slowly** — 10–20/day per inbox, adding ~5/day. The `max_daily_sends: 50` default is a ceiling, not a target.
-5. **Watch bounces.** Above ~3%, stop and fix list quality. Harvey trips its own kill switch past your configured threshold.
+5. **Watch bounces.** Above ~3%, stop and fix list quality. Mercury trips its own kill switch past your configured threshold.
 
 *None of this is legal advice. Sending at scale or into regulated industries? Talk to a lawyer.*
 
@@ -445,9 +445,9 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 
 ## Troubleshooting
 
-**`command not found: harvey`** — `source .venv/bin/activate` first.
+**`command not found: mercury`** — `source .venv/bin/activate` first.
 
-**`ModuleNotFoundError: No module named 'harvey'` after install (macOS)** — Python 3.13 silently ignores `.pth` files carrying the macOS hidden flag, and some Macs propagate that flag into `.venv`. Run `harvey install` again (it auto-fixes), or: `ln -s "$(pwd)/harvey" .venv/lib/python3.13/site-packages/harvey`
+**`ModuleNotFoundError: No module named 'mercury'` after install (macOS)** — Python 3.13 silently ignores `.pth` files carrying the macOS hidden flag, and some Macs propagate that flag into `.venv`. Run `mercury install` again (it auto-fixes), or: `ln -s "$(pwd)/mercury" .venv/lib/python3.13/site-packages/mercury`
 
 **`externally-managed-environment`** — Use a venv, not system Python.
 
@@ -455,28 +455,28 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 
 **Claude headless mode fails** — `claude login`, and confirm the subscription is active. Test with `claude -p "say hi"`. In Docker, mount `~/.claude` into the container.
 
-**Discovery finds nothing** — Confirm signals first (`harvey signals --confirm free`); nothing is collected until you do. If you're on the free OpenStreetMap source, it only covers mapped trades and is thin for service-area businesses — `harvey discover --providers` shows the alternatives.
+**Discovery finds nothing** — Confirm signals first (`mercury signals --confirm free`); nothing is collected until you do. If you're on the free OpenStreetMap source, it only covers mapped trades and is thin for service-area businesses — `mercury discover --providers` shows the alternatives.
 
-**Overpass is throttling** — It's free volunteer infrastructure. Harvey walks three mirrors before giving up. Wait a few minutes, or use a paid provider for bulk work.
+**Overpass is throttling** — It's free volunteer infrastructure. Mercury walks three mirrors before giving up. Wait a few minutes, or use a paid provider for bulk work.
 
 **Emails land in spam** — Almost always the domain, not the copy. Check SPF/DKIM/DMARC, confirm warmup ran, halve your volume.
 
-**Harvey does nothing during the day** — Check `quiet_hours` and whether it hit `max_daily_claude_percent`. `harvey status` shows current state; the `actions` table logs every decision.
+**Mercury does nothing during the day** — Check `quiet_hours` and whether it hit `max_daily_claude_percent`. `mercury status` shows current state; the `actions` table logs every decision.
 
-**How do I stop it right now?** — `Ctrl+C`, or `harvey sending pause` to stop outbound while leaving the loop running. State is in SQLite, so it resumes cleanly.
+**How do I stop it right now?** — `Ctrl+C`, or `mercury sending pause` to stop outbound while leaving the loop running. State is in SQLite, so it resumes cleanly.
 
-**Where does my data live?** — All local: `data/harvey.db`, `.env`, `harvey.yaml`. Nothing goes anywhere except the APIs you configured.
+**Where does my data live?** — All local: `data/mercury.db`, `.env`, `mercury.yaml`. Nothing goes anywhere except the APIs you configured.
 
 ---
 
 ## Project structure
 
 ```
-harvey/
+mercury/
 ├── main.py              # heartbeat loop
 ├── brain.py             # Claude CLI wrapper + skills loading + usage recording
 ├── state.py             # SQLite schema, migrations, observations, cohorts
-├── signals.py           # the 23-signal catalog Harvey proposes
+├── signals.py           # the 23-signal catalog Mercury proposes
 ├── pipeline.py          # DISCOVER → PROFILE chaining
 ├── gate.py              # deterministic pre-send checks
 ├── dashboard.py         # FastAPI JSON API
@@ -496,9 +496,9 @@ tests/                   # 242 tests
 
 ## Philosophy
 
-**Autonomous doesn't mean unsupervised.** Quiet hours, spend caps, send limits, an approval queue, a deterministic pre-send gate, and a kill switch. Harvey asks before it spends and before it sends, until you tell it not to.
+**Autonomous doesn't mean unsupervised.** Quiet hours, spend caps, send limits, an approval queue, a deterministic pre-send gate, and a kill switch. Mercury asks before it spends and before it sends, until you tell it not to.
 
-**You decide what a good prospect is.** Harvey proposes signals; you confirm them. A prospect list you can't explain is a prospect list you shouldn't send to.
+**You decide what a good prospect is.** Mercury proposes signals; you confirm them. A prospect list you can't explain is a prospect list you shouldn't send to.
 
 **If it can be gotten deterministically, don't use a model.** Rank position, tech detection, junk filtering, the priority decision, the pre-send gate — all plain code. Claude is reserved for the parts that genuinely need judgment. That's why this runs on a subscription at all.
 
@@ -506,7 +506,7 @@ tests/                   # 242 tests
 
 **The database is the asset, not the agent.** The initial list is worth little. The same signals observed over quarters — who changed agencies, who started spending on ads, who let their content go stale — is worth a great deal.
 
-**Everything is editable.** Prompts, skills, config, the dashboard. All plain text. You don't need to be a developer to change how Harvey sells.
+**Everything is editable.** Prompts, skills, config, the dashboard. All plain text. You don't need to be a developer to change how Mercury sells.
 
 ---
 

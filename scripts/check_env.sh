@@ -12,11 +12,17 @@ echo
 echo "REQUIRED"
 echo
 echo " Cloud state:"
-have HARVEY_STATE_REPO
+if [ -n "${MERCURY_STATE_REPO:-}" ]; then
+    echo "  [x] MERCURY_STATE_REPO"
+elif [ -n "${HARVEY_STATE_REPO:-}" ]; then
+    echo "  [x] HARVEY_STATE_REPO   (old name; rename it to MERCURY_STATE_REPO)"
+else
+    echo "  [ ] MERCURY_STATE_REPO   <-- MISSING"
+fi
 echo
 # Read the provider actually configured rather than assuming one -- a
 # checklist that reports on the wrong provider is worse than no checklist.
-PROVIDER="$(grep -A6 '^ *email:' harvey.local.yaml harvey.yaml 2>/dev/null \
+PROVIDER="$(grep -A6 '^ *email:' mercury.local.yaml mercury.yaml 2>/dev/null \
     | grep -m1 'provider:' | sed 's/.*provider: *//; s/["'"'"']//g; s/ *#.*//' | tr -d '\r')"
 PROVIDER="${PROVIDER:-unknown}"
 echo " Mail provider (configured: $PROVIDER):"
@@ -24,7 +30,7 @@ case "$PROVIDER" in
     gmail)
         have GMAIL_CLIENT_ID
         have GMAIL_CLIENT_SECRET
-        echo "      also run 'harvey gmail auth' once, locally"
+        echo "      also run 'mercury gmail auth' once, locally"
         ;;
     smtp)
         have SMTP_HOST
@@ -39,10 +45,10 @@ case "$PROVIDER" in
         echo "  [ ] channels.email.provider is not gmail, smtp or instantly"
         ;;
 esac
-echo "      verify with: harvey mail test"
+echo "      verify with: mercury mail test"
 echo
 echo " Email verification -- without ANY of these every address stays"
-echo " 'guess' and Harvey never sends a single email:"
+echo " 'guess' and Mercury never sends a single email:"
 if any REOON_API_KEY ZEROBOUNCE_API_KEY HUNTER_API_KEY; then
     echo "  [x] at least one verifier present"
 else
