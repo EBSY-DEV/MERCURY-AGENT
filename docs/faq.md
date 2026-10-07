@@ -71,7 +71,7 @@ Check in this order:
 4. `mercury mail test`: are the provider credentials and ports working?
 5. Quiet hours: nothing sends between `quiet_hours.start` and `end`.
 6. Caps: the Outbox tab shows each mailbox's cap today and what is left. A warming mailbox may be at 5 a day, or 0 if its `warmup_start` is in the future.
-7. Warm-up tab: is a mailbox paused by the health gate?
+7. Mailboxes tab: is a mailbox paused by the health gate?
 
 ## How do I pause all sending?
 
@@ -83,7 +83,7 @@ Or press **Pause all sending** on the Outbox tab. Nothing leaves the outbox unti
 
 ## How do I resume a paused mailbox?
 
-A mailbox paused by the health gate (more than 5% bounces over at least 20 sends in 7 days) or by hand stays paused until you press **Resume** on its card in the Warm-up tab. Resuming restarts its 7-day health window. Clean up the cause first, usually unverified or catch-all addresses. There is no CLI command for this.
+A mailbox paused by the health gate (more than 5% bounces over at least 20 sends in 7 days) or by hand stays paused until you press **Resume** in its drawer on the Mailboxes tab. Resuming restarts its 7-day health window. Clean up the cause first, usually unverified or catch-all addresses. There is no CLI command for this.
 
 ## How do I stop emailing someone?
 

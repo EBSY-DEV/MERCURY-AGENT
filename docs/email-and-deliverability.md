@@ -164,9 +164,9 @@ With the defaults (`warmup_initial_cap: 5`, `warmup_weekly_increase: 5`) and `da
 | 28-34 | 25 |
 | 35 and later | 30 |
 
-The mailbox reaches full volume on day 35. The Warm-up tab plots each mailbox's planned cap per day against what it actually sent.
+The mailbox reaches full volume on day 35. The Mailboxes tab plots each mailbox's planned cap per day against what it actually sent.
 
-The ramp is stored in `channels.email.mailboxes`; edit caps and start dates through **Settings → Sending inboxes** or your private configuration file. Restart a running Mercury agent after saving. The Warm-up tab handles pause/resume, monitoring, the checklist, and notes.
+The ramp is stored in `channels.email.mailboxes`; edit caps and start dates from an inbox's settings on the **Mailboxes** tab, **Settings → Sending inboxes**, or your private configuration file. Restart a running Mercury agent after saving. The Mailboxes tab also handles pause/resume, monitoring, the checklist, and notes.
 
 Mercury does not run a "warm-up network" that trades fake emails with other inboxes. It does the parts that move reputation for a new mailbox: authenticate the domain, start small, ramp slowly, and stop when bounces climb.
 
@@ -177,11 +177,11 @@ Before each drain, Mercury computes per-mailbox health over the last 7 days (or 
 | Condition | Result |
 |---|---|
 | Fewer than 20 sends | OK ("not enough sends yet") |
-| Bounce rate above 5% | **Pause.** The mailbox's cold cap becomes 0 and it stays paused until you resume it on the Warm-up tab. |
+| Bounce rate above 5% | **Pause.** The mailbox's cold cap becomes 0 and it stays paused until you resume it on the Mailboxes tab. |
 | Bounce rate above 3%, up to 5% | **Hold.** Today's cap is yesterday's ramp cap, so a warming mailbox stops climbing. |
 | Otherwise | OK |
 
-A gate can only lower a cap. Openers and follow-ups from a paused mailbox are held, not cancelled; replies still go out. Resuming restarts the 7-day window, so the old spike cannot immediately re-pause a fixed mailbox. You can also pause a mailbox by hand from the Warm-up tab.
+A gate can only lower a cap. Openers and follow-ups from a paused mailbox are held, not cancelled; replies still go out. Resuming restarts the 7-day window, so the old spike cannot immediately re-pause a fixed mailbox. You can also pause a mailbox by hand from the Mailboxes tab.
 
 With `gmail`, or a single SMTP mailbox, the same gates apply to that one mailbox. Hold has no visible effect there because there is no ramp to freeze.
 
@@ -243,7 +243,7 @@ Opting out is by reply. Opted-out prospects are never emailed again. For regiona
 
 ## DNS: SPF, DKIM, DMARC, MX
 
-Authentication decides whether mail lands in the inbox. The Warm-up tab checks each sending domain (2-second timeout per lookup, cached for 10 minutes):
+Authentication decides whether mail lands in the inbox. The Mailboxes tab checks each sending domain (2-second timeout per lookup, cached for 10 minutes):
 
 | Check | Pass when | Typical fix |
 |---|---|---|

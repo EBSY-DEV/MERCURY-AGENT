@@ -1,6 +1,6 @@
 # Dashboard
 
-`mercury dashboard` serves a local web UI on port 5555. It opens on Today, which shows anything waiting on a decision first and then how the pipeline is doing. The other tabs let you confirm signals, run discovery, review and approve email, move deals, watch mailbox warm-up, and read what Mercury did. This page walks through each tab and explains how to reach the dashboard from another machine safely.
+`mercury dashboard` serves a local web UI on port 5555. It opens on Today, which shows anything waiting on a decision first and then how the pipeline is doing. The other tabs let you confirm signals, run discovery, review and approve email, move deals, manage sending mailboxes and their warm-up, and read what Mercury did. This page walks through each tab and explains how to reach the dashboard from another machine safely.
 
 ```bash
 mercury dashboard                          # http://127.0.0.1:5555
@@ -143,20 +143,22 @@ Shortcuts are ignored while you are typing in a field. You can also:
 
 Below the desk: sending capacity per mailbox (today's cap after warm-up and health gates, sent in the last 24 hours, remaining), then approved and scheduled emails, recent sends, and failed, rejected or cancelled emails with the reason. See [The approval outbox](email-and-deliverability.md#the-approval-outbox).
 
-## Warm-up
+## Mailboxes
 
-![Warm-up](images/warmup.png)
+![Mailboxes](images/mailboxes.png)
 
-One card per sending mailbox (gmail or smtp; Instantly runs its own warm-up):
+Every sending inbox (gmail or smtp; Instantly runs its own warm-up) in one table, built to stay readable with dozens of inboxes:
 
-- **Stage**: scheduled, warming, warm, fixed (a ramp that never reaches its cap) or paused.
-- **Today's cap** after the ramp and health gates, **sent** in the last 24 hours, and **bounce rate** and **reply rate** over the last 7 days with the gate verdict.
-- **Plan**: the planned cap per day from `warmup_start` to full volume, against what was actually sent.
-- **Week-by-week checklist**: domain setup, light sending, building volume, steady ramp, reaching target, after warm-up. The DNS item ticks itself; you tick the rest.
-- **DNS check**: MX, SPF, DKIM and DMARC for the sending domain, each with a plain-language fix.
-- **Notes**, and **Pause** / **Resume** for that mailbox.
+- **Summary**: sends in the last 24 hours against today's capacity, how many inboxes are in each stage, and what needs you.
+- **Search and filters**: All, Needs you, Warming, Starting soon, Warm.
+- **Grouped by sending domain**, because DNS is a domain setting. Each domain row shows its MX, SPF, DKIM and DMARC result once, today's sends across its inboxes, and any issue. Domains that need you come first; with more than a dozen inboxes the healthy ones stay folded.
+- **One row per inbox**: stage (scheduled, warming, warm, on hold, paused, replies only), ramp progress, today's sends against its cap, bounce and reply rate over 7 days, and what it needs next.
 
-Use **Settings → Sending inboxes** to add inboxes, set or replace passwords, and edit daily caps and start dates. These settings are persisted to your private mailbox configuration; restart a running Mercury agent after changing them. The Warm-up tab keeps monitoring, pause/resume, and the checklist. See [Mailbox rotation](email-and-deliverability.md#mailbox-rotation), [Warm-up ramp](email-and-deliverability.md#warm-up-ramp), and [Health gates](email-and-deliverability.md#health-gates).
+Click an inbox to open its drawer: what it can still send today, the ramp chart (planned cap per day from `warmup_start` to full volume against what was sent), health over 7 days, open checklist items (earlier weeks first), the full week-by-week plan, notes, and **Pause** / **Resume**. The arrows step through the other inboxes on the same domain. The gear opens **Inbox settings**: status (sending, replies only, paused), sender name, password and connection test, server settings, the daily limit and the warm-up start date. **Add inbox** in the toolbar uses the same form. Inbox settings are saved to your private mailbox configuration; restart a running Mercury agent after changing them.
+
+Click a domain to see its DNS records, each with a plain-language fix, and every inbox on it. One fix covers all of them.
+
+See [Mailbox rotation](email-and-deliverability.md#mailbox-rotation), [Warm-up ramp](email-and-deliverability.md#warm-up-ramp), and [Health gates](email-and-deliverability.md#health-gates).
 
 ## Conversations
 
