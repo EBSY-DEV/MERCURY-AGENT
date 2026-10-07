@@ -10,11 +10,20 @@ router = APIRouter()
 HTTP_STATUS = {"not_found": 404, "provider_failed": 502}
 
 
+class DraftInput(BaseModel):
+    """Unsaved writing edits to preview before they become a version."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    tone: str = Field(min_length=1, max_length=1000)
+    instructions: str = Field(default="", max_length=8000)
+    examples: str = Field(default="", max_length=8000)
+
+
 class PromptInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     prospect_id: str = Field(min_length=1, max_length=100)
     version_id: str = Field(default="", max_length=100)
     instruction: str = Field(default="", max_length=500)
+    draft: DraftInput | None = None
 
 
 class ArchiveInput(BaseModel):
@@ -45,11 +54,13 @@ async def overview():
     template = PROMPTS_DIR / "writer.md"
     return {
         **await service.list(),
+        "totals": await service.totals(),
         "current": generation_config(config),
         "config_file": _find_config_file(),
         "markets": [market.model_dump() for market in config.icp.markets],
         "email": {"provider": config.channels.email.provider,
                   "require_approval": config.channels.email.require_approval,
+                  "auto_approve_followups": config.channels.email.auto_approve_followups,
                   "max_daily_sends": config.channels.email.max_daily_sends},
         "template": template.read_text() if template.exists() else "",
         "knowledge": brain.load_skills_for_agent("writer"),
@@ -95,14 +106,18 @@ async def persona_versions(persona_id: str):
 @router.post("/api/personas/prompt")
 async def inspect_prompt(body: PromptInput):
     *_, service = await context()
-    return await call(service.prompt("", body.prospect_id, instruction=body.instruction, version_id=body.version_id))
+    return await call(service.prompt(
+        "", body.prospect_id, instruction=body.instruction, version_id=body.version_id,
+        draft=body.draft.model_dump() if body.draft else None))
 
 
 @router.post("/api/personas/preview")
 async def preview_email(body: PromptInput):
     *_, service = await context()
     # This makes one model call, but never creates an outbox item or campaign.
-    result = await call(service.preview("", body.prospect_id, instruction=body.instruction, version_id=body.version_id))
+    result = await call(service.preview(
+        "", body.prospect_id, instruction=body.instruction, version_id=body.version_id,
+        draft=body.draft.model_dump() if body.draft else None))
     return {"success": True, **result}
 
 
