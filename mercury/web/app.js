@@ -915,7 +915,7 @@ function openInboxEditor(index) {
     input('name', 'Sender name', 'text', b ? b.name : '', 'autocomplete="off" placeholder="Uses your default sender name"') + '</div>' +
     input('password', b && b.password_set ? 'Change password' : 'Password / app password', 'password', '',
       'autocomplete="new-password" placeholder="' + (b && b.password_set ? 'Leave blank to keep the saved password' : 'Can be added later') + '"') +
-    '<div class="form-row">' + input('cap', 'Daily sending limit', 'number', b ? b.daily_cap : 30, 'required min="0" step="1"') +
+    '<div class="form-row">' + input('cap', 'Daily sending limit', 'number', b ? b.daily_cap : 15, 'required min="0" step="1"') +
     input('start', 'Warm-up start date', 'date', b ? b.warmup_start || '' : _inboxSettings.today) + '</div>' +
     '<p class="muted inbox-field-hint">Clear the date only if this inbox is already warmed up.</p>' +
     '<details class="inbox-servers"' + (!defaults.smtp_host || b && !b.configured ? ' open' : '') + '><summary>Server settings</summary>' +
@@ -3982,7 +3982,7 @@ async function mbOpenSettings(email) {
           'Only needed when the mailbox reads replies with a different password.') +
       '</details></div>' +
     '<div class="drawer-section"><h4>Sending</h4><div class="form-row">' +
-      input('cap', 'Daily limit at full volume', 'number', v('daily_cap', 30), 'required min="0" step="1"',
+      input('cap', 'Daily limit at full volume', 'number', v('daily_cap', 15), 'required min="0" step="1"',
         'All inboxes share the overall limit of ' + fmtN(s.max_daily_sends) + ' a day.') +
       input('start', 'Warm-up start date', 'date', b ? (b.warmup_start || '') : s.today, '',
         'Clear the date only if this inbox is already warmed up.') + '</div></div>' +
