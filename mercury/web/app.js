@@ -3513,6 +3513,7 @@ function renderMailboxes() {
   }
   if (!document.getElementById('mb-table')) {
     body.innerHTML = '<div class="kpis kpis-3" id="mb-summary"></div>' +
+      '<div class="mb-limits" id="mb-limits"></div>' +
       '<div class="toolbar mb-toolbar">' +
         '<label class="search-field">' + icon('magnifying-glass') +
           '<input type="search" id="mb-search" placeholder="Search ' + list.length + ' inboxes" autocomplete="off" ' +
@@ -3525,12 +3526,27 @@ function renderMailboxes() {
   const search = document.getElementById('mb-search');
   if (search) search.placeholder = 'Search ' + list.length + ' inbox' + (list.length === 1 ? '' : 'es');
   document.getElementById('mb-summary').innerHTML = mbSummary();
+  document.getElementById('mb-limits').innerHTML = mbLimitNotes();
   document.getElementById('mb-filters').innerHTML = MB_FILTERS.map(([k, label]) => {
     const n = list.filter(b => mbInFilter(b, k)).length;
     return '<button role="tab" aria-selected="' + (_mb.filter === k) + '" class="' + (_mb.filter === k ? 'on' : '') +
       '" onclick="mbSetFilter(\'' + k + '\')">' + label + '<span class="mb-count' + (k === 'needs' && n ? ' bad' : '') + '">' + n + '</span></button>';
   }).join('');
   renderMbTable();
+}
+
+// Inbox lifecycle limits the config breaks (too many inboxes on a domain, a
+// cap over the provider ceiling, an inbox younger than two weeks). Advisory:
+// nothing is lowered, so the operator decides.
+function mbLimitNotes() {
+  const w = (_mb.data && _mb.data.limit_warnings) || [];
+  if (!w.length) return '';
+  return '<section class="panel"><div class="panel-head"><div><h3>Inbox limits</h3><p>' + w.length +
+    (w.length === 1 ? ' limit is' : ' limits are') + ' broken. Mercury still sends at the configured caps.</p></div></div>' +
+    '<div class="panel-body mb-limit-list">' + w.map(x =>
+      '<div>' + toneBadge('waiting', x.code === 'domain_inboxes' ? 'Too many inboxes'
+        : x.code === 'cap_over_ceiling' ? 'Cap too high' : 'Young inbox') +
+      '<span>' + escHtml(x.message) + '</span></div>').join('') + '</div></section>';
 }
 
 function mbSearch(v) { _mb.q = v || ''; renderMbTable(); }
@@ -3569,6 +3585,8 @@ function mbSummary() {
   list.filter(b => b.status === 'paused').forEach(b => issues.push(['bad', b.email + ' is paused']));
   const held = list.filter(b => mbStage(b).key === 'hold').length;
   if (held) issues.push(['waiting', held + ' ramp' + (held === 1 ? '' : 's') + ' on hold from bounces']);
+  const limits = ((d.limit_warnings) || []).length;
+  if (limits) issues.push(['waiting', limits + ' inbox limit' + (limits === 1 ? '' : 's') + ' broken']);
   const noPw = list.filter(b => b.configured === false).length;
   if (noPw) issues.push(['bad', noPw + ' inbox' + (noPw === 1 ? '' : 'es') + ' missing a password']);
   const needs = kpi('Needs you',
@@ -3742,6 +3760,7 @@ function mbInboxBody(b) {
       '<div class="mb-legend"><span><i class="mb-s-sent"></i>' + fmtN(sent) + ' sent</span>' +
         '<span><i class="mb-s-left"></i>' + fmtN(Math.max(0, cap - sent)) + ' left today</span>' +
         (locked ? '<span><i class="mb-s-lock"></i>' + fmtN(locked) + ' unlock as it warms</span>' : '') + '</div>' : '') +
+    (b.cap_reason ? '<p class="drawer-note">Limit: ' + escHtml(b.cap_reason) + '</p>' : '') +
     '</div>';
 
   if ((b.plan || []).length) {
