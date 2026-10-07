@@ -132,9 +132,22 @@ class PersonaService:
         return await self.find(persona["id"])
 
     async def versions(self, ref: str) -> list[dict]:
-        return await self.store.versions((await self.find(ref))["id"])
+        """Every version, newest first, with what it wrote and how it did."""
+        persona_id = (await self.find(ref))["id"]
+        stats = await self.store.stats(persona_id)
+        empty = {"drafted": 0, "sent": 0, "replies": 0}
+        return [v | {key: stats.get(v["id"], empty)[key] for key in empty} for v in await self.store.versions(persona_id)]
 
-    async def _generation_inputs(self, ref, prospect_id, revision=None, version_id=""):
+    async def totals(self) -> dict:
+        """Drafted, sent and replies per persona across all its versions."""
+        result = {}
+        for row in (await self.store.stats()).values():
+            total = result.setdefault(row["persona_id"], {"drafted": 0, "sent": 0, "replies": 0})
+            for key in total:
+                total[key] += row[key]
+        return result
+
+    async def _generation_inputs(self, ref, prospect_id, revision=None, version_id="", draft=None):
         """Contact by id or email; persona by reference and revision, or the default."""
         from mercury.agents.writer import Writer
         from mercury.brain import Brain
@@ -153,17 +166,28 @@ class PersonaService:
         profile = await self.store.resolve(self.config, version_id)
         if profile["archived"]:
             raise PersonaError("invalid", "Restore this persona before generating a preview")
+        if draft:
+            # Unsaved edits ride on the version they started from; the snapshot
+            # says so, and nothing is saved as a new version.
+            edits = validated({key: profile[key] or "" for key in EDITABLE} | {
+                key: draft[key] for key in ("tone", "instructions", "examples") if key in draft})
+            profile = profile | {key: edits[key] for key in ("tone", "instructions", "examples")} | {"unsaved": True}
         return Writer(Brain(self.state), self.state, self.config), prospect, profile
 
-    async def prompt(self, ref, prospect_id, revision=None, instruction="", version_id="") -> dict:
-        """The exact writer prompt, assembled without a model call."""
-        writer, prospect, profile = await self._generation_inputs(ref, prospect_id, revision, version_id)
-        prompt, _profile = await writer.build_personal_prompt(prospect, instruction, profile)
-        return {"prompt": prompt + JSON_INSTRUCTION, "persona": profile}
+    async def prompt(self, ref, prospect_id, revision=None, instruction="", version_id="", draft=None) -> dict:
+        """The exact writer prompt, assembled without a model call, plus its labelled sections."""
+        writer, prospect, profile = await self._generation_inputs(ref, prospect_id, revision, version_id, draft)
+        sections, _profile = await writer.personal_prompt_sections(prospect, instruction, profile)
+        sections.append(("format", "Output format", JSON_INSTRUCTION))
+        return {
+            "prompt": "".join(text for _key, _label, text in sections),
+            "sections": [{"key": key, "label": label, "text": text} for key, label, text in sections],
+            "persona": profile,
+        }
 
-    async def preview(self, ref, prospect_id, revision=None, instruction="", version_id="") -> dict:
+    async def preview(self, ref, prospect_id, revision=None, instruction="", version_id="", draft=None) -> dict:
         """Write one sample email. One model call; nothing is queued or sent."""
-        writer, prospect, profile = await self._generation_inputs(ref, prospect_id, revision, version_id)
+        writer, prospect, profile = await self._generation_inputs(ref, prospect_id, revision, version_id, draft)
         draft = await writer._write_personal_email(prospect, instruction, profile)
         if not draft:
             raise PersonaError("provider_failed", "The writer returned no draft. Check the agent log and try again")
