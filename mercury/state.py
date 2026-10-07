@@ -412,9 +412,7 @@ MIGRATIONS: list[str] = [
     -- old bounce spike can't immediately re-pause a fixed inbox.
     CREATE TABLE IF NOT EXISTS warmup_inboxes (
         email TEXT PRIMARY KEY,
-        status TEXT DEFAULT 'not_started',
-        start_date TEXT,
-        target_daily INTEGER,
+        status TEXT DEFAULT 'active',
         notes TEXT DEFAULT '',
         tasks_json TEXT DEFAULT '{}',
         paused_at TIMESTAMP,
@@ -1730,29 +1728,20 @@ class StateManager:
             )
             await db.commit()
 
-    # ── Warm-up inboxes ──
+    # ── Warm-up overlay (see mercury/warmup.py) ──
 
     _WARMUP_COLUMNS = frozenset({
-        "status", "start_date", "target_daily", "notes", "tasks_json",
-        "paused_at", "pause_reason", "resumed_at",
+        "status", "notes", "tasks_json", "paused_at", "pause_reason", "resumed_at",
     })
 
-    async def add_warmup_inbox(
-        self,
-        email: str,
-        *,
-        status: str = "not_started",
-        start_date: str | None = None,
-        target_daily: int | None = None,
-        notes: str = "",
-    ) -> bool:
-        """Insert an inbox. Returns False when it already exists."""
+    async def add_warmup_inbox(self, email: str, *, status: str = "active",
+                               notes: str = "") -> bool:
+        """Insert an overlay row. Returns False when it already exists."""
         async with self._connect() as db:
             cursor = await db.execute(
-                """INSERT OR IGNORE INTO warmup_inboxes
-                   (email, status, start_date, target_daily, notes, tasks_json)
-                   VALUES (?, ?, ?, ?, ?, '{}')""",
-                (_norm(email), status, start_date, target_daily, notes),
+                """INSERT OR IGNORE INTO warmup_inboxes (email, status, notes, tasks_json)
+                   VALUES (?, ?, ?, '{}')""",
+                (_norm(email), status, notes),
             )
             await db.commit()
             return cursor.rowcount > 0
@@ -1770,8 +1759,7 @@ class StateManager:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT * FROM warmup_inboxes "
-                "ORDER BY start_date IS NULL, start_date ASC, created_at ASC"
+                "SELECT * FROM warmup_inboxes ORDER BY created_at ASC, email ASC"
             ) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
 
@@ -1786,14 +1774,6 @@ class StateManager:
             cursor = await db.execute(
                 f"UPDATE warmup_inboxes SET {sets}, updated_at = ? WHERE email = ?",
                 (*kwargs.values(), _utcnow().isoformat(), _norm(email)),
-            )
-            await db.commit()
-            return cursor.rowcount > 0
-
-    async def delete_warmup_inbox(self, email: str) -> bool:
-        async with self._connect() as db:
-            cursor = await db.execute(
-                "DELETE FROM warmup_inboxes WHERE email = ?", (_norm(email),)
             )
             await db.commit()
             return cursor.rowcount > 0

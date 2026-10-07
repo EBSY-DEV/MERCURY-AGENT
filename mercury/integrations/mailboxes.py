@@ -19,6 +19,12 @@ nobody reads that inbox any more, so a reply or opt-out there would be lost.
 Without ``channels.email.mailboxes`` the pool wraps the single configured
 provider (gmail, or the SMTP_* mailbox), so every deployment runs the same
 code path.
+
+Health gates (see mercury/warmup.py) sit on top of the ramp: before each
+drain the sender fills ``MailboxPool.gates`` from the last 7 days of sends
+and bounces per mailbox. ``paused`` (a bounce spike, or a manual pause in the
+dashboard) makes the mailbox's cap 0; ``hold`` keeps it at yesterday's cap.
+A gate can only lower a cap, never raise it.
 """
 
 from __future__ import annotations
@@ -130,6 +136,8 @@ class MailboxPool:
         # One mailbox without a rotation list: whatever address a row
         # recorded, it went out through (and is answered in) this inbox.
         self.single_inbox = False
+        # email -> "paused" | "hold", filled by warmup.apply_health().
+        self.gates: dict[str, str] = {}
 
     # ── construction ──
 
@@ -221,9 +229,24 @@ class MailboxPool:
 
     # ── caps ──
 
-    def cap_on(self, mb: Mailbox, day: date) -> int:
+    def base_cap_on(self, mb: Mailbox, day: date) -> int:
+        """The configured ramp alone, before any health gate."""
         return warmup_cap(mb.daily_cap, mb.warmup_start, day,
                           self.warmup_initial_cap, self.warmup_weekly_increase)
+
+    def cap_on(self, mb: Mailbox, day: date) -> int:
+        """The cap the sender enforces: the ramp, lowered by a health gate."""
+        cap = self.base_cap_on(mb, day)
+        gate = self.gates.get(mb.email)
+        if gate == "paused":
+            return 0
+        if gate == "hold":
+            # Yesterday's ramp value; on the first ramp day that is day one.
+            prev = day - timedelta(days=1)
+            if mb.warmup_start is not None and prev < mb.warmup_start:
+                prev = mb.warmup_start
+            cap = min(cap, self.base_cap_on(mb, prev))
+        return cap
 
     def used(self, mb: Mailbox, sent_by_mailbox: dict[str, int]) -> int:
         if self.single_inbox:
@@ -311,15 +334,19 @@ def mailbox_report(config, pool: MailboxPool | None, sent_by_mailbox: dict[str, 
     for mb in pool.mailboxes:
         configured = mb.provider.is_configured()
         cap = pool.cap_on(mb, day)
+        base_cap = pool.base_cap_on(mb, day)
+        gate = pool.gates.get(mb.email, "")
         sent = pool.used(mb, sent_by_mailbox)
         known.add(mb.email)
         if mb.legacy:
             known.add("")
         full_on = full_volume_on(mb.daily_cap, mb.warmup_start,
                                  pool.warmup_initial_cap, pool.warmup_weekly_increase)
-        if mb.warmup_start is not None and day < mb.warmup_start:
+        if gate == "paused":
+            stage = "paused"
+        elif mb.warmup_start is not None and day < mb.warmup_start:
             stage = "scheduled"
-        elif cap < mb.daily_cap:
+        elif base_cap < mb.daily_cap:
             stage = "warming" if full_on else "fixed"
         else:
             stage = "warm"
@@ -330,6 +357,8 @@ def mailbox_report(config, pool: MailboxPool | None, sent_by_mailbox: dict[str, 
                     or getattr(config.persona, "name", ""),
             "daily_cap": mb.daily_cap,
             "cap_today": cap,
+            "base_cap_today": base_cap,
+            "gate": gate,
             "sent_24h": sent,
             # What the sender would really still send from it today.
             "remaining": min(max(0, cap - sent), global_left) if configured else 0,
@@ -346,7 +375,7 @@ def mailbox_report(config, pool: MailboxPool | None, sent_by_mailbox: dict[str, 
     if other:
         rows.append({
             "email": "", "name": "removed mailboxes", "daily_cap": 0, "cap_today": 0,
-            "sent_24h": other, "remaining": 0, "warmup_start": None, "full_on": None,
+            "base_cap_today": 0, "gate": "", "sent_24h": other, "remaining": 0, "warmup_start": None, "full_on": None,
             "stage": "removed", "accepts_new": False, "configured": None, "legacy": False,
         })
 
