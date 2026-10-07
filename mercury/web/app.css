@@ -148,8 +148,8 @@ body { display: grid; grid-template-columns: 252px minmax(0, 1fr); background: v
   background: linear-gradient(140deg, #C7B6FF 0%, #9C84F0 55%, #7A5EDB 100%);
   color: #fff; border-radius: 9px;
   box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 8px rgba(109, 83, 211, 0.25);
-  font-family: var(--display); font-size: 15px; font-weight: 600; line-height: 1; letter-spacing: -0.02em;
 }
+.brand .mark svg { width: 20px; height: 20px; fill: currentColor; } /* small cut of the Transit mark, design/brand/final */
 .brand h1 { font-family: var(--display); font-size: 15.5px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
 .brand .tagline { font-size: 11.5px; font-weight: 500; color: var(--text-3); line-height: 1.2; margin-top: 2px; }
 

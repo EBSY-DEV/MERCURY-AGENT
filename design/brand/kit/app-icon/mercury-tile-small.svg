@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img">
+  <title>Mercury Agent</title>
+  <defs>
+    <linearGradient id="tile-grad" gradientUnits="userSpaceOnUse" x1="243.91" y1="-10.14" x2="12.09" y2="266.14">
+      <stop offset="0" stop-color="#C7B6FF"/>
+      <stop offset="0.55" stop-color="#9C84F0"/>
+      <stop offset="1" stop-color="#7A5EDB"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="74" fill="url(#tile-grad)"/>
+  <path fill="#FFFFFF" d="M196.73 75.61A91.69 91.69 0 1 0 196.73 180.39A52.39 52.39 0 1 1 196.73 75.61ZM163.98 128A32.75 32.75 0 1 1 229.48 128A32.75 32.75 0 1 1 163.98 128Z"/>
+</svg>

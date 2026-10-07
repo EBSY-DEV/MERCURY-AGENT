@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-150 -150 420 300" width="840" height="600" role="img">
+  <title>Mercury Agent construction</title>
+  <rect x="-150" y="-150" width="420" height="300" fill="#FFFFFF"/>
+  <line x1="-120" y1="-120" x2="-120" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-100" y1="-120" x2="-100" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-80" y1="-120" x2="-80" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-60" y1="-120" x2="-60" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-40" y1="-120" x2="-40" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-20" y1="-120" x2="-20" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="0" y1="-120" x2="0" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="20" y1="-120" x2="20" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="40" y1="-120" x2="40" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="60" y1="-120" x2="60" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="80" y1="-120" x2="80" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="100" y1="-120" x2="100" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="120" y1="-120" x2="120" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="140" y1="-120" x2="140" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="160" y1="-120" x2="160" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="-120" x2="160" y2="-120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="-100" x2="160" y2="-100" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="-80" x2="160" y2="-80" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="-60" x2="160" y2="-60" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="-40" x2="160" y2="-40" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="-20" x2="160" y2="-20" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="0" x2="160" y2="0" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="20" x2="160" y2="20" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="40" x2="160" y2="40" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="60" x2="160" y2="60" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="80" x2="160" y2="80" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="100" x2="160" y2="100" stroke="#D9CFFA" stroke-width="0.5"/>
+  <line x1="-120" y1="120" x2="160" y2="120" stroke="#D9CFFA" stroke-width="0.5"/>
+  <path fill="#ECE6FD" stroke="#211C35" stroke-width="0.8" d="M-100 0C-100 -55.23 -55.23 -100 0 -100C32.72 -100 61.76 -84.29 80.01 -60H80C46.86 -60 20 -33.14 20 0C20 33.14 46.86 60 80 60H80.01C61.76 84.29 32.72 100 0 100C-55.23 100 -100 55.23 -100 0ZM40 0C40 -22.09 57.91 -40 80 -40C102.09 -40 120 -22.09 120 0C120 22.09 102.09 40 80 40C57.91 40 40 22.09 40 0Z"/>
+  <line x1="-135" y1="0" x2="170" y2="0" stroke="#6D53D3" stroke-width="0.8"/>
+  <line x1="0" y1="0" x2="91.92" y2="-91.92" stroke="#716A90" stroke-width="0.6" stroke-dasharray="3 3"/>
+  <circle cx="0" cy="0" r="100" fill="none" stroke="#6D53D3" stroke-width="0.8" stroke-dasharray="4 3"/>
+  <circle cx="80" cy="0" r="60" fill="none" stroke="#6D53D3" stroke-width="0.8" stroke-dasharray="4 3"/>
+  <circle cx="80" cy="0" r="40" fill="none" stroke="#6D53D3" stroke-width="0.8"/>
+  <path d="M0 0H80V-60Z" fill="none" stroke="#6D53D3" stroke-width="1.4" stroke-linejoin="round"/>
+  <path d="M72 0V-8H80" fill="none" stroke="#6D53D3" stroke-width="0.8"/>
+  <circle cx="0" cy="0" r="2.2" fill="#6D53D3"/>
+  <circle cx="80" cy="0" r="2.2" fill="#6D53D3"/>
+  <circle cx="80" cy="-60" r="2.2" fill="#6D53D3"/><circle cx="80" cy="60" r="2.2" fill="#6D53D3"/>
+  <text x="40" y="12" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="middle" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round">d = 4u</text>
+  <text x="40" y="12" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="middle" fill="#6D53D3">d = 4u</text>
+  <text x="84" y="-30" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="start" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round">B = 3u</text>
+  <text x="84" y="-30" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="start" fill="#6D53D3">B = 3u</text>
+  <text x="34" y="-30" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="middle" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round">R = 5u</text>
+  <text x="34" y="-30" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="middle" fill="#6D53D3">R = 5u</text>
+  <text x="80" y="26" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="middle" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round">r = 2u</text>
+  <text x="80" y="26" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="middle" fill="#6D53D3">r = 2u</text>
+  <line x1="110.64" y1="25.71" x2="125.96" y2="38.57" stroke="#211C35" stroke-width="1.2"/>
+  <text x="129.96" y="48.57" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="start" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round">g = 1u</text>
+  <text x="129.96" y="48.57" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="start" fill="#211C35">g = 1u</text>
+  <text x="168" y="-5" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="8" font-weight="500" text-anchor="end" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round">travel axis</text>
+  <text x="168" y="-5" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="8" font-weight="500" text-anchor="end" fill="#6D53D3">travel axis</text>
+  <text x="96" y="-96" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="8" font-weight="500" text-anchor="start" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round">45°, the badge corner, not used</text>
+  <text x="96" y="-96" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="8" font-weight="500" text-anchor="start" fill="#716A90">45°, the badge corner, not used</text>
+  <text x="-120" y="-128" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="9" font-weight="600" text-anchor="start" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round">Grid unit u = 20 (disc radius 100)</text>
+  <text x="-120" y="-128" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="9" font-weight="600" text-anchor="start" fill="#211C35">Grid unit u = 20 (disc radius 100)</text>
+  <text x="-120" y="138" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="start" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round">g : r : B : d : R  =  1 : 2 : 3 : 4 : 5</text>
+  <text x="-120" y="138" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="start" fill="#211C35">g : r : B : d : R  =  1 : 2 : 3 : 4 : 5</text>
+  <text x="160" y="-128" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="end" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linejoin="round">d² + B² = R²</text>
+  <text x="160" y="-128" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="9" font-weight="500" text-anchor="end" fill="#6D53D3">d² + B² = R²</text>
+</svg>
