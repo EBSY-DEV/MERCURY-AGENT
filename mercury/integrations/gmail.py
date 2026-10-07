@@ -203,6 +203,11 @@ class GmailProvider(MailProvider):
             return None
         subject = headers.get("subject", "")
         body = GmailProvider._extract_text(payload) or data.get("snippet", "")
+        bounce = looks_like_bounce(from_email, subject)
+        if bounce:
+            status = GmailProvider._dsn_status(payload)
+            if status:
+                headers["dsn_status"] = status
         return InboundMessage(
             provider_id=data.get("id", ""),
             from_email=from_email,
@@ -212,9 +217,33 @@ class GmailProvider(MailProvider):
             in_reply_to=headers.get("in-reply-to", ""),
             thread_ref=data.get("threadId", ""),
             date=headers.get("date", ""),
-            is_bounce=looks_like_bounce(from_email, subject),
+            is_bounce=bounce,
             headers=headers,
         )
+
+    @staticmethod
+    def _dsn_status(payload: dict) -> str:
+        """The ``Status:`` field of a bounce's message/delivery-status part
+        (the RFC 3463 code), '' when the message has none."""
+        stack = [payload]
+        while stack:
+            part = stack.pop()
+            if part.get("mimeType", "") == "message/delivery-status":
+                for sub in [part, *(part.get("parts") or [])]:
+                    for h in sub.get("headers") or []:
+                        if h.get("name", "").lower() == "status" and h.get("value", "").strip():
+                            return h["value"].strip()
+                    raw = (sub.get("body") or {}).get("data", "")
+                    if raw:
+                        try:
+                            text = base64.urlsafe_b64decode(raw + "===").decode(errors="replace")
+                        except Exception:
+                            continue
+                        for line in text.splitlines():
+                            if line.lower().startswith("status:") and line[7:].strip():
+                                return line[7:].strip()
+            stack.extend(part.get("parts") or [])
+        return ""
 
     @staticmethod
     def _extract_text(payload: dict) -> str:

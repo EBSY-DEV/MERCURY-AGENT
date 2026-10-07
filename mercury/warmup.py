@@ -46,7 +46,7 @@ import re
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from mercury import metrics
+from mercury import bounces, metrics
 from mercury.integrations.mailboxes import (
     MailboxPool,
     full_volume_on,
@@ -261,6 +261,23 @@ async def _health_counts(state, pool: MailboxPool, since_by_email: dict[str, str
     return out
 
 
+async def _bucket_counts(state, pool: MailboxPool, since_by_email: dict[str, str]) -> dict[str, dict]:
+    """``{email: {BUCKET: n}}`` over each mailbox's own health window: what kind
+    of bounces it got, as classified by ``mercury.bounces``."""
+    out: dict[str, dict[str, int]] = {mb.email: {} for mb in pool.mailboxes}
+    by_since: dict[str, list[str]] = {}
+    for email, since in since_by_email.items():
+        by_since.setdefault(since, []).append(email)
+    for since, emails in by_since.items():
+        for key, buckets in (await metrics.bucket_counts_by_mailbox(state.db_path, since)).items():
+            mb = _owner(pool, key)
+            if mb is None or mb.email not in emails:
+                continue
+            for bucket, n in buckets.items():
+                out[mb.email][bucket] = out[mb.email].get(bucket, 0) + n
+    return out
+
+
 async def apply_health(state, pool: MailboxPool, *, persist: bool = True,
                        now: datetime | None = None) -> dict[str, dict]:
     """Evaluate every mailbox's health and set ``pool.gates``.
@@ -306,6 +323,19 @@ async def apply_health(state, pool: MailboxPool, *, persist: bool = True,
             "since": since_by_email[mb.email], "row": row or {},
         }
     pool.gates = gates
+    # A 4.x.x throttling bounce halves that mailbox's cap for a week.
+    try:
+        factors = await bounces.load_throttles(
+            state, [mb.email for mb in pool.mailboxes], now)
+        for email in factors:
+            if email in result:
+                result[email]["throttled_until"] = await bounces.throttled_until(
+                    state, email, now)
+    except Exception as e:
+        logger.warning(f"Warm-up: could not read mailbox throttles ({e}); "
+                       "halving every mailbox's cap to be safe.")
+        factors = {mb.email: bounces.THROTTLE_FACTOR for mb in pool.mailboxes}
+    pool.cap_factors = factors
     return result
 
 
@@ -329,6 +359,10 @@ async def set_resumed(state, email: str) -> None:
     await _ensure_row(state, email)
     await state.update_warmup_inbox(email, status="active", paused_at=None,
                                     pause_reason="", resumed_at=_utcnow_iso())
+    # A person looked at the mailbox: a BURNED verdict on its domain was theirs
+    # to act on, so it no longer stands.
+    if "@" in (email or ""):
+        await bounces.clear_verdict(state, email.rsplit("@", 1)[-1])
 
 
 async def set_task(state, email: str, key: str, done: bool) -> None:
@@ -399,6 +433,13 @@ async def overview(state, config, pool: MailboxPool | None,
                 bucket[d] = bucket.get(d, 0) + n
 
     initial, inc = pool.warmup_initial_cap, pool.warmup_weekly_increase
+    bucket_counts = await _bucket_counts(
+        state, pool, {e: h["since"] for e, h in health.items() if "since" in h})
+    verdicts = {}
+    for mb in pool.mailboxes:
+        if mb.domain and mb.domain not in verdicts:
+            verdicts[mb.domain] = await bounces.get_verdict(state, mb.domain)
+
     inboxes = []
     for idx, mb in enumerate(pool.mailboxes):
         rep = rows_by_email.get(mb.email, {})
@@ -451,6 +492,12 @@ async def overview(state, config, pool: MailboxPool | None,
             "paused_at": row.get("paused_at"),
             "pause_reason": row.get("pause_reason") or "",
             "notes": row.get("notes") or "",
+            # Bounces by DSN bucket over the health window, and the 4.x.x
+            # throttle and BURNED verdict that came from them.
+            "bounce_buckets": {b: bucket_counts.get(mb.email, {}).get(b, 0)
+                               for b in bounces.BUCKETS},
+            "throttled_until": h.get("throttled_until"),
+            "verdict": (verdicts.get(mb.domain) or {}).get("verdict"),
         })
 
     # Last stored DNS check per sending domain, so the Mailboxes table can show
