@@ -79,12 +79,29 @@ def test_add_without_password_then_edit_without_erasing_it(client):
     assert "new-secret" not in client.get("/api/settings/mailboxes").text
 
 
-@pytest.mark.parametrize("password", [r"two\\slashes", r"literal\nsequence", "slash\\'quote", '${TOKEN} # space'])
+@pytest.mark.parametrize("password", [r"two\\slashes", r"literal\nsequence", "slash\\'quote", '${TOKEN} # space',
+                                      ' intentional surrounding spaces '])
 def test_password_special_characters_roundtrip(client, password):
     res = client.post("/api/settings/mailboxes", json={"email": "a@example.com", "password": password})
     assert res.status_code == 200
     _, pool = dash._mail_context()
     assert pool.primary.provider.smtp_pass == password
+
+
+def test_legacy_password_whitespace_is_preserved_when_adding_rotation(client):
+    inbox_settings.write_env(client.env_path, {"SMTP_USERNAME": "original@example.com",
+                                             "SMTP_PASSWORD": " smtp password ", "IMAP_PASSWORD": " imap password "})
+    client.post("/api/settings/mailboxes", json={"email": "new@example.com"})
+    _, pool = dash._mail_context()
+    assert pool.legacy.provider.smtp_pass == " smtp password "
+    assert pool.legacy.provider.imap_pass == " imap password "
+
+
+def test_primary_smtp_password_save_preserves_whitespace(client):
+    password = " primary password "
+    res = client.post("/api/settings/env", json={"SMTP_PASSWORD": password})
+    assert res.json()["success"]
+    assert dotenv_values(client.env_path, interpolate=False)["SMTP_PASSWORD"] == password
 
 
 def test_general_settings_save_preserves_inbox_credentials_and_comments(client):
