@@ -27,9 +27,14 @@ class Prospect(BaseModel):
     department: str = ""
     source: str = ""           # how we found them
     source_url: str = ""       # where we found the info
-    status: str = "new"        # new/contacted/replied/meeting/closed/lost
+    # new/contacted/replied/meeting/closed/lost, or imported: held out of
+    # outreach until someone releases it
+    status: str = "new"
     score: int = 0
     personalization_notes: str = ""
+    # The CSV import batch and data row a contact came from, if any.
+    import_batch_id: str = ""
+    import_row: int = 0
     # legacy fields kept for backwards compat with existing code
     company: str = ""
     industry: str = ""

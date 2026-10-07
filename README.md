@@ -17,6 +17,7 @@ Mercury Agent finds businesses that match your ideal customer, collects specific
 - **Handles replies.** Classifies intent, stops the sequence when someone replies, advances the conversation stage, and drafts a response for your approval. Opt-outs are honored immediately. Bounces mark the address invalid, and a high bounce rate pauses all sending.
 - **Shows its work.** A local dashboard covers today's queue, the pipeline, a calendar of scheduled sends, the approval outbox, warm-up status, signals, discovery and Claude quota usage.
 - **Exports lists.** `mercury export` writes a sequencer-ready CSV, so you can use Mercury as a list builder even if it never sends anything.
+- **Imports lists.** Bring your own CSV from the dashboard or `mercury import`. It previews every row (new, needs enrichment, duplicate, invalid) before anything changes. Imported contacts stay held until you verify and release them.
 
 ## How it works
 
@@ -164,6 +165,8 @@ Cold email law (CAN-SPAM, GDPR/PECR) is your responsibility as the sender. Use a
 | `mercury gmail auth\|test` | One-time Gmail OAuth, or connection check |
 | `mercury mail test` | Test the configured provider and every mailbox |
 | `mercury export [--out FILE] [--all] [--min-score N]` | Deliverable prospects to CSV |
+| `mercury import FILE [--dry-run] [--map FIELD=HEADER] [--policy skip\|fill] [--skip-invalid] [--json]` | Import contacts from a CSV |
+| `mercury imports [list\|show\|verify\|release] [BATCH]` | Import batches: verify addresses, release to outreach |
 | `mercury usage [--days N]` | Claude quota and per-agent token usage |
 | `mercury install` | Install or repair dependencies |
 

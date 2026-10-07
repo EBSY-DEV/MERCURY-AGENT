@@ -89,6 +89,8 @@ const STATUS = {
   risky:          ['Catch-all', 'waiting'],
   guess:          ['Unverified', 'idle'],
   invalid:        ['Invalid', 'bad'],
+  // imports
+  imported:       ['Held (imported)', 'waiting'],
   // runs
   running:        ['Running', 'active'],
   stale:          ['Stale', 'bad'],
@@ -1667,13 +1669,353 @@ async function loadProspects() {
   data.forEach((p, i) => {
     const emailV = p.email ? (escHtml(p.email) + emailTag(p)) : '';
     const phoneV = p.phone ? (escHtml(p.phone) + (p.phone_verified ? ' <span class="verified" title="verified">' + icon('check-circle') + '</span>' : '')) : '';
-    html += '<tr><td>' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</td>' +
+    // Imported contacts say where they came from and what they still lack.
+    const needs = p.import_batch_id
+      ? [['first name', p.first_name], ['last name', p.last_name], ['title', p.title]].filter(x => !x[1]).map(x => x[0]) : [];
+    const source = p.import_batch_id
+      ? '<span title="Import batch ' + escHtml(p.import_batch_id) + '">Import ' + escHtml(p.import_batch_id.slice(0, 6)) +
+        ' · row ' + escHtml(String(p.import_row)) + '</span>'
+      : escHtml(p.source);
+    html += '<tr><td>' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) +
+      (needs.length ? '<div class="chip">needs ' + escHtml(needs.join(', ')) + '</div>' : '') + '</td>' +
       '<td>' + escHtml(p.title) + '</td><td>' + escHtml(p.company) + '</td>' +
       '<td>' + emailV + '</td><td>' + phoneV + '</td><td>' + badge(p.status) + '</td>' +
-      '<td class="muted">' + escHtml(p.source) + '</td><td class="muted">' + formatDate(p.created_at) + '</td>' +
+      '<td class="muted">' + source + '</td><td class="muted">' + formatDate(p.created_at) + '</td>' +
       '<td><button class="btn btn-secondary btn-sm" onclick="fbProspect(' + i + ')">Feedback</button></td></tr>';
   });
   el.innerHTML = html + '</tbody></table></div>';
+}
+
+// ── Contacts: CSV import ──
+//
+// upload -> map columns -> preview -> commit -> verify / release. The browser
+// keeps the file and re-sends it with each preview and the commit, so the
+// server never stores an upload. Every count and row outcome comes from the
+// same service the CLI (`mercury import`) uses.
+
+const IMP_MAX_BYTES = 5 * 1024 * 1024;
+const IMP_OUTCOME = {
+  new: ['New', 'good'], incomplete: ['Needs enrichment', 'waiting'],
+  duplicate: ['Duplicate', 'idle'], invalid: ['Invalid', 'bad'],
+};
+const IMP_ACTION = {
+  create: 'Import', fill: 'Fill blanks', skip: 'Skip', exclude: 'Leave out',
+  created: 'Imported', filled: 'Filled', skipped: 'Skipped', excluded: 'Left out',
+};
+const _imp = {
+  open: false, name: '', b64: '', mapping: null, delimiter: '', policy: 'skip',
+  preview: null, error: null, exclude: new Set(), filter: 'problems',
+  skipInvalid: false, result: null, busy: false, batches: [], providers: [], verifying: '',
+};
+
+function toggleImport(force) {
+  _imp.open = force === undefined ? !_imp.open : force;
+  const panel = document.getElementById('import-panel');
+  panel.hidden = !_imp.open;
+  document.getElementById('imp-toggle').setAttribute('aria-expanded', String(_imp.open));
+  if (_imp.open) { renderImport(); loadImportBatches(); }
+}
+
+function impReset() {
+  Object.assign(_imp, { name: '', b64: '', mapping: null, delimiter: '', policy: 'skip', preview: null,
+    error: null, exclude: new Set(), filter: 'problems', skipInvalid: false, result: null });
+  renderImport();
+}
+
+async function impSend(path, body) {
+  try {
+    const r = await fetch(path, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: body === undefined ? undefined : {'Content-Type': 'application/json'},
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    let data = null;
+    try { data = await r.json(); } catch { /* not JSON */ }
+    if (r.ok) return { ok: true, data };
+    const d = data && data.detail;
+    const error = d && typeof d === 'object' ? d
+      : { code: 'http', message: typeof d === 'string' ? d : 'Request failed (' + r.status + ')' };
+    return { ok: false, error };
+  } catch {
+    return { ok: false, error: { code: 'offline', message: 'Can\'t reach the dashboard server.' } };
+  }
+}
+
+function impBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+async function impPickFile(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  if (file.size > IMP_MAX_BYTES) {
+    _imp.error = { code: 'too_large', message: 'That file is ' + (file.size / 1048576).toFixed(1) +
+      ' MB. The limit is 5 MB; split it and import the parts.' };
+    renderImport();
+    return;
+  }
+  impReset();
+  _imp.name = file.name;
+  _imp.b64 = impBase64(await file.arrayBuffer());
+  await impPreview();
+}
+
+function impBody() {
+  return { filename: _imp.name, content_b64: _imp.b64, mapping: _imp.mapping,
+    delimiter: _imp.delimiter, policy: _imp.policy, exclude_rows: [..._imp.exclude] };
+}
+
+async function impPreview() {
+  _imp.busy = true; renderImport();
+  const res = await impSend('/api/imports/preview', impBody());
+  _imp.busy = false;
+  if (res.ok) {
+    _imp.preview = res.data; _imp.error = null; _imp.mapping = res.data.mapping;
+    if (!_imp.delimiter) _imp.delimiter = res.data.delimiter;
+  } else {
+    // Keep the mapping controls when the server named the columns, but drop
+    // counts and rows: they described a mapping that no longer applies.
+    _imp.error = res.error;
+    _imp.preview = res.error.headers
+      ? { headers: res.error.headers, fields: IMP_FIELDS_FALLBACK, mapping: _imp.mapping || {} } : null;
+  }
+  renderImport();
+}
+
+const IMP_FIELDS_FALLBACK = [
+  ['email', 'Email'], ['first_name', 'First name'], ['last_name', 'Last name'], ['full_name', 'Full name'],
+  ['title', 'Title'], ['company_name', 'Company'], ['website', 'Website'], ['industry', 'Industry'],
+  ['linkedin_url', 'LinkedIn URL'], ['phone', 'Phone'], ['personalization', 'Personalization notes'],
+].map(([key, label]) => ({ key, label }));
+
+function impMap(field, header) {
+  const mapping = Object.assign({}, _imp.mapping || {});
+  if (header) mapping[field] = header; else delete mapping[field];
+  _imp.mapping = mapping;
+  impPreview();
+}
+
+function impSetDelimiter(value) { _imp.delimiter = value; _imp.mapping = null; impPreview(); }
+function impSetPolicy(value) { _imp.policy = value; impPreview(); }
+function impSetFilter(value) { _imp.filter = value; renderImport(); }
+
+function impToggleRow(row, on) {
+  if (on) _imp.exclude.delete(row); else _imp.exclude.add(row);
+  renderImport();
+}
+
+function impRowsShown(rows) {
+  const f = _imp.filter;
+  if (f === 'all') return rows;
+  if (f === 'problems') return rows.filter(r => r.outcome !== 'new' || r.warnings.length);
+  return rows.filter(r => r.outcome === f);
+}
+
+function impPlannedAction(r) {
+  if ((r.action === 'create' || r.action === 'fill') && _imp.exclude.has(r.row)) return 'exclude';
+  return r.action;
+}
+
+async function impCommit() {
+  const p = _imp.preview;
+  const going = p.rows.filter(r => ['create', 'fill'].includes(impPlannedAction(r))).length;
+  const ok = await confirmModal({ title: 'Import ' + going + ' contact' + (going === 1 ? '' : 's') + '?',
+    copy: 'They are added as held, unverified contacts. Nothing is verified, drafted or sent until you ask.',
+    ok: 'Import' });
+  if (!ok) return;
+  _imp.busy = true; renderImport();
+  const res = await impSend('/api/imports/commit', Object.assign(impBody(), { skip_invalid: _imp.skipInvalid }));
+  _imp.busy = false;
+  if (!res.ok) { _imp.error = res.error; renderImport(); return; }
+  _imp.result = res.data; _imp.error = null;
+  showToast(res.data.already_committed ? 'Already imported. Nothing changed.' : 'Import complete.', 'success');
+  renderImport();
+  loadImportBatches();
+  loadProspects();
+}
+
+async function loadImportBatches() {
+  const res = await impSend('/api/imports');
+  if (res.ok) { _imp.batches = res.data.batches || []; _imp.providers = res.data.providers || []; }
+  if (_imp.open) renderImport();
+}
+
+async function impVerify(batchId) {
+  const est = await impSend('/api/imports/' + encodeURIComponent(batchId) + '/verify');
+  if (!est.ok) { showToast(est.error.message, 'error'); return; }
+  const e = est.data;
+  if (!e.providers.length) { showToast(e.cost, 'error'); return; }
+  if (!e.addresses) { showToast('Every address in this batch is already verified or settled.', 'success'); return; }
+  const ok = await confirmModal({ title: 'Verify ' + e.addresses + ' address' + (e.addresses === 1 ? '' : 'es') + '?',
+    copy: e.cost + ' Providers: ' + e.providers.map(p => p.name + ' (' + p.free_tier + ')').join(', ') + '.',
+    ok: 'Verify' });
+  if (!ok) return;
+  let after = 0, done = 0;
+  const totals = {};
+  _imp.verifying = batchId;
+  while (true) {
+    _imp.verifyNote = 'Verifying ' + done + ' / ' + e.addresses + '…';
+    renderImport();
+    const res = await impSend('/api/imports/' + encodeURIComponent(batchId) + '/verify', { limit: 10, after_row: after });
+    if (!res.ok) { showToast(res.error.message, 'error'); break; }
+    const s = res.data;
+    done += s.checked; after = s.next_after_row;
+    for (const [k, v] of Object.entries(s.results)) totals[k] = (totals[k] || 0) + v;
+    if (s.stopped) { showToast(s.stopped, 'error'); break; }
+    if (!s.remaining || !s.checked) break;
+  }
+  _imp.verifying = ''; _imp.verifyNote = '';
+  const summary = Object.entries(totals).map(([k, v]) => v + ' ' + statusMeta(k).label.toLowerCase()).join(', ');
+  showToast(summary ? 'Verified: ' + summary : 'Nothing was checked.', 'success');
+  loadImportBatches();
+  loadProspects();
+}
+
+async function impRelease(batchId) {
+  const ok = await confirmModal({ title: 'Release verified contacts to outreach?',
+    copy: 'Verified contacts from this import join the pipeline as new. The Writer drafts for them on its next cycle, and drafts wait in the Outbox for your approval unless approval is off. Unverified contacts stay held.',
+    ok: 'Release' });
+  if (!ok) return;
+  const res = await impSend('/api/imports/' + encodeURIComponent(batchId) + '/release', { include_risky: false });
+  if (!res.ok) { showToast(res.error.message, 'error'); return; }
+  showToast('Released ' + res.data.released + '. ' + res.data.still_held + ' still held.', 'success');
+  loadImportBatches();
+  loadProspects();
+}
+
+function impCounts(c) {
+  const tile = (k, n, label) => '<div class="sig-stat imp-' + k + '"><div class="n">' + n + '</div><div class="k">' + label + '</div></div>';
+  return '<div class="sig-summary imp-summary">' +
+    tile('new', c.new, 'new') + tile('incomplete', c.incomplete, 'needs enrichment') +
+    tile('duplicate', c.duplicate, 'duplicate' + (c.suppressed ? ' (' + c.suppressed + ' opted out or invalid)' : '')) +
+    tile('invalid', c.invalid, 'invalid') + '</div>';
+}
+
+function impRowsTable(rows, committed) {
+  if (!rows.length) return '<p class="loading-note">No rows in this view.</p>';
+  const cap = 500;
+  let html = '<div class="table-card imp-rows"><table><thead><tr>' + (committed ? '' : '<th></th>') +
+    '<th class="num">Row</th><th>Email</th><th>Name</th><th>Company</th><th>Outcome</th><th>Action</th><th>Detail</th></tr></thead><tbody>';
+  rows.slice(0, cap).forEach(r => {
+    const action = committed ? r.action : impPlannedAction(r);
+    const o = IMP_OUTCOME[r.outcome] || [r.outcome, 'idle'];
+    const can = !committed && (r.action === 'create' || r.action === 'fill');
+    const detail = [r.reason, (r.fill || []).length ? 'fills ' + r.fill.join(', ') : '', ...(r.warnings || [])]
+      .filter(Boolean).map(escHtml).join(' · ');
+    html += '<tr>' + (committed ? '' : '<td>' + (can
+      ? '<input type="checkbox" aria-label="Import row ' + r.row + '"' + (_imp.exclude.has(r.row) ? '' : ' checked') +
+        ' onchange="impToggleRow(' + r.row + ', this.checked)">' : '') + '</td>') +
+      '<td class="num">' + r.row + '</td><td>' + escHtml(r.email || '') + '</td><td>' + escHtml(r.name || '') +
+      '</td><td>' + escHtml(r.company || '') + '</td><td>' + toneBadge(o[1], o[0]) + '</td><td>' +
+      escHtml(IMP_ACTION[action] || action) + '</td><td class="muted">' + detail + '</td></tr>';
+  });
+  html += '</tbody></table></div>';
+  if (rows.length > cap) html += '<p class="drawer-note">Showing ' + cap + ' of ' + rows.length + ' rows.</p>';
+  return html;
+}
+
+function impMappingGrid(p) {
+  const fields = p.fields || IMP_FIELDS_FALLBACK;
+  const mapping = _imp.mapping || p.mapping || {};
+  return '<div class="imp-map">' + fields.map(f => {
+    const opts = '<option value="">Not imported</option>' + p.headers.map(h =>
+      '<option value="' + escHtml(h) + '"' + (mapping[f.key] === h ? ' selected' : '') + '>' + escHtml(h) + '</option>').join('');
+    return '<label class="form-group"><span class="form-label">' + escHtml(f.label) + (f.key === 'email' ? ' (required)' : '') +
+      '</span><select class="form-input" onchange="impMap(\'' + f.key + '\', this.value)"' + (_imp.busy ? ' disabled' : '') + '>' +
+      opts + '</select></label>';
+  }).join('') + '</div>';
+}
+
+function impBatchesHtml() {
+  if (!_imp.batches.length) return '';
+  return '<div class="imp-step"><h3>Recent imports</h3><div class="table-card"><table><thead><tr>' +
+    '<th>File</th><th>Imported</th><th class="num">Created</th><th class="num">Held</th><th class="num">Unverified</th><th></th></tr></thead><tbody>' +
+    _imp.batches.map(b => {
+      const id = escHtml(b.id);
+      const busy = _imp.verifying === b.id;
+      return '<tr><td>' + escHtml(b.filename || 'import') + ' <span class="muted">' + id + ' · ' + escHtml(b.origin || '') + '</span></td>' +
+        '<td class="muted">' + formatDate(b.created_at) + '</td><td class="num">' + b.created + '</td><td class="num">' + b.held +
+        '</td><td class="num">' + b.unverified + '</td><td class="imp-actions">' +
+        (busy ? '<span class="muted">' + escHtml(_imp.verifyNote || 'Verifying…') + '</span>'
+          : '<button class="btn btn-secondary btn-sm" onclick="impVerify(\'' + id + '\')"' + (b.unverified ? '' : ' disabled') + '>Verify</button>' +
+            '<button class="btn btn-secondary btn-sm" onclick="impRelease(\'' + id + '\')"' + (b.held ? '' : ' disabled') + '>Release</button>') +
+        '</td></tr>';
+    }).join('') + '</tbody></table></div>' +
+    '<p class="drawer-note">Verify spends one verifier credit per address' +
+    (_imp.providers.length ? ' (' + _imp.providers.map(p => escHtml(p.name)).join(', ') + ')' : '; no verifier is configured in .env') +
+    '. Release hands verified contacts to the Writer; unverified ones stay held.</p></div>';
+}
+
+function renderImport() {
+  const el = document.getElementById('import-panel');
+  if (!el || !_imp.open) return;
+  const p = _imp.preview, err = _imp.error, r = _imp.result;
+  let html = '<div class="card imp-card"><div class="imp-head"><div><h2>Import contacts from CSV</h2>' +
+    '<p class="lede">UTF-8 CSV, up to 5 MB and 5,000 rows. Every contact needs an email. Imported addresses start unverified ' +
+    '(any status column in the file is ignored), and nothing is drafted or sent until you verify and release them.</p></div>' +
+    '<button class="btn btn-secondary btn-sm" onclick="toggleImport(false)">Close</button></div>';
+
+  if (r) {
+    const b = r.batch;
+    html += '<div class="imp-step"><h3>' + (r.already_committed ? 'Already imported' : 'Imported') + ' · ' + escHtml(b.filename || '') + '</h3>' +
+      '<p class="toolbar-note"><b>' + b.created + '</b> created · <b>' + b.filled + '</b> filled · <b>' + b.skipped +
+      '</b> skipped · <b>' + b.excluded + '</b> left out · batch <b>' + escHtml(b.id) + '</b></p>' +
+      impRowsTable((r.rows || []).filter(x => x.action !== 'created' || (x.missing || []).length), true) +
+      '<div class="drawer-actions"><button class="btn btn-primary btn-sm" onclick="impVerify(\'' + escHtml(b.id) + '\')">Verify addresses</button>' +
+      '<button class="btn btn-secondary btn-sm" onclick="impReset()">Import another file</button></div></div>';
+  } else {
+    html += '<div class="imp-step"><label class="btn btn-secondary btn-sm imp-file">' + icon('upload-simple') +
+      (_imp.name ? 'Choose a different file' : 'Choose a CSV file') +
+      '<input type="file" accept=".csv,.tsv,.txt,text/csv" onchange="impPickFile(this)" hidden></label>' +
+      (_imp.name ? ' <span class="toolbar-note">' + escHtml(_imp.name) + (_imp.busy ? ' · reading…' : '') + '</span>' : '') + '</div>';
+
+    if (err) {
+      html += '<div class="imp-error" role="alert">' + icon('warning-circle') + '<span>' + escHtml(err.message) +
+        (err.rows ? ' Rows: ' + err.rows.map(escHtml).join(', ') + '.' : '') + '</span></div>';
+    }
+    if (_imp.name && !_imp.busy || p) {
+      const delims = ['comma', 'semicolon', 'tab'];
+      html += '<div class="imp-step"><h3>1 · Columns</h3><div class="toolbar">' +
+        '<span class="toolbar-note">Delimiter</span><div class="segmented" role="radiogroup" aria-label="Delimiter">' +
+        delims.map(d => '<button type="button" role="radio" aria-checked="' + (_imp.delimiter === d) + '" class="' + (_imp.delimiter === d ? 'on' : '') +
+          '" onclick="impSetDelimiter(\'' + d + '\')">' + d + '</button>').join('') + '</div>' +
+        (err && err.candidates ? '<span class="toolbar-note">Choose ' + err.candidates.map(escHtml).join(' or ') + '</span>' : '') +
+        '</div>' + (p && p.headers ? impMappingGrid(p) : '') +
+        (p && (p.ignored_columns || []).length ? '<p class="drawer-note">Ignored ' + p.ignored_columns.map(escHtml).join(', ') +
+          ': a CSV can\'t vouch for an address. Mercury verifies it when you ask.</p>' : '') + '</div>';
+    }
+    if (p && p.counts) {
+      const c = p.counts;
+      const invalidLeft = p.rows.filter(x => x.outcome === 'invalid').length;
+      const going = p.rows.filter(x => ['create', 'fill'].includes(impPlannedAction(x))).length;
+      const filters = [['problems', 'Needs a look'], ['all', 'All'], ['new', 'New'], ['incomplete', 'Needs enrichment'],
+        ['duplicate', 'Duplicates'], ['invalid', 'Invalid']];
+      html += '<div class="imp-step"><h3>2 · Preview</h3>' + impCounts(c) +
+        '<div class="toolbar"><span class="toolbar-note">Existing contacts</span>' +
+        '<div class="segmented" role="radiogroup" aria-label="Existing contacts">' +
+        [['skip', 'Skip them'], ['fill', 'Fill their blank fields']].map(([k, l]) =>
+          '<button type="button" role="radio" aria-checked="' + (_imp.policy === k) + '" class="' + (_imp.policy === k ? 'on' : '') +
+          '" onclick="impSetPolicy(\'' + k + '\')">' + l + '</button>').join('') + '</div>' +
+        '<div class="segmented" role="tablist" aria-label="Rows">' + filters.map(([k, l]) =>
+          '<button type="button" role="tab" aria-selected="' + (_imp.filter === k) + '" class="' + (_imp.filter === k ? 'on' : '') +
+          '" onclick="impSetFilter(\'' + k + '\')">' + l + '</button>').join('') + '</div></div>' +
+        impRowsTable(impRowsShown(p.rows), false) +
+        '<p class="drawer-note">Filling never replaces a value that is already there, and never changes a contact\'s status, ' +
+        'verification or notes. Opted-out and invalid contacts are always skipped.</p></div>' +
+        '<div class="imp-step imp-commit">' +
+        (invalidLeft ? '<label class="check"><input type="checkbox"' + (_imp.skipInvalid ? ' checked' : '') +
+          ' onchange="_imp.skipInvalid = this.checked; renderImport()"> Leave out the ' + invalidLeft + ' invalid row' +
+          (invalidLeft === 1 ? '' : 's') + ' and import the rest</label>' : '') +
+        '<button class="btn btn-primary btn-sm" onclick="impCommit()"' +
+        ((_imp.busy || !going || (invalidLeft && !_imp.skipInvalid)) ? ' disabled' : '') + '>Import ' + going + ' contact' +
+        (going === 1 ? '' : 's') + '</button></div>';
+    }
+  }
+  html += impBatchesHtml() + '</div>';
+  el.innerHTML = html;
 }
 
 async function loadCampaigns() {
@@ -2032,6 +2374,7 @@ function pipeCard(it) {
   const name = it.name || it.email || 'Unknown';
   const sub = [it.title, it.company].filter(Boolean).map(escHtml).join(' &middot; ');
   const meta = [];
+  if (it.status === 'imported') meta.push(badge('imported'));
   if (it.email_status) meta.push(badge(it.email_status));
   if (next) {
     meta.push('<span class="pc-fact" title="Next email: ' + escHtml(fullWhen(next)) + '">' + icon('clock') +

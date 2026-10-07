@@ -242,12 +242,14 @@
 <!-- Contacts -->
 <div id="prospects" class="section">
   <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
-    <div><h2>Contacts</h2><p>People Mercury has found and verified.</p></div>
+    <div><h2>Contacts</h2><p>People Mercury has found, verified or imported.</p></div>
     <div style="display:flex;gap:8px;flex-shrink:0">
+      <button class="btn btn-primary btn-sm" id="imp-toggle" onclick="toggleImport()" aria-expanded="false" aria-controls="import-panel"><i data-ph="upload-simple"></i>Import CSV</button>
       <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv" download>Export deliverable CSV</a>
       <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv?all=true" download>Export all</a>
     </div>
   </div>
+  <div id="import-panel" class="imp" hidden></div>
   <div id="prospects-table"></div>
 </div>
 

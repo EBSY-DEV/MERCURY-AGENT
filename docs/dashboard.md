@@ -55,7 +55,9 @@ Every business Mercury has recorded. Click a row to see its contacts.
 
 ## Contacts
 
-Everyone Mercury has found, with title, company, email status and score. **Export deliverable CSV** downloads verified and risky addresses; **Export all** downloads everything.
+Everyone Mercury has found or you imported, with title, company, email status and score. **Export deliverable CSV** downloads verified and risky addresses; **Export all** downloads everything.
+
+**Import CSV** opens the import panel. Choose a file, check the column mapping, then review the preview: counts of new, needs-enrichment, duplicate and invalid rows, and a row table you can filter. Untick a row to leave it out. Invalid rows have to be left out before the Import button enables. After the import, **Recent imports** lists each batch with how many contacts are still held and unverified, plus **Verify** (shows the credit cost first) and **Release** (hands verified contacts to outreach). Imported contacts show their batch and row in the Source column, and a "needs ..." note when they lack a name or title. See [Importing a list](prospecting.md#importing-a-list).
 
 ## Pipeline
 
