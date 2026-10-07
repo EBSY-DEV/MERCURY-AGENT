@@ -697,6 +697,186 @@ def cmd_personas(args):
         sys.exit(1)
 
 
+def _import_mapping(pairs):
+    """--map email="Work Email" --map company_name=Company -> {field: header}."""
+    if not pairs:
+        return None
+    mapping = {}
+    for pair in pairs:
+        name, sep, header = pair.partition("=")
+        if not sep:
+            raise SystemExit(f"\n  --map takes FIELD=HEADER, got {pair!r}\n")
+        mapping[name.strip()] = header.strip()
+    return mapping
+
+
+def _print_import_rows(rows, show_all):
+    shown = [r for r in rows if show_all or r["outcome"] != "new" or r["action"] != "create"]
+    if not shown:
+        return
+    print(f"\n  {'Row':>5}  {'Outcome':<11} {'Action':<9} Detail")
+    for r in shown[:200]:
+        detail = r.get("email") or ""
+        if r.get("reason"):
+            detail = f"{detail}  {r['reason']}".strip()
+        if r.get("fill"):
+            detail += f"  (fills {', '.join(r['fill'])})"
+        print(f"  {r['row']:>5}  {r['outcome']:<11} {r['action']:<9} {detail}")
+    if len(shown) > 200:
+        print(f"  ... {len(shown) - 200} more (use --json for every row)")
+
+
+def cmd_import(args):
+    """Import contacts from a CSV: preview, then commit unless --dry-run."""
+    import json
+
+    from mercury.control.imports import ImportService
+    from mercury.csv_import import ImportFileError
+    from mercury.state import StateManager
+
+    async def _run():
+        data = sys.stdin.buffer.read() if args.file == "-" else Path(args.file).read_bytes()
+        service = await ImportService(StateManager()).ready()
+        try:
+            exclude_rows = [int(x) for x in args.exclude_rows.split(",") if x.strip()]
+        except ValueError:
+            raise SystemExit(f"\n  --exclude-rows takes row numbers, got {args.exclude_rows!r}\n")
+        options = dict(filename=Path(args.file).name, mapping=_import_mapping(args.map),
+                       delimiter=args.delimiter, policy=args.policy, exclude_rows=exclude_rows)
+        if args.dry_run:
+            result = await service.preview(data, **options)
+            if args.json:
+                return print(json.dumps(result, indent=2))
+            c = result["counts"]
+            print(f"\n  {args.file}: {c['total']} rows, {result['delimiter']}-separated")
+            print("  Columns: " + ", ".join(f"{k}={v!r}" for k, v in result["mapping"].items()))
+            if result["ignored_columns"]:
+                print(f"  Ignored {', '.join(result['ignored_columns'])}: imported addresses "
+                      "are unverified until Mercury verifies them.")
+            print(f"\n  New {c['new']} · needs enrichment {c['incomplete']} · duplicate "
+                  f"{c['duplicate']} · invalid {c['invalid']}")
+            print(f"  Would create {c['create']}, fill {c['fill']}, skip {c['skip']}, "
+                  f"leave out {c['exclude']}")
+            _print_import_rows(result["rows"], args.all_rows)
+            print("\n  Dry run: nothing was changed. Drop --dry-run to import.\n")
+            return
+        result = await service.commit(data, skip_invalid=args.skip_invalid, origin="cli", **options)
+        if args.json:
+            return print(json.dumps(result, indent=2))
+        b = result["batch"]
+        if result["already_committed"]:
+            print(f"\n  Already imported as batch {b['id']} on {b['created_at'][:16]}. Nothing changed.\n")
+            return
+        print(f"\n  Imported batch {b['id']}: created {b['created']}, filled {b['filled']}, "
+              f"skipped {b['skipped']}, left out {b['excluded']}")
+        _print_import_rows(result["rows"], args.all_rows)
+        print("\n  Imported contacts are held: nothing is drafted or sent for them.")
+        print(f"  Next: mercury imports verify {b['id']}   then   mercury imports release {b['id']}\n")
+
+    try:
+        asyncio.run(_run())
+    except ImportFileError as error:
+        print(f"\n  {error}")
+        if error.details.get("headers"):
+            print("  Columns in this file: " + ", ".join(error.details["headers"]))
+        if error.details.get("rows"):
+            print("  Invalid rows: " + ", ".join(map(str, error.details["rows"])))
+            print("  Re-run with --dry-run to see why, or --skip-invalid to import the rest.")
+        if error.code == "ambiguous_delimiter":
+            print("  Pass --delimiter " + " or --delimiter ".join(error.details["candidates"]))
+        print()
+        sys.exit(1)
+
+
+def cmd_imports(args):
+    """List import batches, verify their addresses, release them to outreach."""
+    import json
+
+    from mercury.config import load_env
+    from mercury.control.imports import ImportService
+    from mercury.csv_import import ImportFileError
+    from mercury.state import StateManager
+
+    async def _run():
+        service = await ImportService(StateManager(), load_env()).ready()
+        action = args.imports_action or "list"
+        if action != "list" and not args.batch:
+            raise ImportFileError("not_found", f"Which batch? mercury imports {action} BATCH_ID")
+        if action == "list":
+            batches = await service.batches(args.limit)
+            if args.json:
+                return print(json.dumps(batches, indent=2))
+            if not batches:
+                return print("\n  No imports yet. Try: mercury import contacts.csv --dry-run\n")
+            print(f"\n  {'Batch':<13} {'When':<17} {'Created':>7} {'Held':>5} {'Unverified':>10}  File")
+            for b in batches:
+                print(f"  {b['id']:<13} {b['created_at'][:16]:<17} {b['created']:>7} {b['held']:>5} "
+                      f"{b['unverified']:>10}  {b['filename']}")
+            print()
+        elif action == "show":
+            result = await service.batch(args.batch)
+            if args.json:
+                return print(json.dumps(result, indent=2))
+            b = result["batch"]
+            print(f"\n  Batch {b['id']}  {b['filename']}  ({b['origin']}, {b['policy']} duplicates)")
+            for c in result["contacts"]:
+                print(f"    {c['n']:>5}  {c['status']:<10} email {c['email_status'] or 'unknown'}")
+            _print_import_rows(result["rows"], args.all_rows)
+            print()
+        elif action == "verify":
+            estimate = await service.verify_estimate(args.batch)
+            if args.estimate:
+                return print(json.dumps(estimate, indent=2) if args.json else f"\n  {estimate['cost']}\n")
+            if not estimate["providers"]:
+                raise ImportFileError("no_verifier", estimate["cost"])
+            if not estimate["addresses"]:
+                return print("\n  Every address in this batch is already verified or settled.\n")
+            print(f"\n  {estimate['cost']}")
+            totals, after, results, unresolved = 0, 0, {}, 0
+
+            async def progress(done, total):
+                print(f"\r  Verifying {totals + done}/{estimate['addresses']}", end="", flush=True)
+
+            while True:
+                step = await service.verify(args.batch, limit=args.limit, after_row=after,
+                                            progress=None if args.json else progress)
+                totals += step["checked"]
+                unresolved += step.get("unresolved", 0)
+                after = step["next_after_row"]
+                for k, v in step["results"].items():
+                    results[k] = results.get(k, 0) + v
+                if step["stopped"] or not step["remaining"] or not step["checked"] or not args.all:
+                    break
+            summary = {"checked": totals, "results": results, "remaining": step["remaining"],
+                       "unresolved": unresolved, "stopped": step["stopped"]}
+            if args.json:
+                return print(json.dumps(summary, indent=2))
+            print("\n  " + (", ".join(f"{v} {k}" for k, v in results.items()) or "nothing checked"))
+            if step["stopped"]:
+                print(f"  {step['stopped']}")
+            elif step["remaining"]:
+                print(f"  {step['remaining']} left. Run again, or pass --all.")
+            if unresolved:
+                print(f"  {unresolved} could not be settled and stay unverified. Verifying again "
+                      "spends credits on them again.")
+            print(f"  Release the verified ones: mercury imports release {estimate['batch_id']}\n")
+        elif action == "release":
+            result = await service.release(args.batch, include_risky=args.include_risky)
+            if args.json:
+                return print(json.dumps(result, indent=2))
+            print(f"\n  Released {result['released']} contact(s) to outreach; "
+                  f"{result['still_held']} still held (unverified or invalid).")
+            if result["released"]:
+                print("  The Writer drafts for them on its next cycle; drafts wait in the Outbox.")
+            print()
+
+    try:
+        asyncio.run(_run())
+    except ImportFileError as error:
+        print(f"\n  {error}\n")
+        sys.exit(1)
+
+
 def cmd_sending(args):
     """Pause/resume the sending kill switch."""
     from mercury.state import StateManager
@@ -805,6 +985,41 @@ def main():
     sub.add_argument("--approve-all", action="store_true", help="Approve all pending")
     sub.add_argument("--reject", metavar="ID", default="", help="Reject one item")
     sub.set_defaults(func=cmd_outbox)
+
+    # mercury import FILE / mercury imports
+    sub = subparsers.add_parser(
+        "import", help="Import contacts from a CSV (preview with --dry-run)")
+    sub.add_argument("file", help="CSV file (UTF-8), or - for stdin")
+    sub.add_argument("--dry-run", action="store_true", help="Preview only; change nothing")
+    sub.add_argument("--map", action="append", metavar="FIELD=HEADER",
+                     help="Map a field to a column, e.g. --map email='Work Email'. Repeatable; "
+                          "replaces the automatic mapping. Fields: email, first_name, last_name, "
+                          "full_name, title, company_name, website, industry, linkedin_url, "
+                          "phone, personalization")
+    sub.add_argument("--delimiter", default="", choices=["", "comma", "semicolon", "tab"],
+                     help="Column delimiter when detection is ambiguous")
+    sub.add_argument("--policy", default="skip", choices=["skip", "fill"],
+                     help="Existing contacts: skip them (default) or fill their blank fields")
+    sub.add_argument("--skip-invalid", action="store_true",
+                     help="Leave invalid rows out and import the rest")
+    sub.add_argument("--exclude-rows", default="", metavar="N,N",
+                     help="Row numbers to leave out (row 1 is the header)")
+    sub.add_argument("--all-rows", action="store_true", help="List every row, not just problems")
+    sub.add_argument("--json", action="store_true", help="Machine-readable result")
+    sub.set_defaults(func=cmd_import)
+
+    sub = subparsers.add_parser("imports", help="Import batches: list, show, verify, release")
+    sub.add_argument("imports_action", nargs="?", default="list",
+                     choices=["list", "show", "verify", "release"])
+    sub.add_argument("batch", nargs="?", default="", help="Batch id (or a unique prefix)")
+    sub.add_argument("--estimate", action="store_true", help="verify: show the cost only")
+    sub.add_argument("--all", action="store_true", help="verify: keep going until done")
+    sub.add_argument("--limit", type=int, default=25, help="Batches to list / addresses per verify run")
+    sub.add_argument("--include-risky", action="store_true",
+                     help="release: also release catch-all (risky) addresses")
+    sub.add_argument("--all-rows", action="store_true", help="show: list every row")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub.set_defaults(func=cmd_imports)
 
     # mercury sending pause|resume|status
     sub = subparsers.add_parser("discover", help="Find businesses matching your ICP")

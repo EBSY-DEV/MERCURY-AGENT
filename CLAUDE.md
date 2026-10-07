@@ -240,6 +240,7 @@ Users will come back with questions and tasks. Common ones:
 - **"I want to change what Mercury says"** → Skills are in `skills/`, prompts are in `prompts/`. Both are plain markdown files. Edit them directly.
 - **"Train Mercury on a different product"** → `mercury train <new-url>`
 - **"How do I see the database?"** → It's at `data/mercury.db`. They can open it with any SQLite tool, or ask you to query it.
+- **"I already have a list"** → Contacts → **Import CSV** in the dashboard, or `mercury import leads.csv --dry-run` first. Imported contacts are held (status `imported`, address `guess`) until they run `mercury imports verify BATCH` and `mercury imports release BATCH`. Details in docs/prospecting.md#importing-a-list.
 - **"I just want the prospect list"** → `mercury export` writes a sequencer-ready CSV (verified/risky emails only; `--all` for everything). Also available as Export buttons on the dashboard's Contacts tab. Mercury is valuable purely as a list-builder even if the user never lets it send.
 
 ---
@@ -303,6 +304,8 @@ mercury status                # Pipeline summary
 mercury usage                 # Claude quota gauges + per-agent token usage (no dollar costs — subscription plans aren't billed per token)
 mercury export                # Deliverable prospects → sequencer-ready CSV (prospects.csv)
 mercury export --all          # Full raw list, no filters
+mercury import FILE --dry-run # Preview a CSV import; drop --dry-run to import (held, unverified)
+mercury imports               # Import batches; verify BATCH / release BATCH
 mercury gmail auth            # One-time Gmail OAuth (when provider: gmail)
 mercury gmail test            # Verify the Gmail connection
 mercury mail test             # Verify whichever provider is configured (gmail or smtp)
