@@ -619,6 +619,10 @@ td a:hover { text-decoration: underline; }
 .desk-regen .btn { flex: none; }
 .desk-note { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-2); margin-top: 8px; }
 .desk-note .ph { font-size: 14px; color: var(--text-3); }
+/* Demo gate: why this email waits, and the way to release it */
+.desk-note.hold { flex-wrap: wrap; row-gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.desk-note.hold > span:not(.badge) { flex: 1; min-width: 200px; text-wrap: pretty; }
+.desk-note.hold .btn { flex: none; }
 
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .mono-sm { font-family: var(--mono); font-size: 12px; }

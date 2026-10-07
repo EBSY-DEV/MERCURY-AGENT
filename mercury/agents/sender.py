@@ -20,6 +20,9 @@ from datetime import date, datetime, timedelta, timezone
 
 from mercury.brain import Brain
 from mercury.config import MercuryConfig, EnvConfig
+from mercury.demos import check_campaign as demo_check_campaign
+from mercury.demos import check_outbox_item as demo_check_item
+from mercury.demos import register_requests as register_demo_requests
 from mercury.gate import pre_send_check
 from mercury.integrations.instantly import InstantlyClient
 from mercury.integrations.mail_provider import NATIVE_PROVIDERS, SendResult, get_mail_provider
@@ -187,6 +190,14 @@ class Sender:
         # 0. Validate before touching the network
         if not self._validate_sequence(campaign):
             await self.state.update_campaign(campaign.id, status="failed")
+            return
+
+        # Instantly runs the whole sequence once deployed, so an offer that
+        # promises a demo keeps the campaign in draft until every contact's
+        # demo is ready.
+        demo = await demo_check_campaign(self.state, self.config, campaign)
+        if demo.held:
+            logger.info(f"Sender: holding campaign '{campaign.name}': {demo.reason}")
             return
 
         # 1. Create campaign in Instantly — or resume one from a previous
@@ -497,6 +508,7 @@ class Sender:
         skipped = 0
         now = self.clock()
         seen_emails: set[str] = set()
+        queued_ids: list[str] = []
 
         for prospect_id in campaign.prospect_ids:
             prospect = await self.state.get_prospect(prospect_id)
@@ -539,10 +551,17 @@ class Sender:
                     provider=self.provider.name,
                     generation_id=step.generation_id,
                     mailbox=campaign.mailbox,
+                    offer_key=campaign.offer_key,
                 )
                 if item_id:
                     staged += 1
             await self.state.update_prospect_status(prospect.id, "queued")
+            queued_ids.append(prospect.id)
+
+        # An offer that promises a demo: put each contact's demo on the list
+        # to build now, not when the email first comes due.
+        if queued_ids and campaign.offer_key:
+            await register_demo_requests(self.state, self.config, queued_ids, campaign.offer_key)
 
         await self.state.update_campaign(campaign.id, status="active")
         if skipped:
@@ -705,6 +724,15 @@ class Sender:
                         f"to {earliest[:16]} (its delay after the previous step)."
                     )
                     continue
+
+            # Demo gate: an offer that says a demo was built for this business
+            # holds its emails until that demo is ready. Fails closed.
+            demo = await demo_check_item(self.state, self.config, item)
+            if demo.held:
+                logger.info(
+                    f"Sender: holding step {item['step']} to {item['to_email']}: {demo.reason}"
+                )
+                continue
 
             mailbox, _verdict = self._mailbox_for(item, prev, pool, remaining,
                                                   sent_this_cycle, today)
