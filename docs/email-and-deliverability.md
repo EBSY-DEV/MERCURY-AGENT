@@ -191,7 +191,8 @@ On native providers the Handler polls every configured inbox on every cycle (ski
 
 | Intent | What happens |
 |---|---|
-| Out-of-office / auto-reply | Ignored. The sequence continues. |
+| Out-of-office / vacation reply | Recorded as an `auto_reply` event, not a reply: no conversation, no reply metrics. The contact's remaining cold steps are **paused** until they are back (see below). |
+| Other automatic mail (ticket acknowledgements, read receipts, list mail) | Recorded as an `auto_reply` event and otherwise ignored. The sequence continues. |
 | `unsubscribe` | Prospect becomes `opted_out`, conversation closed, every queued email cancelled. No reply is sent. |
 | `escalate` (legal threats, harassment complaints) | Conversation flagged `needs_human`. No auto-reply. |
 | `not_interested` | Prospect becomes `lost`, conversation closed. |
@@ -200,6 +201,14 @@ On native providers the Handler polls every configured inbox on every cycle (ski
 Opt-outs are matched by keyword before any model call: English phrases such as "unsubscribe", "remove me", "stop emailing", Spanish forms of "baja", and a one-word reply like "stop". Mercury first cuts quoted text and its own footer out of the message, so its own opt-out line in a quoted reply is not mistaken for a request.
 
 **Stop-on-reply.** Any human reply (anything other than an auto-responder) moves the prospect to `replied` and cancels every queued email for them. A prospect you already moved to Meeting or Won is not pulled back to `replied`.
+
+**Out-of-office pauses.** A vacation reply (found from the `Auto-Submitted` and similar headers, or by the classifier for a message with none) pauses that prospect's cold sequence. Not every automatic message does: a ticket acknowledgement or a read receipt does not.
+
+- *With a return date.* Mercury reads dates in English and Spanish ("until October 20", "hasta el 20 de octubre", "back Monday", "for two weeks", "Oct 12-20"), measured against when the message arrived in `usage.quiet_hours.timezone`. Sending resumes when quiet hours end that day, or the next Monday if it is a weekend. "Until" names the day they are back; "through" and ranges such as "Oct 12-20" name the last day away, so those resume the day after. To give them time to clear their inbox first, set `channels.email.ooo_resume_buffer_days` (default 0) to resume that many business days later. A date you set by hand on the Outbox tab is used as is.
+- *Without a usable date.* No date, a date that can be read two ways (`10/11`), one that does not exist (`31/02`), one already past, or one over a year away puts the contact into **return date needs review**. Mercury never invents a date and never resumes these on its own. Set a date or resume the contact from the Outbox tab (or the Today list, which flags them).
+- *Resuming.* Approvals and reviewed text are untouched; the contact's queued steps get new send times. The next unsent step goes out under normal pacing, caps and quiet hours, and later steps keep their usual gap after it. A later vacation notice moves the date; an older one replayed, or a duplicate, does not, and neither overwrites a date you set.
+- *Ending a pause for good.* A human reply, opt-out, bounce, or moving the contact to Meeting, Won or Lost ends the pause and the sequence stays stopped.
+- *Instantly.* The legacy path cannot pause a sequence Instantly is sending, so Mercury logs `sequence_pause_unavailable` instead of claiming a pause.
 
 Conversations move through stages `initial_outreach`, `engaged`, `qualifying`, `presenting`, `negotiating`, `closing`, and end at `closed_won` or `closed_lost`. Mercury advances them from reply intent; you move deals on the Pipeline tab.
 
