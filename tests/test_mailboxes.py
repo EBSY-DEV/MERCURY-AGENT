@@ -9,17 +9,17 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 
-from harvey.agents.sender import spread_budget
-from harvey.config import EmailChannelConfig, EnvConfig, MailboxConfig, ProductConfig
-from harvey.integrations.mail_provider import InboundMessage
-from harvey.integrations.mailboxes import (
+from mercury.agents.sender import spread_budget
+from mercury.config import EmailChannelConfig, EnvConfig, MailboxConfig, ProductConfig
+from mercury.integrations.mail_provider import InboundMessage
+from mercury.integrations.mailboxes import (
     Mailbox,
     MailboxPool,
     planned_daily_capacity,
     warmup_cap,
 )
-from harvey.integrations.smtp_mail import SmtpImapProvider
-from harvey.state import StateManager
+from mercury.integrations.smtp_mail import SmtpImapProvider
+from mercury.state import StateManager
 from tests.test_outbox_native import FakeProvider, StubBrain, seed_prospect
 
 
@@ -67,7 +67,7 @@ def make_pool(*specs, initial=5, weekly=5):
 
 
 def make_sender(state, pool, **email_overrides):
-    from harvey.agents.sender import Sender
+    from mercury.agents.sender import Sender
     sender = Sender(brain=None, state=state, config=make_config(**email_overrides),
                     env=SimpleNamespace(instantly_api_key=""))
     sender.mailboxes = pool
@@ -108,7 +108,7 @@ def test_planned_capacity_is_the_smaller_of_global_and_mailbox_caps():
 
 
 def test_mailbox_config_normalises_and_rejects_duplicates():
-    assert MailboxConfig(email=" Harvey@EbsyHQ.com ").email == "harvey@ebsyhq.com"
+    assert MailboxConfig(email=" Mercury@EbsyHQ.com ").email == "mercury@ebsyhq.com"
     with pytest.raises(ValueError):
         MailboxConfig(email="not-an-address")
     with pytest.raises(ValueError):
@@ -126,13 +126,13 @@ def test_env_secret_reads_mailbox_vars_and_known_fields():
 def test_smtp_provider_sends_as_its_mailbox():
     env = EnvConfig(smtp_host="mail.example.com", smtp_port=465, smtp_username="old@main.co",
                     smtp_password="legacy", mailbox_secrets={"MAILBOX_PASSWORD": "pw"})
-    mb = MailboxConfig(email="harvey@ebsyhq.com", name="Carlos | EBSY",
+    mb = MailboxConfig(email="mercury@ebsyhq.com", name="Carlos | EBSY",
                        password_env="MAILBOX_PASSWORD")
     p = SmtpImapProvider(make_config(), env, mailbox=mb)
     assert (p.smtp_user, p.smtp_pass, p.imap_user, p.imap_pass) == (
-        "harvey@ebsyhq.com", "pw", "harvey@ebsyhq.com", "pw")
+        "mercury@ebsyhq.com", "pw", "mercury@ebsyhq.com", "pw")
     assert p.smtp_host == "mail.example.com" and p.smtp_port == 465
-    assert p.sender_address == "harvey@ebsyhq.com"
+    assert p.sender_address == "mercury@ebsyhq.com"
     assert "pw" not in repr(p)
     missing = SmtpImapProvider(make_config(), env, mailbox=MailboxConfig(
         email="x@y.co", password_env="MAILBOX_NOPE"))
@@ -361,7 +361,7 @@ async def test_capped_follow_ups_do_not_starve_other_mailboxes(state):
 
 @pytest.mark.asyncio
 async def test_follow_up_waits_its_delay_after_the_opener_really_went_out(state):
-    from harvey.models.campaign import Campaign, EmailStep
+    from mercury.models.campaign import Campaign, EmailStep
 
     camp = Campaign(id="", name="c", sequence=[
         EmailStep(step=1, subject="s1", body="b1", delay_days=0),
@@ -493,7 +493,7 @@ class BrokenProvider(FakeProvider):
 
 @pytest.mark.asyncio
 async def test_handler_reads_every_inbox_and_answers_from_the_receiving_one(state):
-    from harvey.agents.handler import Handler
+    from mercury.agents.handler import Handler
 
     pid = await seed_prospect(state, email="jane@acme.com")
     s1 = await queue(state, pid, "jane@acme.com", step=1)
@@ -526,7 +526,7 @@ def _report_pool(env, cfg):
 
 
 def test_mailbox_report_matches_what_the_sender_enforces():
-    from harvey.integrations.mailboxes import mailbox_report
+    from mercury.integrations.mailboxes import mailbox_report
 
     today = date(2026, 10, 7)
     env = EnvConfig(smtp_host="mail.x", smtp_username="old@main.co", smtp_password="p",
@@ -565,7 +565,7 @@ def test_mailbox_report_matches_what_the_sender_enforces():
 
 
 def test_mailbox_report_stage_for_a_ramp_that_never_finishes():
-    from harvey.integrations.mailboxes import mailbox_report
+    from mercury.integrations.mailboxes import mailbox_report
 
     today = date(2026, 10, 7)
     env = EnvConfig(smtp_host="h", mailbox_secrets={"MAILBOX_P": "x"})
@@ -576,7 +576,7 @@ def test_mailbox_report_stage_for_a_ramp_that_never_finishes():
 
 
 def test_mailbox_report_without_rotation_is_one_mailbox():
-    from harvey.integrations.mailboxes import mailbox_report
+    from mercury.integrations.mailboxes import mailbox_report
 
     cfg = make_config(max_daily_sends=15)
     pool = MailboxPool.single(FakeProvider(), 15, "carlos@main.co")
@@ -599,7 +599,7 @@ def test_planned_capacity_counts_only_usable_mailboxes_for_new_threads():
 
 
 def test_load_env_from_a_mapping_leaves_os_environ_alone(monkeypatch):
-    from harvey.config import load_env
+    from mercury.config import load_env
 
     monkeypatch.delenv("MAILBOX_ONLY_IN_FILE", raising=False)
     env = load_env({"SMTP_HOST": "h", "MAILBOX_ONLY_IN_FILE": "x"})
@@ -621,7 +621,7 @@ async def test_promotion_can_be_limited_to_one_thread(state):
 
 
 def test_has_credentials_ignores_an_empty_mailbox_secrets_dict(monkeypatch):
-    from harvey import main as M
+    from mercury import main as M
 
     monkeypatch.setattr(M, "load_env", lambda: EnvConfig())
     assert M._has_credentials() is False
@@ -631,7 +631,7 @@ def test_has_credentials_ignores_an_empty_mailbox_secrets_dict(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_outbox_api_shows_the_mailbox_a_follow_up_inherits(state, monkeypatch):
-    from harvey import dashboard
+    from mercury import dashboard
 
     pid = await seed_prospect(state)
     s1 = await queue(state, pid, "jane@acme.com", step=1)
@@ -643,7 +643,7 @@ async def test_outbox_api_shows_the_mailbox_a_follow_up_inherits(state, monkeypa
 
 @pytest.mark.asyncio
 async def test_from_mailbox_resolves_legacy_threads_and_waiting_chains(state):
-    from harvey import dashboard
+    from mercury import dashboard
 
     # Old thread: opener sent before tracking -> follow-up goes from legacy.
     p1 = await seed_prospect(state, email="old@acme.com")
@@ -674,7 +674,7 @@ async def test_from_mailbox_resolves_legacy_threads_and_waiting_chains(state):
 
 def test_mailboxes_endpoint_reports_presence_only(state, monkeypatch):
     from fastapi.testclient import TestClient
-    from harvey import dashboard
+    from mercury import dashboard
 
     env = EnvConfig(smtp_host="mail.x", smtp_username="old@main.co",
                     smtp_password="TOPSECRET-1", mailbox_secrets={"MAILBOX_PASSWORD": "TOPSECRET-2"})
@@ -698,7 +698,7 @@ def test_mailboxes_endpoint_reports_presence_only(state, monkeypatch):
 
 def test_mailboxes_endpoint_explains_a_broken_config(monkeypatch):
     from fastapi.testclient import TestClient
-    from harvey import dashboard
+    from mercury import dashboard
 
     def boom():
         raise ValueError("channels.email.mailboxes.0.email: secret-looking input")
@@ -711,7 +711,7 @@ def test_mailboxes_endpoint_explains_a_broken_config(monkeypatch):
 @pytest.mark.asyncio
 async def test_approving_an_opener_promotes_its_follow_ups_at_once(state, monkeypatch):
     from fastapi.testclient import TestClient
-    from harvey import dashboard
+    from mercury import dashboard
 
     pid = await seed_prospect(state)
     s1 = await queue(state, pid, "jane@acme.com", step=1, status="pending_review")
@@ -719,7 +719,7 @@ async def test_approving_an_opener_promotes_its_follow_ups_at_once(state, monkey
     s3 = await queue(state, pid, "jane@acme.com", step=3, status="pending_review")
     cfg = make_config(auto_approve_followups=True)
     monkeypatch.setattr(dashboard, "_state", lambda: state)
-    monkeypatch.setattr("harvey.config.load_config", lambda *a, **k: cfg)
+    monkeypatch.setattr("mercury.config.load_config", lambda *a, **k: cfg)
 
     data = TestClient(dashboard.app).post(f"/api/outbox/{s1}/approve").json()
 
@@ -750,7 +750,7 @@ async def test_reply_from_a_mailbox_without_credentials_is_held(state):
 
 @pytest.mark.asyncio
 async def test_from_mailbox_flags_threads_of_removed_mailboxes(state):
-    from harvey import dashboard
+    from mercury import dashboard
 
     pid = await seed_prospect(state)
     s1 = await queue(state, pid, "jane@acme.com", step=1)

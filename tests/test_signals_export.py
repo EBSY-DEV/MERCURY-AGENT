@@ -6,11 +6,11 @@ import tempfile
 import pytest
 import pytest_asyncio
 
-from harvey.state import StateManager
-from harvey.models.company import Company
-from harvey.models.prospect import Prospect
-from harvey.integrations.tech_detect import detect_tech
-from harvey.export import collect_prospects, export_prospects_csv, to_csv, CSV_COLUMNS
+from mercury.state import StateManager
+from mercury.models.company import Company
+from mercury.models.prospect import Prospect
+from mercury.integrations.tech_detect import detect_tech
+from mercury.export import collect_prospects, export_prospects_csv, to_csv, CSV_COLUMNS
 
 
 @pytest_asyncio.fixture

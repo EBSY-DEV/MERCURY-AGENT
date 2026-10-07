@@ -1,11 +1,38 @@
 # Changelog
 
-Notable changes to Harvey. Dates are release dates; the format follows
+Notable changes to Mercury (formerly Harvey). Dates are release dates; the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely and versions
-follow [semver](https://semver.org/), with the caveat that Harvey is pre-1.0 and
+follow [semver](https://semver.org/), with the caveat that Mercury is pre-1.0 and
 minor versions can still change behaviour.
 
 ## [Unreleased]
+
+### Changed
+
+- **Harvey is now Mercury by EBSY.** The package (`mercury/`), CLI
+  (`mercury ...`), config (`mercury.yaml`, `mercury.local.yaml`) and database
+  (`data/mercury.db`) are renamed. Existing checkouts migrate automatically:
+  `harvey.local.yaml` and `data/harvey.db*` / `harvey.log` are renamed in place
+  on first start, never overwriting a newer file. Re-run `pip install -e .`
+  so the `mercury` command exists.
+- **Dashboard redesign.** Light, lavender-tinted theme with a single violet
+  accent; dark mode re-tokenised as deep aubergine. Sans-only type (Geist +
+  Geist Mono). Tokens live in `mercury/web/app.css`; the matching Pencil
+  source is `design/mercury-brand.pen` (rebuild with
+  `design/build_brand_pen.py`).
+- **Warm-up follows the mailbox config.** The Warm-up tab shows every mailbox
+  in `channels.email.mailboxes` (or the single configured inbox) with the ramp
+  the sender enforces. Caps and start dates are edited in `mercury.yaml`
+  only; the tab keeps pause/resume, the checklist, notes and DNS checks. A
+  per-mailbox health gate sits on top of the ramp: over 5% bounces (after 20
+  sends in 7 days) pauses that mailbox until resumed, 3-5% holds it at
+  yesterday's cap. A paused mailbox still sends replies. Bounce events now
+  record the mailbox they came back to. `MERCURY_SENDER_EMAIL` is gone.
+- The deprecated `harvey` command still works as an alias of `mercury`, and
+  conversation threads recorded with sender `harvey` still read as ours.
+- `scripts/cloud_run.sh` / `local_dashboard.sh` read `MERCURY_STATE_REPO`
+  (falling back to `HARVEY_STATE_REPO`), keep state in `.mercury-state/`, and
+  rename a pre-rename state repo's `harvey.*` files on the next run.
 
 ### Added
 
@@ -24,10 +51,18 @@ minor versions can still change behaviour.
   before quiet hours.
 - **Dashboard.** A Sending mailboxes card on the Outbox (sends in the last 24
   hours against today's cap, warm-up stage, missing passwords), and the From
-  address on every queued and sent email. `harvey mail` tests every mailbox.
+  address on every queued and sent email. `mercury mail` tests every mailbox.
 
 ### Fixed
 
+- **Fresh databases could get stuck on "duplicate column name".** The
+  dashboard's parallel first-load requests each ran schema migrations at
+  once; a half-applied migration left the schema version behind for good.
+  Migrations now take the write lock first and apply atomically.
+- The usage tab's daily bar chart referenced undefined colour tokens and
+  rendered invisible bars.
+- The heartbeat backed off an hour on `budget_exhausted`, a value the cycle
+  never returns; a spent Claude quota now backs off on `over_budget` as meant.
 - A follow-up waits its delay after the previous email actually went out,
   not after the day the sequence was staged. Approving an old opener no
   longer sends its follow-ups right behind it.
