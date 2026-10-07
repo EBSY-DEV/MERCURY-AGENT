@@ -257,7 +257,32 @@ The company comes from `persona.company`, the address from `compliance.postal_ad
 
 While `compliance.postal_address` is empty, the native sender sends nothing and logs a compliance hold on every cycle.
 
-Opting out is by reply. Opted-out prospects are never emailed again. For regional rules beyond this, see the [FAQ](faq.md#is-this-legal-can-spam-gdpr).
+Opting out is by reply. An opt-out is recorded as an exclusion on the address itself (see below), so deleting the contact, importing it again or rediscovering it never makes it emailable. For regional rules beyond this, see the [FAQ](faq.md#is-this-legal-can-spam-gdpr).
+
+## Exclusions and company limits
+
+**Exclusions** stop every Mercury email, replies included, to an exact address or a domain. A domain rule matches that domain only; tick *include subdomains* (`--subdomains`) to also match `eu.acme.com` and the like. Each rule records its source:
+
+| Source | Added by | Lifting it |
+|---|---|---|
+| `opt_out` | The reply handler, when someone asks to stop | Needs an explicit confirmation and a note. Never lifted by an import or by removing another rule. |
+| `bounce` | The bounce handler | Any time, with a note. |
+| `manual` | You, in the dashboard (**Exclusions**) or `mercury exclusions add` | Any time. |
+| `import` | A CSV of exclusions | Any time. An import only ever adds rules. |
+
+Rules for the same address from different sources are separate, so removing a manual rule leaves an opt-out in place. Rules are never deleted: lifting one stamps who did it and why, and every change is kept in an append-only history.
+
+Exclusions are checked when contacts are imported, when a campaign is staged, and again inside the same database transaction that claims an email for sending. Email already queued when a rule is added (approved or not) is moved to **blocked** at once. Lifting the rule does not send it: send it back to review from the Exclusions or Outbox tab and approve it again.
+
+**Company limits** count against a *known company*: the contact's `company_id`, or the company whose domain is the contact's email domain. Shared providers such as gmail.com or outlook.com never make two people colleagues, and a contact with no known company shows "Company unknown" and gets no company limit.
+
+- `max_new_contacts_per_company_per_day` caps first emails per company in a rolling 24 hours.
+- `max_active_contacts_per_company` caps unfinished cold sequences per company (first email sent, later steps still queued, paused or blocked).
+- `pause_company_on_reply` holds cold mail to the rest of a company once one person writes back. Replies to the people who wrote keep going. Resume it on the Exclusions tab or with `mercury holds release`. You can also pause a company yourself from its contact list.
+
+Limits are enforced when an email is claimed for sending. A claimed first email counts until the provider answers, so two sender processes cannot both take the last slot. A send that fails frees its slot, and a person contacted twice in a day counts once. Held email keeps its status: when the hold lifts or a slot frees up, approved email goes out and drafts still wait for review. The Outbox shows why each held email is waiting.
+
+The legacy Instantly provider sends sequences itself, so Mercury applies exclusions only when it adds leads and cannot enforce company limits or reply holds there.
 
 ## DNS: SPF, DKIM, DMARC, MX
 

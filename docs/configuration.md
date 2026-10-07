@@ -124,6 +124,9 @@ icp:
 | `warmup_weekly_increase` | `5` | Added to the cap every 7 days, up to the mailbox's `daily_cap`. |
 | `auto_approve_followups` | `false` | With approval on, approving a first email also approves its follow-ups. Replies still need approval. |
 | `spread_sends` | `false` | Pace the day's remaining cold sends evenly over the cycles left before quiet hours, instead of up to 8 per cycle. |
+| `max_new_contacts_per_company_per_day` | `0` | Native providers: first emails to a known company in a rolling 24 hours (the same window as `max_daily_sends`, so no timezone applies). `0` = no limit. See [Exclusions and company limits](email-and-deliverability.md#exclusions-and-company-limits). |
+| `max_active_contacts_per_company` | `0` | Native providers: contacts at one company with an unfinished cold sequence at once. A paused sequence keeps its slot until its remaining steps are rejected or cancelled. `0` = no limit. |
+| `pause_company_on_reply` | `true` | Native providers: when a person at a company replies, hold cold mail to their colleagues until you resume it. Auto-replies, read receipts and bounces never trigger it. |
 
 Each entry in `mailboxes`:
 
