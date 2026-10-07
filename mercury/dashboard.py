@@ -949,6 +949,146 @@ async def outbox_reschedule(item_id: str, request: Request):
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
 
+# ── Out-of-office pauses ──
+#
+# A prospect who sent a vacation notice has their remaining cold sequence held
+# back (see Handler._pause_for_ooo). The Outbox tab lists them, flags the ones
+# whose return date needs a human, and lets an operator correct the date or
+# resume them. Both actions are recorded in the activity log.
+
+
+def _operator_clock():
+    """(timezone name, quiet-hours end) from the config, or UTC defaults."""
+    try:
+        from mercury.config import load_config
+        from mercury.ooo import operator_clock
+
+        return operator_clock(load_config())
+    except Exception:
+        return "UTC", "07:00"
+
+
+def _pause_view(row: dict, tz_name: str) -> dict:
+    """One paused contact as the UI needs it, with the return date as the
+    operator's calendar day (what the date field edits)."""
+    resume_local = ""
+    if row.get("resume_at"):
+        try:
+            import pytz
+
+            when = datetime.fromisoformat(str(row["resume_at"]).replace(" ", "T"))
+            resume_local = pytz.UTC.localize(when).astimezone(pytz.timezone(tz_name)).date().isoformat()
+        except Exception:
+            resume_local = ""
+    name = f"{row.get('first_name') or ''} {row.get('last_name') or ''}".strip()
+    return {
+        "prospect_id": row["prospect_id"],
+        "name": name or row.get("email") or "",
+        "email": row.get("email") or "",
+        "title": row.get("title") or "",
+        "company": row.get("company_name") or "",
+        "state": row["state"],
+        "review_reason": row.get("review_reason") or "",
+        "return_text": row.get("return_text") or "",
+        "resume_at": row.get("resume_at") or "",
+        "resume_local": resume_local,
+        "confidence": row.get("confidence") or 0,
+        "manual_override": bool(row.get("manual_override")),
+        "queued_count": int(row.get("queued_count") or 0),
+        "paused_since": row.get("created_at") or "",
+        "heard_at": row.get("trigger_at") or "",
+    }
+
+
+@app.get("/api/pauses")
+async def get_pauses():
+    """Contacts whose cold sequence is paused for an out-of-office reply."""
+    try:
+        state = _state()
+        await state.init_db()
+        tz_name, _end = _operator_clock()
+        rows = await state.list_pauses()
+        return {"timezone": tz_name, "pauses": [_pause_view(r, tz_name) for r in rows]}
+    except Exception as e:
+        return {"error": str(e), "pauses": []}
+
+
+@app.post("/api/pauses/{prospect_id}/resume")
+async def resume_pause_api(prospect_id: str):
+    """Resume a paused contact now. Their next unsent step goes out under the
+    normal pacing; later steps keep their gaps."""
+    try:
+        state = _state()
+        await state.init_db()
+        before = await state.get_active_pause(prospect_id)
+        if before is None:
+            return JSONResponse(
+                {"success": False, "error": "this contact has no active pause"}, status_code=404)
+        pause = await state.resume_pause(prospect_id, reason="operator")
+        if pause is None:
+            return JSONResponse(
+                {"success": False, "error": "this contact has no active pause"}, status_code=404)
+        await state.log_action("sequence_resumed", "dashboard", {
+            "prospect_id": prospect_id, "by": "operator",
+            "was": before["state"], "resume_at": before.get("resume_at") or "",
+            "rescheduled": pause.get("rescheduled", 0),
+        })
+        return {"success": True, "rescheduled": pause.get("rescheduled", 0)}
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/api/pauses/{prospect_id}/return-date")
+async def set_pause_return_date(prospect_id: str, request: Request):
+    """Correct a contact's return date (YYYY-MM-DD, the operator's calendar).
+    Sending resumes at the first sending time on that day, weekends skipped.
+    The date is kept: replaying an older message will not overwrite it."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    raw = str((body or {}).get("return_date") or "").strip() if isinstance(body, dict) else ""
+    day = _parse_day(raw)
+    if day is None:
+        return JSONResponse(
+            {"success": False, "error": "return_date must be YYYY-MM-DD"}, status_code=400)
+    try:
+        from mercury.ooo import MAX_DAYS_AHEAD, resume_time
+
+        tz_name, quiet_end = _operator_clock()
+        import pytz
+
+        today = datetime.now(pytz.timezone(tz_name)).date()
+        if day < today:
+            return JSONResponse(
+                {"success": False,
+                 "error": "that date has already passed; use Resume to continue now"},
+                status_code=400)
+        if (day - today).days > MAX_DAYS_AHEAD:
+            return JSONResponse(
+                {"success": False, "error": f"return date is more than {MAX_DAYS_AHEAD} days away"},
+                status_code=400)
+        state = _state()
+        await state.init_db()
+        before = await state.get_active_pause(prospect_id)
+        if before is None:
+            return JSONResponse(
+                {"success": False, "error": "this contact has no active pause"}, status_code=404)
+        when = resume_time(day, tz_name, quiet_end)
+        pause = await state.override_pause(prospect_id, when)
+        if pause is None:
+            return JSONResponse(
+                {"success": False, "error": "this contact has no active pause"}, status_code=404)
+        await state.log_action("pause_date_changed", "dashboard", {
+            "prospect_id": prospect_id, "by": "operator",
+            "from": before.get("resume_at") or "", "was": before["state"],
+            "to": pause.get("resume_at") or "", "now": pause["state"],
+        })
+        return {"success": True, "state": pause["state"], "resume_at": pause.get("resume_at") or ""}
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
 # ── Pipeline board + calendar ──
 
 PIPELINE_COLUMNS = [
@@ -1687,6 +1827,18 @@ async def get_today():
                           else f"{len(pending)} emails waiting for approval"),
                 "detail": "Nothing sends until you approve it. Read them one at a time.",
                 "action": "Open the decisions desk", "tab": "outbox",
+            })
+
+        review = (await state.count_active_pauses()).get("needs_review", 0)
+        if review:
+            items.append({
+                "key": "pauses", "tone": "warn",
+                "title": (f"{review} contact is out of office with no usable return date"
+                          if review == 1 else
+                          f"{review} contacts are out of office with no usable return date"),
+                "detail": ("Their sequences are paused and stay paused until you set a "
+                           "return date or resume them."),
+                "action": "Review paused contacts", "tab": "outbox",
             })
 
         if open_convos:
