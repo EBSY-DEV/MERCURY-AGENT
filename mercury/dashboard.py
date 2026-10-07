@@ -26,6 +26,7 @@ logger = logging.getLogger("mercury.dashboard")
 from mercury.paths import PROJECT_ROOT  # noqa: E402
 from mercury.personas_api import router as personas_router  # noqa: E402
 from mercury.imports_api import router as imports_router  # noqa: E402
+from mercury.exclusions_api import router as exclusions_router  # noqa: E402
 # MERCURY_DB_PATH points the dashboard at another database (e.g. the demo
 # DB from scripts/seed_demo.py) without touching the real one.
 DB_PATH = Path(os.environ.get("MERCURY_DB_PATH") or (PROJECT_ROOT / "data" / "mercury.db"))
@@ -37,6 +38,7 @@ LOG_FILE = PROJECT_ROOT / "data" / "mercury.log"
 app = FastAPI(title="Mercury Dashboard")
 app.include_router(personas_router)
 app.include_router(imports_router)
+app.include_router(exclusions_router)
 
 # Mercury process tracking
 _mercury_process: subprocess.Popen | None = None
@@ -670,10 +672,12 @@ async def get_outbox_api():
             legacy, known = "", None
         return {
             "paused": await state.get_setting("sending_paused"),
-            "pending": await _with_from_mailbox(
-                state, await state.get_outbox(status="pending_review", limit=100), legacy, known),
-            "approved": await _with_from_mailbox(
-                state, await state.get_outbox(status="approved", limit=50), legacy, known),
+            "pending": await _with_policy(state, await _with_from_mailbox(
+                state, await state.get_outbox(status="pending_review", limit=100), legacy, known)),
+            "approved": await _with_policy(state, await _with_from_mailbox(
+                state, await state.get_outbox(status="approved", limit=50), legacy, known)),
+            "blocked": await _with_policy(state, await state.get_outbox(
+                status="blocked", limit=50)),
             "sending": await _with_from_mailbox(
                 state, await state.get_outbox(status="sending", limit=50), legacy, known),
             "sent": await _with_from_mailbox(state, await query_db(
@@ -702,6 +706,22 @@ def _mail_context():
         values.update({k: v for k, v in dotenv_values(str(ENV_FILE), interpolate=False).items() if v is not None})
     config = load_config()
     return config, MailboxPool.from_config(config, load_env(values))
+
+
+async def _with_policy(state, rows: list[dict]) -> list[dict]:
+    """Add ``policy``: whether each queued email can go out under the
+    exclusions and company limits, and if not, why and what to do."""
+    from mercury.policy import ContactPolicy
+
+    try:
+        from mercury.config import load_config
+        config = load_config()
+    except Exception:
+        config = None
+    policy = ContactPolicy(state, config)
+    for r in rows:
+        r["policy"] = (await policy.explain(r)).as_dict()
+    return rows
 
 
 async def _with_from_mailbox(state, rows: list[dict], legacy_email: str = "",
@@ -1329,7 +1349,8 @@ async def sending_toggle(action: str):
             await state.set_setting("sending_paused", "paused from dashboard")
         else:
             await state.set_setting("sending_paused", "")
-            await state.set_setting("bounce_count", "0")
+            from mercury.bounces import reset_counters
+            await reset_counters(state)
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -1686,6 +1707,29 @@ async def get_today():
                           else f"{len(pending)} emails waiting for approval"),
                 "detail": "Nothing sends until you approve it. Read them one at a time.",
                 "action": "Open the decisions desk", "tab": "outbox",
+            })
+
+        blocked = await state.get_outbox(status="blocked", limit=200)
+        if blocked:
+            items.append({
+                "key": "blocked", "tone": "warn",
+                "title": (f"{len(blocked)} email blocked by an exclusion" if len(blocked) == 1
+                          else f"{len(blocked)} emails blocked by exclusions"),
+                "detail": ("They were queued before the address or domain was excluded. "
+                           "Nothing goes out unless you lift the rule and approve again."),
+                "action": "Review exclusions", "tab": "exclusions",
+            })
+
+        holds = await state.list_company_holds()
+        held_mail = sum(h["queued"] for h in holds)
+        if holds:
+            items.append({
+                "key": "company-holds", "tone": "good",
+                "title": (f"{len(holds)} company on hold" if len(holds) == 1
+                          else f"{len(holds)} companies on hold"),
+                "detail": ("Someone there replied or you paused it, so cold mail to their "
+                           f"colleagues waits ({held_mail} queued). Replies still go out."),
+                "action": "Review holds", "tab": "exclusions",
             })
 
         if open_convos:

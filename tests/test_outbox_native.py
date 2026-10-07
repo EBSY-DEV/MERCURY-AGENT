@@ -73,7 +73,7 @@ class Cfg:
             max_daily_sends = 50
             send_to_risky = False
             require_approval = True
-            max_bounce_rate = 0.05
+            max_bounce_rate = 0.02
 
         class linkedin:
             enabled = False
@@ -356,8 +356,7 @@ async def test_reply_cancels_pending_outbox(state):
     assert prospect.status == "opted_out"   # opt-out keywords honored
 
 
-@pytest.mark.asyncio
-async def test_bounce_marks_invalid_and_kill_switch(state):
+async def _sent_for_bounce(state, extra):
     pid = await seed_prospect(state, status="contacted")
     # A sent item whose message-id the bounce references
     item_id = await state.add_outbox_item(
@@ -367,27 +366,49 @@ async def test_bounce_marks_invalid_and_kill_switch(state):
     await state.update_outbox_item(
         item_id, status="sent", message_id="<m1@x>", sent_at=_now_iso()
     )
-    # Ten more sent items so the kill-switch minimum-sample rule is met
-    for i in range(10):
+    # `extra` more sent items, for the kill-switch minimum-sample rule
+    for i in range(extra):
         oid = await state.add_outbox_item(
             prospect_id=pid, to_email="jane@acme.com", subject="s", body="b",
             send_at=_now_iso(), status="approved", campaign_id=f"c{i+2}", step=1,
         )
         await state.update_outbox_item(oid, status="sent", sent_at=_now_iso())
+    return pid
 
-    provider = FakeProvider()
-    provider.inbound = [InboundMessage(
-        provider_id="b1", from_email="mailer-daemon@googlemail.com",
+
+def _dsn(provider_id="b1"):
+    return InboundMessage(
+        provider_id=provider_id, from_email="mailer-daemon@googlemail.com",
         subject="Delivery Status Notification (Failure)",
         body="couldn't be delivered", in_reply_to="<m1@x>", is_bounce=True,
-    )]
+    )
+
+
+@pytest.mark.asyncio
+async def test_bounce_marks_invalid_and_kill_switch(state):
+    pid = await _sent_for_bounce(state, extra=49)
+    provider = FakeProvider()
+    provider.inbound = [_dsn("b1"), _dsn("b2")]
     handler = make_handler(state, provider)
     await handler._run_native()
 
     prospect = await state.get_prospect(pid)
     assert prospect.email_status == "invalid"
-    # 1 bounce / 11 sent = 9% > 5% threshold with >= 10 sends → kill switch
+    # 2 bounces / 50 sent = 4% > 2% threshold with >= 50 sends → kill switch
     assert await state.get_setting("sending_paused") != ""
+
+
+@pytest.mark.asyncio
+async def test_bounce_in_a_small_sample_marks_invalid_without_the_kill_switch(state):
+    pid = await _sent_for_bounce(state, extra=10)
+    provider = FakeProvider()
+    provider.inbound = [_dsn()]
+    handler = make_handler(state, provider)
+    await handler._run_native()
+
+    assert (await state.get_prospect(pid)).email_status == "invalid"
+    # 1 bounce / 11 sent is 9%, but 11 sends is too few to judge the list
+    assert await state.get_setting("sending_paused") == ""
 
 
 @pytest.mark.asyncio

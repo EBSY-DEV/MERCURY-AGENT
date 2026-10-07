@@ -46,7 +46,7 @@ People will ask "how does this work?" — explain it simply:
 
 - **"What does it cost?"** → Just your Claude Max subscription (which you already have). The only paid integration is Instantly for sending emails (their cheapest plan works). Everything else — prospecting, email writing, reply handling — is included.
 
-- **"What's the dashboard?"** → Run `mercury dashboard` to see a local web UI at localhost:5555. It opens on **Today** — anything waiting on a decision, then the pipeline. Tabs for Signals, Companies, Contacts, Pipeline, Calendar, Campaigns, Outbox, Mailboxes, Conversations, Activity, Usage, Settings. Mailboxes lists every sending inbox grouped by domain, with its warm-up ramp, health, DNS and checklist; an inbox's drawer pauses/resumes it and edits its settings (saved to `channels.email.mailboxes`). For a populated demo: `python scripts/seed_demo.py`, then run the dashboard with the `MERCURY_DB_PATH` / `MERCURY_CONFIG` line it prints.
+- **"What's the dashboard?"** → Run `mercury dashboard` to see a local web UI at localhost:5555. It opens on **Today** — anything waiting on a decision, then the pipeline. Tabs for Signals, Companies, Contacts, Pipeline, Calendar, Campaigns, Outbox, Exclusions, Mailboxes, Conversations, Activity, Usage, Settings. Mailboxes lists every sending inbox grouped by domain, with its warm-up ramp, health, DNS and checklist; an inbox's drawer pauses/resumes it and edits its settings (saved to `channels.email.mailboxes`). For a populated demo: `python scripts/seed_demo.py`, then run the dashboard with the `MERCURY_DB_PATH` / `MERCURY_CONFIG` line it prints.
 
 - **"What are signals?"** → Signals are the facts Mercury collects about a business: who its current agency is, whether it's running ads, whether it has online booking, how it ranks. **Mercury proposes; you confirm.** Nothing is collected until the user says yes on the Signals tab (or `mercury signals --confirm ...`). That keeps spend intentional and makes every prospect list explainable — a cohort is a query over signals a human chose, not a black box.
 
@@ -315,6 +315,8 @@ mercury signals               # The signal vocabulary; --confirm / --reject CODE
 mercury personas              # Writing voices: list / show / create / edit / default / archive / versions / prompt / preview
 mercury personas mailboxes    # Each sending mailbox's voice and sign-off; change one with: personas assign EMAIL [PERSONA] --sign-name NAME
 mercury discover              # Find businesses; --providers / --estimate / --provider <key>
+mercury exclusions            # Never-email list: add / remove / check / import / export (opt-outs and bounces land here too)
+mercury holds                 # Companies whose cold mail is paused (after a reply, or by you); release HOLD_ID to resume
 mercury sending pause|resume  # Kill switch for all outbound
 ```
 
