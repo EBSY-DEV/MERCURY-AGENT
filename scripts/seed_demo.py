@@ -4,7 +4,9 @@ Creates ~12 Denver/Boulder roofing + HVAC companies, 30 prospects spread
 across all seven pipeline columns (new, queued, contacted, replied, meeting,
 won, lost), conversations at several stages, and outbox rows: sequence steps
 1-3 with send times spread over the past two weeks and the next three weeks
-(sent / approved / pending_review / cancelled) plus two replies.
+(sent / approved / pending_review / cancelled) plus two replies. Three of
+the queued contacts are on a ``voice`` offer that requires a demo: one demo
+requested, one not registered, one ready, so the Outbox shows the demo gate.
 
 On top of that: ~60 days of outreach history (sends, replies, positive
 replies, bounces) so the Trends chart has 30/90-day shape, spread over three
@@ -68,6 +70,7 @@ DEFAULT_DB = ROOT / "data" / "demo.db"
 REAL_DB = ROOT / "data" / "mercury.db"
 
 NOW = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+VOICE_OFFER = "voice"
 
 COMPANIES = [
     ("Summit Peak Roofing", "summitpeakroofing.com", "Roofing", "Denver, CO"),
@@ -140,17 +143,23 @@ async def seed(db_path: Path) -> dict:
     campaign = Campaign(id="", name="Denver trades — page two", sequence=SEQUENCE,
                         status="active", created_at=NOW - timedelta(days=14))
     campaign.id = await sm.add_campaign(campaign)
+    # The voice offer promises a line already built for each business, so
+    # its emails wait in the Outbox until that contact's demo is ready.
+    voice = Campaign(id="", name="Denver trades — after-hours line", sequence=SEQUENCE,
+                     status="active", offer_key=VOICE_OFFER, created_at=NOW - timedelta(days=2))
+    voice.id = await sm.add_campaign(voice)
 
     counts = {"prospects": 0, "conversations": 0, "outbox": 0}
     idx = 0
     thread_box: dict[str, str] = {}
 
-    async def outbox(p, pid, company, step, status, send_at, sent_at=None, error="", mailbox=""):
+    async def outbox(p, pid, company, step, status, send_at, sent_at=None, error="", mailbox="",
+                     camp=None):
         s = SEQUENCE[step - 1]
         item = await sm.add_outbox_item(
             prospect_id=pid, to_email=p.email, subject=render(s.subject, p, company),
             body=render(s.body, p, company), send_at=iso(send_at), status=status,
-            campaign_id=campaign.id, step=step, provider="smtp", mailbox=mailbox,
+            campaign_id=(camp or campaign).id, step=step, provider="smtp", mailbox=mailbox,
         )
         fields = {}
         if sent_at:
@@ -207,10 +216,19 @@ async def seed(db_path: Path) -> dict:
                 continue
             if column == "queued":
                 first_at = NOW + timedelta(days=rnd.randint(0, 6), hours=rnd.randint(2, 9))
+                # Three on the voice offer: a demo requested, none registered
+                # yet, and one ready (so its emails are not held).
+                camp = voice if k < 3 else None
                 for step in (1, 2, 3):
                     at = first_at + timedelta(days=(step - 1) * 4 + (step > 2))
                     await outbox(p, pid, cname, step,
-                                 "pending_review" if k % 2 else "approved", at)
+                                 "pending_review" if k % 2 else "approved", at, camp=camp)
+                if k in (0, 2):
+                    demo_id, _ = await sm.request_demo(pid, VOICE_OFFER, "voice")
+                    if k == 2:
+                        await sm.mark_demo_ready(demo_id, agent_id="agent_demo_summit",
+                                                 recording_path="demos/summit-call.mp3",
+                                                 built_by="Jordan")
                 continue
 
             # Everyone else got step 1, from whichever mailbox rotation picked
@@ -317,6 +335,7 @@ def demo_config(template: Path) -> dict:
         ],
     })
     cfg["compliance"] = {"postal_address": "1550 Wewatta St, Denver, CO 80202"}
+    cfg["offers"] = [{"key": VOICE_OFFER, "requires_demo": True, "demo_kind": "voice"}]
     cfg.setdefault("usage", {}).setdefault("quiet_hours", {})["timezone"] = "UTC"
     return cfg
 
