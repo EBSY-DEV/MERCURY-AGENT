@@ -5,10 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mercury"
 version = "0.2.0"
-description = "Mercury by EBSY: an autonomous AI sales agent."
+description = "Mercury: an autonomous AI sales agent that runs on your Claude subscription."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
+authors = [{ name = "EBSY" }]
 keywords = ["sales", "ai-agent", "cold-email", "prospecting", "autonomous-agent", "claude"]
 classifiers = [
     "Development Status :: 4 - Beta",

@@ -66,8 +66,8 @@ LANGUAGE:
 CASE STUDIES AND REGISTER:
 - Speak to the prospect's own market. To a Dominican prospect, a Dominican
   client is closeness: name it. To a US prospect, never name a client's
-  country, and never say EBSY helps US companies unless the product knowledge
-  lists a US client, which today it does not. Say "a local trade like yours",
+  country, and never claim the company serves a market unless the product
+  knowledge says so. Say "a local trade like yours",
   "a family-run business" or "a business your size" instead: true, and closer
   to them than any flag.
 - Small local businesses are run by one person who reads email on a phone

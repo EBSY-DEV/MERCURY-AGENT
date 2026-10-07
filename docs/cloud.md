@@ -8,6 +8,9 @@ A scheduled cloud run has neither. The container is created for one firing and
 reclaimed afterwards, so the loop has nowhere to loop and the database has
 nowhere to live. Two pieces bridge the gap.
 
+If you do have a machine that stays up, [Deployment](deployment.md) (systemd,
+Docker, cron) is simpler.
+
 ## 1. One cycle per firing
 
 ```bash
@@ -71,13 +74,22 @@ the script seeds its layout and `.gitignore` on first run.
 
 ### b. Put the trained config in it
 
-Train locally, then move the generated files across:
+Train locally (it writes `mercury.local.yaml` and the product skills, all
+gitignored here), review the config, then copy the generated files across:
 
 ```bash
 mercury train https://your-product.com
-mv mercury.yaml mercury.local.yaml        # keep the template tracked, the real one private
+mkdir -p ../mercury-state/skills
+cp mercury.local.yaml ../mercury-state/
+cp skills/product_knowledge.md ../mercury-state/skills/
+cp skills/competitive_intel.md ../mercury-state/skills/   # only exists if competitors were found
 git -C ../mercury-state add mercury.local.yaml skills/ && git -C ../mercury-state commit -m "Config"
 ```
+
+Set `channels.email.provider` and `compliance.postal_address` before you copy
+it: the trainer writes `provider: instantly` and no postal address, and the
+native sender holds the outbox until the address is set (see
+[Configuration](configuration.md)).
 
 ### c. Set environment variables
 

@@ -1,5 +1,5 @@
 /* ══════════════════════════════════════════════════════════════
-   Mercury by EBSY — dashboard styles
+   Mercury — dashboard styles
 
    Rules the whole sheet follows:
 
@@ -152,7 +152,6 @@ body { display: grid; grid-template-columns: 252px minmax(0, 1fr); background: v
 }
 .brand h1 { font-family: var(--display); font-size: 15.5px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
 .brand .tagline { font-size: 11.5px; font-weight: 500; color: var(--text-3); line-height: 1.2; margin-top: 2px; }
-.brand .tagline b { color: var(--accent-deep); font-weight: 600; }
 
 .side-cta { display: flex; gap: 8px; }
 .btn-block { flex: 1; justify-content: center; }
@@ -197,6 +196,11 @@ body { display: grid; grid-template-columns: 252px minmax(0, 1fr); background: v
 .nav-count.on { display: inline-block; }
 
 .side-foot { margin-top: auto; display: flex; flex-direction: column; gap: 1px; }
+.side-credit {
+  align-self: flex-start; margin: 6px 10px 0; font-size: 11px; line-height: 1.4;
+  color: var(--text-3); text-decoration: none; transition: color .15s;
+}
+.side-credit:hover, .side-credit:focus-visible { color: var(--accent); }
 .agent-card {
   display: flex; align-items: center; gap: 10px; width: 100%; margin-bottom: 8px;
   padding: 11px 12px; text-align: left; cursor: pointer;
@@ -1263,6 +1267,7 @@ details[open] summary::before { content: '– '; }
   background: var(--text); color: var(--panel); border-radius: var(--r-sm);
   font-size: 12px; box-shadow: var(--shadow);
 }
+.hm-tip[hidden] { display: none; }
 .hm-tip b { font-weight: 600; }
 .hm-tip span { color: color-mix(in srgb, var(--panel) 80%, transparent); }
 .hm-tip small { font-size: 11px; color: color-mix(in srgb, var(--panel) 65%, transparent); }

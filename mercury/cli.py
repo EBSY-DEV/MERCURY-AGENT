@@ -593,7 +593,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="mercury",
-        description="Mercury by EBSY: autonomous AI sales agent.",
+        description="Mercury: an autonomous AI sales agent that runs on your Claude subscription.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
