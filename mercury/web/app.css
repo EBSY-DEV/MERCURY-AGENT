@@ -1671,6 +1671,7 @@ details[open] summary::before { content: '– '; }
 /* ── Contacts: CSV import ─────────────────────────────────────── */
 
 .imp-card { margin-bottom: 16px; }
+.imp-needs { font-size: 12px; margin-top: 2px; }
 .imp-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .imp-step { margin-top: 18px; }
 .imp-step h3 { font-size: 13px; font-weight: 600; color: var(--text-2); margin-bottom: 10px; }

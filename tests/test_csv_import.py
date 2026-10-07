@@ -319,6 +319,44 @@ def test_same_name_at_same_company_is_a_duplicate(service, db_path):
     assert result["rows"][0]["reason"] == "same name at the same company as an existing contact"
 
 
+def test_linkedin_urls_match_in_any_spelling(service, db_path):
+    run(StateManager(db_path).add_prospect(Prospect(
+        first_name="Jane", last_name="Doe", company="Acme", email="",
+        linkedin_url="https://www.linkedin.com/in/janedoe")))
+    result = run(service.preview(
+        b"Email,First Name,Last Name,Company,LinkedIn\n"
+        b"jane@acme.io,Jane,Doe,Acme Inc,http://linkedin.com/in/JaneDoe/?trk=x\n"
+        b"pt@acme.io,P,T,Acme,pt.linkedin.com/in/pt\n"
+        b"pt2@acme.io,P,T,Acme,https://PT.linkedin.com/in/PT/\n"))
+    r = by_row(result)
+    assert r[2]["reason"] == "same LinkedIn profile as an existing contact"
+    assert r[3]["action"] == "create"
+    assert r[4]["reason"] == "same LinkedIn profile as row 3"
+
+
+def test_leaving_out_the_first_duplicate_lets_the_next_one_in(service, db_path):
+    data = b"Email,First Name,Last Name\nx@foo.io,A,B\nx@foo.io,A,B\n"
+    r = by_row(run(service.preview(data, exclude_rows=[2])))
+    assert (r[2]["action"], r[3]["action"]) == ("exclude", "create")
+    run(service.commit(data, exclude_rows=[2]))
+    assert rows(db_path, "SELECT import_row FROM prospects") == [(3,)]
+
+
+def test_batch_prefix_lookup_has_no_wildcards(service):
+    result = run(service.commit(BASIC.encode(), skip_invalid=True))
+    batch_id = result["batch"]["id"]
+    assert run(service.batch(batch_id[:4]))["batch"]["id"] == batch_id
+    for bad in ("%", "_", ""):
+        with pytest.raises(ImportFileError):
+            run(service.batch(bad))
+
+
+def test_stored_reasons_carry_no_row_contents(service, db_path):
+    run(service.commit(b"Email\nsecret-person@example\n", skip_invalid=True))
+    (reason,) = rows(db_path, "SELECT reason FROM import_rows")[0]
+    assert "secret" not in reason and reason == "not a valid email address"
+
+
 # ── Verification and release ──
 
 
