@@ -485,7 +485,7 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
         stop_event = asyncio.Event()
 
     logger.info("=" * 60)
-    logger.info("Mercury is online.")
+    logger.info("Mercury Agent is online.")
     logger.info("=" * 60)
 
     rt = await build_runtime()

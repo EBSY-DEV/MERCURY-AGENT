@@ -1,4 +1,4 @@
-"""Build design/mercury-brand.pen: the Mercury tokens + UI kit.
+"""Build design/mercury-brand.pen: the Mercury Agent tokens + UI kit.
 
 Source of truth is mercury/web/app.css. Re-run after changing tokens:
 
@@ -56,8 +56,8 @@ const build=(root)=>{
   const mark=Insert(brand,{type:"frame",name:"Mark",width:52,height:52,cornerRadius:15,justifyContent:"center",alignItems:"center",fill:{type:"gradient",gradientType:"linear",rotation:220,colors:[{color:"#C7B6FF",position:0},{color:"#9C84F0",position:0.55},{color:"#7A5EDB",position:1}]},effect:{type:"shadow",offset:{x:0,y:4},blur:14,color:"#6D53D340"}});
   Insert(mark,T({name:"M",content:"M",fontSize:26,fontWeight:"600",fill:"#FFFFFF"}));
   const wm=Insert(brand,{type:"frame",name:"Wordmark",layout:"vertical",gap:2});
-  Insert(wm,T({name:"Name",content:"Mercury",fontSize:30,fontWeight:"600",letterSpacing:-0.8}));
-  Insert(wm,T({name:"Tagline",content:"Sales agent",fontSize:14,fontWeight:"500",fill:"$text-3"}));
+  Insert(wm,T({name:"Name",content:"Mercury Agent",fontSize:30,fontWeight:"600",letterSpacing:-0.8}));
+  Insert(wm,T({name:"Tagline",content:"Outreach agent",fontSize:14,fontWeight:"500",fill:"$text-3"}));
   Insert(head,M({name:"Sheet label",content:"Brand + UI tokens",fontSize:12}));
 
   const sec=(title,sub)=>{const s=Insert(root,{type:"frame",name:title,layout:"vertical",gap:16,width:"fill_container"});
@@ -107,8 +107,8 @@ const build=(root)=>{
   const qa=Insert(qb,{type:"frame",name:"Action",padding:[7,14],cornerRadius:"$r-sm",fill:"$panel",stroke:"$border-strong",strokeWidth:1});
   Insert(qa,T({name:"Label",content:"Review",fontSize:12,fontWeight:"500"}));
 };
-lightId=sheet("Mercury / Light","light",0);build(lightId);
-darkId=sheet("Mercury / Dark","dark",1360);build(darkId);
+lightId=sheet("Mercury Agent / Light","light",0);build(lightId);
+darkId=sheet("Mercury Agent / Dark","dark",1360);build(darkId);
 
 const GRAD={type:"gradient",gradientType:"linear",rotation:220,colors:[{color:"#C7B6FF",position:0},{color:"#9C84F0",position:0.55},{color:"#7A5EDB",position:1}]};
 const BAR={type:"gradient",gradientType:"linear",rotation:270,colors:[{color:"#C7B6FF",position:0},{color:"$accent",position:1}]};
@@ -131,8 +131,8 @@ const screen=(name,theme,x,y)=>{
   const mk=F(br,{name:"Mark",width:30,height:30,cornerRadius:9,justifyContent:"center",alignItems:"center",fill:GRAD,effect:{type:"shadow",offset:{x:0,y:2},blur:8,color:"#6D53D340"}});
   Insert(mk,T({name:"M",content:"M",fontSize:15,fontWeight:"600",fill:"#FFFFFF"}));
   const wm=F(br,{name:"Wordmark",layout:"vertical",gap:1});
-  Insert(wm,T({name:"Name",content:"Mercury",fontSize:15.5,fontWeight:"600",letterSpacing:-0.3}));
-  Insert(wm,T({name:"Tagline",content:"Sales agent",fontSize:11.5,fontWeight:"500",fill:"$text-3"}));
+  Insert(wm,T({name:"Name",content:"Mercury Agent",fontSize:15.5,fontWeight:"600",letterSpacing:-0.3}));
+  Insert(wm,T({name:"Tagline",content:"Outreach agent",fontSize:11.5,fontWeight:"500",fill:"$text-3"}));
   const cta=F(sb,{name:"CTA",gap:8,width:W});
   const fb=F(cta,{name:"Find businesses",width:W,height:34,gap:6,justifyContent:"center",alignItems:"center",cornerRadius:"$r-sm",fill:"$accent",effect:SH});
   I(fb,"plus",14,"$accent-contrast");
@@ -235,8 +235,8 @@ const screen=(name,theme,x,y)=>{
   for(const [t,v] of tracks){const w=hOf(t).width;Insert(t,{type:"rectangle",name:"Fill",width:Math.max(8,Math.round(w*v/412)),height:10,cornerRadius:99,fill:BAR});}
   return s;};
 const sy=Math.max(hOf(lightId).height,hOf(darkId).height)+120;
-todayLightId=screen("Mercury / Today (light)","light",0,sy);
-todayDarkId=screen("Mercury / Today (dark)","dark",1560,sy);
+todayLightId=screen("Mercury Agent / Today (light)","light",0,sy);
+todayDarkId=screen("Mercury Agent / Today (dark)","dark",1560,sy);
 Get(document,(n,c)=>c.problems&&Print(n.name,"|",c.parentCtx&&c.parentCtx.node.name,"|",c.problems));
 for(const [id,f] of [[lightId,"light"],[darkId,"dark"],[todayLightId,"today-light"],[todayDarkId,"today-dark"]])Print("EXPORTMAP",id,f);
 Export([lightId,darkId,todayLightId,todayDarkId],"png","%(out)s");

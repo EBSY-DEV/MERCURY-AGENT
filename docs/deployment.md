@@ -12,7 +12,7 @@ Two units: the heartbeat, and the dashboard bound to a private address. Replace 
 
 ```ini
 [Unit]
-Description=Mercury sales agent (heartbeat)
+Description=Mercury Agent (heartbeat)
 After=network-online.target
 Wants=network-online.target
 

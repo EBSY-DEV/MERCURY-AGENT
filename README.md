@@ -1,10 +1,10 @@
-# Mercury
+# Mercury Agent
 
-An autonomous sales agent that runs on your Claude Code subscription.
+An outreach agent that runs on your Claude Code subscription.
 
-Mercury finds businesses that match your ideal customer, collects specific facts about each one, writes short cold emails that reference those facts, sends them from your own mailboxes, and handles the replies. It runs locally on a 15-minute heartbeat and keeps everything in a SQLite file. Its model calls go through the `claude` CLI in headless mode, so they count against the Claude Pro or Max plan you already have rather than a per-token API bill. By default, nothing is sent until you approve it.
+Mercury Agent finds businesses that match your ideal customer, collects specific facts about each one, writes short cold emails that reference those facts, sends them from your own mailboxes, and handles the replies. It runs locally on a 15-minute heartbeat and keeps everything in a SQLite file. Its model calls go through the `claude` CLI in headless mode, so they count against the Claude Pro or Max plan you already have rather than a per-token API bill. By default, nothing is sent until you approve it.
 
-![The Mercury dashboard's Today view: KPIs, reply and bounce rates, outreach trend, and items waiting on a decision](docs/images/today.png)
+![The Mercury Agent dashboard's Today view: KPIs, reply and bounce rates, outreach trend, and items waiting on a decision](docs/images/today.png)
 
 ## What it does
 
@@ -196,8 +196,8 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Mercury began as [Harvey](https://github.com/ethanplusai/harvey) by Ethan Rogers.
+GNU AGPL v3 or later — see [LICENSE](LICENSE). Mercury Agent began as [Harvey](https://github.com/ethanplusai/harvey) by Ethan Rogers (MIT); see [NOTICE](NOTICE) for the original notice.
 
 ---
 
-Mercury is built and maintained by [EBSY](https://ebsy.marketing).
+Built by [EBSY](https://ebsy.dev).

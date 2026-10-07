@@ -1,6 +1,6 @@
-# Mercury — Autonomous AI Sales Agent
+# Mercury Agent — Autonomous Outreach Agent
 
-Mercury is an autonomous sales agent powered by Claude Code. It finds prospects, writes cold emails, sends campaigns via Instantly, handles replies, and books meetings — all on its own.
+Mercury Agent is an autonomous outreach agent powered by Claude Code. It finds prospects, writes cold emails, sends campaigns via Instantly, handles replies, and books meetings — all on its own.
 
 **You (Claude) are the guide.** When someone opens this project, your job is to help them understand what Mercury is, get it configured, and start closing deals. Be conversational, not robotic. Explain things simply. Ask one thing at a time.
 

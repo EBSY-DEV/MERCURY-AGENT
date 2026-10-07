@@ -1,4 +1,4 @@
-"""Mercury — an autonomous sales agent that runs on your Claude subscription."""
+"""Mercury Agent — an autonomous outreach agent that runs on your Claude subscription."""
 
 import sys
 
@@ -16,4 +16,4 @@ if sys.version_info < (3, 11):  # pragma: no cover - version guard
         f"    source .venv/bin/activate && pip install -e ."
     )
 
-"""Mercury: an autonomous AI sales agent."""
+"""Mercury Agent: an autonomous outreach agent."""
