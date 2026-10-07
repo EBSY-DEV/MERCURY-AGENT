@@ -7,6 +7,19 @@ minor versions can still change behaviour.
 
 ## [Unreleased]
 
+### Added
+
+- **Exclusions and company limits.** Exact-address and domain exclusions
+  (subdomains only when you ask), with a reason, a source and an append-only
+  history. Opt-outs and bounces are recorded as exclusions on the address, so
+  deleting, re-importing or rediscovering a contact never reactivates it.
+  Exclusions are re-checked in the transaction that claims each email, and
+  queued email they cover is blocked until you send it back to review. New
+  per-company limits (`max_new_contacts_per_company_per_day`,
+  `max_active_contacts_per_company`) and a company hold when someone replies
+  (`pause_company_on_reply`, on by default). Dashboard **Exclusions** tab,
+  reasons in the Outbox, and `mercury exclusions` / `mercury holds` commands.
+
 ### Changed
 
 - **Harvey is now Mercury Agent.** The package (`mercury/`), CLI

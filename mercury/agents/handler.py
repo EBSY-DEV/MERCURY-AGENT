@@ -21,6 +21,7 @@ from mercury.integrations.mailboxes import (
     rotation_configured,
 )
 from mercury.models.conversation import Conversation, Message
+from mercury.policy import ContactPolicy
 from mercury.state import StateManager
 from mercury.personas import PersonaStore, voice_instructions
 
@@ -115,7 +116,12 @@ def strip_quoted(text: str, extra_markers: tuple[str, ...] = ()) -> str:
 AUTO_REPLY_SUBJECTS = (
     "out of office", "out-of-office", "automatic reply", "auto-reply", "autoreply",
     "fuera de la oficina", "respuesta automática", "respuesta automatica",
+    # Delivery and read acknowledgements are machines too.
+    "read receipt", "delivery receipt", "return receipt",
+    "we have received your", "we've received your", "acuse de recibo",
 )
+# Outlook-style receipts put the original subject after one of these.
+AUTO_REPLY_PREFIXES = ("read:", "delivered:", "leído:", "leido:", "entregado:")
 
 
 def _is_auto_reply(msg) -> bool:
@@ -127,8 +133,9 @@ def _is_auto_reply(msg) -> bool:
         return True
     if "x-autoreply" in h or "x-autorespond" in h:
         return True
-    subject = (getattr(msg, "subject", "") or "").lower()
-    return any(m in subject for m in AUTO_REPLY_SUBJECTS)
+    subject = (getattr(msg, "subject", "") or "").lower().strip()
+    return (any(m in subject for m in AUTO_REPLY_SUBJECTS)
+            or subject.startswith(AUTO_REPLY_PREFIXES))
 
 
 # Phrases that mean a human must take over. Never auto-reply to these.
@@ -162,6 +169,7 @@ class Handler:
         self.state = state
         self.config = config
         self.personas = PersonaStore(state)
+        self.policy = ContactPolicy(state, config)
         self._response_generation_id = ""
         self.instantly = InstantlyClient(env.instantly_api_key)
         # Every configured mailbox is polled; see Sender for the pool.
@@ -323,6 +331,7 @@ class Handler:
                 )
         except Exception as e:
             logger.debug(f"Handler: outbox cancel failed: {e}")
+        await self._hold_company_on_reply(prospect, intent)
 
         # The timestamped event the trends chart counts (replies / positive).
         try:
@@ -376,6 +385,12 @@ class Handler:
             # Honor opt-outs ALWAYS. No reply, no future contact.
             await self.state.update_conversation(convo.id, status="closed", stage="closed_lost")
             await self.state.update_prospect_status(prospect.id, "opted_out")
+            # The opt-out is a rule about the address, kept apart from the
+            # prospect row, so deleting or re-importing them never lifts it.
+            await self.state.add_suppression(
+                "email", prospect.email, source="opt_out", prospect_id=prospect.id,
+                reason="asked not to be contacted", actor="handler",
+            )
             await self.state.log_action(
                 action_type="opt_out",
                 agent="handler",
@@ -513,6 +528,31 @@ class Handler:
         else:
             logger.info("Handler: no new replies.")
 
+    async def _hold_company_on_reply(self, prospect, intent: str):
+        """A person at a company answered: hold cold mail to their colleagues
+        so the company is not approached from two sides mid-conversation.
+        Auto-replies and bounces never get here. Only native providers can
+        hold a send, so the Instantly path records nothing it cannot enforce."""
+        if not (self.is_native and self.policy.limits.pause_on_reply):
+            return
+        company_id = await self.policy.company_for(prospect)
+        if not company_id:
+            return
+        hold, created = await self.state.hold_company(
+            company_id, reason="reply", prospect_id=prospect.id,
+            note=f"{prospect.email} replied ({intent})", actor="handler",
+        )
+        if created:
+            logger.info(
+                f"Handler: {prospect.email} replied; cold mail to their company is held "
+                "until you resume it."
+            )
+            await self.state.log_action(
+                action_type="company_hold", agent="handler",
+                details={"company_id": company_id, "hold_id": hold["id"],
+                         "prospect_email": prospect.email, "intent": intent},
+            )
+
     async def _handle_bounce(self, msg):
         """A bounce is a data bug AND a reputation threat. Fix both."""
         headers = getattr(msg, "headers", None) or {}
@@ -548,6 +588,10 @@ class Handler:
             )
             cancelled = await self.state.cancel_pending_outbox_for_prospect(
                 prospect.id, reason="bounced"
+            )
+            await self.state.add_suppression(
+                "email", prospect.email, source="bounce", prospect_id=prospect.id,
+                reason="hard bounce", actor="handler",
             )
             logger.warning(
                 f"Handler: BOUNCE for {prospect.email} — marked invalid, "

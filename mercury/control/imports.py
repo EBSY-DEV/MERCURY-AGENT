@@ -29,7 +29,7 @@ from mercury.csv_import import (
 )
 from mercury.models.company import Company
 from mercury.models.prospect import Prospect
-from mercury.state import _new_id, _utcnow
+from mercury.state import _matching_rules, _new_id, _utcnow, describe_rule
 
 POLICIES = ("skip", "fill")
 HELD_STATUS = "imported"
@@ -139,7 +139,18 @@ class ImportService:
                                    f"{seen_linkedin[linkedin_key(v['linkedin_url'])]}")
             else:
                 existing, why = await self._existing(db, v)
-                if existing:
+                rules = await _matching_rules(db, v["email"])
+                if rules:
+                    # An exclusion is about the address, so it holds whether
+                    # or not the contact still exists.
+                    item.update(
+                        outcome="duplicate" if existing else (
+                            "incomplete" if clean.missing else "new"),
+                        existing_id=existing["id"] if existing else "",
+                        action="skip", suppressed=True,
+                        reason=f"excluded: {describe_rule(rules[0])}; "
+                               "an import never lifts an exclusion")
+                elif existing:
                     item.update(outcome="duplicate", existing_id=existing["id"], reason=why)
                     if existing.get("status") == "opted_out":
                         item.update(action="skip", suppressed=True,

@@ -29,7 +29,8 @@ from mercury.integrations.mailboxes import (
     local_today,
     rotation_configured,
 )
-from mercury.state import StateManager
+from mercury.policy import ContactPolicy, capability
+from mercury.state import StateManager, describe_rule
 
 logger = logging.getLogger("mercury.sender")
 
@@ -118,6 +119,7 @@ class Sender:
             self.mailboxes.primary.provider if self.mailboxes
             else get_mail_provider(config, env)
         )
+        self.policy = ContactPolicy(state, config)
         # Disabled in tests to skip inter-send sleeps.
         self.send_pacing = True
         self._last_drain_at: float | None = None  # monotonic, for spread_sends
@@ -235,6 +237,7 @@ class Sender:
         prospects = []
         seen_emails: set[str] = set()
         skipped_unverified = 0
+        skipped_excluded = 0
         for prospect_id in campaign.prospect_ids:
             prospect = await self.state.get_prospect(prospect_id)
             if not prospect or not prospect.email:
@@ -260,9 +263,19 @@ class Sender:
                     f"'{prospect.email_status or 'guess'}' not deliverable)."
                 )
                 continue
+            # Instantly sends on its own schedule, so this is the only point
+            # where an exclusion can stop the address.
+            if await self.policy.exclusion_for(email):
+                skipped_excluded += 1
+                continue
             seen_emails.add(email)
             prospects.append(prospect)
 
+        if skipped_excluded:
+            logger.info(
+                f"Sender: left {skipped_excluded} excluded address(es) out of "
+                f"'{campaign.name}'. {capability(self.config)['note']}"
+            )
         if skipped_unverified:
             logger.info(
                 f"Sender: Held back {skipped_unverified} prospect(s) with "
@@ -467,6 +480,7 @@ class Sender:
 
         staged = 0
         skipped = 0
+        excluded = 0
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         seen_emails: set[str] = set()
 
@@ -482,7 +496,13 @@ class Sender:
             if (prospect.email_status or "guess") not in sendable_email:
                 skipped += 1
                 continue
+            rule = await self.policy.exclusion_for(email)
+            if rule:
+                excluded += 1
+                logger.info(f"Sender: not staging {email}: excluded, {describe_rule(rule)}.")
+                continue
             seen_emails.add(email)
+            company_id = await self.policy.company_for(prospect)
 
             cumulative_days = 0
             for step in campaign.sequence:
@@ -500,6 +520,7 @@ class Sender:
                     provider=self.provider.name,
                     generation_id=step.generation_id,
                     mailbox=campaign.mailbox,
+                    company_id=company_id,
                 )
                 if item_id:
                     staged += 1
@@ -510,6 +531,10 @@ class Sender:
             logger.info(
                 f"Sender: held back {skipped} prospect(s) with unverified "
                 f"emails from '{campaign.name}'."
+            )
+        if excluded:
+            logger.info(
+                f"Sender: left {excluded} excluded address(es) out of '{campaign.name}'."
             )
         if staged:
             mode = "awaiting your approval" if require_approval else "approved"
@@ -686,7 +711,18 @@ class Sender:
 
             # The reviewed text and its generation must stay together during
             # the provider call. A stale due scan cannot send a replaced draft.
-            if not await self.state.claim_outbox_item(item, mailbox.email):
+            # Exclusions, company holds and company limits are re-checked in
+            # the same write transaction, so a rule added a moment ago, or a
+            # second sender process, cannot slip a send past them.
+            limits = self.policy.limits
+            claim, detail = await self.state.claim_for_send(
+                item, mailbox.email,
+                company_id=await self.policy.company_for(prospect),
+                max_new_per_day=limits.max_new_per_day,
+                max_active=limits.max_active,
+            )
+            if claim != "claimed":
+                self._log_unclaimed(item, claim, detail)
                 continue
             body_out = item["body"]
             if item["kind"] != "reply":
@@ -773,6 +809,21 @@ class Sender:
             capacity = min(max_daily, pool.capacity_on(today))
             logger.info(f"Sender: {sent} email(s) sent this cycle "
                         f"({sent_today + sent}/{capacity} today).")
+
+    @staticmethod
+    def _log_unclaimed(item, claim: str, detail: dict):
+        to = item["to_email"]
+        if claim == "suppressed":
+            logger.warning(f"Sender: blocked email to {to}: {detail['error']}.")
+        elif claim == "company_hold":
+            logger.info(f"Sender: holding step {item['step']} to {to}: cold mail to "
+                        "this company is paused.")
+        elif claim == "company_daily_limit":
+            logger.info(f"Sender: holding first email to {to}: its company had "
+                        f"{detail['new_today']}/{detail['limit']} new contacts in 24 hours.")
+        elif claim == "company_active_limit":
+            logger.info(f"Sender: holding first email to {to}: its company has "
+                        f"{detail['active']}/{detail['limit']} contacts in a sequence.")
 
     def _mailbox_for(self, item, prev, pool, remaining, sent_this_cycle, today):
         """(mailbox, verdict): verdict is "send" or "hold" (try a later cycle).
