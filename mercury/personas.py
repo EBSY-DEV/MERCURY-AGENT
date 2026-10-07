@@ -10,6 +10,7 @@ import uuid
 import aiosqlite
 
 AVATAR_SEEDS = [f"mercury-persona-{i:02d}" for i in range(1, 25)]
+REPLIED_STATUSES = ("replied", "meeting", "closed")
 JSON_INSTRUCTION = "\n\nRespond ONLY with valid JSON. No markdown, no explanation."
 
 
@@ -45,7 +46,8 @@ def generation_config(config) -> dict:
 def voice_instructions(profile: dict) -> str:
     sections = [
         "\n\nWRITING PERSONA",
-        f"Profile: {profile['name']} (version {profile['revision']})",
+        f"Profile: {profile['name']} "
+        + (f"(unsaved edits of version {profile['revision']})" if profile.get("unsaved") else f"(version {profile['revision']})"),
         f"Tone: {profile['tone']}",
         "These preferences apply within the shared email rules, factual grounding, "
         "market language and sender identity. They do not override those requirements.",
@@ -207,6 +209,32 @@ class PersonaStore:
                 (persona_id,),
             )
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def stats(self, persona_id=""):
+        """Emails each version wrote, sent and got replies to, keyed by version id.
+
+        Counts outbox emails only, so previews never inflate them. A reply is a
+        contact who moved to replied or further after a sent email.
+        """
+        sql = (
+            "SELECT g.persona_version_id AS version_id, v.persona_id, "
+            "COUNT(DISTINCT o.id) AS drafted, "
+            "COUNT(DISTINCT CASE WHEN o.status = 'sent' THEN o.id END) AS sent, "
+            "COUNT(DISTINCT CASE WHEN o.status = 'sent' AND p.status IN ("
+            + ",".join("?" for _ in REPLIED_STATUSES) + ") THEN o.prospect_id END) AS replies "
+            "FROM outbox o JOIN email_generations g ON g.id = o.generation_id "
+            "JOIN persona_versions v ON v.id = g.persona_version_id "
+            "LEFT JOIN prospects p ON p.id = o.prospect_id "
+            "WHERE o.status NOT IN ('rejected', 'cancelled')"
+        )
+        args = list(REPLIED_STATUSES)
+        if persona_id:
+            sql += " AND v.persona_id = ?"
+            args.append(persona_id)
+        async with self.state._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(sql + " GROUP BY g.persona_version_id", args)
+            return {row["version_id"]: dict(row) for row in await cursor.fetchall()}
 
     async def record(self, profile, config, prompt, output, task, instruction="", json_mode=True):
         generation_id = uuid.uuid4().hex

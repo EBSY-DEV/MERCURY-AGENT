@@ -46,7 +46,11 @@ class Writer:
         self.personas = PersonaStore(state)
 
     def _base_prompt(self, profile: dict) -> str:
-        prompt = self.brain.load_prompt(
+        return "".join(text for _key, _label, text in self._base_sections(profile))
+
+    def _base_sections(self, profile: dict) -> list[tuple[str, str, str]]:
+        """Template, knowledge and voice, as labelled pieces that join into the base prompt."""
+        template = self.brain.load_prompt(
             "writer",
             product_name=self.config.product.name,
             product_description=self.config.product.description,
@@ -62,10 +66,12 @@ class Writer:
             f"Description: {self.config.product.description}\nPricing: {self.config.product.pricing}\n"
             "Benefits:\n" + "\n".join(f"- {b}" for b in self.config.product.key_benefits)
         )
+        sections = [("template", "Writer template", template)]
         self.skills = self.brain.load_skills_for_agent("writer")
         if self.skills:
-            prompt += "\n\n" + self.skills
-        return prompt + voice_instructions(profile)
+            sections.append(("knowledge", "Knowledge", "\n\n" + self.skills))
+        sections.append(("persona", "Writing persona", voice_instructions(profile)))
+        return sections
 
     @property
     def is_native(self) -> bool:
@@ -201,6 +207,11 @@ class Writer:
 
     async def build_personal_prompt(self, prospect, instruction: str = "", profile=None):
         """The same assembled inputs for prompt inspection, preview and drafting."""
+        sections, profile = await self.personal_prompt_sections(prospect, instruction, profile)
+        return "".join(text for _key, _label, text in sections), profile
+
+    async def personal_prompt_sections(self, prospect, instruction: str = "", profile=None):
+        """The first-email prompt as labelled pieces, in the order the writer receives them."""
         profile = profile or await self.personas.resolve(self.config)
         facts = [
             f"- Name: {prospect.full_name()}",
@@ -256,9 +267,7 @@ class Writer:
             if instruction and instruction.strip() else ""
         )
 
-        prompt = self._base_prompt(profile)
-
-        prompt += f"""
+        task = f"""
 
 Write ONE cold email (the very first touch) to this specific person.
 
@@ -278,7 +287,7 @@ Requirements:
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
-        return prompt, profile
+        return self._base_sections(profile) + [("email", "This email", task)], profile
 
     async def _write_personal_email(self, prospect, instruction: str = "", profile=None) -> dict | None:
         prompt, profile = await self.build_personal_prompt(prospect, instruction, profile)
