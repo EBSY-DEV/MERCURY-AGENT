@@ -293,3 +293,37 @@ def test_calendar_link_method_without_a_url_promises_nothing():
 
 def test_an_unconfigured_offer_adds_no_section():
     assert _handler_with_offer()._offer_brief() == ""
+
+
+# --- heartbeat -------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_heartbeat_backs_off_an_hour_when_over_budget(monkeypatch):
+    """run_cycle reports a spent quota as OVER_BUDGET; the loop must back off
+    an hour on exactly that value, not re-run a cycle every heartbeat."""
+    import asyncio
+
+    rt = _runtime(_State(prospects={"new": 0}))
+    slept = []
+    stop = asyncio.Event()
+
+    async def fake_build():
+        return rt
+
+    async def fake_cycle(_rt):
+        return M.OVER_BUDGET
+
+    async def fake_sleep(seconds, stop_event):
+        slept.append(seconds)
+        stop_event.set()
+        return True
+
+    monkeypatch.setattr(M, "build_runtime", fake_build)
+    monkeypatch.setattr(M, "run_cycle", fake_cycle)
+    monkeypatch.setattr(M, "in_quiet_hours", lambda cfg: False)
+    monkeypatch.setattr(M, "_interruptible_sleep", fake_sleep)
+
+    await M.heartbeat(stop)
+
+    assert M.OVER_BUDGET == "over_budget"
+    assert slept == [3600]
