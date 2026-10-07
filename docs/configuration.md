@@ -124,6 +124,37 @@ icp:
 | `warmup_weekly_increase` | `5` | Added to the cap every 7 days, up to the mailbox's `daily_cap`. |
 | `auto_approve_followups` | `false` | With approval on, approving a first email also approves its follow-ups. Replies still need approval. |
 | `spread_sends` | `false` | Pace the day's remaining cold sends evenly over the cycles left before quiet hours, instead of up to 8 per cycle. |
+| `placement` | none | Seed inboxes and a control sender for the [placement test](email-and-deliverability.md#placement-test) (`mercury mail placement`). |
+
+`placement`:
+
+| Key | Default | Description |
+|---|---|---|
+| `seeds` | `[]` | Inboxes you own that the test sends to and reads: ideally one Gmail, one Outlook and one Yahoo. |
+| `seeds[].email` | required | The seed address. |
+| `seeds[].provider` | guessed | `gmail`, `outlook`, `yahoo`, `icloud` or `other`, guessed from the address. Set `gmail` for a Google Workspace seed on its own domain so Primary and Promotions are told apart. |
+| `seeds[].password_env` | `""` | Env var with the seed's IMAP app password (`PLACEMENT_*` or `MAILBOX_*`). Empty: Mercury doesn't read this seed; record its folders with `mercury mail placement mark`. |
+| `seeds[].imap_host` / `imap_port` / `username` | guessed / `993` / `email` | Only needed for providers Mercury can't guess. |
+| `control` | none | A mailbox with a known-good reputation (usually a personal Gmail) that sends the same text as the control. |
+| `control.email` | required | The control address. |
+| `control.password_env` | `""` | Env var with its SMTP app password (`PLACEMENT_*` or `MAILBOX_*`). Never falls back to `SMTP_PASSWORD`. |
+| `control.smtp_host` / `smtp_port` / `username` / `name` | guessed / `587` / `email` / `persona.name` | Only needed for providers Mercury can't guess. |
+| `wait_seconds` | `180` | How long to keep looking for the test emails in the seeds. |
+
+```yaml
+channels:
+  email:
+    placement:
+      seeds:
+        - email: me.seed@gmail.com
+          password_env: PLACEMENT_GMAIL_SEED      # a Google app password
+        - email: me.seed@yahoo.com
+          password_env: PLACEMENT_YAHOO_SEED
+        - email: me.seed@outlook.com              # no password: record by hand
+      control:
+        email: me@gmail.com
+        password_env: PLACEMENT_CONTROL
+```
 
 Each entry in `mailboxes`:
 
@@ -196,6 +227,7 @@ Copy `.env.example` to `.env`. Mercury loads the project's `.env` into the proce
 | `IMAP_USERNAME` | `SMTP_USERNAME` | |
 | `IMAP_PASSWORD` | `SMTP_PASSWORD` | |
 | `MAILBOX_*` | | Any variable starting with `MAILBOX_` can hold a rotation mailbox's password, named by `password_env`, e.g. `MAILBOX_ALEX_PASSWORD`. |
+| `PLACEMENT_*` | | App passwords of the placement test's seed inboxes and control sender, named by their `password_env`, e.g. `PLACEMENT_GMAIL_SEED`. |
 | `INSTANTLY_API_KEY` | | Legacy Instantly provider. Requires Instantly's Growth plan or higher. |
 
 ### Email verification (add at least one)
