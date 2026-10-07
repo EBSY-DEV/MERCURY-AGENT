@@ -107,8 +107,9 @@ class MailboxConfig(BaseModel):
     # Preserve a legacy inbox with separate IMAP credentials when rotation
     # is enabled from the dashboard. Empty uses its SMTP password.
     imap_password_env: str = ""
-    # Steady-state ceiling once warm-up has run its course.
-    daily_cap: int = 30
+    # Steady-state ceiling once warm-up has run its course. 15 is the smtp
+    # provider ceiling (provider_daily_ceilings), so the default never warns.
+    daily_cap: int = 15
     # First day this mailbox sent cold mail. The cap starts at
     # channels.email.warmup_initial_cap and grows weekly from here. Leave
     # empty for a mailbox that is already warm. A date in the future means
@@ -163,6 +164,13 @@ class EmailChannelConfig(BaseModel):
     # here and rises by warmup_weekly_increase every 7 days, up to daily_cap.
     warmup_initial_cap: int = 5
     warmup_weekly_increase: int = 5
+    # Inbox lifecycle limits. Breaking one is a warning (CLI, startup log and
+    # the dashboard Mailboxes tab), or a refusal to start under
+    # `mercury run --strict`. Caps are never lowered silently. Set a value to
+    # 0 (or drop a provider) to switch that check off.
+    max_inboxes_per_domain: int = 2
+    # Safe per-inbox daily_cap by provider, overridable per deployment.
+    provider_daily_ceilings: dict[str, int] = {"gmail": 30, "smtp": 15}
     # With require_approval on, approving a first email also approves its
     # follow-ups (steps 2+), so a sequence you signed off on is not stuck
     # waiting for a second and third click. Replies still need approval.
@@ -183,6 +191,13 @@ class EmailChannelConfig(BaseModel):
     def _warmup_non_negative(cls, v: int) -> int:
         if v < 0:
             raise ValueError("warm-up values must be >= 0")
+        return v
+
+    @field_validator("max_inboxes_per_domain")
+    @classmethod
+    def _inboxes_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("max_inboxes_per_domain must be >= 0")
         return v
 
     @field_validator("mailboxes")
