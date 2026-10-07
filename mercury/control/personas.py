@@ -5,6 +5,8 @@ so a person at a terminal can type "Alex, founder" and a tool can pass the id.
 Every failure is a PersonaError carrying a stable code.
 """
 
+from __future__ import annotations
+
 import secrets
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
