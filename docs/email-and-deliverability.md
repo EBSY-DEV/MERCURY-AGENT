@@ -64,6 +64,8 @@ Temporary failures (timeouts, connection errors, 4xx deferrals, rate limiting) k
 
 **Follow-up auto-approval.** With `auto_approve_followups: true`, a pending follow-up is approved as soon as the step before it is approved or sent. That happens when you approve in the dashboard and again on every cycle, so a sequence you signed off on is not stuck waiting for two more clicks. Replies always need their own approval while `require_approval` is on.
 
+**Follow-ups in the same thread.** With `thread_followups: true` (the default, also a switch on the dashboard's Settings tab), follow-ups go out as replies to the email before them. When a step is sent, its Message-ID and thread are copied onto the later steps still queued: `In-Reply-To` names the previous email, `References` lists the whole chain (step 1, then step 2 for step 3), Gmail gets the same `threadId`, and the subject on the wire is `Re: ` plus the first email's subject. The Writer's own follow-up subject stays in the row; the Outbox and `mercury outbox` show the `Re:` subject the recipient will see. Editing or regenerating a follow-up keeps its thread. If the first email failed or was cancelled, the follow-ups are cancelled with it. Set `thread_followups: false` to send every step as a new email with its own subject.
+
 **Writer backlog.** Mercury stops drafting new sequences once the queued first emails (pending or approved) add up to seven days of sending capacity. Drafts written weeks ahead go stale.
 
 ## The pre-send gate

@@ -9,6 +9,13 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Follow-ups thread under the first email.** With `channels.email.thread_followups`
+  (on by default, also a switch on the Settings tab), steps 2 and 3 go out as
+  replies to the email before them: `In-Reply-To`, a `References` header with
+  the whole chain, the Gmail `threadId`, and the subject `Re: <first subject>`.
+  The Writer's subject stays in the row for review; the Outbox and
+  `mercury outbox` show the subject the recipient sees. Off sends each step as
+  a new email, as before.
 - **Exclusions and company limits.** Exact-address and domain exclusions
   (subdomains only when you ask), with a reason, a source and an append-only
   history. Opt-outs and bounces are recorded as exclusions on the address, so
