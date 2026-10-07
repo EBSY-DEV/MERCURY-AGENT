@@ -283,6 +283,55 @@ async def test_send_failure_recorded(state):
     assert failed and "smtp boom" in failed[0]["error"]
 
 
+@pytest.mark.asyncio
+async def test_sending_freezes_draft_and_persona_attribution(state):
+    from mercury.personas import PersonaStore
+
+    pid = await seed_prospect(state)
+    store = PersonaStore(state)
+    profile = await store.resolve(Cfg())
+    generation_id = await store.record(profile, Cfg(), "Original prompt", {}, "personal_email")
+    item_id = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="original subject",
+        body="Original body. Question?", send_at=_now_iso(), status="approved",
+        generation_id=generation_id,
+    )
+
+    class EditingProvider(FakeProvider):
+        async def send_email(self, *args, **kwargs):
+            with pytest.raises(ValueError, match="no longer available"):
+                await store.replace_draft(item_id, {
+                    "subject": "replacement", "body": "New body", "generation_id": "",
+                })
+            assert not await state.edit_outbox_item(item_id, body="Late manual edit")
+            return await super().send_email(*args, **kwargs)
+
+    provider = EditingProvider()
+    await make_sender(state, provider)._drain_due()
+    item = await state.get_outbox_item(item_id)
+    assert item["status"] == "sent"
+    assert item["generation_id"] == generation_id
+    assert item["subject"] == provider.sent[0]["subject"] == "original subject"
+    assert item["body"] == provider.sent[0]["body"]
+    assert len(await store.history(item_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_claim_rejects_stale_and_duplicate_snapshots(state):
+    pid = await seed_prospect(state)
+    item_id = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="hello", body="Fine body.",
+        send_at=_now_iso(), status="approved",
+    )
+    stale = await state.get_outbox_item(item_id)
+    assert await state.edit_outbox_item(item_id, subject="reviewed subject", manually_edited=1)
+    assert not await state.claim_outbox_item(stale, "mercury@x.co")
+    current = await state.get_outbox_item(item_id)
+    assert await state.claim_outbox_item(current, "mercury@x.co")
+    assert not await state.claim_outbox_item(current, "mercury@x.co")
+    assert not await state.edit_outbox_item(item_id, send_at=_now_iso())
+
+
 # ── handler: stop-on-reply, bounces, kill switch ──
 
 

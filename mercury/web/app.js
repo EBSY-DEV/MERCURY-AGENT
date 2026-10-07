@@ -75,6 +75,7 @@ const STATUS = {
   // outbox
   pending_review: ['Waiting on you', 'waiting'],
   approved:       ['Approved', 'good'],
+  sending:        ['Sending', 'active'],
   scheduled:      ['Scheduled', 'active'],
   sent:           ['Sent', 'good'],
   failed:         ['Failed', 'bad'],
@@ -166,6 +167,7 @@ const TAB_META = {
   companies: ['Companies', 'buildings'], prospects: ['Contacts', 'address-book'],
   pipeline: ['Pipeline', 'kanban'], calendar: ['Calendar', 'calendar-blank'],
   campaigns: ['Campaigns', 'megaphone'], outbox: ['Outbox', 'tray'], warmup: ['Warm-up', 'fire'],
+  personas: ['Voice & Personas', 'sparkle'],
   conversations: ['Conversations', 'chat-circle-text'], activity: ['Activity', 'pulse'],
   usage: ['Usage', 'gauge'], settings: ['Settings', 'gear-six'], controls: ['Controls', 'power'],
   help: ['Help', 'question'],
@@ -207,6 +209,7 @@ function loadCurrentTab() {
     case 'pipeline': loadPipeline(); break;
     case 'calendar': loadCalendar(); break;
     case 'campaigns': loadCampaigns(); break;
+    case 'personas': loadPersonas(); break;
     case 'outbox': loadOutbox(); break;
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
@@ -1326,14 +1329,22 @@ async function loadOutbox() {
   };
 
   list.innerHTML =
+    table('Sending', data.sending, [
+      ['To', r => r.to_email], ['Subject', r => r.subject],
+      ['From', r => r.from_mailbox || r.mailbox || '—', true],
+      ['Persona', r => personaChip(r), false, true],
+      ['Started', r => formatDate(r.updated_at), true],
+    ]) +
     table('Approved &amp; scheduled', data.approved, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
       ['From', r => fromCell(r), true, true],
+      ['Persona', r => personaChip(r), false, true],
       ['Sends', r => formatDate(r.send_at), true],
     ]) +
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
       ['From', r => r.from_mailbox || r.mailbox || '—', true],
+      ['Persona', r => personaChip(r), false, true],
       ['Sent', r => formatDate(r.sent_at), true],
     ]) +
     table('Didn\'t send', data.failed, [
@@ -1359,6 +1370,8 @@ function renderDesk(items, i) {
         (_mailboxes && _mailboxes.rotation ? ' &middot; from <b>' + escHtml(fromLabel(cur)) + '</b>' : '') +
         '</div>' +
       followupNote(cur) +
+      '<div class="desk-persona">' + personaChip(cur) +
+        (cur.manually_edited ? '<span class="muted">Edited before sending</span>' : '') + '</div>' +
       '<label class="sr-only" for="desk-subject">Subject</label>' +
       '<input class="form-input desk-subject" id="desk-subject" value="' + escAttr(cur.subject || '') +
         '" placeholder="Subject" autocomplete="off">' +
@@ -1427,6 +1440,7 @@ async function outboxSave(id, quiet) {
   });
   if (data && data.success) {
     e.it.subject = e.subject; e.it.body = e.body;
+    e.it.manually_edited = 1;
     if (!quiet) showToast('Edits saved.', 'success');
     return true;
   }
@@ -1445,7 +1459,7 @@ async function outboxRegenerate(id) {
   });
   if (data && data.success) {
     const it = _desk.items.find(x => x.id === id);
-    if (it) { it.subject = data.subject; it.body = data.body; }
+    if (it) Object.assign(it, data);
     document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i);
     showToast('New draft ready. Review it before approving.', 'success');
   } else {

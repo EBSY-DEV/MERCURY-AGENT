@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from mercury.state import StateManager
+from mercury.personas import JSON_INSTRUCTION
 
 logger = logging.getLogger("mercury.brain")
 
@@ -272,10 +273,7 @@ class Brain:
         task: str = "",
     ) -> dict | list | None:
         """Send a prompt and parse the response as JSON."""
-        full_prompt = (
-            prompt
-            + "\n\nRespond ONLY with valid JSON. No markdown, no explanation."
-        )
+        full_prompt = prompt + JSON_INSTRUCTION
         response = await self.think(
             full_prompt, session_id=session_id, agent=agent, task=task
         )

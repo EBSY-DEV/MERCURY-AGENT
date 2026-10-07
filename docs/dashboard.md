@@ -94,6 +94,33 @@ Every email Mercury has sent or will send, including follow-ups and replies, in 
 
 The sequences the Writer produced, with their steps and the prospects in each.
 
+## Voice & Personas
+
+Create named writing profiles with a tone, writing preferences and examples.
+Each profile has a local DiceBear Critters avatar; **Shuffle avatar** or choose
+one from the picker. Set a default for future campaigns, duplicate a profile to
+try another voice, or archive it without losing its historical attribution.
+Changing the writing preferences creates a new version. Renaming a profile or
+changing its avatar does not.
+
+**Current configuration** shows the default voice, sender identity, product,
+offer, market language settings and email behavior. **Prompt & preview** shows
+the shared Writer template and knowledge. Choose a contact and a saved persona
+version to inspect the assembled prompt without making a model call, or generate
+a sample email. Samples use a model call but never create a campaign or an
+outbox item.
+
+Persona labels in the Outbox open an email's generation history: the original
+draft, the exact prompt, the persona version and any regeneration instruction.
+Sent emails retain that history alongside their final sent text and mailbox.
+When sending starts, the approved text and persona are frozen together; edits
+and regeneration are rejected. If a process stops during a provider call, the
+row remains in **Sending** for reconciliation with the mailbox rather than
+automatically sending a possible duplicate.
+Emails written before history tracking show **Unknown persona**. This release
+collects attribution for future persona reports and A/B tests; it does not yet
+assign experiment variants or calculate persona conversion rates.
+
 ## Outbox
 
 ![Outbox](images/outbox.png)

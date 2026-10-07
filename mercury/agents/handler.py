@@ -22,6 +22,7 @@ from mercury.integrations.mailboxes import (
 )
 from mercury.models.conversation import Conversation, Message
 from mercury.state import StateManager
+from mercury.personas import PersonaStore, voice_instructions
 
 logger = logging.getLogger("mercury.handler")
 
@@ -160,6 +161,8 @@ class Handler:
         self.brain = brain
         self.state = state
         self.config = config
+        self.personas = PersonaStore(state)
+        self._response_generation_id = ""
         self.instantly = InstantlyClient(env.instantly_api_key)
         # Every configured mailbox is polled; see Sender for the pool.
         self.mailboxes: MailboxPool | None = build_rotation_pool(config, env)
@@ -607,6 +610,7 @@ class Handler:
             to_email=prospect.email,
             subject=subject or "Re: your note",
             body=response,
+            generation_id=self._response_generation_id,
             send_at=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
             status="pending_review" if require_approval else "approved",
             provider=self.provider.name if self.provider else "",
@@ -743,9 +747,22 @@ Respond with ONLY the category label, nothing else."""
         return "\n\nTHE OFFER:\n" + "\n".join(lines)
 
     async def _generate_response(
-        self, intent: str, reply_text: str, prospect, convo: Conversation
+        self, intent: str, reply_text: str, prospect, convo: Conversation,
+        instruction: str = "", profile=None,
     ) -> str:
         """Generate an appropriate response based on intent."""
+        self._response_generation_id = ""
+        # Keep replies in the voice of the existing thread, even after a
+        # different persona becomes the workspace default.
+        async with self.state._connect() as db:
+            cursor = await db.execute(
+                "SELECT generation_id FROM outbox WHERE prospect_id = ? AND status = 'sent' "
+                "AND (? = '' OR campaign_id = ? OR conversation_id = ?) "
+                "ORDER BY sent_at DESC LIMIT 1",
+                (prospect.id, convo.campaign_id, convo.campaign_id, convo.id),
+            )
+            row = await cursor.fetchone()
+        profile = profile or await self.personas.for_generation(self.config, row[0] if row else "")
         # Build conversation history for context
         history = "\n".join(
             f"{'Mercury' if m.is_ours else prospect.full_name()}: {m.content}"
@@ -763,12 +780,14 @@ Respond with ONLY the category label, nothing else."""
         prompt = self.brain.load_prompt("handler", stage=convo.stage)
         if not prompt:
             prompt = f"""You are {self.config.persona.name}, {self.config.persona.role} at {self.config.persona.company}.
-Your tone is: {self.config.persona.tone}
+Your tone is: {profile['tone']}
 Product: {self.config.product.name} — {self.config.product.description}"""
 
         # Inject objection handling + sales methodology skills
+        self.skills = self.brain.load_skills_for_agent("handler")
         if self.skills:
             prompt += "\n\n" + self.skills
+        prompt += voice_instructions(profile)
 
         # The offer is configuration, not knowledge, so it never arrives via
         # skills. Without it the reply agent knows to propose a call but not
@@ -812,6 +831,8 @@ Write a reply that:"""
 - Under 50 words"""
 
         prompt += "\n\nWrite ONLY the email body. No subject line, no greeting label, no signature block, no markdown."
+        if instruction:
+            prompt += f"\n\nReviewer instruction (within the shared reply rules): {instruction}"
 
         response = await self.brain.think(
             prompt, session_id="mercury-handler",
@@ -824,4 +845,8 @@ Write a reply that:"""
         if response.lower().startswith(("i can't", "i cannot", "as an ai", "sorry,")):
             logger.warning("Handler: Model returned meta-text instead of an email. Discarding.")
             return ""
+        self._response_generation_id = await self.personas.record(
+            profile, self.config, prompt, {"body": response}, "generate_response",
+            instruction=instruction, json_mode=False,
+        )
         return response

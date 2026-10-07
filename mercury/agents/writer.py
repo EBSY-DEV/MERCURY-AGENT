@@ -18,6 +18,7 @@ from mercury.config import MercuryConfig
 from mercury.integrations.mail_provider import NATIVE_PROVIDERS
 from mercury.models.campaign import Campaign, EmailStep
 from mercury.state import StateManager
+from mercury.personas import PersonaStore, voice_instructions
 
 logger = logging.getLogger("mercury.writer")
 
@@ -42,6 +43,29 @@ class Writer:
         self.skills = self.brain.load_skills_for_agent("writer")
         self.config = config
         self.env = env
+        self.personas = PersonaStore(state)
+
+    def _base_prompt(self, profile: dict) -> str:
+        prompt = self.brain.load_prompt(
+            "writer",
+            product_name=self.config.product.name,
+            product_description=self.config.product.description,
+            product_benefits="\n".join(f"- {b}" for b in self.config.product.key_benefits),
+            product_pricing=self.config.product.pricing,
+            persona_name=self.config.persona.name,
+            persona_company=self.config.persona.company,
+            persona_role=self.config.persona.role,
+            persona_tone=profile["tone"],
+        ) or (
+            f"You are {self.config.persona.name}, {self.config.persona.role} "
+            f"at {self.config.persona.company}.\nProduct: {self.config.product.name}\n"
+            f"Description: {self.config.product.description}\nPricing: {self.config.product.pricing}\n"
+            "Benefits:\n" + "\n".join(f"- {b}" for b in self.config.product.key_benefits)
+        )
+        self.skills = self.brain.load_skills_for_agent("writer")
+        if self.skills:
+            prompt += "\n\n" + self.skills
+        return prompt + voice_instructions(profile)
 
     @property
     def is_native(self) -> bool:
@@ -112,7 +136,8 @@ class Writer:
             # Native providers: replace the shared template for email 1 with
             # a per-prospect draft grounded in that company's actual facts.
             if self.is_native:
-                await self._personalize_first_emails(campaign_id, prospects)
+                profile = await self.personas.for_generation(self.config, sequence[0].generation_id)
+                await self._personalize_first_emails(campaign_id, prospects, profile)
 
             await self.state.log_action(
                 action_type="write_campaign",
@@ -129,7 +154,7 @@ class Writer:
                 f"{len(sequence)} emails for {len(prospects)} prospects."
             )
 
-    async def _personalize_first_emails(self, campaign_id: str, prospects: list):
+    async def _personalize_first_emails(self, campaign_id: str, prospects: list, profile=None):
         """Draft a grounded, per-prospect email 1 and stage it in the outbox.
 
         The outbox unique index means the sender's later template staging
@@ -147,7 +172,7 @@ class Writer:
         drafted = 0
         for prospect in prospects:
             try:
-                draft = await self._write_personal_email(prospect)
+                draft = await self._write_personal_email(prospect, profile=profile)
             except Exception as e:
                 logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
                 continue
@@ -163,6 +188,7 @@ class Writer:
                 send_at=now,
                 status=status,
                 provider=provider,
+                generation_id=draft.get("generation_id", ""),
             )
             if item_id:
                 drafted += 1
@@ -173,8 +199,9 @@ class Writer:
                 f"({'awaiting approval' if require_approval else 'approved'})."
             )
 
-    async def _write_personal_email(self, prospect, instruction: str = "") -> dict | None:
-        """One grounded draft for one person. Facts in, one email out."""
+    async def build_personal_prompt(self, prospect, instruction: str = "", profile=None):
+        """The same assembled inputs for prompt inspection, preview and drafting."""
+        profile = profile or await self.personas.resolve(self.config)
         facts = [
             f"- Name: {prospect.full_name()}",
             f"- Title: {prospect.title}",
@@ -229,19 +256,7 @@ class Writer:
             if instruction and instruction.strip() else ""
         )
 
-        prompt = self.brain.load_prompt(
-            "writer",
-            product_name=self.config.product.name,
-            product_description=self.config.product.description,
-            product_benefits="\n".join(f"- {b}" for b in self.config.product.key_benefits),
-            product_pricing=self.config.product.pricing,
-            persona_name=self.config.persona.name,
-            persona_company=self.config.persona.company,
-            persona_role=self.config.persona.role,
-            persona_tone=self.config.persona.tone,
-        ) or ""
-        if self.skills:
-            prompt += "\n\n" + self.skills
+        prompt = self._base_prompt(profile)
 
         prompt += f"""
 
@@ -263,6 +278,10 @@ Requirements:
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
+        return prompt, profile
+
+    async def _write_personal_email(self, prospect, instruction: str = "", profile=None) -> dict | None:
+        prompt, profile = await self.build_personal_prompt(prospect, instruction, profile)
         result = await self.brain.think_json(
             prompt, session_id="mercury-writer",
             agent="writer", task="personal_email",
@@ -273,7 +292,11 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         body = str(result.get("body") or "").strip()
         if not subject or not body:
             return None
-        return {"subject": subject[:120], "body": body[:2000]}
+        draft = {"subject": subject[:120], "body": body[:2000]}
+        draft["generation_id"] = await self.personas.record(
+            profile, self.config, prompt, draft, "personal_email", instruction,
+        )
+        return draft
 
     async def regenerate_email(self, item: dict, prospect, instruction: str = "") -> dict | None:
         """Rewrite one outbox draft from the review desk.
@@ -282,9 +305,10 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         the context of the first email of its thread. The reviewer's
         instruction ("más corto", "menciona la constructora") is binding.
         """
+        profile = await self.personas.for_generation(self.config, item.get("generation_id", ""))
         step = int(item.get("step") or 1)
         if step == 1:
-            return await self._write_personal_email(prospect, instruction=instruction)
+            return await self._write_personal_email(prospect, instruction=instruction, profile=profile)
 
         first = ""
         try:
@@ -314,19 +338,7 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             "the BREAK-UP email, the last one: 30-50 words, gives permission to say "
             "no, leaves the door open, no guilt"
         )
-        prompt = self.brain.load_prompt(
-            "writer",
-            product_name=self.config.product.name,
-            product_description=self.config.product.description,
-            product_benefits="\n".join(f"- {b}" for b in self.config.product.key_benefits),
-            product_pricing=self.config.product.pricing,
-            persona_name=self.config.persona.name,
-            persona_company=self.config.persona.company,
-            persona_role=self.config.persona.role,
-            persona_tone=self.config.persona.tone,
-        ) or ""
-        if self.skills:
-            prompt += "\n\n" + self.skills
+        prompt = self._base_prompt(profile)
         prompt += f"""
 
 Rewrite ONE email for this person: {prospect.full_name()}, {prospect.title} at {prospect.company}.
@@ -354,7 +366,11 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         body = str(result.get("body") or "").strip()
         if not subject or not body:
             return None
-        return {"subject": subject[:120], "body": body[:2000]}
+        draft = {"subject": subject[:120], "body": body[:2000]}
+        draft["generation_id"] = await self.personas.record(
+            profile, self.config, prompt, draft, "regenerate_email", instruction,
+        )
+        return draft
 
     async def _market_lang(self, prospects: list) -> str:
         """The language line for a batch, decided from the prospects' market.
@@ -403,30 +419,8 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             for p in prospects[:5]  # Show sample for context
         )
 
-        prompt = self.brain.load_prompt(
-            "writer",
-            product_name=self.config.product.name,
-            product_description=self.config.product.description,
-            product_benefits="\n".join(f"- {b}" for b in self.config.product.key_benefits),
-            product_pricing=self.config.product.pricing,
-            persona_name=self.config.persona.name,
-            persona_company=self.config.persona.company,
-            persona_role=self.config.persona.role,
-            persona_tone=self.config.persona.tone,
-        )
-
-        if not prompt:
-            prompt = f"""You are {self.config.persona.name}, {self.config.persona.role} at {self.config.persona.company}.
-Your tone is: {self.config.persona.tone}
-
-Product: {self.config.product.name}
-Description: {self.config.product.description}
-Key benefits: {', '.join(self.config.product.key_benefits)}
-Pricing: {self.config.product.pricing}"""
-
-        # Inject email framework skills
-        if self.skills:
-            prompt += "\n\n" + self.skills
+        profile = await self.personas.resolve(self.config)
+        prompt = self._base_prompt(profile)
 
         prompt += f"""
 
@@ -461,7 +455,14 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             prompt, session_id="mercury-writer",
             agent="writer", task="write_sequence",
         )
-        return self._parse_sequence(result)
+        steps = self._parse_sequence(result)
+        if steps:
+            generation_id = await self.personas.record(
+                profile, self.config, prompt, [step.model_dump() for step in steps], "write_sequence",
+            )
+            for step in steps:
+                step.generation_id = generation_id
+        return steps
 
     def _parse_sequence(self, result) -> list[EmailStep]:
         """Robustly coerce LLM output into a validated EmailStep list.
