@@ -309,6 +309,14 @@ async def build_runtime() -> Runtime | None:
         logger.error(f"Cannot start \u2014 configuration error:\n{e}")
         return None
 
+    try:
+        from mercury.integrations.mailboxes import inbox_limit_warnings
+
+        for w in inbox_limit_warnings(config):
+            logger.warning(f"Inbox limits: {w['message']}")
+    except Exception as e:  # advisory only: never block startup
+        logger.debug(f"Inbox limit check skipped: {e}")
+
     env = load_env()
     state = StateManager()
     brain = Brain(state)

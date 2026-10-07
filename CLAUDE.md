@@ -314,6 +314,7 @@ mercury signals               # The signal vocabulary; --confirm / --reject CODE
 mercury personas              # Writing voices: list / show / create / edit / default / archive / versions / prompt / preview
 mercury personas mailboxes    # Each sending mailbox's voice and sign-off; change one with: personas assign EMAIL [PERSONA] --sign-name NAME
 mercury discover              # Find businesses; --providers / --estimate / --provider <key>
+mercury mail limits [--strict] # Inbox limit warnings (2 per domain, provider ceilings, 14-day warm-up); `mercury run --strict` refuses to start on any
 mercury sending pause|resume  # Kill switch for all outbound
 ```
 

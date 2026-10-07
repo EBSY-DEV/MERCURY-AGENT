@@ -52,6 +52,8 @@ from mercury.integrations.mailboxes import (
     full_volume_on,
     local_today,
     mailbox_report,
+    ramp_full_weeks,
+    ramp_week_cap,
 )
 
 logger = logging.getLogger("mercury.warmup")
@@ -110,17 +112,17 @@ def health_gate(sent: int, bounces: int) -> tuple[str, str]:
 
 def ramp_cap(week: int, daily_cap: int, initial: int, weekly_increase: int) -> int:
     """The ramp's cap during plan week ``week`` (1-based), independent of
-    the start date — the same formula as ``mailboxes.warmup_cap``."""
-    return max(0, min(int(daily_cap), int(initial) + (max(1, week) - 1) * int(weekly_increase)))
+    the start date — the same ramp as ``mailboxes.warmup_cap`` (including
+    the rule that no week more than doubles the one before)."""
+    return ramp_week_cap(max(1, week) - 1, daily_cap, initial, weekly_increase)
 
 
 def ramp_weeks(daily_cap: int, initial: int, weekly_increase: int) -> int:
     """Weeks spent below daily_cap (0 when the ramp starts at full volume)."""
     if daily_cap <= initial:
         return 0
-    if weekly_increase <= 0:
-        return 4  # never reaches the cap; the plan shows the first month
-    return -(-(int(daily_cap) - int(initial)) // int(weekly_increase))
+    weeks = ramp_full_weeks(daily_cap, initial, weekly_increase)
+    return 4 if weeks is None else weeks  # never reaching the cap: show the first month
 
 
 # ── The week-by-week plan ─────────────────────────────────────────────
@@ -433,6 +435,8 @@ async def overview(state, config, pool: MailboxPool | None,
             "ramp_days": (full_on - mb.warmup_start).days if full_on else None,
             "day": day,
             "target_daily": mb.daily_cap,
+            "cap_source": rep.get("cap_source", ""),
+            "cap_reason": rep.get("cap_reason", ""),
             "today_cap": rep.get("cap_today", 0),
             "base_cap": rep.get("base_cap_today", 0),
             "sent_today": rep.get("sent_24h", 0),

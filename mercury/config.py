@@ -160,6 +160,13 @@ class EmailChannelConfig(BaseModel):
     # here and rises by warmup_weekly_increase every 7 days, up to daily_cap.
     warmup_initial_cap: int = 5
     warmup_weekly_increase: int = 5
+    # Inbox lifecycle limits. Breaking one is a warning (CLI, startup log and
+    # the dashboard Mailboxes tab), or a refusal to start under
+    # `mercury run --strict`. Caps are never lowered silently. Set a value to
+    # 0 (or drop a provider) to switch that check off.
+    max_inboxes_per_domain: int = 2
+    # Safe per-inbox daily_cap by provider, overridable per deployment.
+    provider_daily_ceilings: dict[str, int] = {"gmail": 30, "smtp": 15}
     # With require_approval on, approving a first email also approves its
     # follow-ups (steps 2+), so a sequence you signed off on is not stuck
     # waiting for a second and third click. Replies still need approval.
@@ -180,6 +187,13 @@ class EmailChannelConfig(BaseModel):
     def _warmup_non_negative(cls, v: int) -> int:
         if v < 0:
             raise ValueError("warm-up values must be >= 0")
+        return v
+
+    @field_validator("max_inboxes_per_domain")
+    @classmethod
+    def _inboxes_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("max_inboxes_per_domain must be >= 0")
         return v
 
     @field_validator("mailboxes")
