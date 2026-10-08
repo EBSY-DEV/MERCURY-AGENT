@@ -95,12 +95,13 @@ async def test_pre_merge_dev_db_gets_the_mailbox_column(tmp_path):
 def test_migration_order_contact_policy_v14_v15_then_pauses_v16_demos_v17():
     # main shipped v14/v15 (exclusions, manual review) first; the
     # integration/p0 work (out-of-office pauses, demo gate) comes after.
-    assert len(MIGRATIONS) == 18
+    assert len(MIGRATIONS) == 19
     assert "CREATE TABLE suppressions" in MIGRATIONS[13]
     assert "requires_manual_review" in MIGRATIONS[14]
     assert "CREATE TABLE IF NOT EXISTS sequence_pauses" in MIGRATIONS[15]
     assert "CREATE TABLE demos" in MIGRATIONS[16]
     assert "CREATE TABLE audit_log" in MIGRATIONS[17]
+    assert "ALTER TABLE outbox ADD COLUMN thread_subject" in MIGRATIONS[18]
 
 
 _FULL_TABLES = {"suppressions", "company_holds", "sequence_pauses", "demos",
@@ -113,16 +114,40 @@ def _assert_full_schema(db: str) -> None:
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert _FULL_TABLES <= tables
     assert {"company_id", "requires_manual_review", "offer_key", "revision",
-            "approved_revision", "approved_hash"} <= _columns(conn, "outbox")
+            "approved_revision", "approved_hash", "thread_subject",
+            "thread_references"} <= _columns(conn, "outbox")
     assert "offer_key" in _columns(conn, "campaigns")
     conn.close()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stamped", [13, 14, 15, 16, 17, 18])
+@pytest.mark.parametrize("stamped", [13, 14, 15, 16, 17, 18, 19])
 async def test_main_line_db_upgrades_at_every_version(tmp_path, stamped):
     db = str(tmp_path / "main.db")
     _apply(db, MIGRATIONS[:stamped])
+    await StateManager(db).init_db()
+    _assert_full_schema(db)
+
+
+@pytest.mark.asyncio
+async def test_threading_branch_v16_db_keeps_headers_and_gains_later_migrations(tmp_path):
+    db = str(tmp_path / "threading.db")
+    _apply(db, MIGRATIONS[:15] + [MIGRATIONS[18]])
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO outbox (id, prospect_id, to_email, status, subject, body, "
+                 "thread_subject, thread_references, in_reply_to) "
+                 "VALUES ('o1', 'p1', 'person@example.com', 'approved', 'followup_a', 'body_a', "
+                 "'opener_a', '<message_a@example.com>', '<message_a@example.com>')")
+    conn.commit()
+    conn.close()
+
+    await StateManager(db).init_db()
+    _assert_full_schema(db)
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT thread_subject, thread_references, in_reply_to, approved_revision "
+                        "FROM outbox WHERE id = 'o1'").fetchone() == (
+                            "opener_a", "<message_a@example.com>", "<message_a@example.com>", 1)
+    conn.close()
     await StateManager(db).init_db()
     _assert_full_schema(db)
 

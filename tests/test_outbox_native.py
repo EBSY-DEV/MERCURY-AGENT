@@ -43,12 +43,14 @@ class FakeProvider(MailProvider):
     def is_configured(self):
         return True
 
-    async def send_email(self, to_email, subject, body, thread_ref="", in_reply_to=""):
+    async def send_email(self, to_email, subject, body, thread_ref="", in_reply_to="",
+                         references=""):
         if self.fail_next:
             self.fail_next = False
             return SendResult(ok=False, error="smtp boom")
         self.sent.append({"to": to_email, "subject": subject, "body": body,
-                          "thread_ref": thread_ref, "in_reply_to": in_reply_to})
+                          "thread_ref": thread_ref, "in_reply_to": in_reply_to,
+                          "references": references})
         return SendResult(ok=True, message_id=f"<m{len(self.sent)}@x>", thread_ref="t1")
 
     async def get_replies(self, limit=50):

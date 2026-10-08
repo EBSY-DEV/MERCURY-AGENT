@@ -538,6 +538,14 @@
   </div>
 
   <div class="card">
+    <h2>Follow-ups</h2>
+    <p class="lede">How steps 2 and 3 of a sequence go out with Gmail or SMTP. Saved to <span style="font-family:var(--mono);font-size:12px">channels.email.thread_followups</span>.</p>
+    <label class="ex-check"><input type="checkbox" id="thread-followups" onchange="saveThreadFollowups(this)" disabled>Send follow-ups as replies in the same thread</label>
+    <p class="check-help">On: each follow-up replies to the email before it, under the first email's subject with "Re:" in front, so the recipient sees one conversation. Off: each step goes out as a new email with its own subject.</p>
+    <div id="email-options-notice" class="check-help" role="status" aria-live="polite"></div>
+  </div>
+
+  <div class="card">
     <h2>Prospect search <span class="optional-tag">recommended</span></h2>
     <p class="lede">Serper gives Mercury reliable Google results when hunting for companies; without it, prospecting falls back to slower scraping. The rest are optional sources the scout and discovery use when present.</p>
     <div class="form-group"><label class="form-label" for="serper-key">Serper API key <span id="serper-status" class="email-tag"></span></label>

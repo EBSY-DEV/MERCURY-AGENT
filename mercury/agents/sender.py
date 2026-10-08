@@ -11,6 +11,9 @@ Native flow:
      again right before each claim (mercury/holds.py), so a pause or a
      shutdown that lands mid-drain stops the next email; the one already
      claimed finishes.
+  3. With channels.email.thread_followups (default on), a sent step hands
+     its Message-ID and thread to the later steps, which go out as replies
+     ("Re: <first subject>", In-Reply-To, References chain, Gmail threadId).
 """
 
 import asyncio
@@ -37,7 +40,13 @@ from mercury.integrations.mailboxes import (
     rotation_configured,
 )
 from mercury.policy import ContactPolicy, capability
-from mercury.state import StateManager, describe_rule
+from mercury.state import (
+    THREAD_FIELDS,
+    StateManager,
+    describe_rule,
+    reply_subject,
+    thread_headers,
+)
 
 logger = logging.getLogger("mercury.sender")
 
@@ -622,6 +631,10 @@ class Sender:
                 )
                 if item_id:
                     staged += 1
+            if self._threads_followups():
+                # An opener can go out before its follow-ups are staged (the
+                # writer stages step 1 itself); they still join its thread.
+                await self.state.thread_followups(campaign.id, prospect.id)
             await self.state.update_prospect_status(prospect.id, "queued")
             queued_ids.append(prospect.id)
 
@@ -810,8 +823,11 @@ class Sender:
             if mailbox is None:
                 continue
 
+            thread = self._thread_for(item, prev)
+            subject_out = (reply_subject(thread["thread_subject"])
+                           if thread.get("thread_subject") else item["subject"])
             gate = pre_send_check(
-                item["to_email"], item["subject"], item["body"],
+                item["to_email"], subject_out, item["body"],
                 prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
             )
             if not gate:
@@ -861,12 +877,19 @@ class Sender:
             body_out = item["body"]
             if item["kind"] != "reply":
                 body_out = self._with_legal_footer(body_out)
+            if item["kind"] != "sequence":
+                # Replies thread through their conversation, as before.
+                refs = {"thread_ref": item.get("thread_ref", ""),
+                        "in_reply_to": item.get("in_reply_to", "")}
+            else:
+                refs = {"thread_ref": thread.get("thread_ref", ""),
+                        "in_reply_to": thread.get("in_reply_to", "")}
+                if thread.get("thread_references"):
+                    refs["references"] = thread["thread_references"]
             raised = False
             try:
                 result = await mailbox.provider.send_email(
-                    item["to_email"], item["subject"], body_out,
-                    thread_ref=item.get("thread_ref", ""),
-                    in_reply_to=item.get("in_reply_to", ""),
+                    item["to_email"], subject_out, body_out, **refs,
                 )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise
@@ -919,11 +942,18 @@ class Sender:
             remaining[mailbox.email] = remaining.get(mailbox.email, 0) - 1
             sent_this_cycle[mailbox.email] = sent_this_cycle.get(mailbox.email, 0) + 1
             now_iso = self.clock().isoformat()
+            # A sent sequence row records how it went out: the headers it
+            # carried, or none, so its subject on record matches the wire.
+            sent_thread = {}
+            if item["kind"] == "sequence":
+                sent_thread = {f: thread.get(f, "") for f in THREAD_FIELDS if f != "thread_ref"}
             await self.state.update_outbox_item(
                 item["id"], status="sent", sent_at=now_iso, body=body_out,
                 message_id=result.message_id, thread_ref=result.thread_ref,
-                mailbox=mailbox.email,
+                mailbox=mailbox.email, **sent_thread,
             )
+            if item["kind"] == "sequence" and self._threads_followups():
+                await self.state.thread_followups(item["campaign_id"], item["prospect_id"])
             if prospect.status in ("new", "queued"):
                 await self.state.update_prospect_status(prospect.id, "contacted")
 
@@ -1036,6 +1066,23 @@ class Sender:
             )
             return None, "hold"
         return mailbox, "send"
+
+    def _threads_followups(self) -> bool:
+        return bool(getattr(self.config.channels.email, "thread_followups", True))
+
+    def _thread_for(self, item, prev) -> dict:
+        """Thread headers a sequence follow-up goes out with ({} = a new
+        email with its own subject). Read from the previous step, which the
+        drain fetched fresh: this row's copy can predate a step sent earlier
+        in the same cycle. Replies keep their own headers and are not
+        handled here."""
+        if (item["kind"] != "sequence" or int(item.get("step") or 1) <= 1
+                or not self._threads_followups()):
+            return {}
+        thread = thread_headers(prev)
+        if not thread and item.get("in_reply_to"):
+            thread = {f: item.get(f) or "" for f in THREAD_FIELDS}
+        return thread
 
     async def _followup_earliest(self, item, prev) -> str | None:
         """Earliest send time for a follow-up: the previous step's actual

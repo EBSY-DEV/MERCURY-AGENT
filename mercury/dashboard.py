@@ -712,6 +712,52 @@ async def get_inbox_settings():
                             status_code=400)
 
 
+def _config_targets(found: str) -> tuple[Path, Path | None]:
+    """(config read, private file written instead or None). Saving from the
+    tracked template goes to mercury.local.yaml so real settings stay out of
+    the repository."""
+    source = Path(found)
+    private = (source.with_name("mercury.local.yaml")
+               if source.name == "mercury.yaml" and not os.getenv("MERCURY_CONFIG") else None)
+    return source, private
+
+
+@app.get("/api/settings/email-options")
+async def get_email_options():
+    from mercury.config import _find_config_file
+    from mercury.inbox_settings import email_options
+
+    try:
+        return email_options(Path(_find_config_file()))
+    except Exception:
+        return JSONResponse({"error": "Could not read the sending settings. Check your Mercury configuration."},
+                            status_code=400)
+
+
+@app.post("/api/settings/email-options")
+async def save_email_options_api(request: Request):
+    """On/off sending switches under channels.email (thread_followups)."""
+    from mercury.config import _find_config_file
+    from mercury.inbox_settings import InboxError, save_email_options
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
+    async with _env_lock:
+        try:
+            source, private = _config_targets(_find_config_file())
+            result = save_email_options(source, data, private)
+            result["restart_required"] = _check_mercury_pid() is not None
+            return result
+        except InboxError as e:
+            return JSONResponse({"success": False, "message": str(e)}, status_code=e.status)
+        except Exception:
+            logger.warning("Could not save sending settings", exc_info=False)
+            return JSONResponse({"success": False, "message": "Could not save the setting. Check file permissions and configuration."},
+                                status_code=500)
+
+
 async def _save_inbox(request: Request, email: str | None = None):
     from mercury.control.settings import config_paths
     from mercury.inbox_settings import InboxError, save

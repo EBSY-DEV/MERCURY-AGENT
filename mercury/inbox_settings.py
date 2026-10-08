@@ -110,6 +110,46 @@ def settings(config_path: Path, env_path: Path) -> dict:
     }
 
 
+def _round_trip(config_path: Path):
+    """(loader, raw config) with channels.email present. The round-trip
+    loader keeps the user's comments and key order when saving."""
+    rt_yaml = YAML(typ="rt")
+    rt_yaml.preserve_quotes = True
+    rt_yaml.width = 4096
+    raw = rt_yaml.load(config_path.read_text()) or {}
+    # A bare `channels:` / `email:` key loads as None; treat it as empty.
+    if not isinstance(raw.get("channels"), dict):
+        raw["channels"] = {}
+    if not isinstance(raw["channels"].get("email"), dict):
+        raw["channels"]["email"] = {}
+    return rt_yaml, raw
+
+
+# On/off switches under channels.email that the Settings tab edits directly.
+EMAIL_OPTIONS = ("thread_followups",)
+
+
+def email_options(config_path: Path) -> dict:
+    config = MercuryConfig(**(yaml.safe_load(config_path.read_text()) or {}))
+    return {k: getattr(config.channels.email, k) for k in EMAIL_OPTIONS}
+
+
+def save_email_options(config_path: Path, data: dict, private_path: Path | None = None) -> dict:
+    """Write sending switches to channels.email, keeping comments and order."""
+    if not isinstance(data, dict) or not data or set(data) - set(EMAIL_OPTIONS):
+        raise InboxError("Use only the supported sending settings.")
+    if any(not isinstance(v, bool) for v in data.values()):
+        raise InboxError("Sending settings must be on or off.")
+    rt_yaml, raw = _round_trip(config_path)
+    for key, value in data.items():
+        raw["channels"]["email"][key] = value
+    MercuryConfig(**_plain(raw))  # validate the whole result before writing
+    out = StringIO()
+    rt_yaml.dump(raw, out)
+    atomic_write((private_path or config_path).resolve(), out.getvalue())
+    return {"success": True, **data}
+
+
 class InboxError(ValueError):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
@@ -123,16 +163,7 @@ def save(config_path: Path, env_path: Path, data: dict, email: str | None = None
                "activate_smtp", "imap_username", "imap_password"}
     if not isinstance(data, dict) or set(data) - allowed:
         raise InboxError("Use only the supported inbox settings.")
-    # Round-trip loader so saving keeps the user's comments and key order.
-    rt_yaml = YAML(typ="rt")
-    rt_yaml.preserve_quotes = True
-    rt_yaml.width = 4096
-    raw = rt_yaml.load(config_path.read_text()) or {}
-    # A bare `channels:` / `email:` key loads as None; treat it as empty.
-    if not isinstance(raw.get("channels"), dict):
-        raw["channels"] = {}
-    if not isinstance(raw["channels"].get("email"), dict):
-        raw["channels"]["email"] = {}
+    rt_yaml, raw = _round_trip(config_path)
     config = MercuryConfig(**_plain(raw))
     env = load_env(env_values(env_path))
     boxes = configured_inboxes(config, env)
