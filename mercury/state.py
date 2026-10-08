@@ -1917,23 +1917,28 @@ class StateManager:
         return await self.get_pause(prospect_id)
 
     async def resume_pause(
-        self, prospect_id: str, reason: str = "operator", now: datetime | None = None
+        self, prospect_id: str, reason: str = "operator", now: datetime | None = None,
+        *, only_due: bool = False,
     ) -> dict | None:
         """End an active pause and reschedule what is left of the sequence from
         now. None when there was no active pause."""
-        pause = await self.get_active_pause(prospect_id)
-        if pause is None:
-            return None
         now_s = _ts(now)
-        # An elapsed return date anchors the new schedule to when they were due
-        # back, not to whenever this ran; an operator resume or an early return
-        # anchors to now.
-        anchor = pause["resume_at"] if (
-            pause["state"] == "paused" and pause["resume_at"] and pause["resume_at"] <= now_s
-        ) else now_s
         async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             try:
+                async with db.execute(
+                    "SELECT state, resume_at FROM sequence_pauses WHERE prospect_id = ?",
+                    (prospect_id,),
+                ) as cursor:
+                    pause = await cursor.fetchone()
+                if pause is None or pause[0] not in PAUSE_ACTIVE_STATES or (
+                    only_due and (pause[0] != "paused" or not pause[1] or pause[1] > now_s)
+                ):
+                    await db.rollback()
+                    return None
+                # Re-read the date under the write lock: the operator or a
+                # newer reply may have extended it since the sender's scan.
+                anchor = pause[1] if pause[0] == "paused" and pause[1] and pause[1] <= now_s else now_s
                 cursor = await db.execute(
                     "UPDATE sequence_pauses SET state = 'resumed', ended_at = ?, "
                     "ended_reason = ?, updated_at = ? WHERE prospect_id = ? "
@@ -1966,7 +1971,7 @@ class StateManager:
                 due = [r[0] for r in await cursor.fetchall()]
         resumed = []
         for pid in due:
-            pause = await self.resume_pause(pid, reason="return date", now=now)
+            pause = await self.resume_pause(pid, reason="return date", now=now, only_due=True)
             if pause is not None:
                 resumed.append(pause)
         return resumed
