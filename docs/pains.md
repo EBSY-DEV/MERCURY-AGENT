@@ -56,13 +56,48 @@ names no signals or the company carries at least one of them (confirmed
 signals only). The most specific eligible pain wins: more matched signals, then
 a named sector, market and offer, then the lowest code.
 
+## Pains in the Writer
+
+Every email gets exactly one confirmed pain when one fits, and none otherwise.
+`Writer.pain_source` (default: the selection above, with the offer the prospect
+was routed to) supplies it; set it to `None` and every prompt says no pain was
+supplied.
+
+- **Where it goes.** With an offer, the pain is in the offer brief
+  ("the only pain you may name"). Without offers, once at least one pain is
+  confirmed, it is its own block in the prompt. The block also carries the
+  pain's code as an internal reference, so the recorded prompt says which
+  pain it was written around.
+- **Never-use list.** Rejected pains go into every first-email, sequence and
+  rewrite prompt as "NEVER raise these", in the owner's words. A rejected pain
+  written for another offer is left out of this offer's prompt, so one offer's
+  content does not reach another's; the guard below still checks drafts
+  against it.
+- **A shared sequence.** Steps 2 and 3 are one template for the whole group, so
+  the sequence carries a pain only when every prospect in the group was given
+  the same one. Otherwise the template raises none, and each prospect's own
+  first email still carries theirs. The template's pain code is stored on its
+  steps (`EmailStep.pain_code`) and copied onto the staged outbox rows.
+- **Rewrites.** A rewrite from the review desk selects again for that
+  prospect, keeps the email's offer, and records the pain it used.
+- **Recording.** `outbox.pain_code` is set for personalized first emails,
+  staged sequence rows and rewrites. `GET /api/outbox` rows (and
+  `GET /api/outbox/{id}`) carry `pain_code` and `pain`: `null`, or
+  `{code, label, words, scene, cost, status}` read from the library as it is
+  now (`status` is `missing` if the pain was deleted), next to `offer`.
+- **Discarded drafts.** A first email, sequence or rewrite that raises a
+  rejected pain is discarded before it is staged; the prospects are tried
+  again on the next cycle. The send gate still checks everything that leaves.
+
 ## The guard
 
 `find_rejected_pain_hits(text, rejected, allowed)` reports a draft that uses an
 avoided phrase, or at least two distinctive words of a rejected pain (words of
 four letters or more that no confirmed pain also uses). The sender runs it on
-every cold sequence email just before sending; a hit fails the email with
-`gate: rejected pain CODE`.
+every cold sequence email just before sending, whatever wrote it (a first
+email, a template follow-up, a rewrite, a manual edit); a hit fails the email
+with `gate: rejected pain CODE`. It is a separate check from the case-study
+scope: a draft that trips both lists both reasons, one each.
 
 ## Results per pain
 

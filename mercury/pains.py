@@ -310,6 +310,14 @@ def _pain_lines(pain: dict) -> list[str]:
     return lines
 
 
+def _reference_line(pain: dict) -> list[str]:
+    """The pain's code, so the recorded prompt says which pain it was written
+    around. Marked internal: it is never part of the email."""
+    if not pain.get("code"):
+        return []
+    return [f"- Pain reference (internal, never write it in the email): {pain['code']}"]
+
+
 def pain_block(selection: PainSelection) -> str:
     """The 'use only this pain' block. With no pain it says so, so the model
     is not left to invent one."""
@@ -319,6 +327,7 @@ def pain_block(selection: PainSelection) -> str:
     return "\n".join([
         "PAIN (the only pain you may raise in this email; do not add, combine or invent others):",
         *_pain_lines(selection.pain),
+        *_reference_line(selection.pain),
     ])
 
 
@@ -338,6 +347,32 @@ def never_use_block(rejected: Iterable[dict]) -> str:
 def pain_prompt_blocks(selection: PainSelection) -> str:
     """Both blocks, ready to append to the Writer's prompt."""
     return "\n\n".join(b for b in (pain_block(selection), never_use_block(selection.rejected)) if b)
+
+
+# ── The Outbox ──
+
+
+async def annotate_outbox(state, rows: list[dict]) -> list[dict]:
+    """Give each outbox row ``pain``: None when it was written around no
+    pain, else {code, label, words, scene, cost, status}. ``words`` is the
+    owner's own wording the Writer was given (the label when there are none),
+    read from the pain library as it stands now; ``status`` is that pain's
+    current state, ``missing`` if it has since been removed."""
+    wanted = {r.get("pain_code") for r in rows if r.get("pain_code")}
+    library = {p["code"]: p for p in await state.list_pains()} if wanted else {}
+    for row in rows:
+        code = row.get("pain_code") or ""
+        pain = library.get(code)
+        if not code:
+            row["pain"] = None
+        elif pain is None:
+            row["pain"] = {"code": code, "label": "", "words": "", "scene": "", "cost": "",
+                           "status": "missing"}
+        else:
+            row["pain"] = {"code": code, "label": pain["label"],
+                           "words": (pain["owner_words"] or pain["label"]).strip(),
+                           "scene": pain["scene"], "cost": pain["cost"], "status": pain["status"]}
+    return rows
 
 
 # ── The guard ──

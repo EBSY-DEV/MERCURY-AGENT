@@ -19,6 +19,7 @@ routed to.
 
 import json
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from mercury.brain import AGENT_SKILLS, Brain
@@ -38,6 +39,13 @@ from mercury.offers import (
     route_prospect,
     routing_enabled,
 )
+from mercury.pains import (
+    PainSelection,
+    find_rejected_pain_hits,
+    never_use_block,
+    pain_block,
+    select_pain_for_prospect,
+)
 from mercury.state import StateManager
 from mercury.personas import PersonaStore, voice_instructions
 from mercury.voices import MailboxVoices
@@ -52,6 +60,33 @@ LEGACY_BATCH_CAP = 50
 # Skills an authoritative offer brief replaces. product_knowledge is the
 # trainer's description of everything the business sells.
 BRIEF_REPLACES_SKILLS = ("product_knowledge",)
+
+
+@dataclass
+class PainPlan:
+    """The pain decision behind one prompt (one email, or one shared sequence).
+
+    ``pain`` is the one confirmed pain the email may raise (None: none fits,
+    and the prompt says so). ``never_use`` is the rejected pains the model is
+    shown; ``rejected`` is all of them, which the Writer and the send gate
+    check a draft against, and ``confirmed`` is the vocabulary a draft may
+    share with them."""
+    pain: ConfirmedPain | None = None
+    never_use: list = field(default_factory=list)
+    rejected: list = field(default_factory=list)
+    confirmed: list = field(default_factory=list)
+
+    @property
+    def code(self) -> str:
+        return self.pain.code if self.pain is not None else ""
+
+
+def _selection(plan: PainPlan) -> PainSelection:
+    """The plan's pain in the shape pains.pain_block renders."""
+    pain = plan.pain
+    return PainSelection(pain=None if pain is None else {
+        "code": pain.code, "owner_words": pain.words, "scene": pain.scene, "cost": pain.cost,
+    }, reason="")
 
 
 class Writer:
@@ -71,21 +106,25 @@ class Writer:
         self.env = env
         self.personas = PersonaStore(state)
         self.voices = MailboxVoices(state, config, env)
-        # The confirmed-pain hook (#59): an async callable
-        # (prospect, offer_key, step) -> ConfirmedPain | None. Unset, a brief
-        # says no pain was supplied; the Writer never makes one up.
-        self.pain_source = None
+        # The confirmed-pain hook: an async callable
+        # (prospect, offer_key, step) -> ConfirmedPain | None. By default it
+        # selects the one confirmed pain from the governed pain library that
+        # fits the prospect and offer. Set to None, every prompt says no pain
+        # was supplied; the Writer never makes one up either way.
+        self.pain_source = self._confirmed_pain
 
-    def _base_prompt(self, profile: dict, brief: OfferBrief | None = None) -> str:
-        return "".join(text for _key, _label, text in self._base_sections(profile, brief))
+    def _base_prompt(self, profile: dict, brief: OfferBrief | None = None,
+                     plan: PainPlan | None = None) -> str:
+        return "".join(text for _key, _label, text in self._base_sections(profile, brief, plan))
 
     def _sign_off_rule(self, profile: dict) -> str:
         name = profile.get("signer") or self.config.persona.name
         return (f"Sign off with this name and no other: {name}. "
                 "Never sign with a persona, team or company name instead.")
 
-    def _base_sections(self, profile: dict, brief: OfferBrief | None = None) -> list[tuple[str, str, str]]:
-        """Template, knowledge, offer brief and voice, as labelled pieces that join into the base prompt."""
+    def _base_sections(self, profile: dict, brief: OfferBrief | None = None,
+                       plan: PainPlan | None = None) -> list[tuple[str, str, str]]:
+        """Template, knowledge, offer brief, pain and voice, as labelled pieces that join into the base prompt."""
         product = self.config.product
         description, pricing = product.description, product.pricing
         benefits = "\n".join(f"- {b}" for b in product.key_benefits)
@@ -121,6 +160,15 @@ class Writer:
             sections.append(("knowledge", "Knowledge", "\n\n" + self.skills))
         if brief is not None:
             sections.append(("offer", "Offer brief", brief.render()))
+        if plan is not None:
+            # With a brief the pain rides inside it. Without offers it is its
+            # own block, once the pain library is in use (an install with no
+            # confirmed pain keeps the prompt it always had).
+            if brief is None and (plan.pain is not None or plan.confirmed):
+                sections.append(("pain", "Confirmed pain", "\n\n" + pain_block(_selection(plan))))
+            never = never_use_block(plan.never_use)
+            if never:
+                sections.append(("never_use", "Rejected pains", "\n\n" + never))
         sections.append(("persona", "Writing persona", voice_instructions(profile)))
         return sections
 
@@ -129,14 +177,52 @@ class Writer:
     async def _route(self, prospect) -> RouteDecision:
         return await route_prospect(self.state, self.config, prospect)
 
+    async def _confirmed_pain(self, prospect, offer_key: str, step: int) -> ConfirmedPain | None:
+        """The default pain source: the one confirmed pain from the pain
+        library that fits this prospect and offer (mercury/pains.py), or
+        None. Every step of a thread gets the same pick, so a follow-up
+        never raises a different problem than its opener."""
+        found = await select_pain_for_prospect(
+            self.state, prospect, config=self.config, offer_key=offer_key)
+        pain = found.pain
+        if pain is None:
+            return None
+        return ConfirmedPain(code=pain["code"], words=(pain["owner_words"] or pain["label"]).strip(),
+                             scene=pain["scene"], cost=pain["cost"])
+
     async def _pain(self, prospect, decision: RouteDecision, step: int) -> ConfirmedPain | None:
-        if self.pain_source is None or decision.offer is None:
+        if self.pain_source is None:
             return None
         try:
             return await self.pain_source(prospect, decision.key, step)
         except Exception as e:
             logger.warning(f"Writer: pain lookup failed for {getattr(prospect, 'email', '')}: {e}")
             return None
+
+    async def _pain_plan(self, prospects: list, decision: RouteDecision, steps: list[int]) -> PainPlan:
+        """The pain for one prompt. A shared sequence template has no single
+        reader, so it carries a pain only when every prospect in the group
+        was given the same one."""
+        pains = [await self._pain(p, decision, steps[0]) for p in prospects]
+        pain = pains[0] if pains and pains[0] is not None and all(
+            x is not None and x.code == pains[0].code for x in pains) else None
+        try:
+            library = await self.state.list_pains()
+        except Exception as e:
+            logger.warning(f"Writer: could not read the pain library: {e}")
+            library = []
+        rejected = [p for p in library if p["status"] == "rejected"]
+        # The prompt must not carry another offer's content: a rejected pain
+        # written for a different offer stays out of it (the gate still
+        # checks drafts against it).
+        shown = [p for p in rejected if not p["offer_key"] or p["offer_key"] == decision.key]
+        return PainPlan(pain=pain, never_use=shown, rejected=rejected,
+                        confirmed=[p for p in library if p["status"] == "confirmed"])
+
+    def _raises_rejected_pain(self, plan: PainPlan, *texts: str) -> list[str]:
+        """Codes of the rejected pains a draft raises: the same check the
+        send gate runs, applied before the draft is ever staged."""
+        return [h.code for h in find_rejected_pain_hits("\n".join(texts), plan.rejected, plan.confirmed)]
 
     def _blocked(self, decision: RouteDecision, brief: OfferBrief | None, contexts: list) -> list[str]:
         """Case-study names a draft must not contain."""
@@ -311,6 +397,7 @@ class Writer:
                 generation_id=draft.get("generation_id", ""),
                 mailbox=mailbox,
                 offer_key=decision.key,
+                pain_code=draft.get("pain_code", ""),
             )
             if item_id:
                 drafted += 1
@@ -329,7 +416,7 @@ class Writer:
     async def personal_prompt_sections(self, prospect, instruction: str = "", profile=None, decision=None):
         """The first-email prompt as labelled pieces, in the order the writer receives them.
         ``decision`` None routes the prospect now (prompt inspection, preview)."""
-        sections, profile, _brief, _decision = await self._personal_inputs(
+        sections, profile, _brief, _decision, _plan = await self._personal_inputs(
             prospect, instruction, profile, decision)
         return sections, profile
 
@@ -338,10 +425,11 @@ class Writer:
         profile = profile or await self.personas.resolve(self.config)
         if decision is None:
             decision = await self._route(prospect)
+        plan = await self._pain_plan([prospect], decision, [1])
         brief = None
         if decision.offer is not None:
             brief = await build_brief(self.state, self.config, decision, [1], [decision.context],
-                                      await self._pain(prospect, decision, 1))
+                                      plan.pain)
         facts = [
             f"- Name: {prospect.full_name()}",
             f"- Title: {prospect.title}",
@@ -429,12 +517,12 @@ Requirements:
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
-        sections = self._base_sections(profile, brief) + [("email", "This email", task)]
-        return sections, profile, brief, decision
+        sections = self._base_sections(profile, brief, plan) + [("email", "This email", task)]
+        return sections, profile, brief, decision, plan
 
     async def _write_personal_email(self, prospect, instruction: str = "", profile=None,
                                     decision: RouteDecision | None = None) -> dict | None:
-        sections, profile, brief, decision = await self._personal_inputs(
+        sections, profile, brief, decision, plan = await self._personal_inputs(
             prospect, instruction, profile, decision)
         prompt = "".join(text for _key, _label, text in sections)
         result = await self.brain.think_json(
@@ -452,10 +540,16 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             logger.warning(f"Writer: discarded the draft for {prospect.email}: it names a case "
                            f"study outside its scope ({', '.join(hits)}).")
             return None
+        rejected = self._raises_rejected_pain(plan, subject, body)
+        if rejected:
+            logger.warning(f"Writer: discarded the draft for {prospect.email}: it raises a "
+                           f"rejected pain ({', '.join(rejected)}).")
+            return None
         draft = {"subject": subject[:120], "body": body[:2000]}
         draft["generation_id"] = await self.personas.record(
             profile, self.config, prompt, draft, "personal_email", instruction,
         )
+        draft["pain_code"] = plan.code
         return draft
 
     async def regenerate_email(self, item: dict, prospect, instruction: str = "") -> dict | None:
@@ -495,10 +589,11 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             f"\n- The reviewer asked for this change; it is binding: {instruction.strip()}"
             if instruction and instruction.strip() else ""
         )
+        plan = await self._pain_plan([prospect], decision, [step])
         brief = None
         if decision.offer is not None:
             brief = await build_brief(self.state, self.config, decision, [step], [decision.context],
-                                      await self._pain(prospect, decision, step))
+                                      plan.pain)
         proof = ("the approved claims or a case study in the OFFER BRIEF"
                  if brief is not None and brief.authoritative else "the product knowledge")
         role = (
@@ -512,7 +607,7 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         if brief is not None and brief.step(step) is not None:
             role += (f". Use the angle and call to action the OFFER BRIEF gives for email {step}; "
                      "they take precedence over this description")
-        prompt = self._base_prompt(profile, brief)
+        prompt = self._base_prompt(profile, brief, plan)
         prompt += f"""
 
 Rewrite ONE email for this person: {prospect.full_name()}, {prospect.title} at {prospect.company}.
@@ -545,10 +640,16 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             logger.warning(f"Writer: discarded a rewrite for {prospect.email}: it names a case "
                            f"study outside its scope ({', '.join(hits)}).")
             return None
+        rejected = self._raises_rejected_pain(plan, subject, body)
+        if rejected:
+            logger.warning(f"Writer: discarded a rewrite for {prospect.email}: it raises a "
+                           f"rejected pain ({', '.join(rejected)}).")
+            return None
         draft = {"subject": subject[:120], "body": body[:2000]}
         draft["generation_id"] = await self.personas.record(
             profile, self.config, prompt, draft, "regenerate_email", instruction,
         )
+        draft["pain_code"] = plan.code
         return draft
 
     async def _market_lang(self, prospects: list) -> str:
@@ -600,13 +701,12 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             decisions = {p.id: await self._route(p) for p in prospects}
         decision = decisions[prospects[0].id]
         contexts = [decisions[p.id].context for p in prospects if p.id in decisions]
+        # One pain for the shared template, and only when every prospect in
+        # the group has that same one (see _pain_plan).
+        plan = await self._pain_plan(prospects, decision, [1])
         brief = None
         if decision.offer is not None:
-            pains = [await self._pain(p, decision, 1) for p in prospects]
-            # One pain for a shared template only when every prospect has it.
-            pain = pains[0] if pains and pains[0] is not None and all(
-                x is not None and x.code == pains[0].code for x in pains) else None
-            brief = await build_brief(self.state, self.config, decision, [1, 2, 3], contexts, pain)
+            brief = await build_brief(self.state, self.config, decision, [1, 2, 3], contexts, plan.pain)
         lang_line = await self._market_lang(prospects)
         # Build context about the prospects
         prospect_summary = "\n".join(
@@ -616,7 +716,7 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         )
 
         profile = profile or await self.personas.resolve(self.config)
-        prompt = self._base_prompt(profile, brief)
+        prompt = self._base_prompt(profile, brief, plan)
         proof = ("the approved claims or a case study in the OFFER BRIEF"
                  if brief is not None and brief.authoritative else "the product knowledge")
         brief_line = (
@@ -666,12 +766,18 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             logger.warning(f"Writer: discarded a sequence: it names a case study outside its "
                            f"scope ({', '.join(hits)}). The prospects are tried again next cycle.")
             return []
+        rejected = self._raises_rejected_pain(plan, *(f"{st.subject}\n{st.body}" for st in steps))
+        if rejected:
+            logger.warning(f"Writer: discarded a sequence: it raises a rejected pain "
+                           f"({', '.join(rejected)}). The prospects are tried again next cycle.")
+            return []
         if steps:
             generation_id = await self.personas.record(
                 profile, self.config, prompt, [step.model_dump() for step in steps], "write_sequence",
             )
             for step in steps:
                 step.generation_id = generation_id
+                step.pain_code = plan.code
         return steps
 
     def _parse_sequence(self, result) -> list[EmailStep]:

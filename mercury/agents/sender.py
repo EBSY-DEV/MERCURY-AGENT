@@ -611,6 +611,7 @@ class Sender:
                     mailbox=campaign.mailbox,
                     offer_key=campaign.offer_key,
                     company_id=company_id,
+                    pain_code=step.pain_code,
                 )
                 if item_id:
                     staged += 1

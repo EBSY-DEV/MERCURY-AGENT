@@ -346,6 +346,8 @@ class OfferBrief:
                 lines.append(f"- Scene: {self.pain.scene}")
             if self.pain.cost:
                 lines.append(f"- What it costs them: {self.pain.cost}")
+            if self.pain.code:
+                lines.append(f"- Pain reference (internal, never write it in the email): {self.pain.code}")
         else:
             lines.append("Confirmed pain: none supplied. Do not state a pain as a fact about "
                          "this business; you may ask how they handle what the offer addresses.")
