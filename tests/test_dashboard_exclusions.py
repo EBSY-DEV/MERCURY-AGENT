@@ -136,7 +136,10 @@ def test_discarding_blocked_mail_rejects_later_steps_and_keeps_the_exclusion(cli
         prospect_id=item["prospect_id"], to_email=item["to_email"], subject="later", body="b",
         campaign_id=item["campaign_id"], step=2, send_at=item["send_at"], status="approved"))
     client.post("/api/exclusions", json={"kind": "email", "value": "jane@acme.com"})
-    response = client.post(f"/api/outbox/{item_id}/reject")
+    stale = client.post(f"/api/outbox/{item_id}/reject", json={"revision": item["revision"] + 1})
+    assert stale.status_code == 409 and stale.json()["code"] == "stale_revision"
+    assert _run(client.sm.get_outbox_item(later_id))["status"] == "blocked"
+    response = client.post(f"/api/outbox/{item_id}/reject", json={"revision": item["revision"]})
     assert response.status_code == 200 and response.json()["rejected"] == 2
     assert _run(client.sm.get_outbox_item(later_id))["status"] == "rejected"
     assert client.get("/api/outbox").json()["blocked"] == []

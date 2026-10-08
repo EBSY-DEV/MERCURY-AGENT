@@ -39,6 +39,7 @@ from mercury.control.errors import Conflict, Invalid, NotFound, Unavailable
 logger = logging.getLogger(__name__)
 
 EDITABLE_STATUSES = ("pending_review", "approved")
+REJECTABLE_STATUSES = (*EDITABLE_STATUSES, "blocked")
 SUBJECT_MAX, BODY_MAX, INSTRUCTION_MAX = 200, 4000, 500
 BATCH_MAX = 200
 BATCH_ACTIONS = ("approve", "reject")
@@ -243,13 +244,13 @@ class OutboxService:
 
     async def _reject_one(self, item_id: str, revision: int, trail) -> dict:
         item = await self._item(item_id)
-        if item["status"] not in EDITABLE_STATUSES:
+        if item["status"] not in REJECTABLE_STATUSES:
             raise Conflict(f"only queued emails can be rejected; this one is {item['status']}",
                            code="not_queued", status=item["status"])
         self._current(item, revision)
         n = await self.state.reject_outbox_item(item_id, revision)
         if not n:
-            await self._lost_race(item_id, revision, EDITABLE_STATUSES, "not_queued",
+            await self._lost_race(item_id, revision, REJECTABLE_STATUSES, "not_queued",
                                   "only queued emails can be rejected; this one is {status}")
         trail.record(item_id, revision, revision, rejected=n)
         return {"id": item_id, "rejected": n, "revision": revision}
