@@ -52,6 +52,11 @@ def _bounce_details(msg) -> dict:
                         val = str(sub.get(key, "") or "").strip()
                         if val and "bounced_recipient" not in out:
                             out["bounced_recipient"] = val.split(";")[-1].strip().lower()
+                    # The machine-readable RFC 3463 code (5.1.1); the handler
+                    # buckets the bounce by it (mercury/bounces.py).
+                    status = str(sub.get("Status", "") or "").strip()
+                    if status and "dsn_status" not in out:
+                        out["dsn_status"] = status
             elif ctype in ("message/rfc822", "text/rfc822-headers"):
                 inner = None
                 if isinstance(payload, list) and payload:
@@ -224,7 +229,7 @@ class SmtpImapProvider(MailProvider):
         headers = {
             k: str(msg.get(k, "")).strip()
             for k in ("Auto-Submitted", "Precedence", "X-Autoreply",
-                      "X-Autorespond", "Return-Path")
+                      "X-Autorespond", "Return-Path", "Content-Type")
             if msg.get(k)
         }
         bounce = looks_like_bounce(from_email, subject)

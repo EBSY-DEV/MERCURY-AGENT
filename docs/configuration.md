@@ -118,12 +118,46 @@ icp:
 | `max_daily_sends` | `50` | Hard cap on all native sends (first emails, follow-ups and replies) in a rolling 24 hours. On Instantly, the number of leads added per day. |
 | `send_to_risky` | `false` | Also send to `risky` (catch-all) addresses. Off means verified addresses only. |
 | `require_approval` | `true` | Native providers: every outgoing email, including replies, waits in the outbox until approved. |
-| `max_bounce_rate` | `0.05` | Global kill switch threshold. `0` disables it. See [Bounces](email-and-deliverability.md#bounces-and-the-kill-switch). |
+| `max_bounce_rate` | `0.02` | Global kill switch threshold, checked once 50 emails have been sent. `0` disables this rate check (the sender/burned share check stays on). See [Bounces](email-and-deliverability.md#bounces-and-the-kill-switch). |
 | `mailboxes` | `[]` | SMTP only: rotate sends across several mailboxes. Empty uses the single `SMTP_*` mailbox. Ignored (with a warning) for other providers. |
 | `warmup_initial_cap` | `5` | Day-one cap for a mailbox with a `warmup_start`. |
 | `warmup_weekly_increase` | `5` | Added to the cap every 7 days, up to the mailbox's `daily_cap`. |
 | `auto_approve_followups` | `false` | With approval on, approving a first email also approves its follow-ups. Replies still need approval. |
 | `spread_sends` | `false` | Pace the day's remaining cold sends evenly over the cycles left before quiet hours, instead of up to 8 per cycle. |
+| `max_new_contacts_per_company_per_day` | `0` | Native providers: first emails to a known company in a rolling 24 hours (the same window as `max_daily_sends`, so no timezone applies). `0` = no limit. See [Exclusions and company limits](email-and-deliverability.md#exclusions-and-company-limits). |
+| `max_active_contacts_per_company` | `0` | Native providers: contacts at one company with an unfinished cold sequence at once. A paused sequence keeps its slot until its remaining steps are rejected or cancelled. `0` = no limit. |
+| `pause_company_on_reply` | `true` | Native providers: when a person at a company replies, hold cold mail to their colleagues until you resume it. Auto-replies, read receipts and bounces never trigger it. |
+| `placement` | none | Seed inboxes and a control sender for the [placement test](email-and-deliverability.md#placement-test) (`mercury mail placement`). |
+
+`placement`:
+
+| Key | Default | Description |
+|---|---|---|
+| `seeds` | `[]` | Inboxes you own that the test sends to and reads: ideally one Gmail, one Outlook and one Yahoo. |
+| `seeds[].email` | required | The seed address. |
+| `seeds[].provider` | guessed | `gmail`, `outlook`, `yahoo`, `icloud` or `other`, guessed from the address. Set `gmail` for a Google Workspace seed on its own domain so Primary and Promotions are told apart. |
+| `seeds[].password_env` | `""` | Env var with the seed's IMAP app password (`PLACEMENT_*` or `MAILBOX_*`). Empty: Mercury doesn't read this seed; record its folders with `mercury mail placement mark`. |
+| `seeds[].imap_host` / `imap_port` / `username` | guessed / `993` / `email` | Only needed for providers Mercury can't guess. |
+| `control` | none | A mailbox with a known-good reputation (usually a personal Gmail) that sends the same text as the control. |
+| `control.email` | required | The control address. |
+| `control.password_env` | `""` | Env var with its SMTP app password (`PLACEMENT_*` or `MAILBOX_*`). Never falls back to `SMTP_PASSWORD`. |
+| `control.smtp_host` / `smtp_port` / `username` / `name` | guessed / `587` / `email` / `persona.name` | Only needed for providers Mercury can't guess. |
+| `wait_seconds` | `180` | How long to keep looking for the test emails in the seeds. |
+
+```yaml
+channels:
+  email:
+    placement:
+      seeds:
+        - email: me.seed@gmail.com
+          password_env: PLACEMENT_GMAIL_SEED      # a Google app password
+        - email: me.seed@yahoo.com
+          password_env: PLACEMENT_YAHOO_SEED
+        - email: me.seed@outlook.com              # no password: record by hand
+      control:
+        email: me@gmail.com
+        password_env: PLACEMENT_CONTROL
+```
 
 Each entry in `mailboxes`:
 
@@ -196,6 +230,7 @@ Copy `.env.example` to `.env`. Mercury loads the project's `.env` into the proce
 | `IMAP_USERNAME` | `SMTP_USERNAME` | |
 | `IMAP_PASSWORD` | `SMTP_PASSWORD` | |
 | `MAILBOX_*` | | Any variable starting with `MAILBOX_` can hold a rotation mailbox's password, named by `password_env`, e.g. `MAILBOX_ALEX_PASSWORD`. |
+| `PLACEMENT_*` | | App passwords of the placement test's seed inboxes and control sender, named by their `password_env`, e.g. `PLACEMENT_GMAIL_SEED`. |
 | `INSTANTLY_API_KEY` | | Legacy Instantly provider. Requires Instantly's Growth plan or higher. |
 
 ### Email verification (add at least one)

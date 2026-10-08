@@ -4,8 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Mercury Agent</title>
-<meta name="theme-color" content="#F7F5FD">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%229%22 fill=%22%237A5EDB%22/%3E%3Ctext x=%2216%22 y=%2222%22 text-anchor=%22middle%22 font-family=%22sans-serif%22 font-weight=%22600%22 font-size=%2217%22 fill=%22white%22%3EM%3C/text%3E%3C/svg%3E">
+<meta name="theme-color" content="#F7F5FD" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14111E" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="/static/brand/site.webmanifest">
+<link rel="icon" href="/static/brand/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/static/brand/favicon-32.png" sizes="32x32" type="image/png">
+<link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
 <link rel="stylesheet" href="/static/app.css">
 <link rel="stylesheet" href="/static/personas.css">
 </head>
@@ -13,7 +17,7 @@
 
 <aside class="sidebar" id="sidebar">
   <div class="brand">
-    <div class="mark" aria-hidden="true">M</div>
+    <div class="mark" aria-hidden="true"><svg viewBox="6 6 244 244"><path d="M209.91 64A112 112 0 1 0 209.91 192A64 64 0 1 1 209.91 64ZM169.91 128A40 40 0 1 1 249.91 128A40 40 0 1 1 169.91 128Z"/></svg></div>
     <div>
       <h1>Mercury Agent</h1>
       <div class="tagline">Outreach agent</div>
@@ -43,6 +47,7 @@
       <button data-tab="campaigns" onclick="showTab('campaigns', this)"><i data-ph="megaphone"></i><span class="lbl">Campaigns</span></button>
       <button data-tab="personas" onclick="showTab('personas', this)"><i data-ph="sparkle"></i><span class="lbl">Voice &amp; Personas</span></button>
       <button data-tab="outbox" onclick="showTab('outbox', this)"><i data-ph="tray"></i><span class="lbl">Outbox</span><span class="nav-count" id="nav-outbox"></span></button>
+      <button data-tab="exclusions" onclick="showTab('exclusions', this)"><i data-ph="prohibit"></i><span class="lbl">Exclusions</span><span class="nav-count" id="nav-exclusions"></span></button>
       <button data-tab="mailboxes" onclick="showTab('mailboxes', this)"><i data-ph="envelope-simple"></i><span class="lbl">Mailboxes</span><span class="nav-flag" id="nav-mailboxes" hidden></span></button>
       <button data-tab="conversations" onclick="showTab('conversations', this)"><i data-ph="chat-circle-text"></i><span class="lbl">Conversations</span></button>
     </div>
@@ -56,7 +61,7 @@
 
   <div class="side-foot">
     <button class="agent-card" onclick="goTab('controls')" id="header-status">
-      <span class="status-dot stopped" id="header-dot"></span>
+      <span class="agent-mark stopped" id="header-dot" aria-hidden="true"><svg viewBox="0 0 256 256"><defs><mask id="am-bite-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="256" height="256"><rect width="256" height="256" fill="#000"/><circle cx="122.18" cy="128" r="98.18" fill="#FFF"/><circle class="am-mv am-bite" cx="200.73" cy="128" r="58.91" fill="#000"/></mask></defs><circle class="am-disc" cx="122.18" cy="128" r="98.18" mask="url(#am-bite-mask)"/><circle class="am-mv am-dot" cx="200.73" cy="128" r="39.27"/></svg></span>
       <span class="agent-text">
         <span class="agent-title" id="header-status-text">Checking…</span>
         <span class="agent-sub">Open controls</span>
@@ -124,6 +129,15 @@
       <span class="hm-stats" id="hm-stats">&nbsp;</span>
       <span class="hm-legend" aria-hidden="true">Less<i class="hm-c l0"></i><i class="hm-c l1"></i><i class="hm-c l2"></i><i class="hm-c l3"></i><i class="hm-c l4"></i>More</span>
     </div>
+  </section>
+
+  <section class="panel" id="today-health">
+    <div class="panel-head">
+      <div><h3>Deliverability</h3><p>A verdict per sending domain, from its sends, replies and bounces.</p></div>
+      <button class="link-btn" onclick="goTab('mailboxes')">Mailboxes<i data-ph="arrow-right"></i></button>
+    </div>
+    <div id="health-body"><div class="chart-note">Loading deliverability…</div></div>
+    <div class="panel-foot health-foot" id="health-foot" hidden></div>
   </section>
 
   <!-- Two independent columns: panels stack under each other instead of
@@ -367,8 +381,69 @@
   </div>
   <div id="outbox-banner"></div>
   <div id="outbox-desk"></div>
+  <div id="outbox-pauses"></div>
   <div id="outbox-mailboxes"></div>
   <div id="outbox-list"></div>
+</div>
+
+<!-- Exclusions: addresses and domains Mercury never emails, and company holds -->
+<div id="exclusions" class="section">
+  <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
+    <div>
+      <h2>Exclusions</h2>
+      <p>Addresses and domains Mercury never emails, and companies whose cold mail is paused.</p>
+    </div>
+    <div style="display:flex;gap:8px;flex-shrink:0">
+      <label class="btn btn-secondary btn-sm"><i data-ph="upload-simple"></i>Import CSV<input type="file" accept=".csv,text/csv" hidden onchange="exImport(this)"></label>
+      <a class="btn btn-secondary btn-sm" href="/api/exclusions/export.csv" download><i data-ph="download-simple"></i>Export CSV</a>
+    </div>
+  </div>
+  <div id="ex-policy"></div>
+  <div id="ex-holds"></div>
+  <div id="ex-blocked"></div>
+  <section class="panel">
+    <div class="panel-head"><div>
+      <h3>Add an exclusion</h3>
+      <p>Stops every email to it, replies included. Anything already queued for it is blocked right away.</p>
+    </div></div>
+    <form class="panel-body" onsubmit="exAdd(event)">
+      <div class="form-row">
+        <div class="form-group fit">
+          <span class="form-label">Kind</span>
+          <div class="segmented" id="ex-kind" role="radiogroup" aria-label="Kind">
+            <button type="button" role="radio" aria-checked="true" class="on" data-k="email" onclick="exSetKind('email')"><i data-ph="envelope-simple"></i>Email</button>
+            <button type="button" role="radio" aria-checked="false" data-k="domain" onclick="exSetKind('domain')"><i data-ph="globe-simple"></i>Domain</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="ex-value">Address or domain</label>
+          <input class="form-input" id="ex-value" placeholder="jane@acme.com" autocomplete="off" maxlength="320">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="ex-reason">Reason</label>
+          <input class="form-input" id="ex-reason" placeholder="Existing customer" autocomplete="off" maxlength="300">
+        </div>
+        <div class="form-group fit" id="ex-sub-wrap" hidden>
+          <label class="check ex-check"><input type="checkbox" id="ex-subdomains">Include subdomains</label>
+        </div>
+        <div class="form-group fit">
+          <button class="btn btn-primary" type="submit"><i data-ph="plus"></i>Add</button>
+        </div>
+      </div>
+    </form>
+  </section>
+  <div class="toolbar">
+    <label class="search-field">
+      <i data-ph="magnifying-glass"></i>
+      <input type="search" id="ex-search" placeholder="Search address, domain or reason"
+             autocomplete="off" aria-label="Search exclusions" oninput="exSearch(this.value)">
+    </label>
+    <div class="segmented" id="ex-view" role="tablist" aria-label="Show">
+      <button role="tab" aria-selected="true" class="on" data-v="active" onclick="exSetView('active')">Active</button>
+      <button role="tab" aria-selected="false" data-v="lifted" onclick="exSetView('lifted')">Lifted</button>
+    </div>
+  </div>
+  <div id="ex-rules"><div class="loading-note">Loading exclusions…</div></div>
 </div>
 
 <!-- Mailboxes: every inbox Mercury sends from, its warm-up ramp and its health -->
@@ -694,5 +769,6 @@
 <script src="/static/icons.js"></script>
 <script src="/static/app.js"></script>
 <script src="/static/personas.js"></script>
+<script src="/static/exclusions.js"></script>
 </body>
 </html>

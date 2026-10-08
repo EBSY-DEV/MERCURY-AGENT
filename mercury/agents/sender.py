@@ -5,9 +5,12 @@ Native flow:
   1. Draft campaigns are STAGED: merge variables rendered per prospect,
      one outbox row per (prospect, step) with a scheduled send_at.
      Rows start as pending_review (copilot) or approved (autopilot).
-  2. Each heartbeat DRAINS due approved rows: kill-switch check, stop-on-
+  2. Each heartbeat DRAINS due approved rows: pause/hold check, stop-on-
      reply check, deterministic pre-send gate, then provider.send_email
-     with jittered pacing and the daily cap.
+     with jittered pacing and the daily cap. The pause/hold check runs
+     again right before each claim (mercury/holds.py), so a pause or a
+     shutdown that lands mid-drain stops the next email; the one already
+     claimed finishes.
 """
 
 import asyncio
@@ -18,8 +21,12 @@ import time
 import re
 from datetime import date, datetime, timedelta, timezone
 
+from mercury import holds
 from mercury.brain import Brain
 from mercury.config import MercuryConfig, EnvConfig
+from mercury.demos import check_campaign as demo_check_campaign
+from mercury.demos import check_outbox_item as demo_check_item
+from mercury.demos import register_requests as register_demo_requests
 from mercury.gate import pre_send_check
 from mercury.integrations.instantly import InstantlyClient
 from mercury.integrations.mail_provider import NATIVE_PROVIDERS, SendResult, get_mail_provider
@@ -29,7 +36,8 @@ from mercury.integrations.mailboxes import (
     local_today,
     rotation_configured,
 )
-from mercury.state import StateManager
+from mercury.policy import ContactPolicy, capability
+from mercury.state import StateManager, describe_rule
 
 logger = logging.getLogger("mercury.sender")
 
@@ -82,6 +90,8 @@ def spread_budget(remaining: int, now_local: datetime, quiet_start: str,
     cycles_left = max(1, math.ceil(minutes_left / max(1, int(interval_minutes or 15))))
     return math.ceil(remaining / cycles_left)
 
+# The bounce kill switch (a health hold). The operator pause has its own key:
+# mercury/holds.py.
 KILL_SWITCH_KEY = "sending_paused"
 BOUNCE_COUNT_KEY = "bounce_count"
 
@@ -96,6 +106,26 @@ SENDABLE_STATUSES = {"new", "queued"}
 # or "invalid" address — that bounces and burns the sending domain.
 SENDABLE_EMAIL_STATUSES = {"verified"}
 SENDABLE_EMAIL_STATUSES_WITH_RISKY = {"verified", "risky"}
+
+# Stopword counts decide the footer language; drafts are ES or EN.
+_ES_MARKERS = (" el ", " la ", " de ", " que ", " para ", " los ", " las ",
+               " una ", " con ", " por ", " tu ", " su ", " está ", " cómo ")
+_EN_MARKERS = (" the ", " and ", " you ", " your ", " with ", " for ",
+               " that ", " on ", " is ", " are ", " to ", " of ")
+
+
+def with_legal_footer(config, body: str) -> str:
+    """Append company + postal address + opt-out line (CAN-SPAM) in the
+    language of the email. Kept out of the draft so the writer never
+    rewrites or drops it. The placement test sends the same footer, so it
+    tests the email prospects actually get."""
+    c = config.compliance
+    padded = f" {body.lower()} "
+    es = sum(padded.count(m) for m in _ES_MARKERS)
+    en = sum(padded.count(m) for m in _EN_MARKERS)
+    opt_out = c.opt_out_line_es if es > en else c.opt_out_line_en
+    company = config.persona.company
+    return f"{body.rstrip()}\n\n{company} · {c.postal_address.strip()}\n{opt_out}"
 
 
 class Sender:
@@ -118,9 +148,15 @@ class Sender:
             self.mailboxes.primary.provider if self.mailboxes
             else get_mail_provider(config, env)
         )
+        self.policy = ContactPolicy(state, config)
         # Disabled in tests to skip inter-send sleeps.
         self.send_pacing = True
         self._last_drain_at: float | None = None  # monotonic, for spread_sends
+        # Set by the heartbeat on SIGTERM: claim nothing new, let the email
+        # in flight finish, skip the pacing sleep.
+        self.stop_event: asyncio.Event | None = None
+        # Naive-UTC "now" for scheduling decisions; tests substitute their own.
+        self.clock = lambda: datetime.now(timezone.utc).replace(tzinfo=None)
 
     @property
     def is_native(self) -> bool:
@@ -187,6 +223,14 @@ class Sender:
             await self.state.update_campaign(campaign.id, status="failed")
             return
 
+        # Instantly runs the whole sequence once deployed, so an offer that
+        # promises a demo keeps the campaign in draft until every contact's
+        # demo is ready.
+        demo = await demo_check_campaign(self.state, self.config, campaign)
+        if demo.held:
+            logger.info(f"Sender: holding campaign '{campaign.name}': {demo.reason}")
+            return
+
         # 1. Create campaign in Instantly — or resume one from a previous
         # partially-failed deploy. Never create a duplicate.
         campaign_id = campaign.instantly_campaign_id
@@ -235,6 +279,7 @@ class Sender:
         prospects = []
         seen_emails: set[str] = set()
         skipped_unverified = 0
+        skipped_excluded = 0
         for prospect_id in campaign.prospect_ids:
             prospect = await self.state.get_prospect(prospect_id)
             if not prospect or not prospect.email:
@@ -260,9 +305,19 @@ class Sender:
                     f"'{prospect.email_status or 'guess'}' not deliverable)."
                 )
                 continue
+            # Instantly sends on its own schedule, so this is the only point
+            # where an exclusion can stop the address.
+            if await self.policy.exclusion_for(email):
+                skipped_excluded += 1
+                continue
             seen_emails.add(email)
             prospects.append(prospect)
 
+        if skipped_excluded:
+            logger.info(
+                f"Sender: left {skipped_excluded} excluded address(es) out of "
+                f"'{campaign.name}'. {capability(self.config)['note']}"
+            )
         if skipped_unverified:
             logger.info(
                 f"Sender: Held back {skipped_unverified} prospect(s) with "
@@ -370,14 +425,37 @@ class Sender:
 
     # ── Native provider flow (Gmail / SMTP via the outbox) ──
 
+    async def _resume_due_pauses(self):
+        """Release out-of-office pauses whose return time has come. This only
+        moves their queued steps' send times; approvals are untouched and the
+        drain below still applies pacing, caps and every gate."""
+        try:
+            resumed = await self.state.resume_due_pauses(self.clock())
+        except Exception as e:
+            logger.error(f"Sender: resuming out-of-office pauses failed: {e}")
+            return
+        for pause in resumed:
+            logger.info(
+                f"Sender: out-of-office pause for prospect {pause['prospect_id']} ended; "
+                f"{pause.get('rescheduled', 0)} queued step(s) rescheduled."
+            )
+            try:
+                await self.state.log_action(
+                    action_type="sequence_resumed",
+                    agent="sender",
+                    details={"prospect_id": pause["prospect_id"], "by": "return date",
+                             "resume_at": pause.get("resume_at") or "",
+                             "rescheduled": pause.get("rescheduled", 0)},
+                )
+            except Exception as e:
+                logger.debug(f"Sender: sequence_resumed log failed: {e}")
+
     async def _run_native(self):
         """Stage new campaigns into the outbox, then drain what's due."""
-        paused = await self.state.get_setting(KILL_SWITCH_KEY)
-        if paused:
-            logger.warning(
-                f"Sender: SENDING PAUSED ({paused}). Resume from the dashboard "
-                "or `mercury sending resume` once the cause is fixed."
-            )
+        await self._resume_due_pauses()
+        kind, reason = await holds.blocking(self.state)
+        if kind:
+            self._log_blocked(kind, reason)
             return
 
         for campaign in await self.state.get_campaigns_by_status("draft"):
@@ -390,6 +468,41 @@ class Sender:
             await self._promote_followups()
 
         await self._drain_due()
+
+    @staticmethod
+    def _log_blocked(kind: str, reason: str):
+        if kind == "operator":
+            logger.warning(f"Sender: SENDING PAUSED ({reason}). Resume from the dashboard "
+                           "or `mercury sending resume`.")
+        else:
+            logger.warning(f"Sender: SENDING ON HOLD ({reason}). Resume does not lift it: "
+                           "fix the cause, then `mercury sending clear-hold`.")
+
+    def _stopping(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    async def _may_claim(self) -> bool:
+        """Checked right before every claim: a pause, a hold or a shutdown
+        that arrived while this drain ran stops the next email."""
+        if self._stopping():
+            logger.info("Sender: shutting down; the rest of the due mail stays queued.")
+            return False
+        kind, reason = await holds.blocking(self.state)
+        if kind:
+            self._log_blocked(kind, reason)
+            return False
+        return True
+
+    async def _pace(self):
+        """The human-ish gap between sends, cut short by a shutdown."""
+        delay = random.uniform(*SEND_JITTER_SECONDS)
+        if self.stop_event is None:
+            await asyncio.sleep(delay)
+            return
+        try:
+            await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
 
     async def _promote_followups(self):
         """auto_approve_followups: a follow-up rides on its approved opener.
@@ -431,23 +544,8 @@ class Sender:
             text = text.replace("{{ " + key + " }}", value or "")
         return text.strip()
 
-    # Stopword counts decide the footer language; drafts are ES or EN.
-    _ES_MARKERS = (" el ", " la ", " de ", " que ", " para ", " los ", " las ",
-                   " una ", " con ", " por ", " tu ", " su ", " está ", " cómo ")
-    _EN_MARKERS = (" the ", " and ", " you ", " your ", " with ", " for ",
-                   " that ", " on ", " is ", " are ", " to ", " of ")
-
     def _with_legal_footer(self, body: str) -> str:
-        """Append company + postal address + opt-out line (CAN-SPAM) in the
-        language of the email. Kept out of the draft so the writer never
-        rewrites or drops it."""
-        c = self.config.compliance
-        padded = f" {body.lower()} "
-        es = sum(padded.count(m) for m in self._ES_MARKERS)
-        en = sum(padded.count(m) for m in self._EN_MARKERS)
-        opt_out = c.opt_out_line_es if es > en else c.opt_out_line_en
-        company = self.config.persona.company
-        return f"{body.rstrip()}\n\n{company} · {c.postal_address.strip()}\n{opt_out}"
+        return with_legal_footer(self.config, body)
 
     async def _stage_campaign_native(self, campaign):
         """Render + schedule a draft campaign's emails into the outbox."""
@@ -467,8 +565,10 @@ class Sender:
 
         staged = 0
         skipped = 0
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        excluded = 0
+        now = self.clock()
         seen_emails: set[str] = set()
+        queued_ids: list[str] = []
 
         for prospect_id in campaign.prospect_ids:
             prospect = await self.state.get_prospect(prospect_id)
@@ -482,12 +582,29 @@ class Sender:
             if (prospect.email_status or "guess") not in sendable_email:
                 skipped += 1
                 continue
+            rule = await self.policy.exclusion_for(email)
+            if rule:
+                excluded += 1
+                logger.info(f"Sender: not staging {email}: excluded, {describe_rule(rule)}.")
+                continue
             seen_emails.add(email)
+            company_id = await self.policy.company_for(prospect)
+
+            # A prospect on an out-of-office pause is staged normally (the
+            # drafts still wait for review) but the sequence starts after
+            # their return; the drain holds it until the pause ends anyway.
+            base = now
+            pause = await self.state.get_active_pause(prospect.id)
+            if pause and pause.get("resume_at"):
+                try:
+                    base = max(base, datetime.fromisoformat(pause["resume_at"]))
+                except ValueError:
+                    pass
 
             cumulative_days = 0
             for step in campaign.sequence:
                 cumulative_days += max(0, step.delay_days)
-                send_at = now + timedelta(days=cumulative_days)
+                send_at = base + timedelta(days=cumulative_days)
                 item_id = await self.state.add_outbox_item(
                     prospect_id=prospect.id,
                     campaign_id=campaign.id,
@@ -500,16 +617,28 @@ class Sender:
                     provider=self.provider.name,
                     generation_id=step.generation_id,
                     mailbox=campaign.mailbox,
+                    offer_key=campaign.offer_key,
+                    company_id=company_id,
                 )
                 if item_id:
                     staged += 1
             await self.state.update_prospect_status(prospect.id, "queued")
+            queued_ids.append(prospect.id)
+
+        # An offer that promises a demo: put each contact's demo on the list
+        # to build now, not when the email first comes due.
+        if queued_ids and campaign.offer_key:
+            await register_demo_requests(self.state, self.config, queued_ids, campaign.offer_key)
 
         await self.state.update_campaign(campaign.id, status="active")
         if skipped:
             logger.info(
                 f"Sender: held back {skipped} prospect(s) with unverified "
                 f"emails from '{campaign.name}'."
+            )
+        if excluded:
+            logger.info(
+                f"Sender: left {excluded} excluded address(es) out of '{campaign.name}'."
             )
         if staged:
             mode = "awaiting your approval" if require_approval else "approved"
@@ -580,12 +709,15 @@ class Sender:
             logger.info(f"Sender: daily send cap reached ({sent_today}/{capacity}).")
             return
 
-        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        now = self.clock().isoformat()
         # The whole due set, not a budget-sized slice: rows pinned to a
         # mailbox at its cap are skipped below, and a slice of the oldest
         # rows could be nothing but those while other mailboxes sat idle.
+        # Prospects on an out-of-office pause are left out of the scan, so a
+        # long pause cannot crowd due mail out of the scan limit.
         due = await self.state.get_outbox(
-            status="approved", due_before=now, limit=DUE_SCAN_LIMIT
+            status="approved", due_before=now, limit=DUE_SCAN_LIMIT,
+            exclude_paused=True,
         )
         if not due:
             return
@@ -664,6 +796,15 @@ class Sender:
                     )
                     continue
 
+            # Demo gate: an offer that says a demo was built for this business
+            # holds its emails until that demo is ready. Fails closed.
+            demo = await demo_check_item(self.state, self.config, item)
+            if demo.held:
+                logger.info(
+                    f"Sender: holding step {item['step']} to {item['to_email']}: {demo.reason}"
+                )
+                continue
+
             mailbox, _verdict = self._mailbox_for(item, prev, pool, remaining,
                                                   sent_this_cycle, today)
             if mailbox is None:
@@ -684,9 +825,38 @@ class Sender:
                 )
                 continue
 
+            # A vacation notice may have landed since the due scan was read.
+            # Look again right before claiming (the claim itself refuses a
+            # paused prospect too), so a stale scan cannot send into a pause.
+            if item["kind"] == "sequence" and await self.state.get_active_pause(
+                item["prospect_id"]
+            ):
+                logger.info(
+                    f"Sender: holding step {item['step']} to {item['to_email']}: "
+                    "out-of-office pause."
+                )
+                continue
+
+            # Pause before claim: nothing new is claimed once a person pauses,
+            # a hold lands or the agent is told to stop. Past this point the
+            # row is in flight and finishes (mercury/holds.py).
+            if not await self._may_claim():
+                break
+
             # The reviewed text and its generation must stay together during
             # the provider call. A stale due scan cannot send a replaced draft.
-            if not await self.state.claim_outbox_item(item, mailbox.email):
+            # Exclusions, company holds and company limits are re-checked in
+            # the same write transaction, so a rule added a moment ago, or a
+            # second sender process, cannot slip a send past them.
+            limits = self.policy.limits
+            claim, detail = await self.state.claim_for_send(
+                item, mailbox.email,
+                company_id=await self.policy.company_for(prospect),
+                max_new_per_day=limits.max_new_per_day,
+                max_active=limits.max_active,
+            )
+            if claim != "claimed":
+                self._log_unclaimed(item, claim, detail)
                 continue
             body_out = item["body"]
             if item["kind"] != "reply":
@@ -748,7 +918,7 @@ class Sender:
                 cold_sent += 1
             remaining[mailbox.email] = remaining.get(mailbox.email, 0) - 1
             sent_this_cycle[mailbox.email] = sent_this_cycle.get(mailbox.email, 0) + 1
-            now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+            now_iso = self.clock().isoformat()
             await self.state.update_outbox_item(
                 item["id"], status="sent", sent_at=now_iso, body=body_out,
                 message_id=result.message_id, thread_ref=result.thread_ref,
@@ -784,13 +954,28 @@ class Sender:
             logger.info(f"Sender: sent step {item['step']} to {item['to_email']} via {via}.")
             # Human-ish pacing BETWEEN sends (not after the last, and never
             # in tests where pacing is disabled).
-            if self.send_pacing and sent < budget:
-                await asyncio.sleep(random.uniform(*SEND_JITTER_SECONDS))
+            if self.send_pacing and sent < budget and not self._stopping():
+                await self._pace()
 
         if sent:
             capacity = min(max_daily, pool.capacity_on(today))
             logger.info(f"Sender: {sent} email(s) sent this cycle "
                         f"({sent_today + sent}/{capacity} today).")
+
+    @staticmethod
+    def _log_unclaimed(item, claim: str, detail: dict):
+        to = item["to_email"]
+        if claim == "suppressed":
+            logger.warning(f"Sender: blocked email to {to}: {detail['error']}.")
+        elif claim == "company_hold":
+            logger.info(f"Sender: holding step {item['step']} to {to}: cold mail to "
+                        "this company is paused.")
+        elif claim == "company_daily_limit":
+            logger.info(f"Sender: holding first email to {to}: its company had "
+                        f"{detail['new_today']}/{detail['limit']} new contacts in 24 hours.")
+        elif claim == "company_active_limit":
+            logger.info(f"Sender: holding first email to {to}: its company has "
+                        f"{detail['active']}/{detail['limit']} contacts in a sequence.")
 
     def _mailbox_for(self, item, prev, pool, remaining, sent_this_cycle, today):
         """(mailbox, verdict): verdict is "send" or "hold" (try a later cycle).

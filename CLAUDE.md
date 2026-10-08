@@ -46,7 +46,7 @@ People will ask "how does this work?" — explain it simply:
 
 - **"What does it cost?"** → Just your Claude Max subscription (which you already have). The only paid integration is Instantly for sending emails (their cheapest plan works). Everything else — prospecting, email writing, reply handling — is included.
 
-- **"What's the dashboard?"** → Run `mercury dashboard` to see a local web UI at localhost:5555. It opens on **Today** — anything waiting on a decision, then the pipeline. Tabs for Signals, Companies, Contacts, Pipeline, Calendar, Campaigns, Outbox, Mailboxes, Conversations, Activity, Usage, Settings. Mailboxes lists every sending inbox grouped by domain, with its warm-up ramp, health, DNS and checklist; an inbox's drawer pauses/resumes it and edits its settings (saved to `channels.email.mailboxes`). For a populated demo: `python scripts/seed_demo.py`, then run the dashboard with the `MERCURY_DB_PATH` / `MERCURY_CONFIG` line it prints.
+- **"What's the dashboard?"** → Run `mercury dashboard` to see a local web UI at localhost:5555. It opens on **Today** — anything waiting on a decision, then the pipeline. Tabs for Signals, Companies, Contacts, Pipeline, Calendar, Campaigns, Outbox, Exclusions, Mailboxes, Conversations, Activity, Usage, Settings. Mailboxes lists every sending inbox grouped by domain, with its warm-up ramp, health, DNS and checklist; an inbox's drawer pauses/resumes it and edits its settings (saved to `channels.email.mailboxes`). For a populated demo: `python scripts/seed_demo.py`, then run the dashboard with the `MERCURY_DB_PATH` / `MERCURY_CONFIG` line it prints.
 
 - **"What are signals?"** → Signals are the facts Mercury collects about a business: who its current agency is, whether it's running ads, whether it has online booking, how it ranks. **Mercury proposes; you confirm.** Nothing is collected until the user says yes on the Signals tab (or `mercury signals --confirm ...`). That keeps spend intentional and makes every prospect list explainable — a cohort is a query over signals a human chose, not a black box.
 
@@ -253,6 +253,7 @@ Every change to the dashboard (`mercury/web/`) or to a design in `design/*.pen` 
 
 **Hard rules:**
 - **Status is a Phosphor icon plus a word.** Use `.badge t-good|t-waiting|t-bad|t-active|t-note|t-idle` (`toneBadge()` in `app.js`). The colour lives only in the glyph; the label stays `--text-2` (only `t-bad` labels go red). Never use tinted pills, coloured dots, or coloured background chips for status.
+- **Agent presence is the Transit mark, not a dot.** Running is the heartbeat loop, asleep or offline is the closed disc (`.agent-mark` in `app.css`). Logo rules (clear space, minimum sizes, don'ts) are in `design/brand/GUIDELINES.md`.
 - **One accent.** Violet (`--accent`) marks what's selected, primary or interactive. Green, amber, red and blue only mean status. Don't use status colours for decoration or emphasis.
 - **Tokens only.** Colours, fonts and radii come from CSS variables (`--panel`, `--text-2`, `--border`, `--r-sm`, `--r-md`, ...). No raw hex values in new CSS or markup, except the status glyph colours already defined in `.badge`.
 - **Shape scale:** cards and panels 12px, controls 8px, badges and nav pills fully round. Nothing else.
@@ -283,7 +284,7 @@ Every change to the dashboard (`mercury/web/`) or to a design in `design/*.pen` 
 - **Scout**: Python does all web searching (DuckDuckGo → Bing → Google → Serper API) and email resolution (pattern-first: cache → scraped mailto → Hunter domain search → default, then verify one candidate via Reoon/ZeroBounce/Hunter/SMTP; catch-alls flagged `risky`). Claude only scores/personalizes found data. Scout also collects **buying signals**: tech stack detected on each company's site (HubSpot, Shopify, Intercom, ~35 tools — zero extra requests) and hiring signals from careers pages. With `pip install python-jobspy` (optional), a job-board strategy discovers companies actively hiring for roles in `icp.hiring_signals` (falls back to `icp.titles`) — the strongest in-market signal. Signals land in prospects' personalization notes and boost their score.
 - **Writer**: Generates 3-email sequences (Email 1 < 75 words, Email 2 < 75, Email 3 < 40). Strict ban list on AI patterns.
 - **Sender**: Native providers (gmail/smtp) render merge vars per prospect and STAGE each email into the `outbox` (pending_review → approved → sent) with a scheduled send time; each heartbeat drains due, approved items with human-like pacing, the daily cap, the deterministic pre-send gate, and stop-on-reply. Legacy Instantly path deploys campaigns via API. Enforces daily send limits either way.
-- **Handler**: Polls the provider (or Instantly) for replies, dedups them, classifies intent, advances conversation stage, and queues auto-responses through the same outbox approval ladder. On native providers it also detects bounces → marks the address invalid, cancels the prospect's queued sends, and trips a global kill switch past a bounce-rate threshold.
+- **Handler**: Polls the provider (or Instantly) for replies, dedups them, classifies intent, advances conversation stage, and queues auto-responses through the same outbox approval ladder. On native providers it also detects bounces → marks the address invalid, cancels the prospect's queued sends, and trips a global kill switch past a bounce-rate threshold. A vacation auto-reply (not an acknowledgement or receipt) pauses that contact's remaining cold steps in `sequence_pauses` until the return date read by `mercury/ooo.py` (no date, or an ambiguous/past one, means "return date needs review" and the pause never ends by itself); a human reply, opt-out, bounce or closure supersedes it. The Outbox tab lists paused contacts and lets you set a date or resume.
 - **Analyst**: Runs on idle cycles. Generates `data/analytics.json` with pipeline stats and insights.
 
 ### Conversation Stages
@@ -314,7 +315,13 @@ mercury signals               # The signal vocabulary; --confirm / --reject CODE
 mercury personas              # Writing voices: list / show / create / edit / default / archive / versions / prompt / preview
 mercury personas mailboxes    # Each sending mailbox's voice and sign-off; change one with: personas assign EMAIL [PERSONA] --sign-name NAME
 mercury discover              # Find businesses; --providers / --estimate / --provider <key>
+mercury mail limits [--strict] # Inbox limit warnings (2 per domain, provider ceilings, 14-day warm-up); `mercury run --strict` refuses to start on any
+mercury exclusions            # Never-email list: add / remove / check / import / export (opt-outs and bounces land here too)
+mercury holds                 # Companies whose cold mail is paused (after a reply, or by you); release HOLD_ID to resume
 mercury sending pause|resume  # Kill switch for all outbound
+mercury health                # Deliverability verdict per sending domain (too young / not enough data / keep / cancel candidate)
+mercury mail placement        # Send email 1 to your seed inboxes and read where it landed; --dry-run, show / check / mark
+mercury demos                 # Demo gate: who waits for a demo; ready / request / retire EMAIL_OR_ID
 ```
 
 ### Common Issues

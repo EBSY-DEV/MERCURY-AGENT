@@ -142,10 +142,11 @@ With a native provider and `require_approval: true` (the default), every outgoin
 From the terminal:
 
 ```bash
-mercury outbox                        # list what is waiting
-mercury outbox --approve <id>
+mercury outbox                        # list what is waiting, with each email's revision
+mercury outbox --approve <id>         # prints the draft it approves; add --revision N to
+                                      # fail if it changed since you listed it
 mercury outbox --reject <id>          # also rejects later steps of that sequence
-mercury outbox --approve-all
+mercury outbox --approve-all          # approves what is pending now; later changes stay in review
 ```
 
 Approved emails send on schedule, at most 8 per cycle, with a few seconds of jitter between sends. Read the first few dozen carefully. Once you trust the output you can set `auto_approve_followups: true`, or `require_approval: false` for full autopilot. See [The approval outbox](email-and-deliverability.md#the-approval-outbox).

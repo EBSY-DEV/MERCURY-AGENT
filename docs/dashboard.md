@@ -141,7 +141,7 @@ Shortcuts are ignored while you are typing in a field. You can also:
 - edit the subject and body and **Save edits**,
 - type an optional instruction and **Regenerate**; the rewrite comes back for review,
 - **Approve all** pending emails,
-- **Pause all sending** / **Resume sending** (the global kill switch; a banner shows when it is on).
+- **Pause all sending** / **Resume sending** (your pause only). A banner lists your pause, every hold still in force and any email already being sent; a bounce hold has its own **Clear bounce hold** button. See [Pauses and holds](email-and-deliverability.md#pauses-and-holds).
 
 Below the desk: sending capacity per mailbox (today's cap after warm-up and health gates, sent in the last 24 hours, remaining), then approved and scheduled emails, recent sends, and failed, rejected or cancelled emails with the reason. See [The approval outbox](email-and-deliverability.md#the-approval-outbox).
 
@@ -180,7 +180,7 @@ Credentials for the email provider, prospect search, email verification, LinkedI
 
 ## Controls
 
-Open it from the agent status card at the bottom of the sidebar. It shows whether a Mercury process started from the dashboard is running, Start and Stop buttons, and the last 100 lines of `data/mercury.log`. That log only receives output from processes the dashboard started; `mercury run` in a terminal or under systemd logs to its own stdout (see [Deployment](deployment.md#logs)). For anything long-running, prefer a service.
+Open it from the agent status card at the bottom of the sidebar. It shows whether a Mercury process started from the dashboard is running, Start and Stop buttons (Stop lets the agent finish the step it is on and shows **Stopping** until it exits), and the last 100 lines of `data/mercury.log`. That log only receives output from processes the dashboard started; `mercury run` in a terminal or under systemd logs to its own stdout (see [Deployment](deployment.md#logs)). For anything long-running, prefer a service.
 
 ## Help
 

@@ -9,20 +9,21 @@ import uuid
 
 import aiosqlite
 
+from mercury.control.errors import ControlError
+
 AVATAR_SEEDS = [f"mercury-persona-{i:02d}" for i in range(1, 25)]
 REPLIED_STATUSES = ("replied", "meeting", "closed")
 JSON_INSTRUCTION = "\n\nRespond ONLY with valid JSON. No markdown, no explanation."
 
 
-class PersonaError(ValueError):
+class PersonaError(ControlError):
     """A persona command that cannot proceed, with a stable code for every interface.
 
     Codes: not_found, revision_conflict, invalid, ambiguous, provider_failed.
     """
 
     def __init__(self, code: str, message: str):
-        super().__init__(message)
-        self.code = code
+        super().__init__(message, code)
 
 
 def avatar_url(seed: str) -> str:
@@ -250,15 +251,21 @@ class PersonaStore:
             await db.commit()
         return generation_id
 
-    async def replace_draft(self, item_id, draft):
-        """Attach a regeneration atomically, refusing mail that left the review queue."""
+    async def replace_draft(self, item_id, draft, expected_revision=None):
+        """Attach a regeneration atomically, refusing mail that left the review
+        queue (or, given ``expected_revision``, changed since it was read). The
+        new draft is a new revision and goes back to review unapproved."""
         async with self.state._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
                 "UPDATE outbox SET subject = ?, body = ?, generation_id = ?, manually_edited = 0, "
-                "status = 'pending_review', updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = ? AND status IN ('pending_review', 'approved')",
-                (draft["subject"], draft["body"], draft.get("generation_id", ""), item_id),
+                "status = 'pending_review', revision = revision + 1, approved_revision = NULL, "
+                "approved_hash = '', approved_by = '', approved_at = NULL, "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND status IN ('pending_review', 'approved') "
+                "AND (? IS NULL OR revision = ?)",
+                (draft["subject"], draft["body"], draft.get("generation_id", ""), item_id,
+                 expected_revision, expected_revision),
             )
             if not cursor.rowcount:
                 raise ValueError("This email is no longer available for regeneration")

@@ -12,10 +12,13 @@ warm-up health gate, so both read the same definitions:
   (timestamped, carries prospect_id + intent). Prospects with NO such event
   — conversations recorded before the event existed — fall back to the
   conversation's ``created_at`` (the handler creates a conversation on the
-  first reply). Out-of-office auto-replies (intent ``ooo``) are not replies.
+  first reply). Out-of-office auto-replies are not replies: the handler records
+  them as ``auto_reply`` / ``sequence_paused`` events, never ``reply_received``,
+  and the intent ``ooo`` is excluded here as well for older rows.
 * **positive** — the same events where intent is ``interested``.
 * **bounces** — the ``bounce`` event the handler logs, one per prospect per
-  day (unmatched bounces count individually).
+  day (unmatched bounces count individually). Bounces bucketed NOISE (mailbox
+  full, message too big; see ``mercury.bounces``) are not counted anywhere.
 
 Stored timestamps mix ``YYYY-MM-DDTHH:MM:SS`` (Python isoformat) and
 ``YYYY-MM-DD HH:MM:SS`` (SQLite CURRENT_TIMESTAMP); every comparison goes
@@ -61,7 +64,7 @@ _BOUNCE_EVENTS = f"""
            END AS k,
            created_at AS ts, '' AS intent
     FROM actions
-    WHERE action_type = 'bounce'
+    WHERE action_type = 'bounce' AND COALESCE({_j('bucket')}, '') != 'NOISE'
 """
 
 _SENT_EVENTS = """
@@ -197,7 +200,7 @@ async def window_counts_by_mailbox(db_path: str, since: str) -> dict[str, dict[s
             for mailbox, n in await cursor.fetchall():
                 bump(mailbox, "sent", n)
         for metric, action, extra in (
-            ("bounces", "bounce", ""),
+            ("bounces", "bounce", f"AND COALESCE({_j('bucket')}, '') != 'NOISE'"),
             ("replies", "reply_received", f"AND COALESCE({_j('intent')}, '') != 'ooo'"),
         ):
             key = (f"CASE WHEN COALESCE({_j('prospect_id')}, '') != '' "
@@ -211,6 +214,30 @@ async def window_counts_by_mailbox(db_path: str, since: str) -> dict[str, dict[s
             async with db.execute(sql, (action, since)) as cursor:
                 for mailbox, n in await cursor.fetchall():
                     bump(mailbox, metric, n)
+    return out
+
+
+async def bucket_counts_by_mailbox(db_path: str, since: str) -> dict[str, dict[str, int]]:
+    """``{mailbox: {BUCKET: n}}`` — the bounces since a timestamp split by the
+    DSN bucket the handler stored on each (``mercury.bounces``). Same mailbox
+    attribution and per-prospect-per-day de-duplication as the health counts;
+    a bounce logged before buckets existed reads as UNKNOWN. NOISE is shown
+    here (it is what the operator sees), though no rate counts it."""
+    out: dict[str, dict[str, int]] = {}
+    mb = _event_mailbox_sql()
+    key = (f"CASE WHEN COALESCE({_j('prospect_id')}, '') != '' "
+           f"THEN {_j('prospect_id')} ELSE id END")
+    sql = (
+        f"SELECT m, b, COUNT(DISTINCT k || '|' || d) FROM ("
+        f"  SELECT {mb} AS m, COALESCE(NULLIF({_j('bucket')}, ''), 'UNKNOWN') AS b, "
+        f"         {key} AS k, date(created_at) AS d FROM actions "
+        f"  WHERE action_type = 'bounce' AND datetime(created_at) >= datetime(?)"
+        f") GROUP BY m, b"
+    )
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(sql, (since,)) as cursor:
+            for mailbox, bucket, n in await cursor.fetchall():
+                out.setdefault(mailbox or "", {})[bucket] = n
     return out
 
 

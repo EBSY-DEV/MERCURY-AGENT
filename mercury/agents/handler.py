@@ -1,16 +1,19 @@
 """Handler — monitors replies and manages conversations.
 
 Works against Instantly (legacy) or a native mail provider (Gmail/SMTP).
-The native path also owns bounce handling: a bounce marks the address
-invalid, cancels the prospect's queued sends, and — past a bounce-rate
-threshold — flips the global kill switch so a bad list can't torch the
-sending domain while nobody's watching.
+The native path also owns bounce handling (see mercury/bounces.py): each
+bounce is bucketed by its DSN status code. A dead address is marked invalid
+and its queued sends cancelled; a sender or reputation block pauses the
+mailbox or domain; and past the kill-switch thresholds the global switch
+flips, so a bad list can't torch the sending domain while nobody's watching.
 """
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
+from mercury import bounces as bounce_policy
 from mercury.brain import Brain
 from mercury.config import MercuryConfig, EnvConfig
 from mercury.integrations.instantly import InstantlyClient
@@ -21,15 +24,25 @@ from mercury.integrations.mailboxes import (
     rotation_configured,
 )
 from mercury.models.conversation import Conversation, Message
-from mercury.state import StateManager
+from mercury.ooo import (
+    classify_auto_reply,
+    extract_return_date,
+    is_receipt,
+    operator_clock,
+    resume_time,
+)
+from mercury.policy import ContactPolicy
+from mercury.state import PAUSE_ENDING_STATUSES, StateManager
 from mercury.personas import PersonaStore, voice_instructions
 
 logger = logging.getLogger("mercury.handler")
 
 KILL_SWITCH_KEY = "sending_paused"
 BOUNCE_COUNT_KEY = "bounce_count"
-# Kill switch only engages after this many sends (a tiny sample lies).
-MIN_SENDS_FOR_KILL_SWITCH = 10
+# The bounce-rate kill switch only engages after this many sends (a tiny
+# sample lies). SENDER/BURNED bounces do not wait for it.
+MIN_SENDS_FOR_KILL_SWITCH = bounce_policy.MIN_SENDS_FOR_RATE
+DEFAULT_MAX_BOUNCE_RATE = 0.02
 
 INTENT_LABELS = {
     "interested",
@@ -115,7 +128,12 @@ def strip_quoted(text: str, extra_markers: tuple[str, ...] = ()) -> str:
 AUTO_REPLY_SUBJECTS = (
     "out of office", "out-of-office", "automatic reply", "auto-reply", "autoreply",
     "fuera de la oficina", "respuesta automática", "respuesta automatica",
+    # Delivery and read acknowledgements are machines too.
+    "read receipt", "delivery receipt", "return receipt",
+    "we have received your", "we've received your", "acuse de recibo",
 )
+# Outlook-style receipts put the original subject after one of these.
+AUTO_REPLY_PREFIXES = ("read:", "delivered:", "leído:", "leido:", "entregado:")
 
 
 def _is_auto_reply(msg) -> bool:
@@ -127,8 +145,30 @@ def _is_auto_reply(msg) -> bool:
         return True
     if "x-autoreply" in h or "x-autorespond" in h:
         return True
-    subject = (getattr(msg, "subject", "") or "").lower()
-    return any(m in subject for m in AUTO_REPLY_SUBJECTS)
+    subject = (getattr(msg, "subject", "") or "").lower().strip()
+    if any(m in subject for m in AUTO_REPLY_SUBJECTS) or subject.startswith(AUTO_REPLY_PREFIXES):
+        return True
+    # Read and delivery receipts are automatic too: not a person answering.
+    return is_receipt(getattr(msg, "subject", "") or "", getattr(msg, "headers", None))
+
+
+def received_at(date_header: str) -> datetime:
+    """When an inbound message was sent, as naive UTC, from its Date header.
+
+    Relative phrases in an out-of-office ("back tomorrow") are measured from
+    this, and so is the check that a replayed old message must not move a
+    pause. An unreadable header, or one dated in the future, falls back to now.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        when = parsedate_to_datetime(date_header)
+    except (TypeError, ValueError, IndexError):
+        return now
+    if when is None:
+        return now
+    if when.tzinfo is not None:
+        when = when.astimezone(timezone.utc).replace(tzinfo=None)
+    return now if when > now + timedelta(days=1) else when
 
 
 # Phrases that mean a human must take over. Never auto-reply to these.
@@ -162,6 +202,7 @@ class Handler:
         self.state = state
         self.config = config
         self.personas = PersonaStore(state)
+        self.policy = ContactPolicy(state, config)
         self._response_generation_id = ""
         self.instantly = InstantlyClient(env.instantly_api_key)
         # Every configured mailbox is polled; see Sender for the pool.
@@ -303,13 +344,35 @@ class Handler:
         logger.info(f"Handler: Intent for {lead_email}: {intent}")
 
         if intent == "ooo":
-            # Not a human answer: keep the sequence going, open nothing.
-            logger.info(f"Handler: out-of-office from {lead_email}; sequence continues.")
+            # Not a human answer: no conversation, no reply metrics. The
+            # sequence is paused until they are back, not cancelled.
+            meta = reply_meta or {}
+            if self.is_native:
+                await self._pause_for_ooo(
+                    prospect, "", reply_text,
+                    message_id=meta.get("message_id") or meta.get("dedup_key") or "",
+                    received=received_at(meta.get("date", "")),
+                )
+            else:
+                # Instantly owns sequencing there and Mercury has no pause
+                # for it: say so rather than claim a pause that did not happen.
+                logger.warning(
+                    f"Handler: out-of-office from {lead_email}, but the Instantly "
+                    "path cannot pause a remote sequence; it keeps sending."
+                )
+                await self.state.log_action(
+                    action_type="sequence_pause_unavailable",
+                    agent="handler",
+                    details={"prospect_id": prospect.id, "prospect_email": lead_email,
+                             "reason": "legacy Instantly sequences cannot be paused from Mercury"},
+                )
             return
 
         # A human answered, so every queued sequence email for them is now
         # wrong to send. This used to run before classification, so an
         # auto-responder cancelled the whole sequence.
+        # A temporary out-of-office pause is superseded: the person is here.
+        await self.state.supersede_pause(prospect.id, "human reply")
         # A prospect a human already advanced (meeting booked / deal closed)
         # is never pulled back to 'replied' by a later message.
         if prospect.status not in ("meeting", "closed"):
@@ -323,6 +386,7 @@ class Handler:
                 )
         except Exception as e:
             logger.debug(f"Handler: outbox cancel failed: {e}")
+        await self._hold_company_on_reply(prospect, intent)
 
         # The timestamped event the trends chart counts (replies / positive).
         try:
@@ -376,6 +440,12 @@ class Handler:
             # Honor opt-outs ALWAYS. No reply, no future contact.
             await self.state.update_conversation(convo.id, status="closed", stage="closed_lost")
             await self.state.update_prospect_status(prospect.id, "opted_out")
+            # The opt-out is a rule about the address, kept apart from the
+            # prospect row, so deleting or re-importing them never lifts it.
+            await self.state.add_suppression(
+                "email", prospect.email, source="opt_out", prospect_id=prospect.id,
+                reason="asked not to be contacted", actor="handler",
+            )
             await self.state.log_action(
                 action_type="opt_out",
                 agent="handler",
@@ -483,13 +553,15 @@ class Handler:
             dedup_key = msg.provider_id or msg.message_id
             if not dedup_key or await self.state.is_reply_processed(dedup_key):
                 continue
+            keep_for_retry = False
             try:
                 if msg.is_bounce:
                     await self._handle_bounce(msg)
                 elif _is_auto_reply(msg):
-                    # Not a human answer: the sequence keeps going and no
-                    # Claude call is spent classifying it.
-                    logger.info(f"Handler: auto-reply from {msg.from_email} ignored; sequence continues.")
+                    # Not a human answer, and no Claude call is spent
+                    # classifying it. A vacation notice pauses the sequence;
+                    # every other automatic message is only recorded.
+                    await self._handle_auto_reply(msg, dedup_key)
                 elif msg.body.strip():
                     await self._process_reply(
                         msg.from_email,
@@ -500,18 +572,160 @@ class Handler:
                             "message_id": msg.message_id,
                             "subject": msg.subject,
                             "mailbox": getattr(msg, "mailbox", ""),
+                            "date": getattr(msg, "date", ""),
+                            "dedup_key": dedup_key,
                         },
                     )
                 handled += 1
             except Exception as e:
                 logger.error(f"Handler: error processing {msg.from_email}: {e}")
+                if msg.is_bounce:
+                    # A bounce we could not account for is a reputation signal
+                    # we never saw. Stop sending until someone looks; if even
+                    # that cannot be saved, leave the bounce unread so the next
+                    # heartbeat tries again instead of dropping it.
+                    keep_for_retry = not await bounce_policy.engage_kill_switch(
+                        self.state,
+                        f"a bounce could not be processed ({e}). Review the "
+                        "log before clearing the hold",
+                    )
             finally:
-                await self.state.mark_reply_processed(dedup_key)
+                if not keep_for_retry:
+                    await self.state.mark_reply_processed(dedup_key)
 
         if handled:
             logger.info(f"Handler: processed {handled} inbound message(s).")
         else:
             logger.info("Handler: no new replies.")
+
+    async def _handle_auto_reply(self, msg, dedup_key: str = ""):
+        """An automatic message from a prospect's mailbox.
+
+        It is kept as an audit record (action ``auto_reply``) and never opens
+        a conversation or counts as a reply. Only a vacation notice pauses the
+        sequence; read receipts and acknowledgements change nothing.
+        """
+        kind = classify_auto_reply(msg.subject, msg.body, getattr(msg, "headers", None))
+        prospect = None
+        outbox_item = await self.state.find_outbox_by_message_id(msg.in_reply_to)
+        if outbox_item:
+            prospect = await self.state.get_prospect(outbox_item["prospect_id"])
+        if prospect is None:
+            prospect = await self.state.get_prospect_by_email(msg.from_email)
+        await self.state.log_action(
+            action_type="auto_reply",
+            agent="handler",
+            details={"kind": kind, "from": msg.from_email,
+                     "prospect_id": prospect.id if prospect else "",
+                     "subject": (msg.subject or "")[:120],
+                     "message_id": msg.message_id or dedup_key,
+                     "mailbox": (getattr(msg, "mailbox", "") or "").lower()},
+        )
+        if kind != "ooo":
+            logger.info(
+                f"Handler: {kind} from {msg.from_email} recorded; sequence continues."
+            )
+            return
+        if prospect is None:
+            logger.info(f"Handler: out-of-office from {msg.from_email} matches no prospect.")
+            return
+        await self._pause_for_ooo(
+            prospect, msg.subject, msg.body,
+            message_id=msg.message_id or dedup_key,
+            received=received_at(getattr(msg, "date", "")),
+        )
+
+    async def _pause_for_ooo(
+        self, prospect, subject: str, body: str, *, message_id: str, received: datetime,
+    ) -> dict | None:
+        """Pause a prospect's cold sequence until they are back.
+
+        A clear return date pauses until the first sending time after it. No
+        date, an ambiguous one, an impossible one or one already past still
+        pauses, but into the "return date needs review" state: nothing is
+        guessed and nothing resumes until an operator decides.
+        """
+        if prospect.status in PAUSE_ENDING_STATUSES:
+            logger.info(
+                f"Handler: out-of-office from {prospect.email}, but they are already "
+                f"'{prospect.status}'; nothing to pause."
+            )
+            return None
+        compliance = getattr(self.config, "compliance", None)
+        own = strip_quoted(
+            body, (compliance.opt_out_line_en, compliance.opt_out_line_es) if compliance else ()
+        )
+        tz_name, quiet_end = operator_clock(self.config)
+        found = extract_return_date(f"{subject}. {own}" if subject else own, received, tz_name)
+        if found.ok:
+            buffer = getattr(getattr(self.config.channels, "email", None), "ooo_resume_buffer_days", 0)
+            state, resume = "paused", resume_time(found.date, tz_name, quiet_end, buffer)
+        else:
+            state, resume = "needs_review", None
+        result = await self.state.record_ooo_pause(
+            prospect.id,
+            message_id=message_id,
+            message_at=received,
+            state=state,
+            resume_at=resume,
+            confidence=found.confidence if found.ok else 0.0,
+            return_text=found.text,
+            review_reason="" if found.ok else found.status,
+        )
+        if result["action"] == "ignored":
+            logger.info(
+                f"Handler: out-of-office from {prospect.email} left the pause as it was "
+                f"({result['why']})."
+            )
+            return result
+        pause = result["pause"]
+        await self.state.log_action(
+            action_type="sequence_paused",
+            agent="handler",
+            details={
+                "prospect_id": prospect.id, "prospect_email": prospect.email,
+                "change": result["action"], "state": pause["state"],
+                "resume_at": pause["resume_at"] or "", "return_text": pause["return_text"],
+                "confidence": pause["confidence"], "review_reason": pause["review_reason"],
+                "message_id": message_id,
+            },
+        )
+        if state == "paused":
+            logger.info(
+                f"Handler: {prospect.email} is out of office; sequence paused until "
+                f"{pause['resume_at']} UTC ({found.text!r})."
+            )
+        else:
+            logger.info(
+                f"Handler: {prospect.email} is out of office; no usable return date "
+                f"({found.status}). Sequence paused, return date needs review."
+            )
+        return result
+
+    async def _hold_company_on_reply(self, prospect, intent: str):
+        """A person at a company answered: hold cold mail to their colleagues
+        so the company is not approached from two sides mid-conversation.
+        Auto-replies and bounces never get here. Only native providers can
+        hold a send, so the Instantly path records nothing it cannot enforce."""
+        if not (self.is_native and self.policy.limits.pause_on_reply):
+            return
+        company_id = await self.policy.company_for(prospect)
+        if not company_id:
+            return
+        hold, created = await self.state.hold_company(
+            company_id, reason="reply", prospect_id=prospect.id,
+            note=f"{prospect.email} replied ({intent})", actor="handler",
+        )
+        if created:
+            logger.info(
+                f"Handler: {prospect.email} replied; cold mail to their company is held "
+                "until you resume it."
+            )
+            await self.state.log_action(
+                action_type="company_hold", agent="handler",
+                details={"company_id": company_id, "hold_id": hold["id"],
+                         "prospect_email": prospect.email, "intent": intent},
+            )
 
     async def _handle_bounce(self, msg):
         """A bounce is a data bug AND a reputation threat. Fix both."""
@@ -542,22 +756,9 @@ class Handler:
                 if prospect is not None:
                     break
 
-        if prospect:
-            await self.state.update_prospect_email(
-                prospect.id, prospect.email, "invalid"
-            )
-            cancelled = await self.state.cancel_pending_outbox_for_prospect(
-                prospect.id, reason="bounced"
-            )
-            logger.warning(
-                f"Handler: BOUNCE for {prospect.email} — marked invalid, "
-                f"cancelled {cancelled} queued email(s)."
-            )
-        else:
-            logger.warning(
-                f"Handler: bounce received ({msg.subject[:60]}) but couldn't "
-                "match it to a sent email."
-            )
+        # What the bounce says (RFC 3463 code) decides what it costs: a dead
+        # address is one prospect, a blocked sender is the mailbox or domain.
+        dsn_code, bucket = bounce_policy.classify_bounce(headers, msg.body or "")
 
         # Attribute the bounce to the mailbox that sent the email, so the
         # warm-up health gate can pause just that inbox. The DSN normally
@@ -567,30 +768,72 @@ class Handler:
             bounced_from = outbox_item.get("mailbox") or ""
         if not bounced_from:
             bounced_from = getattr(msg, "mailbox", "") or ""
+        bounced_from = bounced_from.strip().lower()
 
+        # Count and log first, the address second: whatever happens to the
+        # prospect, the reputation signal must not be lost.
         bounces = await self.state.increment_setting(BOUNCE_COUNT_KEY)
+        await bounce_policy.record_bucket(self.state, bucket)
         total_sent = await self.state.count_outbox_sent()
         await self.state.log_action(
             action_type="bounce",
             agent="handler",
             details={"prospect": prospect.email if prospect else "unknown",
                      "prospect_id": prospect.id if prospect else "",
-                     "mailbox": bounced_from.strip().lower(),
+                     "mailbox": bounced_from,
+                     "dsn_code": dsn_code, "bucket": bucket,
                      "bounces": bounces, "total_sent": total_sent},
         )
 
-        max_rate = getattr(self.config.channels.email, "max_bounce_rate", 0.05)
-        if (
-            max_rate > 0
-            and total_sent >= MIN_SENDS_FOR_KILL_SWITCH
-            and bounces / total_sent > max_rate
-        ):
-            reason = (
-                f"bounce rate {bounces}/{total_sent} exceeded "
-                f"{max_rate:.0%} — check list quality before resuming"
+        note = await bounce_policy.apply_bucket(
+            self.state, self._pool(), bucket=bucket, code=dsn_code, mailbox=bounced_from)
+        logger.warning(
+            f"Handler: bounce {dsn_code or 'with no status code'} → {bucket}"
+            + (f" ({note})" if note else "") + "."
+        )
+
+        address_error = None
+        if prospect and bucket in bounce_policy.ADDRESS_BUCKETS:
+            try:
+                await self.state.update_prospect_email(
+                    prospect.id, prospect.email, "invalid"
+                )
+                cancelled = await self.state.cancel_pending_outbox_for_prospect(
+                    prospect.id, reason="bounced"
+                )
+                await self.state.add_suppression(
+                    "email", prospect.email, source="bounce", prospect_id=prospect.id,
+                    reason="hard bounce", actor="handler",
+                )
+                await self.state.supersede_pause(prospect.id, "bounced")
+                logger.warning(
+                    f"Handler: BOUNCE for {prospect.email} — marked invalid, "
+                    f"cancelled {cancelled} queued email(s)."
+                )
+            except Exception as e:
+                # Still run the kill-switch check below, then fail the bounce:
+                # a dead address left sendable is not something to log and move on from.
+                address_error = e
+                logger.error(f"Handler: could not mark {prospect.email} invalid: {e}")
+        elif prospect:
+            logger.warning(
+                f"Handler: {bucket} bounce for {prospect.email} — the address is "
+                "not the problem, so it stays as it is."
             )
-            await self.state.set_setting(KILL_SWITCH_KEY, reason)
-            logger.error(f"Handler: KILL SWITCH ENGAGED — {reason}")
+        else:
+            logger.warning(
+                f"Handler: bounce received ({msg.subject[:60]}) but couldn't "
+                "match it to a sent email."
+            )
+
+        max_rate = getattr(self.config.channels.email, "max_bounce_rate",
+                           DEFAULT_MAX_BOUNCE_RATE)
+        reason = bounce_policy.kill_switch_reason(
+            await bounce_policy.load_counts(self.state), bounces, total_sent, max_rate)
+        if reason:
+            await bounce_policy.engage_kill_switch(self.state, reason)
+        if address_error is not None:
+            raise address_error
 
     async def _queue_native_reply(
         self, response: str, prospect, convo, reply_meta: dict, intent: str
