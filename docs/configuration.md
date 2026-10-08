@@ -212,6 +212,93 @@ During quiet hours the loop sleeps: no sending, no inbox polling, no discovery. 
 
 The opt-out lines also help the reply handler strip Mercury's own quoted text out of inbound replies, so keep them distinctive. See [Compliance](email-and-deliverability.md#compliance-footer-and-opt-outs).
 
+### `offers`
+
+Optional. Without it, every prospect is written from the `product` description, as before. With it, the Writer routes each prospect to one offer and writes from that offer's brief only. Keep real offers in `mercury.local.yaml`; the examples here are placeholders.
+
+**Routing.** At write time each prospect gets the first offer, in the order listed, whose rule matches. A rule is any of:
+
+- `markets`: names from `icp.markets`. A company is in a market when its location or domain contains one of the market's `places` (the same match the Writer uses to pick a language).
+- `segments`: the prospect's industry, or its company's, compared case-insensitively.
+- `signals.require` / `signals.exclude`: signal codes, read like a cohort. Only the newest observation of each signal counts, and a `0` means "checked, not there".
+
+When no rule matches, the offer with `default: true` is used. With no default, the prospect is written without an offer. An offer with no rule is only ever used as the default, so a list written only for the [demo gate](email-and-deliverability.md) (`key`, `requires_demo`, `demo_kind`) routes nothing and changes nothing.
+
+Prospects are grouped so one campaign carries one offer. The campaign and every outbox row (personalized first emails included) carry its `offer_key`, and the reason for each prospect's offer is kept. `mercury offers` lists the rules in order and flags signal codes that are unknown or not confirmed (a rule over a signal Mercury does not collect never matches). `mercury offers route EMAIL` explains one prospect's offer; add `--brief` to print what the Writer would get.
+
+**The brief.** For each email the Writer gets a brief for the selected offer and nothing about any other offer:
+
+- the offer's `content`: its name, what it is (`summary`) and the only claims it may make (`claims`);
+- the call to action and angle for the step being written (`steps`). Follow-ups get their own;
+- verified facts: the newest observation of each code in `facts` (default: the codes in `signals.require`). An existing `SERP_RANK` observation is given here when you list it; nothing new is collected;
+- aggregate evidence, when `evidence` is set and enough companies were checked (below);
+- the case studies in scope for this prospect (below);
+- a confirmed pain, when one is supplied. Mercury never makes one up; without one the brief says none was supplied;
+- the claim restrictions in `restrictions`, plus a standing rule against invented numbers, clients and results.
+
+When an offer has a `content.summary`, the brief is authoritative: the product description, benefits and pricing in the prompt point to it, and the `product_knowledge` skill (the trainer's description of everything you sell) is left out. Without a summary, the brief adds its calls to action, case studies and restrictions to the usual product description.
+
+**Case studies.** Each entry under `case_studies` has a `name`, optional `aliases`, the approved `summary`, and a `scope` of `markets` and `segments` (empty means anywhere). Only the selected offer's case studies in scope for the prospect reach the prompt. A draft naming any other configured case study is discarded by the Writer, and the [pre-send gate](email-and-deliverability.md#the-pre-send-gate) blocks it if it gets into the outbox another way, such as a manual edit.
+
+**Evidence.** `evidence` describes a statistic computed from observations, never typed in: of the companies checked for every `require` signal (only those in `segments`, when set), how many carry them all and none of `exclude`. The brief quotes it only when at least `min_sample` companies were checked and at least one matched, only for prospects in its `segments`, and only in its `steps` (empty means all).
+
+**Supporting materials.** `materials` is metadata for people (a sample, a one-pager). It is listed by `mercury offers`, is not given to the Writer, and nothing waits for it.
+
+| Key | Default | Description |
+|---|---|---|
+| `key` | required | Letters, digits, `-` or `_`. What campaigns and outbox rows carry. |
+| `default` | `false` | The fallback offer. At most one. |
+| `markets` | `[]` | `icp.markets` names. An unknown name is a config error. |
+| `segments` | `[]` | Industries. |
+| `signals.require` / `signals.exclude` | `[]` | Signal codes. |
+| `content.name` / `content.summary` / `content.claims` | `""` / `""` / `[]` | The approved description. |
+| `steps` | `{}` | `{1: {cta, angle}, 2: ..., 3: ...}`, steps 1 to 5. |
+| `facts` | `[]` | Signal codes given as verified facts. Empty uses `signals.require`. |
+| `case_studies` | `[]` | `name`, `aliases`, `summary`, `scope.markets`, `scope.segments`. |
+| `restrictions` | `[]` | Claim restrictions, stated in the brief as written. |
+| `evidence` | none | `description`, `require`, `exclude`, `segments`, `min_sample` (20), `steps`. |
+| `materials` | `[]` | `name`, `kind`, `url`, `notes`. Metadata only. |
+| `requires_demo` / `demo_kind` | `false` / `""` | The [demo gate](email-and-deliverability.md). |
+
+```yaml
+icp:
+  markets:
+    - name: "market_a"
+      places: ["Exampleville"]
+      terms: ["service_a"]
+
+offers:
+  - key: "offer_a"
+    markets: ["market_a"]
+    segments: ["segment_a"]
+    signals:
+      require: ["SIGNAL_A"]
+      exclude: ["SIGNAL_B"]
+    content:
+      name: "Offer A"
+      summary: "One plain sentence on what offer A is."
+      claims: ["An approved claim about offer A."]
+    facts: ["SERP_RANK", "SIGNAL_A"]
+    steps:
+      1: {angle: "The observation to open on.", cta: "The one question to ask."}
+      2: {angle: "A different angle for the follow-up.", cta: "An interest-based question."}
+      3: {cta: "A low-pressure close."}
+    case_studies:
+      - name: "Example Client Co"
+        summary: "What happened, in approved words."
+        scope: {markets: ["market_a"], segments: ["segment_a"]}
+    restrictions: ["Never quote a price."]
+    evidence:
+      description: "carried SIGNAL_A"
+      require: ["SIGNAL_A"]
+      segments: ["segment_a"]
+      min_sample: 30
+  - key: "offer_b"
+    default: true
+    content:
+      summary: "One plain sentence on what offer B is."
+```
+
 ## Environment variables (`.env`)
 
 Copy `.env.example` to `.env`. Mercury loads the project's `.env` into the process environment (variables already set in the environment win), so a container or a scheduled job can inject the same variables without a file. `.env` is gitignored.
@@ -291,7 +378,7 @@ Templates use `{{variable}}` placeholders. Mercury logs a warning if a placehold
 
 ### `skills/`
 
-Skills are knowledge files injected into an agent's prompt. The mapping lives in `load_skills_for_agent` in `mercury/brain.py`:
+Skills are knowledge files injected into an agent's prompt. The mapping lives in `AGENT_SKILLS` in `mercury/brain.py`:
 
 | Agent | Skills |
 |---|---|
@@ -301,6 +388,6 @@ Skills are knowledge files injected into an agent's prompt. The mapping lives in
 | Sender | `email_frameworks`, `product_knowledge` |
 | LinkedIn | `linkedin_outreach`, `prospecting_tactics`, `product_knowledge` |
 
-`product_knowledge.md` and `competitive_intel.md` are generated by `mercury train` and gitignored. To add a new skill, create the file and add its name to the map in `brain.py`. `skills/README.md` describes each built-in skill.
+`product_knowledge.md` and `competitive_intel.md` are generated by `mercury train` and gitignored. When a prospect's [offer](#offers) has a `content.summary`, the Writer leaves `product_knowledge` out for that email: the offer brief is the only offer description it gets. To add a new skill, create the file and add its name to the map in `brain.py`. `skills/README.md` describes each built-in skill.
 
 Prompts are instructions, not guarantees. The [pre-send gate](email-and-deliverability.md#the-pre-send-gate) enforces the hard rules (length, links, banned phrases, merge tags) in code no matter what a prompt says.

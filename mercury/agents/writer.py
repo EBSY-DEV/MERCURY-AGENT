@@ -7,16 +7,37 @@ batch. Mass-templated "token-swap" mail is exactly what inbox filters now
 cluster and junk; a specific, verifiable first line is what earns replies.
 Steps 2-3 stay campaign-level (proof point + breakup are less personal by
 design). Every draft still passes the deterministic pre-send gate.
+
+With ``offers:`` configured, each prospect is routed to one offer first
+(mercury/offers.py) and campaigns are grouped so one campaign carries one
+offer. The prompt then gets that offer's brief and nothing about any other
+offer. A brief with a ``content.summary`` is authoritative: it replaces the
+product description and the trainer's product_knowledge skill, which
+describe the whole business and could name offers this prospect was not
+routed to.
 """
 
 import json
 import logging
 from datetime import datetime, timezone
 
-from mercury.brain import Brain
+from mercury.brain import AGENT_SKILLS, Brain
 from mercury.config import MercuryConfig
 from mercury.integrations.mail_provider import NATIVE_PROVIDERS
 from mercury.models.campaign import Campaign, EmailStep
+from mercury.offers import (
+    ConfirmedPain,
+    OfferBrief,
+    RouteDecision,
+    blocked_terms,
+    build_brief,
+    case_study_hits,
+    decision_for_key,
+    has_case_studies,
+    offer_problems,
+    route_prospect,
+    routing_enabled,
+)
 from mercury.state import StateManager
 from mercury.personas import PersonaStore, voice_instructions
 from mercury.voices import MailboxVoices
@@ -27,6 +48,10 @@ logger = logging.getLogger("mercury.writer")
 # small — the rest of the 'new' pool is picked up on later cycles.
 NATIVE_BATCH_CAP = 20
 LEGACY_BATCH_CAP = 50
+
+# Skills an authoritative offer brief replaces. product_knowledge is the
+# trainer's description of everything the business sells.
+BRIEF_REPLACES_SKILLS = ("product_knowledge",)
 
 
 class Writer:
@@ -46,39 +71,84 @@ class Writer:
         self.env = env
         self.personas = PersonaStore(state)
         self.voices = MailboxVoices(state, config, env)
+        # The confirmed-pain hook (#59): an async callable
+        # (prospect, offer_key, step) -> ConfirmedPain | None. Unset, a brief
+        # says no pain was supplied; the Writer never makes one up.
+        self.pain_source = None
 
-    def _base_prompt(self, profile: dict) -> str:
-        return "".join(text for _key, _label, text in self._base_sections(profile))
+    def _base_prompt(self, profile: dict, brief: OfferBrief | None = None) -> str:
+        return "".join(text for _key, _label, text in self._base_sections(profile, brief))
 
     def _sign_off_rule(self, profile: dict) -> str:
         name = profile.get("signer") or self.config.persona.name
         return (f"Sign off with this name and no other: {name}. "
                 "Never sign with a persona, team or company name instead.")
 
-    def _base_sections(self, profile: dict) -> list[tuple[str, str, str]]:
-        """Template, knowledge and voice, as labelled pieces that join into the base prompt."""
+    def _base_sections(self, profile: dict, brief: OfferBrief | None = None) -> list[tuple[str, str, str]]:
+        """Template, knowledge, offer brief and voice, as labelled pieces that join into the base prompt."""
+        product = self.config.product
+        description, pricing = product.description, product.pricing
+        benefits = "\n".join(f"- {b}" for b in product.key_benefits)
+        if brief is not None and brief.authoritative:
+            # The brief is the only offer description: the product block
+            # (which may describe every offer) points at it instead.
+            description = "See the OFFER BRIEF below. It is the only offer you may describe."
+            benefits = "- Only the approved claims in the OFFER BRIEF below."
+            pricing = "Only what the OFFER BRIEF says, if anything."
         template = self.brain.load_prompt(
             "writer",
-            product_name=self.config.product.name,
-            product_description=self.config.product.description,
-            product_benefits="\n".join(f"- {b}" for b in self.config.product.key_benefits),
-            product_pricing=self.config.product.pricing,
+            product_name=product.name,
+            product_description=description,
+            product_benefits=benefits,
+            product_pricing=pricing,
             persona_name=profile.get("signer") or self.config.persona.name,
             persona_company=self.config.persona.company,
             persona_role=self.config.persona.role,
             persona_tone=profile["tone"],
         ) or (
             f"You are {profile.get('signer') or self.config.persona.name}, {self.config.persona.role} "
-            f"at {self.config.persona.company}.\nProduct: {self.config.product.name}\n"
-            f"Description: {self.config.product.description}\nPricing: {self.config.product.pricing}\n"
-            "Benefits:\n" + "\n".join(f"- {b}" for b in self.config.product.key_benefits)
+            f"at {self.config.persona.company}.\nProduct: {product.name}\n"
+            f"Description: {description}\nPricing: {pricing}\n"
+            "Benefits:\n" + benefits
         )
         sections = [("template", "Writer template", template)]
-        self.skills = self.brain.load_skills_for_agent("writer")
+        if brief is not None and brief.authoritative:
+            self.skills = self.brain.load_skills(
+                [s for s in AGENT_SKILLS["writer"] if s not in BRIEF_REPLACES_SKILLS])
+        else:
+            self.skills = self.brain.load_skills_for_agent("writer")
         if self.skills:
             sections.append(("knowledge", "Knowledge", "\n\n" + self.skills))
+        if brief is not None:
+            sections.append(("offer", "Offer brief", brief.render()))
         sections.append(("persona", "Writing persona", voice_instructions(profile)))
         return sections
+
+    # ── Offers ──
+
+    async def _route(self, prospect) -> RouteDecision:
+        return await route_prospect(self.state, self.config, prospect)
+
+    async def _pain(self, prospect, decision: RouteDecision, step: int) -> ConfirmedPain | None:
+        if self.pain_source is None or decision.offer is None:
+            return None
+        try:
+            return await self.pain_source(prospect, decision.key, step)
+        except Exception as e:
+            logger.warning(f"Writer: pain lookup failed for {getattr(prospect, 'email', '')}: {e}")
+            return None
+
+    def _blocked(self, decision: RouteDecision, brief: OfferBrief | None, contexts: list) -> list[str]:
+        """Case-study names a draft must not contain."""
+        if brief is not None:
+            return brief.blocked
+        if not has_case_studies(self.config):
+            return []
+        return blocked_terms(self.config, decision.offer, [c for c in contexts if c is not None])
+
+    @staticmethod
+    def _out_of_scope(blocked: list[str], *texts: str) -> list[str]:
+        return case_study_hits("\n".join(texts), blocked) if blocked else []
 
     @property
     def is_native(self) -> bool:
@@ -113,8 +183,14 @@ class Writer:
             )
             return
 
-        # Batch prospects into campaign groups (by industry/title for relevance)
-        batches = self._group_prospects(prospects_with_email)
+        # Route each prospect to one offer (none without offers: configured),
+        # then batch by offer and industry so one campaign carries one offer.
+        # A rule over a signal nobody collects never matches: say so.
+        if routing_enabled(self.config):
+            for problem in await offer_problems(self.state, self.config):
+                logger.warning(f"Writer: offers: {problem}")
+        decisions = {p.id: await self._route(p) for p in prospects_with_email}
+        batches = self._group_prospects(prospects_with_email, decisions)
 
         # Each mailbox can write in its own voice and sign with its own name.
         # When they differ, every new thread gets its mailbox now, so the
@@ -139,12 +215,13 @@ class Writer:
             )
 
             # Generate the email sequence
-            sequence = await self._write_sequence(prospects, profile)
+            sequence = await self._write_sequence(prospects, profile, decisions)
             if not sequence:
                 logger.warning(f"Writer: Failed to generate sequence for {batch_name}")
                 continue
 
             # Create the campaign
+            offer_key = decisions[prospects[0].id].key
             campaign = Campaign(
                 id="",
                 name=batch_name,
@@ -153,8 +230,15 @@ class Writer:
                 prospect_ids=[p.id for p in prospects],
                 status="draft",
                 mailbox=mailbox,
+                offer_key=offer_key,
             )
             campaign_id = await self.state.add_campaign(campaign)
+            if offer_key:
+                await self.state.record_offer_routes(campaign_id, [
+                    {"prospect_id": p.id, "offer_key": decisions[p.id].key,
+                     "reason": decisions[p.id].reason, "is_default": decisions[p.id].is_default}
+                    for p in prospects
+                ])
 
             # Mark prospects so they aren't picked up again
             for p in prospects:
@@ -164,7 +248,7 @@ class Writer:
             # a per-prospect draft grounded in that company's actual facts.
             if self.is_native:
                 profile = await self.personas.for_generation(self.config, sequence[0].generation_id)
-                await self._personalize_first_emails(campaign_id, prospects, profile, mailbox)
+                await self._personalize_first_emails(campaign_id, prospects, profile, mailbox, decisions)
 
             await self.state.log_action(
                 action_type="write_campaign",
@@ -174,6 +258,7 @@ class Writer:
                     "campaign_name": batch_name,
                     "prospect_count": len(prospects),
                     "steps": len(sequence),
+                    "offer_key": offer_key,
                 },
             )
             logger.info(
@@ -181,13 +266,16 @@ class Writer:
                 f"{len(sequence)} emails for {len(prospects)} prospects."
             )
 
-    async def _personalize_first_emails(self, campaign_id: str, prospects: list, profile=None, mailbox: str = ""):
+    async def _personalize_first_emails(self, campaign_id: str, prospects: list, profile=None,
+                                        mailbox: str = "", decisions: dict | None = None):
         """Draft a grounded, per-prospect email 1 and stage it in the outbox.
 
         The outbox unique index means the sender's later template staging
         can't overwrite these rows — a personalized draft always wins the
         (campaign, prospect, step 1) slot. If a draft fails, the slot stays
         empty and the sender falls back to the campaign template.
+        ``decisions`` are the offer routes the campaign was grouped by;
+        without them each draft keeps the campaign's offer.
         """
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
@@ -196,10 +284,15 @@ class Writer:
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         provider = self.config.channels.email.provider
 
+        campaign_offer = ""
+        if decisions is None:
+            campaign_offer = await self.state.outbox_offer_key({"campaign_id": campaign_id})
         drafted = 0
         for prospect in prospects:
             try:
-                draft = await self._write_personal_email(prospect, profile=profile)
+                decision = (decisions or {}).get(prospect.id) or await decision_for_key(
+                    self.state, self.config, prospect, campaign_offer)
+                draft = await self._write_personal_email(prospect, profile=profile, decision=decision)
             except Exception as e:
                 logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
                 continue
@@ -217,6 +310,7 @@ class Writer:
                 provider=provider,
                 generation_id=draft.get("generation_id", ""),
                 mailbox=mailbox,
+                offer_key=decision.key,
             )
             if item_id:
                 drafted += 1
@@ -227,14 +321,27 @@ class Writer:
                 f"({'awaiting approval' if require_approval else 'approved'})."
             )
 
-    async def build_personal_prompt(self, prospect, instruction: str = "", profile=None):
+    async def build_personal_prompt(self, prospect, instruction: str = "", profile=None, decision=None):
         """The same assembled inputs for prompt inspection, preview and drafting."""
-        sections, profile = await self.personal_prompt_sections(prospect, instruction, profile)
+        sections, profile = await self.personal_prompt_sections(prospect, instruction, profile, decision)
         return "".join(text for _key, _label, text in sections), profile
 
-    async def personal_prompt_sections(self, prospect, instruction: str = "", profile=None):
-        """The first-email prompt as labelled pieces, in the order the writer receives them."""
+    async def personal_prompt_sections(self, prospect, instruction: str = "", profile=None, decision=None):
+        """The first-email prompt as labelled pieces, in the order the writer receives them.
+        ``decision`` None routes the prospect now (prompt inspection, preview)."""
+        sections, profile, _brief, _decision = await self._personal_inputs(
+            prospect, instruction, profile, decision)
+        return sections, profile
+
+    async def _personal_inputs(self, prospect, instruction: str = "", profile=None,
+                               decision: RouteDecision | None = None):
         profile = profile or await self.personas.resolve(self.config)
+        if decision is None:
+            decision = await self._route(prospect)
+        brief = None
+        if decision.offer is not None:
+            brief = await build_brief(self.state, self.config, decision, [1], [decision.context],
+                                      await self._pain(prospect, decision, 1))
         facts = [
             f"- Name: {prospect.full_name()}",
             f"- Title: {prospect.title}",
@@ -266,6 +373,8 @@ class Writer:
         # Half of the first 24 subjects sent were a variant of "quote form":
         # the model converges on the strongest fact. Show it what is already
         # in the queue so each email finds its own angle and words.
+        # With an offer, only that offer's subjects: another offer's wording
+        # must not reach this prompt.
         recent_line = ""
         try:
             import aiosqlite
@@ -274,7 +383,9 @@ class Writer:
                 async with db.execute(
                     "SELECT subject FROM outbox WHERE step = 1 "
                     "AND status IN ('approved', 'pending_review', 'sent') "
-                    "ORDER BY created_at DESC LIMIT 25"
+                    + ("AND offer_key = ? " if brief is not None else "")
+                    + "ORDER BY created_at DESC LIMIT 25",
+                    (decision.key,) if brief is not None else (),
                 ) as cursor:
                     recent = [r[0] for r in await cursor.fetchall() if r[0]]
             if recent:
@@ -289,6 +400,15 @@ class Writer:
             if instruction and instruction.strip() else ""
         )
 
+        cta = brief.step(1) if brief is not None else None
+        shape = (
+            "One specific observation from the FACTS above, then the\n"
+            "  call to action the OFFER BRIEF gives for this email as its one\n"
+            "  question. Say about the offer only what the OFFER BRIEF allows."
+            if cta is not None and cta.cta else
+            "One specific observation from the FACTS above, one\n"
+            "  question. No pitch, no product name."
+        )
         task = f"""
 
 Write ONE cold email (the very first touch) to this specific person.
@@ -300,8 +420,7 @@ or anything else:
 {chr(10).join(facts)}
 
 Requirements:
-- 50-90 words. One specific observation from the FACTS above, one
-  question. No pitch, no product name.
+- 50-90 words. {shape}
 - Write the actual text (no merge variables — you know their name/company).
 - Subject: lowercase, 2-4 words, reads like an internal note.
 - Language and register: {lang_line}
@@ -310,10 +429,14 @@ Requirements:
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
-        return self._base_sections(profile) + [("email", "This email", task)], profile
+        sections = self._base_sections(profile, brief) + [("email", "This email", task)]
+        return sections, profile, brief, decision
 
-    async def _write_personal_email(self, prospect, instruction: str = "", profile=None) -> dict | None:
-        prompt, profile = await self.build_personal_prompt(prospect, instruction, profile)
+    async def _write_personal_email(self, prospect, instruction: str = "", profile=None,
+                                    decision: RouteDecision | None = None) -> dict | None:
+        sections, profile, brief, decision = await self._personal_inputs(
+            prospect, instruction, profile, decision)
+        prompt = "".join(text for _key, _label, text in sections)
         result = await self.brain.think_json(
             prompt, session_id="mercury-writer",
             agent="writer", task="personal_email",
@@ -323,6 +446,11 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         subject = str(result.get("subject") or "").strip()
         body = str(result.get("body") or "").strip()
         if not subject or not body:
+            return None
+        hits = self._out_of_scope(self._blocked(decision, brief, [decision.context]), subject, body)
+        if hits:
+            logger.warning(f"Writer: discarded the draft for {prospect.email}: it names a case "
+                           f"study outside its scope ({', '.join(hits)}).")
             return None
         draft = {"subject": subject[:120], "body": body[:2000]}
         draft["generation_id"] = await self.personas.record(
@@ -339,8 +467,13 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         """
         profile = await self.personas.for_generation(self.config, item.get("generation_id", ""))
         step = int(item.get("step") or 1)
+        # A rewrite keeps the offer the email was written for; it is never
+        # routed again (a row without one stays without one).
+        decision = await decision_for_key(self.state, self.config, prospect,
+                                          await self.state.outbox_offer_key(item))
         if step == 1:
-            return await self._write_personal_email(prospect, instruction=instruction, profile=profile)
+            return await self._write_personal_email(prospect, instruction=instruction,
+                                                    profile=profile, decision=decision)
 
         first = ""
         try:
@@ -362,15 +495,24 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             f"\n- The reviewer asked for this change; it is binding: {instruction.strip()}"
             if instruction and instruction.strip() else ""
         )
+        brief = None
+        if decision.offer is not None:
+            brief = await build_brief(self.state, self.config, decision, [step], [decision.context],
+                                      await self._pain(prospect, decision, step))
+        proof = ("the approved claims or a case study in the OFFER BRIEF"
+                 if brief is not None and brief.authoritative else "the product knowledge")
         role = (
             "a FOLLOW-UP sent 3 days after the first email: 60-110 words, at least "
             "four sentences, stands on its own, a different angle with one concrete "
-            "proof point from the product knowledge, and an interest-based question"
+            f"proof point from {proof}, and an interest-based question"
             if step == 2 else
             "the BREAK-UP email, the last one: 30-50 words, gives permission to say "
             "no, leaves the door open, no guilt"
         )
-        prompt = self._base_prompt(profile)
+        if brief is not None and brief.step(step) is not None:
+            role += (f". Use the angle and call to action the OFFER BRIEF gives for email {step}; "
+                     "they take precedence over this description")
+        prompt = self._base_prompt(profile, brief)
         prompt += f"""
 
 Rewrite ONE email for this person: {prospect.full_name()}, {prospect.title} at {prospect.company}.
@@ -397,6 +539,11 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         subject = str(result.get("subject") or "").strip()
         body = str(result.get("body") or "").strip()
         if not subject or not body:
+            return None
+        hits = self._out_of_scope(self._blocked(decision, brief, [decision.context]), subject, body)
+        if hits:
+            logger.warning(f"Writer: discarded a rewrite for {prospect.email}: it names a case "
+                           f"study outside its scope ({', '.join(hits)}).")
             return None
         draft = {"subject": subject[:120], "body": body[:2000]}
         draft["generation_id"] = await self.personas.record(
@@ -441,8 +588,25 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
                 "Dominican Republic or a Dominican client; say \"a local business "
                 "like yours\".")
 
-    async def _write_sequence(self, prospects: list, profile=None) -> list[EmailStep]:
-        """Ask the brain to write a 3-email sequence."""
+    async def _write_sequence(self, prospects: list, profile=None,
+                              decisions: dict | None = None) -> list[EmailStep]:
+        """Ask the brain to write a 3-email sequence.
+
+        ``decisions`` are the prospects' offer routes; the group shares the
+        first one's offer (``run`` groups by offer). Without them the
+        prospects are routed here.
+        """
+        if decisions is None:
+            decisions = {p.id: await self._route(p) for p in prospects}
+        decision = decisions[prospects[0].id]
+        contexts = [decisions[p.id].context for p in prospects if p.id in decisions]
+        brief = None
+        if decision.offer is not None:
+            pains = [await self._pain(p, decision, 1) for p in prospects]
+            # One pain for a shared template only when every prospect has it.
+            pain = pains[0] if pains and pains[0] is not None and all(
+                x is not None and x.code == pains[0].code for x in pains) else None
+            brief = await build_brief(self.state, self.config, decision, [1, 2, 3], contexts, pain)
         lang_line = await self._market_lang(prospects)
         # Build context about the prospects
         prospect_summary = "\n".join(
@@ -452,7 +616,14 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         )
 
         profile = profile or await self.personas.resolve(self.config)
-        prompt = self._base_prompt(profile)
+        prompt = self._base_prompt(profile, brief)
+        proof = ("the approved claims or a case study in the OFFER BRIEF"
+                 if brief is not None and brief.authoritative else "the product knowledge")
+        brief_line = (
+            "\n- Each email uses the angle and call to action the OFFER BRIEF gives for it;\n"
+            "  they take precedence over the descriptions above."
+            if brief is not None and any(brief.step(n) for n in (1, 2, 3)) else ""
+        )
 
         prompt += f"""
 
@@ -463,7 +634,7 @@ Requirements:
 - Email 1: Personalized cold observation + one question. 50-90 words. No pitch.
 - Email 2: Follow-up 3 days later. It must stand on its own (the reader does
   not remember email 1): 60-110 words, at least four sentences, a different
-  angle, one concrete proof point from the product knowledge, and an
+  angle, one concrete proof point from {proof}, and an
   interest-based question ("¿le interesa que le cuente cómo…?" / "worth
   hearing how…?"), never "thoughts?".
 - Email 3: Break-up 4 days after that. 30-50 words. Gives permission to say
@@ -475,7 +646,7 @@ Requirements:
 - Subject lines: lowercase, 2-4 words, like an internal note; no salesy words.
 - Language and register: {lang_line}
 - {self._sign_off_rule(profile)}
-- Follow every rule in the STRICT EMAIL RULES above. No exceptions.
+- Follow every rule in the STRICT EMAIL RULES above. No exceptions.{brief_line}
 
 Return ONLY a JSON array (no markdown fences, no commentary):
 [
@@ -489,6 +660,12 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             agent="writer", task="write_sequence",
         )
         steps = self._parse_sequence(result)
+        hits = self._out_of_scope(self._blocked(decision, brief, contexts),
+                                  *(f"{st.subject}\n{st.body}" for st in steps))
+        if hits:
+            logger.warning(f"Writer: discarded a sequence: it names a case study outside its "
+                           f"scope ({', '.join(hits)}). The prospects are tried again next cycle.")
+            return []
         if steps:
             generation_id = await self.personas.record(
                 profile, self.config, prompt, [step.model_dump() for step in steps], "write_sequence",
@@ -547,14 +724,18 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             logger.warning(f"Writer: Expected 3 emails, got {len(steps)}.")
         return steps
 
-    def _group_prospects(self, prospects: list) -> dict[str, list]:
-        """Group prospects into campaign batches by industry/title combo."""
+    def _group_prospects(self, prospects: list, decisions: dict | None = None) -> dict[str, list]:
+        """Group prospects into campaign batches by offer and industry."""
         batches: dict[str, list] = {}
 
         for prospect in prospects:
-            # Group by industry + rough title category
+            # Group by industry + rough title category, and by offer: a
+            # campaign carries exactly one offer_key.
             industry = prospect.industry or "general"
             key = f"{industry}-outreach"
+            decision = (decisions or {}).get(prospect.id)
+            if decision is not None and decision.key:
+                key += f" · {decision.key}"
 
             if key not in batches:
                 batches[key] = []

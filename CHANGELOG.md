@@ -9,6 +9,21 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Offer routing and a per-prospect offer brief.** `offers:` entries can now
+  carry eligibility (`markets`, `segments`, `signals.require` /
+  `signals.exclude`), approved content and claims, per-step calls to action
+  and angles, case studies with a scope, claim restrictions, optional
+  aggregate evidence and supporting-material metadata, and one `default`. The
+  Writer routes each prospect to the first matching offer (else the default),
+  groups campaigns by offer, stamps `offer_key` on the campaign and every
+  outbox row, and writes from that offer's brief only. A case study outside
+  its scope never reaches the prompt; a draft naming one is discarded, and the
+  pre-send gate blocks it. Aggregate evidence is computed from observations
+  and quoted only above its sample size. `/api/outbox` rows carry `offer_key`
+  and `offer` (label and routing reason). `mercury offers` lists the rules and
+  flags unknown or unconfirmed signal codes; `mercury offers route EMAIL`
+  explains one prospect's offer. Configs without offers, or with offers that
+  only set the demo gate, write exactly as before.
 - **Follow-ups thread under the first email.** With `channels.email.thread_followups`
   (on by default, also a switch on the Settings tab), steps 2 and 3 go out as
   replies to the email before them: `In-Reply-To`, a `References` header with

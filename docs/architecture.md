@@ -26,7 +26,7 @@ Mercury Agent is a single Python process that wakes up on a timer, decides what 
 ### Agents
 
 - **Scout** finds people. Python does the searching (Serper, Tavily, DuckDuckGo, Bing, Google), the scraping, the inbox sweep over discovered companies, tech detection and email resolution; Claude only scores and personalizes contacts that were already found.
-- **Writer** turns verified `new` prospects into three-step sequences (opener, follow-up, break-up) and stores them as draft campaigns. It can also regenerate a single outbox email on request.
+- **Writer** turns verified `new` prospects into three-step sequences (opener, follow-up, break-up) and stores them as draft campaigns. It can also regenerate a single outbox email on request. With `offers:` configured, it first routes each prospect to one offer (`mercury/offers.py`, deterministic: first matching rule, else the default), groups campaigns by offer, and writes from that offer's brief only.
 - **Sender** stages draft campaigns into the outbox and drains due, approved rows through the mailbox pool and the gate. On the legacy Instantly path it deploys campaigns through the Instantly API instead.
 - **Handler** polls inboxes, separates bounces from human replies, classifies intent, advances conversation stages, queues replies, handles bounces and the kill switch.
 - **Analyst** writes `data/analytics.json` with pipeline and campaign stats. No Claude calls.

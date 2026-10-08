@@ -176,8 +176,11 @@ class OutboxService:
                 "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
                 "ORDER BY updated_at DESC LIMIT 25"),
         }
+        from mercury.offers import annotate_outbox as annotate_offers
+
         for bucket in ("pending", "approved", "blocked", "sending", "sent", "failed"):
             self._with_wire_subject(data[bucket])
+            await annotate_offers(state, self.config, data[bucket])
         return data
 
     async def _item(self, item_id: str) -> dict:
@@ -195,8 +198,11 @@ class OutboxService:
         if item["status"] in EDITABLE_STATUSES:
             await annotate_outbox(self.state, self.config, [item])
         await self._with_policy([item])
+        from mercury.offers import annotate_outbox as annotate_offers
+
         legacy, known = self._mailboxes()
         rows = await with_from_mailbox(self.state, [item], legacy, known)
+        await annotate_offers(self.state, self.config, rows)
         return self._with_wire_subject(rows)[0]
 
     # ── Review ──

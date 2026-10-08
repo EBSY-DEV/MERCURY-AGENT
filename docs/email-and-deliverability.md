@@ -97,6 +97,7 @@ Prompts can be ignored, so the last check before any email leaves is determinist
 | Banned phrases | Spam triggers and AI tells such as "act now", "click here", "i hope this finds you well", "game-changer", "as an ai". |
 | Links | At most 1 URL. |
 | HTML | None. Mercury sends plain text only. |
+| Case studies | No configured case-study name or alias outside the email's offer and the prospect's market and segment (see [`offers`](configuration.md#offers)). If the scope cannot be worked out, every configured case study is blocked. |
 
 ## Mailbox rotation
 

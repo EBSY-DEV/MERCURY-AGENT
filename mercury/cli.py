@@ -1189,6 +1189,105 @@ def cmd_demos(args):
         sys.exit(1)
 
 
+def cmd_offers(args):
+    """Offers: the routing rules in order, and why a prospect gets one."""
+    import json
+
+    from mercury.config import load_config
+    from mercury.offers import (
+        build_brief, offer_problems, offers_of, route_prospect, routing_enabled,
+    )
+    from mercury.signals import seed_signal_catalog
+    from mercury.state import StateManager
+
+    def rule(o) -> str:
+        parts = []
+        if o.markets:
+            parts.append("market " + " or ".join(o.markets))
+        if o.segments:
+            parts.append("segment " + " or ".join(o.segments))
+        if o.signals.require:
+            parts.append("has " + ", ".join(o.signals.require))
+        if o.signals.exclude:
+            parts.append("not " + ", ".join(o.signals.exclude))
+        return "; ".join(parts) or ("fallback" if o.default else "no rule")
+
+    async def _run():
+        config = load_config()
+        state = StateManager()
+        await state.init_db()
+        await seed_signal_catalog(state)
+        action = args.offers_action or "list"
+        if action == "list":
+            offers = offers_of(config)
+            problems = await offer_problems(state, config)
+            if args.json:
+                return print(json.dumps({
+                    "routing": routing_enabled(config),
+                    "offers": [o.model_dump() | {"has_rule": o.has_rule} for o in offers],
+                    "problems": problems}, indent=2, default=str))
+            if not offers:
+                return print("\n  No offers. Every prospect is written from the product description.\n"
+                             "  Add some under offers: in mercury.yaml (docs/configuration.md#offers).\n")
+            state_txt = "on" if routing_enabled(config) else "off (no offer has a rule or is the default)"
+            print(f"\n  Offers: {len(offers)}, routing {state_txt}. First match wins, in this order:")
+            for n, o in enumerate(offers, 1):
+                tag = "  [default]" if o.default else ""
+                print(f"\n  {n}. {o.key:<16} {o.label if o.label != o.key else ''}{tag}")
+                print(f"     rule:         {rule(o)}")
+                steps = ", ".join(str(s) for s in sorted(o.steps)) or "none"
+                print(f"     steps with a CTA or angle: {steps}")
+                if o.case_studies:
+                    print("     case studies: " + ", ".join(
+                        cs.name + (f" ({'/'.join(cs.scope.markets + cs.scope.segments)})"
+                                   if cs.scope.markets or cs.scope.segments else "")
+                        for cs in o.case_studies))
+                if o.evidence:
+                    print(f"     evidence:     {', '.join(o.evidence.require)} "
+                          f"(quoted once {o.evidence.min_sample}+ companies are checked)")
+                if o.materials:
+                    print("     materials:    " + ", ".join(m.name for m in o.materials))
+                if o.requires_demo:
+                    print(f"     demo:         required ({o.demo_kind or 'any'})")
+            if problems:
+                print("\n  Check:")
+                for problem in problems:
+                    print(f"    - {problem}")
+            print("\n  Why one prospect gets an offer: mercury offers route EMAIL_OR_ID\n")
+            return
+        # route
+        if not args.target:
+            print("\n  Which prospect? mercury offers route EMAIL_OR_ID\n", file=sys.stderr)
+            sys.exit(1)
+        prospect = (await state.get_prospect_by_email(args.target.strip().lower())
+                    or await state.get_prospect(args.target.strip()))
+        if prospect is None:
+            print(f"\n  No prospect '{args.target}'.\n", file=sys.stderr)
+            sys.exit(1)
+        decision = await route_prospect(state, config, prospect)
+        brief = None
+        if args.brief and decision.offer is not None:
+            brief = await build_brief(state, config, decision, [args.step], [decision.context])
+        if args.json:
+            out = decision.as_dict()
+            if brief is not None:
+                out["brief"] = brief.as_dict() | {"text": brief.render().strip()}
+            return print(json.dumps(out, indent=2, default=str))
+        ctx = decision.context
+        print(f"\n  {prospect.email or prospect.id}: "
+              + (f"{decision.key}" if decision.offer is not None else "no offer"))
+        print(f"  Why: {decision.reason}")
+        print(f"  Market: {ctx.market or 'none'}   Segment: {ctx.segment or 'none'}   "
+              f"Signals: {', '.join(sorted(ctx.signals)) or 'none observed'}")
+        for check in decision.checks:
+            print(f"    {'match' if check.matched else '-':<6} {check.key:<16} {check.why}")
+        if brief is not None:
+            print("\n" + "\n".join("  " + line for line in brief.render().strip().splitlines()))
+        print()
+
+    asyncio.run(_run())
+
+
 def _print_sending(status: dict) -> None:
     """The same reasons the dashboard's Outbox banner lists."""
     if status["paused"]:
@@ -1601,6 +1700,14 @@ def main():
     sub.add_argument("--removed", action="store_true", help="list/export: include lifted rules")
     sub.add_argument("--json", action="store_true", help="Machine-readable output")
     sub.set_defaults(func=cmd_exclusions)
+
+    sub = subparsers.add_parser("offers", help="Offers: routing rules, and why a prospect gets one")
+    sub.add_argument("offers_action", nargs="?", default="list", choices=["list", "route"])
+    sub.add_argument("target", nargs="?", default="", help="route: prospect email or id")
+    sub.add_argument("--brief", action="store_true", help="route: also print the Writer's brief")
+    sub.add_argument("--step", type=int, default=1, help="route --brief: which email (default 1)")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub.set_defaults(func=cmd_offers)
 
     sub = subparsers.add_parser("holds", help="Company holds: list, hold, release")
     sub.add_argument("holds_action", nargs="?", default="list",

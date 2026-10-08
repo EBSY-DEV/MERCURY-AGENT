@@ -86,14 +86,34 @@ compliance:
   postal_address: ""
   # opt_out_line_en / opt_out_line_es override the default opt-out sentences.
 
-# Offers a campaign can carry (its offer_key). An offer with requires_demo
-# promises something already built for that business, so none of its
-# sequence emails send until that prospect's demo is marked ready
-# (`mercury demos`, or the Outbox tab). Empty = no demo gate.
+# Offers a prospect can be routed to (docs/configuration.md#offers). The
+# first offer whose rule (markets, segments, signals) matches wins, else the
+# default; the Writer then gets that offer's brief and nothing about the
+# others. An offer with requires_demo promises something already built for
+# that business, so none of its sequence emails send until that prospect's
+# demo is marked ready (`mercury demos`). Empty = one product description,
+# no routing, no demo gate. Keep real offers in mercury.local.yaml.
 offers: []
-#  - key: "voice"
-#    requires_demo: true
-#    demo_kind: "voice"       # voice | website
+#  - key: "offer_a"
+#    segments: ["segment_a"]
+#    signals: {require: ["SIGNAL_A"], exclude: ["SIGNAL_B"]}
+#    content:
+#      summary: "One plain sentence on what offer A is."
+#      claims: ["An approved claim about offer A."]
+#    steps:
+#      1: {cta: "The one question to ask."}
+#      2: {angle: "A different angle.", cta: "An interest-based question."}
+#    case_studies:
+#      - name: "Example Client Co"
+#        summary: "What happened, in approved words."
+#        scope: {segments: ["segment_a"]}
+#    restrictions: ["Never quote a price."]
+#    requires_demo: false
+#    demo_kind: ""            # voice | website
+#  - key: "offer_b"
+#    default: true            # used when no rule matches
+#    content:
+#      summary: "One plain sentence on what offer B is."
 demos:
   # Retire a ready demo this many days after the last email to a prospect
   # who never replied. The break-up email's "stays ready" must match it.

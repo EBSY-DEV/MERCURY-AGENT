@@ -7,9 +7,9 @@ an offer with ``requires_demo: true`` waits until the prospect's demo is
 marked ``ready``.
 
 The offer comes from the outbox row's ``offer_key`` (else its campaign's).
-The offer router (#57) stamps that key at write time; until it does, rows
-carry no offer and nothing here applies. Building the demo itself is out of
-scope: this module is the bookkeeping and the gate.
+The offer router (mercury/offers.py) stamps that key at write time; rows
+written without an offer carry none and nothing here applies. Building the
+demo itself is out of scope: this module is the bookkeeping and the gate.
 
 The gate fails closed. A key that is not in ``offers:``, a row with no
 prospect, or any error while checking holds the email instead of sending it.

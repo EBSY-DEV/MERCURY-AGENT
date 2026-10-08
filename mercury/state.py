@@ -765,6 +765,21 @@ MIGRATIONS: list[str] = [
     # v20: normalize both OOO branch schemas without dropping recorded data.
     # Applied transactionally by _normalize_ooo_schema below.
     "",
+    # ── v21: why each prospect got its offer ──
+    """
+    -- The routing decision behind a campaign's offer_key, per prospect: the
+    -- offer chosen at write time and the plain reason (the rule that
+    -- matched, or the fallback). The Outbox shows it next to the offer.
+    CREATE TABLE IF NOT EXISTS offer_routes (
+        campaign_id TEXT NOT NULL,
+        prospect_id TEXT NOT NULL,
+        offer_key TEXT NOT NULL DEFAULT '',
+        reason TEXT DEFAULT '',
+        is_default INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (campaign_id, prospect_id)
+    );
+    """,
 ]
 
 
@@ -2238,6 +2253,45 @@ class StateManager:
                 row = await cursor.fetchone()
         return _norm(row[0]) if row else ""
 
+    async def record_offer_routes(self, campaign_id: str, routes: list[dict]) -> None:
+        """Keep why each prospect of a campaign got its offer:
+        [{prospect_id, offer_key, reason, is_default}]."""
+        if not campaign_id or not routes:
+            return
+        async with self._connect() as db:
+            await db.executemany(
+                "INSERT OR REPLACE INTO offer_routes "
+                "(campaign_id, prospect_id, offer_key, reason, is_default) VALUES (?, ?, ?, ?, ?)",
+                [(campaign_id, r["prospect_id"], _norm(r.get("offer_key")),
+                  r.get("reason") or "", int(bool(r.get("is_default")))) for r in routes],
+            )
+            await db.commit()
+
+    async def outbox_offers(self, rows: list[dict]) -> dict[str, dict]:
+        """Per outbox id: the offer it carries (its own key, else its
+        campaign's) and the recorded routing reason, if any."""
+        ids = [r["id"] for r in rows if r.get("id")]
+        if not ids:
+            return {}
+        result: dict[str, dict] = {}
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                async with db.execute(
+                    f"SELECT o.id, {self._OUTBOX_OFFER_SQL} AS offer_key, "
+                    "COALESCE(r.reason, '') AS reason, COALESCE(r.is_default, 0) AS is_default "
+                    "FROM outbox o "
+                    "LEFT JOIN campaigns c ON c.id = o.campaign_id AND o.campaign_id != '' "
+                    "LEFT JOIN offer_routes r ON r.campaign_id = o.campaign_id "
+                    "AND r.prospect_id = o.prospect_id AND o.campaign_id != '' "
+                    f"WHERE o.id IN ({', '.join('?' for _ in chunk)})",
+                    chunk,
+                ) as cursor:
+                    for row in await cursor.fetchall():
+                        result[row["id"]] = dict(row)
+        return result
+
     async def queued_offer_outbox(self, ids: list[str] | None = None) -> list[dict]:
         """Queued sequence rows that carry an offer, each with its resolved
         ``offer``, its prospect, and the live demo for that prospect and offer
@@ -3090,6 +3144,75 @@ class StateManager:
         async with self._connect() as db:
             async with db.execute(sql, params) as cursor:
                 return [row[0] for row in await cursor.fetchall()]
+
+    async def company_signals(self, company_id: str) -> dict[str, dict]:
+        """The newest observation of each signal for one company, with the
+        signal's label and value type: what offer routing and the brief read."""
+        if not company_id:
+            return {}
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                self._CURRENT_CTE + """
+                SELECT l.*, COALESCE(sc.label, '') AS label,
+                       COALESCE(sc.value_type, 'text') AS value_type
+                FROM latest l LEFT JOIN signal_codes sc ON sc.code = l.signal_code
+                WHERE l.company_id = ?""",
+                (company_id,),
+            ) as cursor:
+                return {r["signal_code"]: dict(r) for r in await cursor.fetchall()}
+
+    async def cohort_share(
+        self, require: list[str], exclude: list[str] | None = None,
+        segments: list[str] | None = None,
+    ) -> tuple[int, int]:
+        """(matched, checked) for an aggregate-evidence cohort.
+
+        ``checked`` is every company with a current observation of each
+        required signal, whatever its value: the companies Mercury actually
+        looked at. ``matched`` is the subset carrying them all and none of
+        ``exclude``, the same reading ``cohort()`` uses. ``segments`` keeps
+        only companies whose industry, or one of whose prospects' industry,
+        is one of them.
+        """
+        if not require:
+            return 0, 0
+        require = list(dict.fromkeys(require))
+        req_ph = ",".join("?" for _ in require)
+        params: list = []
+
+        def having(source: str) -> str:
+            params.extend([*require, len(require)])
+            return (f"SELECT company_id FROM {source} WHERE signal_code IN ({req_ph}) "
+                    "AND company_id != '' GROUP BY company_id "
+                    "HAVING COUNT(DISTINCT signal_code) = ?")
+
+        segment_sql = ""
+        segments = [s.strip().lower() for s in segments or [] if s and s.strip()]
+        if segments:
+            seg_ph = ",".join("?" for _ in segments)
+            segment_sql = (
+                " AND company_id IN (SELECT id FROM companies "
+                f"WHERE lower(trim(industry)) IN ({seg_ph}) "
+                "UNION SELECT company_id FROM prospects "
+                f"WHERE company_id != '' AND lower(trim(industry)) IN ({seg_ph}))"
+            )
+        checked_sql = f"SELECT COUNT(*) FROM ({having('latest')}) WHERE 1 {segment_sql}"
+        checked_params = list(params) + segments * 2
+        params.clear()
+        matched_sql = f"SELECT COUNT(*) FROM ({having('positive')}) WHERE 1 {segment_sql}"
+        matched_params = list(params) + segments * 2
+        if exclude:
+            exc_ph = ",".join("?" for _ in exclude)
+            matched_sql += (" AND company_id NOT IN (SELECT company_id FROM positive "
+                            f"WHERE signal_code IN ({exc_ph}))")
+            matched_params.extend(exclude)
+        async with self._connect() as db:
+            async with db.execute(self._CURRENT_CTE + checked_sql, checked_params) as cursor:
+                checked = (await cursor.fetchone())[0]
+            async with db.execute(self._CURRENT_CTE + matched_sql, matched_params) as cursor:
+                matched = (await cursor.fetchone())[0]
+        return int(matched), int(checked)
 
     async def companies_needing_profile(
         self, limit: int = 100, stale_days: int = 90
