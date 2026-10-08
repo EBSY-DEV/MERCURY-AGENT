@@ -6,6 +6,8 @@ import pytest_asyncio
 
 import mercury.state as state_module
 from mercury.control.exclusions import ExclusionService
+from mercury.control.context import OperatorContext
+from mercury.control.outbox import OutboxService
 from mercury.integrations.mail_provider import InboundMessage
 from mercury.state import StateManager
 from tests.test_contact_policy import add_campaign, add_company, add_person, sender_with, _utc
@@ -46,7 +48,11 @@ async def test_requeued_followup_waits_for_explicit_approval_after_restart(state
     assert (await state.get_outbox_item(blocked["id"]))["status"] == "pending_review"
 
     # A real approval, including Approve all, releases the review requirement.
-    assert await state.approve_outbox(None if approve_all else blocked["id"]) == 1
+    outbox = OutboxService(OperatorContext.local("cli"), state)
+    if approve_all:
+        assert (await outbox.approve_all(await outbox.pending_snapshot()))["approved"] == 1
+    else:
+        assert (await outbox.approve(blocked["id"], blocked["revision"]))["approved"] == 1
     await sender._run_native()
     assert len(provider.sent) == 2
     assert (await state.get_outbox_item(blocked["id"]))["status"] == "sent"

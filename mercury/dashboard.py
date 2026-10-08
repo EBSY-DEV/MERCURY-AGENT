@@ -5,11 +5,8 @@ import json
 import logging
 import os
 import re
-import signal
-import subprocess
-import sys
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 import pathlib
 
@@ -27,6 +24,15 @@ from mercury.paths import PROJECT_ROOT  # noqa: E402
 from mercury.personas_api import router as personas_router  # noqa: E402
 from mercury.imports_api import router as imports_router  # noqa: E402
 from mercury.demos_api import router as demos_router  # noqa: E402
+from mercury.control.audit import redact_text  # noqa: E402
+from mercury.control.context import OperatorContext  # noqa: E402
+from mercury.control.errors import (  # noqa: E402
+    Conflict, ControlError, Forbidden, Invalid, NotFound, Unavailable,
+)
+from mercury.control.outbox import OutboxService, with_from_mailbox  # noqa: E402
+from mercury.control.queries import (  # noqa: E402
+    SIGNAL_CATEGORIES, SIGNAL_CATEGORY_ORDER, QueryService,
+)
 from mercury.exclusions_api import router as exclusions_router  # noqa: E402
 from mercury.pauses_api import router as pauses_router  # noqa: E402
 # MERCURY_DB_PATH points the dashboard at another database (e.g. the demo
@@ -44,13 +50,51 @@ app.include_router(demos_router)
 app.include_router(exclusions_router)
 app.include_router(pauses_router)
 
-# Mercury process tracking
-_mercury_process: subprocess.Popen | None = None
-_mercury_started_at: datetime | None = None
 _env_lock = asyncio.Lock()
+# Everything this server does, it does for the person at this machine.
+DASHBOARD = OperatorContext.local("dashboard")
+REQUEST_KEY_MAX = 200
+
+
+def _ctx(request: Request | None = None) -> OperatorContext:
+    """The local operator. A request that sends an ``Idempotency-Key``
+    header gets it as its request key: a retry with the same key returns
+    the first answer instead of running the command again."""
+    key = (request.headers.get("Idempotency-Key") or "").strip() if request is not None else ""
+    return OperatorContext.local("dashboard", request_id=key[:REQUEST_KEY_MAX]) if key else DASHBOARD
 
 
 # ── Helpers ──
+
+
+# Domain errors from mercury/control, as HTTP statuses. Request parsing and
+# this translation stay here; the services never build a response.
+CONTROL_STATUS = ((NotFound, 404), (Conflict, 409), (Forbidden, 403), (Invalid, 400))
+CODE_STATUS = {"provider_failed": 502}
+
+
+def _control_status(error: ControlError, overrides: dict | None = None) -> int:
+    if overrides and error.code in overrides:
+        return overrides[error.code]
+    if error.code in CODE_STATUS:
+        return CODE_STATUS[error.code]
+    if isinstance(error, Unavailable):
+        return 503
+    return next((status for cls, status in CONTROL_STATUS if isinstance(error, cls)), 400)
+
+
+def _control_error(error: ControlError, key: str = "message",
+                   overrides: dict | None = None, detail: bool = False) -> JSONResponse:
+    """The error as JSON. ``detail`` adds the stable code and its details;
+    routes that predate the services leave it off to keep their old shape."""
+    body = {"success": False, key: redact_text(str(error))}
+    if detail:
+        body |= {"code": error.code, **error.details}
+    return JSONResponse(body, status_code=_control_status(error, overrides))
+
+
+def _queries() -> QueryService:
+    return QueryService(DASHBOARD, _state())
 
 
 async def query_db(sql: str, params: tuple = ()) -> list[dict]:
@@ -93,19 +137,14 @@ def _write_env_file(updates: dict[str, str]):
     load_dotenv(str(ENV_FILE), override=True, interpolate=False)
 
 
+def _runtime():
+    from mercury.control.runtime import RuntimeService
+    return RuntimeService(DASHBOARD, PROJECT_ROOT, PID_FILE, LOG_FILE)
+
+
 def _check_mercury_pid() -> int | None:
     """Check if there's a running Mercury process from a PID file."""
-    global _mercury_process, _mercury_started_at
-    if _mercury_process and _mercury_process.poll() is None:
-        return _mercury_process.pid
-    if PID_FILE.exists():
-        try:
-            pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 0)  # Check if process exists
-            return pid
-        except (ValueError, ProcessLookupError, PermissionError):
-            PID_FILE.unlink(missing_ok=True)
-    return None
+    return _runtime().pid()
 
 
 # ── Setup Status ──
@@ -346,6 +385,46 @@ async def save_env_settings(request: Request):
     return {"success": True}
 
 
+@app.get("/api/config")
+async def get_supported_config():
+    """The mercury.yaml settings that can be changed from here, and their values."""
+    from mercury.control.settings import ConfigService
+
+    try:
+        return await ConfigService(DASHBOARD, _state()).get()
+    except ControlError as e:
+        return _control_error(e, detail=True)
+    except Exception as e:
+        logger.warning("Could not read the config: %s", e)
+        return JSONResponse({"success": False, "message": "Could not read the Mercury configuration."},
+                            status_code=500)
+
+
+@app.patch("/api/config")
+async def update_supported_config(request: Request):
+    """Change allowlisted settings: {"revision": <from GET>, "changes":
+    {"dotted.path": value, ...}}. A secret or an unsupported field is refused
+    before anything is written; so is a stale revision."""
+    from mercury.control.settings import ConfigService
+
+    body = await _json_body(request)
+    if body is None:
+        return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
+    async with _env_lock:
+        try:
+            state = _state()
+            await state.init_db()
+            result = await ConfigService(_ctx(request), state).update(
+                body.get("changes"), body.get("revision"))
+        except ControlError as e:
+            return _control_error(e, detail=True)
+        except Exception as e:
+            logger.warning("Could not save the config: %s", e)
+            return JSONResponse({"success": False, "message": "Could not save the Mercury configuration."},
+                                status_code=500)
+    return {"success": True, **result, "restart_required": _check_mercury_pid() is not None}
+
+
 @app.post("/api/settings/test-instantly")
 async def test_instantly(request: Request):
     """Test an Instantly API key."""
@@ -377,22 +456,13 @@ async def test_instantly(request: Request):
 @app.get("/api/companies")
 async def get_companies():
     """All companies with contact counts."""
-    rows = await query_db("""
-        SELECT c.*,
-            (SELECT COUNT(*) FROM prospects p WHERE p.company_id = c.id) as contact_count
-        FROM companies c ORDER BY c.created_at DESC LIMIT 200
-    """)
-    return rows
+    return await _queries().companies()
 
 
 @app.get("/api/companies/{company_id}/contacts")
 async def get_company_contacts(company_id: str):
     """Get all contacts for a specific company."""
-    rows = await query_db(
-        "SELECT * FROM prospects WHERE company_id = ? ORDER BY score DESC",
-        (company_id,),
-    )
-    return rows
+    return await _queries().company_contacts(company_id)
 
 
 # ── Feedback ──
@@ -453,99 +523,32 @@ async def get_feedback(entity_type: str, entity_id: str):
 @app.get("/api/mercury/status")
 async def get_mercury_status():
     """Check if Mercury is currently running."""
-    pid = _check_mercury_pid()
-    started = _mercury_started_at.isoformat() if _mercury_started_at else None
-    return {"running": pid is not None, "pid": pid, "started_at": started}
+    return await _runtime().status()
 
 
 @app.post("/api/mercury/start")
 async def start_mercury():
     """Start Mercury's heartbeat loop as a subprocess."""
-    global _mercury_process, _mercury_started_at
-
-    if _check_mercury_pid():
-        return {"success": False, "message": "Mercury is already running."}
-
-    # Ensure data dir exists
-    (PROJECT_ROOT / "data").mkdir(parents=True, exist_ok=True)
-
     try:
-        log_handle = open(LOG_FILE, "a")
-        try:
-            _mercury_process = subprocess.Popen(
-                [sys.executable, "-m", "mercury", "run"],
-                cwd=str(PROJECT_ROOT),
-                stdout=log_handle,
-                stderr=log_handle,
-                start_new_session=True,
-            )
-        finally:
-            # Child holds its own copies of the fds; don't leak ours.
-            log_handle.close()
-    except Exception as e:
-        logger.warning("Failed to start Mercury: %s", e)
-        return {"success": False, "message": f"Failed to start Mercury: {e}"}
-    _mercury_started_at = datetime.now()
-
-    # Write PID file
-    try:
-        PID_FILE.write_text(str(_mercury_process.pid))
-    except OSError as e:
-        logger.warning("Could not write PID file: %s", e)
-
-    return {"success": True, "pid": _mercury_process.pid}
+        return {"success": True, **await _runtime().start()}
+    except ControlError as e:
+        return {"success": False, "message": str(e)}
 
 
 @app.post("/api/mercury/stop")
-async def stop_mercury():
-    """Stop the Mercury subprocess."""
-    global _mercury_process, _mercury_started_at
-
-    pid = _check_mercury_pid()
-    if not pid:
-        return {"success": False, "message": "Mercury is not running."}
-
+async def stop_mercury(force: bool = False):
+    """Ask Mercury to stop. It finishes the step it is on; ``stopping`` says
+    it has not exited yet. ``?force=true`` kills it instead."""
     try:
-        os.kill(pid, signal.SIGTERM)
-        # Wait briefly for graceful shutdown
-        for _ in range(10):
-            try:
-                os.kill(pid, 0)
-                await asyncio.sleep(0.5)
-            except ProcessLookupError:
-                break
-        else:
-            # Force kill if still running
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-    except (ProcessLookupError, PermissionError):
-        pass
-
-    _mercury_process = None
-    _mercury_started_at = None
-    PID_FILE.unlink(missing_ok=True)
-
-    return {"success": True}
+        return {"success": True, **await _runtime().stop(force=force)}
+    except ControlError as e:
+        return {"success": False, "message": str(e)}
 
 
 @app.get("/api/mercury/logs")
 async def get_mercury_logs():
     """Get recent log lines."""
-    if not LOG_FILE.exists():
-        return {"lines": []}
-    try:
-        # Tail only the last 64KB so a huge log file never blocks the UI
-        with open(LOG_FILE, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - 65536))
-            text = f.read().decode("utf-8", errors="replace")
-        lines = text.strip().splitlines()[-100:]
-        return {"lines": lines}
-    except Exception:
-        return {"lines": []}
+    return await _runtime().logs()
 
 
 # ── Pipeline Data (existing endpoints) ──
@@ -555,37 +558,7 @@ async def get_mercury_logs():
 async def get_stats():
     """Pipeline overview stats."""
     try:
-        prospects = await query_db(
-            "SELECT status, COUNT(*) as count FROM prospects GROUP BY status"
-        )
-        prospect_total = sum(r["count"] for r in prospects)
-        prospect_map = {r["status"]: r["count"] for r in prospects}
-
-        campaigns = await query_db(
-            "SELECT status, COUNT(*) as count FROM campaigns GROUP BY status"
-        )
-        campaign_map = {r["status"]: r["count"] for r in campaigns}
-
-        conversations = await query_db(
-            "SELECT status, COUNT(*) as count FROM conversations GROUP BY status"
-        )
-        convo_map = {r["status"]: r["count"] for r in conversations}
-
-        actions = await query_db("SELECT COUNT(*) as count FROM actions")
-        action_count = actions[0]["count"] if actions else 0
-
-        usage = await query_db(
-            "SELECT claude_calls FROM usage_log WHERE date = date('now')"
-        )
-        usage_today = usage[0]["claude_calls"] if usage else 0
-
-        return {
-            "prospects": {"total": prospect_total, "by_status": prospect_map},
-            "campaigns": {"total": sum(campaign_map.values()), "by_status": campaign_map},
-            "conversations": {"total": sum(convo_map.values()), "by_status": convo_map},
-            "actions_total": action_count,
-            "claude_calls_today": usage_today,
-        }
+        return await _queries().stats()
     except Exception as e:
         return {"error": str(e)}
 
@@ -653,8 +626,7 @@ async def get_usage():
 
 @app.get("/api/prospects")
 async def get_prospects():
-    rows = await query_db("SELECT * FROM prospects ORDER BY created_at DESC LIMIT 200")
-    return rows
+    return await _queries().prospects()
 
 
 def _state():
@@ -662,57 +634,27 @@ def _state():
     return StateManager(db_path=str(DB_PATH))
 
 
+def _outbox(with_pool: bool = False, request: Request | None = None) -> OutboxService:
+    """The outbox commands, wired the way the sender sees the world. The
+    pool is only needed to say which mailbox an email goes out from."""
+    pool = None
+    if with_pool:
+        try:
+            _cfg, pool = _mail_context()
+        except Exception:
+            pool = None
+    return OutboxService(_ctx(request), _state(), _demo_config(), pool)
+
+
 @app.get("/api/outbox")
 async def get_outbox_api():
     """Outbox queue + kill-switch state for the Outbox tab."""
     try:
-        state = _state()
-        await state.init_db()
-        try:
-            cfg, pool = _mail_context()
-            legacy = pool.legacy.email if pool else ""
-            known = {mb.email for mb in pool.mailboxes} if pool else None
-            threaded = cfg.channels.email.thread_followups
-        except Exception:
-            legacy, known, threaded = "", None, True
-        from mercury.demos import annotate_outbox, waiting_for_demo
-
-        config = _demo_config()
-        pending = await state.get_outbox(status="pending_review", limit=100)
-        approved = await state.get_outbox(status="approved", limit=50)
-        await annotate_outbox(state, config, pending + approved)
-        return _with_wire_subject(threaded, {
-            "paused": await state.get_setting("sending_paused"),
-            "pending": await _with_policy(
-                state, await _with_from_mailbox(state, pending, legacy, known)),
-            "approved": await _with_policy(
-                state, await _with_from_mailbox(state, approved, legacy, known)),
-            "blocked": await _with_policy(state, await state.get_outbox(
-                status="blocked", limit=50)),
-            "waiting_demo": await waiting_for_demo(state, config),
-            "sending": await _with_from_mailbox(
-                state, await state.get_outbox(status="sending", limit=50), legacy, known),
-            "sent": await _with_from_mailbox(state, await query_db(
-                "SELECT * FROM outbox WHERE status = 'sent' "
-                "ORDER BY sent_at DESC LIMIT 25"), legacy),
-            "failed": (await query_db(
-                "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
-                "ORDER BY updated_at DESC LIMIT 25")),
-        })
+        return await (await _outbox(with_pool=True).ready()).overview()
     except Exception as e:
         return {"error": str(e)}
 
 
-def _with_wire_subject(threaded: bool, data: dict) -> dict:
-    """Add ``wire_subject`` to every row: what the recipient sees. A
-    follow-up threaded under its opener goes out as "Re: <first subject>"."""
-    from mercury.state import wire_subject
-
-    for rows in data.values():
-        if isinstance(rows, list):
-            for r in rows:
-                r["wire_subject"] = wire_subject(r, threaded)
-    return data
 def _demo_config():
     """The config the demo gate reads, or None when it can't be loaded. The
     gate fails closed on None: every email that carries an offer shows held."""
@@ -728,84 +670,13 @@ def _demo_config():
 def _mail_context():
     """(config, pool) built exactly as the sender builds them. Re-reads .env
     on each call, so a password added by hand shows up without a restart."""
-    from mercury.config import load_config, load_env
-    from mercury.integrations.mailboxes import MailboxPool
+    from mercury.control.settings import mail_context
 
-    from dotenv import dotenv_values
-
-    # Read .env over a copy of the environment; never mutate os.environ
-    # here (the agent the dashboard starts inherits it).
-    values = dict(os.environ)
-    if ENV_FILE.exists():
-        values.update({k: v for k, v in dotenv_values(str(ENV_FILE), interpolate=False).items() if v is not None})
-    config = load_config()
-    return config, MailboxPool.from_config(config, load_env(values))
+    return mail_context(ENV_FILE)
 
 
-async def _with_policy(state, rows: list[dict]) -> list[dict]:
-    """Add ``policy``: whether each queued email can go out under the
-    exclusions and company limits, and if not, why and what to do."""
-    from mercury.policy import ContactPolicy
-
-    try:
-        from mercury.config import load_config
-        config = load_config()
-    except Exception:
-        config = None
-    policy = ContactPolicy(state, config)
-    for r in rows:
-        r["policy"] = (await policy.explain(r)).as_dict()
-    return rows
-
-
-async def _with_from_mailbox(state, rows: list[dict], legacy_email: str = "",
-                             known: set[str] | None = None) -> list[dict]:
-    """Add ``from_mailbox``: the address an email goes (or went) out from,
-    resolved the way the sender resolves it. A follow-up inherits its
-    opener's mailbox, '' on an old thread means the legacy mailbox, and a
-    new thread whose opener has not gone out yet stays '' (it rotates)."""
-    need = [r.get("campaign_id") or "" for r in rows
-            if not r.get("mailbox") and r.get("kind") == "sequence"
-            and int(r.get("step") or 1) > 1]
-    threads = await state.get_thread_mailboxes(need)
-    for r in rows:
-        fm = r.get("mailbox") or ""
-        if not fm:
-            if r.get("status") == "sent" or r.get("kind") == "reply":
-                fm = legacy_email
-            elif r.get("kind") == "sequence" and int(r.get("step") or 1) > 1:
-                key = (r.get("campaign_id") or "", r.get("prospect_id") or "")
-                if key in threads:
-                    fm = threads[key] or legacy_email
-        r["from_mailbox"] = fm
-        # Queued mail pinned to a mailbox no longer configured is held by
-        # the sender (never re-routed); say so in the UI.
-        r["from_removed"] = bool(fm and known is not None and fm not in known
-                                 and r.get("status") != "sent")
-    from mercury.personas import PersonaStore
-    return await PersonaStore(state).enrich(rows)
-
-
-async def _promote_followups_if_enabled(state, item: dict | None = None) -> int:
-    """auto_approve_followups: promote right away on approval, so the
-    follow-ups leave the review desk instead of waiting for the next cycle."""
-    try:
-        from mercury.config import load_config
-
-        if not getattr(load_config().channels.email, "auto_approve_followups", False):
-            return 0
-    except Exception:
-        return 0
-    thread = {}
-    if item and item.get("campaign_id"):
-        thread = {"campaign_id": item["campaign_id"], "prospect_id": item.get("prospect_id") or ""}
-    total = 0
-    for _ in range(10):
-        n = await state.approve_ready_followups(**thread)
-        if not n:
-            break
-        total += n
-    return total
+# Kept under its old name: the calendar and the tests use it.
+_with_from_mailbox = with_from_mailbox
 
 
 @app.get("/api/mailboxes")
@@ -890,7 +761,7 @@ async def save_email_options_api(request: Request):
 
 
 async def _save_inbox(request: Request, email: str | None = None):
-    from mercury.config import _find_config_file
+    from mercury.control.settings import config_paths
     from mercury.inbox_settings import InboxError, save
 
     try:
@@ -899,7 +770,7 @@ async def _save_inbox(request: Request, email: str | None = None):
         return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
     async with _env_lock:
         try:
-            source, private = _config_targets(_find_config_file())
+            source, private = config_paths()
             result = save(source, ENV_FILE, data, email, private)
             result["restart_required"] = _check_mercury_pid() is not None
             return result
@@ -942,109 +813,121 @@ async def test_inbox(email: str):
 
 
 @app.post("/api/outbox/approve-all")
-async def outbox_approve_all():
+async def outbox_approve_all(request: Request):
+    """Approve the emails the reviewer was shown: {"items": [{"id", "revision"}]}.
+    Anything not listed, or changed since, stays in review."""
+    body = await _json_body(request)
+    if body is None:
+        return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
     try:
-        state = _state()
-        await state.init_db()
-        n = await state.approve_outbox()
-        await _promote_followups_if_enabled(state)
-        return {"success": True, "approved": n}
+        result = await (await _outbox(request=request).ready()).approve_all(body.get("items"))
+        return {"success": True, **result}
+    except ControlError as e:
+        return _control_error(e, detail=True)
     except Exception as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
 
 
 @app.post("/api/outbox/{item_id}/approve")
-async def outbox_approve(item_id: str):
+async def outbox_approve(item_id: str, request: Request):
+    """Approve one email at the revision on screen: {"revision": n}."""
+    body = await _json_body(request) or {}
     try:
-        state = _state()
-        await state.init_db()
-        n = await state.approve_outbox(item_id)
-        followups = 0
-        if n:
-            followups = await _promote_followups_if_enabled(
-                state, await state.get_outbox_item(item_id))
-        return {"success": bool(n), "followups_approved": followups}
+        result = await (await _outbox(request=request).ready()).approve(item_id, body.get("revision"))
+        return {"success": True, "followups_approved": result["followups_approved"],
+                "revision": result["revision"]}
+    except ControlError as e:
+        if e.code in ("not_found", "not_pending"):
+            return {"success": False, "followups_approved": 0}
+        return _control_error(e, detail=True)
     except Exception as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
+
+
+@app.post("/api/outbox/batch")
+async def outbox_batch(request: Request):
+    """Approve or reject a frozen list: {"action", "items": [{"id", "revision"}]}."""
+    body = await _json_body(request)
+    if body is None:
+        return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
+    try:
+        result = await (await _outbox(request=request).ready()).batch(body.get("action"), body.get("items"))
+        return {"success": True, **result}
+    except ControlError as e:
+        return _control_error(e, detail=True)
+    except Exception as e:
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
+
+
+@app.get("/api/outbox/{item_id}")
+async def outbox_item(item_id: str):
+    """One email as the review desk shows it."""
+    try:
+        return await (await _outbox(with_pool=True).ready()).get(item_id)
+    except ControlError as e:
+        return _control_error(e, detail=True)
 
 
 @app.post("/api/outbox/{item_id}/reject")
-async def outbox_reject(item_id: str):
+async def outbox_reject(item_id: str, request: Request):
+    """Reject one queued email at the revision on screen: {"revision": n}."""
+    body = await _json_body(request) or {}
     try:
-        state = _state()
-        await state.init_db()
-        n = await state.reject_outbox_item(item_id)
-        return {"success": True, "rejected": n}
+        result = await (await _outbox(request=request).ready()).reject(item_id, body.get("revision"))
+        return {"success": True, "rejected": result["rejected"]}
+    except ControlError as e:
+        if e.code in ("not_found", "not_queued"):
+            return {"success": True, "rejected": 0}
+        return _control_error(e, detail=True)
     except Exception as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
 
 
 @app.put("/api/outbox/{item_id}")
 async def outbox_edit(item_id: str, request: Request):
-    """The reviewer edits a draft in place. Approved mail stays approved."""
+    """The reviewer edits a draft in place: {"subject", "body", "revision"}.
+    The edit is a new revision; an approved draft goes back to review."""
     try:
         body = await request.json()
         subject = str(body.get("subject") or "").strip()[:200]
         text = str(body.get("body") or "").strip()[:4000]
-        if not subject or not text:
-            return JSONResponse({"success": False, "message": "subject and body are required"},
-                                status_code=400)
-        state = _state()
-        await state.init_db()
-        item = await state.get_outbox_item(item_id)
-        if not item or item.get("status") not in ("pending_review", "approved"):
-            return JSONResponse({"success": False,
-                                 "message": "only pending or approved drafts can be edited"},
-                                status_code=409)
-        if not await state.edit_outbox_item(item_id, subject=subject, body=text, manually_edited=1):
-            return JSONResponse({"success": False, "message": "this draft has started sending"},
-                                status_code=409)
-        return {"success": True}
+        result = await (await _outbox(request=request).ready()).edit(
+            item_id, subject, text, body.get("revision"))
+        return {"success": True, "revision": result["revision"], "status": result["status"],
+                "approval_cleared": result["approval_cleared"]}
+    except NotFound:
+        return JSONResponse({"success": False,
+                             "message": "only pending or approved drafts can be edited"},
+                            status_code=409)
+    except ControlError as e:
+        return _control_error(e, detail=True)
     except Exception as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
 
 
 @app.post("/api/outbox/{item_id}/reschedule")
 async def outbox_reschedule(item_id: str, request: Request):
-    """Move a queued email to a new send time (stored as naive UTC)."""
+    """Move a queued email to a new send time (stored as naive UTC):
+    {"send_at", "revision"}. An approved email goes back to review."""
     try:
         body = await request.json()
     except Exception:
         body = {}
-    raw = (body or {}).get("send_at") if isinstance(body, dict) else None
-    when = _parse_send_at(raw)
+    body = body if isinstance(body, dict) else {}
+    when = _parse_send_at(body.get("send_at"))
     if when is None:
         return JSONResponse(
             {"success": False, "error": "send_at must be an ISO datetime"},
             status_code=400)
     try:
-        state = _state()
-        await state.init_db()
-        item = await state.get_outbox_item(item_id)
-        if not item:
-            return JSONResponse(
-                {"success": False, "error": "outbox item not found"}, status_code=404)
-        if item.get("status") not in ("pending_review", "approved"):
-            return JSONResponse(
-                {"success": False,
-                 "error": f"cannot reschedule an email that is {item.get('status')}"},
-                status_code=400)
-        if when < _utc_naive_now() - timedelta(minutes=1):
-            return JSONResponse(
-                {"success": False, "error": "send_at is in the past"}, status_code=400)
-        normalized = when.isoformat(timespec="seconds")
-        if not await state.edit_outbox_item(item_id, send_at=normalized):
-            return JSONResponse({"success": False, "error": "this draft has started sending"},
-                                status_code=409)
-        try:
-            await state.log_action("outbox_reschedule", "dashboard", {
-                "outbox_id": item_id, "from": item.get("send_at"), "to": normalized,
-            })
-        except Exception as e:
-            logger.debug("reschedule log_action failed: %s", e)
-        return {"success": True, "send_at": normalized}
+        result = await (await _outbox(request=request).ready()).reschedule(
+            item_id, when, body.get("revision"))
+        return {"success": True, "send_at": result["send_at"], "revision": result["revision"],
+                "status": result["status"], "approval_cleared": result["approval_cleared"]}
+    except ControlError as e:
+        return _control_error(e, "error", {"not_editable": 400}, detail=True)
     except Exception as e:
-        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+        return JSONResponse({"success": False, "error": redact_text(e)}, status_code=500)
 
 
 # ── Out-of-office pauses ──
@@ -1149,10 +1032,6 @@ LEFT JOIN companies c ON c.id = p.company_id
 LEFT JOIN lc ON lc.prospect_id = p.id AND lc.rn = 1
 LEFT JOIN ob ON ob.prospect_id = p.id
 """
-
-
-def _utc_naive_now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _ts_key(value) -> str:
@@ -1364,7 +1243,7 @@ async def get_calendar(start: str | None = None, end: str | None = None):
     except Exception as e:
         logger.debug("calendar init_db failed: %s", e)
     rows = await query_db(
-        f"""SELECT o.id, {_CAL_EVENT_EXPR} AS at, o.kind, o.step, o.status,
+        f"""SELECT o.id, {_CAL_EVENT_EXPR} AS at, o.kind, o.step, o.status, o.revision,
                    o.subject, o.to_email, o.prospect_id, o.campaign_id, o.error,
                    o.body, COALESCE(o.mailbox, '') AS mailbox, p.first_name, p.last_name,
                    COALESCE(NULLIF(c.name, ''), p.company, '') AS company_name
@@ -1399,6 +1278,7 @@ async def get_calendar(start: str | None = None, end: str | None = None):
             "step": int(r.get("step") or 1),
             "label": _outbox_label(kind, r.get("step")),
             "status": r.get("status") or "",
+            "revision": int(r.get("revision") or 1),
             "subject": r.get("subject") or "",
             "to_email": r.get("to_email") or "",
             "prospect_id": r.get("prospect_id") or "",
@@ -1420,67 +1300,54 @@ async def outbox_regenerate(item_id: str, request: Request):
             body = await request.json()
         except Exception:
             body = {}
-        instruction = str((body or {}).get("instruction") or "").strip()[:500]
-        state = _state()
-        await state.init_db()
-        item = await state.get_outbox_item(item_id)
-        if not item or item.get("status") not in ("pending_review", "approved"):
-            return JSONResponse({"success": False,
-                                 "message": "only pending or approved drafts can be regenerated"},
-                                status_code=409)
-        prospect = await state.get_prospect(item["prospect_id"])
-        if not prospect:
-            return JSONResponse({"success": False, "message": "prospect not found"}, status_code=404)
-        from mercury.agents.writer import Writer
-        from mercury.brain import Brain
-        from mercury.config import load_config, load_env
+        body = body if isinstance(body, dict) else {}
+        instruction = str(body.get("instruction") or "").strip()[:500]
+        updated = await (await _outbox(request=request).ready()).regenerate(
+            item_id, instruction, body.get("revision"))
+        return {"success": True, **updated}
+    except NotFound as e:
+        if e.code != "not_found":
+            return _control_error(e)
+        return JSONResponse({"success": False,
+                             "message": "only pending or approved drafts can be regenerated"},
+                            status_code=409)
+    except ControlError as e:
+        return _control_error(e, detail=True)
+    except Exception as e:
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
 
-        from mercury.personas import PersonaStore
-        if item.get("kind") == "reply":
-            from mercury.agents.handler import Handler
-            convo = await state.get_conversation(item.get("conversation_id") or "")
-            if not convo:
-                return JSONResponse({"success": False, "message": "conversation not found"}, status_code=404)
-            config = load_config()
-            handler = Handler(Brain(state), state, config, load_env())
-            profile = await PersonaStore(state).for_generation(config, item.get("generation_id", ""))
-            latest = next((m.content for m in reversed(convo.thread) if not m.is_ours), "")
-            response = await handler._generate_response(
-                convo.intent, latest, prospect, convo, instruction=instruction, profile=profile,
-            )
-            draft = {"subject": item["subject"], "body": response,
-                     "generation_id": handler._response_generation_id} if response else None
-        else:
-            writer = Writer(Brain(state), state, load_config(), load_env())
-            draft = await writer.regenerate_email(item, prospect, instruction)
-        if not draft:
-            return JSONResponse({"success": False, "message": "the writer returned nothing; try again"},
-                                status_code=502)
-        # A regenerated draft is unread: back to the review queue.
-        try:
-            await PersonaStore(state).replace_draft(item_id, draft)
-        except ValueError as error:
-            return JSONResponse({"success": False, "message": str(error)}, status_code=409)
-        updated = await PersonaStore(state).enrich([await state.get_outbox_item(item_id)])
-        return {"success": True, **updated[0]}
+
+def _sending():
+    from mercury.control.sending import SendingService
+
+    return SendingService(DASHBOARD, _state(), _demo_config())
+
+
+@app.get("/api/sending/status")
+async def sending_status():
+    """The operator pause, every hold and what is in flight: the same read
+    `mercury sending status` prints."""
+    try:
+        return await (await _sending().ready()).status()
+    except ControlError as e:
+        return _control_error(e)
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
 @app.post("/api/sending/{action}")
 async def sending_toggle(action: str):
-    if action not in ("pause", "resume"):
+    """pause / resume (the operator pause only) / clear-hold (the bounce kill
+    switch). Each answers with the status after it."""
+    if action not in ("pause", "resume", "clear-hold"):
         return JSONResponse({"success": False, "message": "unknown action"}, status_code=400)
     try:
-        state = _state()
-        await state.init_db()
-        if action == "pause":
-            await state.set_setting("sending_paused", "paused from dashboard")
-        else:
-            await state.set_setting("sending_paused", "")
-            from mercury.bounces import reset_counters
-            await reset_counters(state)
-        return {"success": True}
+        service = await _sending().ready()
+        run = {"pause": service.pause, "resume": service.resume,
+               "clear-hold": service.clear_hold}[action]
+        return {"success": True, **await run()}
+    except ControlError as e:
+        return _control_error(e)
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
@@ -1510,44 +1377,17 @@ async def export_prospects(all: bool = False, min_score: int = 0, email_status: 
 
 @app.get("/api/campaigns")
 async def get_campaigns():
-    rows = await query_db("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 100")
-    for row in rows:
-        try:
-            row["sequence"] = json.loads(row.get("sequence_json", "[]"))
-        except (json.JSONDecodeError, TypeError):
-            row["sequence"] = []
-        try:
-            row["prospect_ids"] = json.loads(row.get("prospect_ids_json", "[]"))
-        except (json.JSONDecodeError, TypeError):
-            row["prospect_ids"] = []
-    return rows
+    return await _queries().campaigns()
 
 
 @app.get("/api/conversations")
 async def get_conversations():
-    rows = await query_db("""
-        SELECT c.*, p.first_name, p.last_name, p.email as prospect_email, p.company
-        FROM conversations c
-        LEFT JOIN prospects p ON c.prospect_id = p.id
-        ORDER BY c.updated_at DESC LIMIT 100
-    """)
-    for row in rows:
-        try:
-            row["thread"] = json.loads(row.get("thread_json", "[]"))
-        except (json.JSONDecodeError, TypeError):
-            row["thread"] = []
-    return rows
+    return await _queries().conversations()
 
 
 @app.get("/api/activity")
 async def get_activity():
-    rows = await query_db("SELECT * FROM actions ORDER BY created_at DESC LIMIT 100")
-    for row in rows:
-        try:
-            row["details"] = json.loads(row.get("details_json", "{}"))
-        except (json.JSONDecodeError, TypeError):
-            row["details"] = {}
-    return rows
+    return await _queries().activity()
 
 
 # ── Dashboard UI ──
@@ -1558,38 +1398,22 @@ async def get_activity():
 # This is the only stage that spends money, so the UI never starts one without
 # showing what it will cost first.
 
-_discovery_task: asyncio.Task | None = None
-_discovery_report: dict | None = None
+def _discovery(config=None):
+    from mercury.control.discovery import DiscoveryService
+    return DiscoveryService(DASHBOARD, _state(), config)
 
 
-def _discovery_queries(body: dict, config):
-    from mercury.collectors.discover import build_queries
-
+def _discovery_args(body: dict) -> dict:
     cities = [c.strip() for c in (body.get("cities") or []) if c.strip()] or None
-    return build_queries(
-        config, cities=cities,
-        depth=int(body.get("depth") or 30),
-        limit=int(body.get("limit") or 100),
-    )
+    return {"provider": body.get("provider") or "", "cities": cities,
+            "depth": int(body.get("depth") or 30), "limit": int(body.get("limit") or 100)}
 
 
 @app.get("/api/discover/providers")
 async def get_discovery_providers():
     """What each source does, what it costs, and whether it's ready to use."""
     try:
-        from mercury.collectors.discover import DEFAULT_PROVIDER, provider_menu
-        from mercury.config import load_env
-
-        state = _state()
-        await state.init_db()
-        return {
-            "providers": provider_menu(load_env().model_dump()),
-            "default": DEFAULT_PROVIDER,
-            "selected": await state.get_setting("discovery_provider") or DEFAULT_PROVIDER,
-            "paused": await state.get_setting("discovery_paused"),
-            "running": bool(_discovery_task and not _discovery_task.done()),
-            "last_report": _discovery_report,
-        }
+        return await (await _discovery().ready()).providers()
     except Exception as e:
         logger.exception("discovery providers failed")
         return {"providers": [], "error": str(e)}
@@ -1599,23 +1423,10 @@ async def get_discovery_providers():
 async def estimate_discovery(request: Request):
     """Projected spend and the exact query list, before anything is called."""
     try:
-        from mercury.collectors.discover import PROVIDERS, estimate_cost
-        from mercury.config import load_config
-
         body = await request.json()
-        provider = body.get("provider") or ""
-        if provider not in PROVIDERS:
-            return JSONResponse({"error": f"unknown provider {provider!r}"},
-                                status_code=400)
-
-        queries = _discovery_queries(body, load_config())
-        return {
-            "provider": provider,
-            "queries": [q.keyword() for q in queries],
-            "query_count": len(queries),
-            "estimated_cost": round(estimate_cost(provider, queries), 4),
-            "free": PROVIDERS[provider].estimate(queries) == 0,
-        }
+        return await _discovery().estimate(**_discovery_args(body))
+    except Invalid as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1627,52 +1438,19 @@ async def start_discovery(request: Request):
     Discovery takes minutes, not milliseconds — holding the request open
     would just time out. Progress shows up in the run log.
     """
-    global _discovery_task, _discovery_report
+    from mercury.control import discovery
 
-    if _discovery_task and not _discovery_task.done():
+    if discovery.running():
         return JSONResponse({"success": False, "message": "a run is already going"},
                             status_code=409)
     try:
-        from mercury.collectors.discover import PROVIDERS
-        from mercury.config import load_config
-        from mercury.pipeline import run_prospecting
-
         body = await request.json()
-        provider = body.get("provider") or ""
-        if provider not in PROVIDERS:
-            return JSONResponse({"success": False,
-                                 "message": f"unknown provider {provider!r}"},
-                                status_code=400)
-
-        config = load_config()
-        queries = _discovery_queries(body, config)
+        args = _discovery_args(body)
         max_spend = float(body.get("max_spend") or 1.0)
-
-        state = _state()
-        await state.init_db()
-        await state.set_setting("discovery_provider", provider)
-        await state.set_setting("discovery_paused", "")
-
-        async def _go():
-            global _discovery_report
-            try:
-                # Discovery chains straight into profiling: reading the sites
-                # is free, and it is what makes the results worth anything.
-                result = await run_prospecting(state, config, provider, queries,
-                                               max_spend=max_spend)
-                _discovery_report = {
-                    **(result.discover or {}),
-                    "profiled_companies": result.profiled_companies,
-                    "profile_observations": result.profile_observations,
-                    "errors": result.errors,
-                }
-            except Exception as exc:
-                logger.exception("discovery run failed")
-                _discovery_report = {"errors": [str(exc)], "stopped": "failed"}
-
-        _discovery_report = None
-        _discovery_task = asyncio.create_task(_go())
-        return {"success": True, "queries": len(queries)}
+        service = await _discovery().ready()
+        return {"success": True, **await service.submit(**args, max_spend=max_spend)}
+    except ControlError as e:
+        return _control_error(e)
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
@@ -1683,35 +1461,10 @@ async def start_profile():
 
     Free and model-free, so there is nothing to estimate and no cap to set.
     """
-    global _discovery_task, _discovery_report
-
-    if _discovery_task and not _discovery_task.done():
-        return JSONResponse({"success": False, "message": "a run is already going"},
-                            status_code=409)
     try:
-        from mercury.pipeline import run_profile_stage
-
-        state = _state()
-        await state.init_db()
-        pending = await state.count_companies_needing_profile()
-        if not pending:
-            return {"success": True, "pending": 0}
-
-        async def _go():
-            global _discovery_report
-            try:
-                companies, observations, _ = await run_profile_stage(state, limit=200)
-                _discovery_report = {
-                    "profiled_companies": companies,
-                    "profile_observations": observations,
-                }
-            except Exception as exc:
-                logger.exception("profile run failed")
-                _discovery_report = {"errors": [str(exc)], "stopped": "failed"}
-
-        _discovery_report = None
-        _discovery_task = asyncio.create_task(_go())
-        return {"success": True, "pending": pending}
+        return {"success": True, **await (await _discovery().ready()).submit_profile()}
+    except ControlError as e:
+        return _control_error(e)
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
@@ -1720,9 +1473,7 @@ async def start_profile():
 async def stop_discovery():
     """Kill switch. Read between batches, so an in-flight run stops cleanly."""
     try:
-        state = _state()
-        await state.init_db()
-        await state.set_setting("discovery_paused", "stopped from dashboard")
+        await (await _discovery().ready()).stop()
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
@@ -1750,7 +1501,7 @@ async def get_today():
         confirmed = [c for c in codes if c.get("status") == "confirmed"]
         pending = await state.get_outbox(status="pending_review", limit=200)
         approved = await state.get_outbox(status="approved", limit=200)
-        paused = await state.get_setting("sending_paused")
+        sending = await _sending().status()
         counts = await state.count_prospects_by_status()
 
         convos = await query_db(
@@ -1772,11 +1523,21 @@ async def get_today():
         }
 
         # Ordered by how much it blocks Mercury from doing anything at all.
-        if paused:
+        # A health hold first: resuming does not lift it.
+        for hold in sending["holds"]:
+            if hold["scope"] != "global":
+                continue
+            items.append({
+                "key": "hold:" + hold["kind"], "tone": "bad",
+                "title": "Sending is on hold",
+                "detail": hold["reason"].rstrip(".") + ". Resuming does not lift this hold.",
+                "action": "Review the hold", "tab": "outbox",
+            })
+        if sending["paused"]:
             items.append({
                 "key": "paused", "tone": "bad",
                 "title": "Sending is paused",
-                "detail": str(paused) + ". Nothing will go out until you resume it.",
+                "detail": sending["reason"].rstrip(".") + ". Nothing new will go out until you resume it.",
                 "action": "Review and resume", "tab": "outbox",
             })
 
@@ -1937,73 +1698,15 @@ async def get_today():
 # whole prospecting pipeline hangs off: collectors ask `state.confirmed_signal_codes()`
 # and skip anything that isn't in the set.
 
-CATEGORY_META = {
-    "discovery": {
-        "label": "Discovery — who exists",
-        "blurb": "How Mercury finds businesses at all, and how visible they are. "
-                 "This is the only stage that costs money.",
-    },
-    "profile": {
-        "label": "Profile — what they are",
-        "blurb": "Read from the pages a business already publishes. Free, no AI "
-                 "tokens, three HTTP requests per company. These are the signals "
-                 "that make an email specific.",
-    },
-    "people": {
-        "label": "People — who decides",
-        "blurb": "Named humans and whether they're the one who can say yes.",
-    },
-    "verification": {
-        "label": "Contactability — can you reach them",
-        "blurb": "Whether the address will actually deliver, and what to do when "
-                 "it won't.",
-    },
-}
-CATEGORY_ORDER = ["discovery", "profile", "people", "verification"]
+CATEGORY_META = SIGNAL_CATEGORIES
+CATEGORY_ORDER = SIGNAL_CATEGORY_ORDER
 
 
 @app.get("/api/signals")
 async def get_signals():
     """The signal vocabulary, grouped for review, with live cohort sizes."""
     try:
-        from mercury.signals import seed_signal_catalog
-
-        state = _state()
-        await state.init_db()
-        # Seeding is idempotent and never overrides a decision the user made,
-        # so it is safe to run on every load — new signals shipped in an
-        # upgrade show up as `proposed` without any migration step.
-        await seed_signal_catalog(state)
-
-        codes = await state.get_signal_codes()
-        counts = {c["signal_code"]: c for c in await state.signal_counts()}
-
-        groups, summary = [], {"proposed": 0, "confirmed": 0, "rejected": 0}
-        for cat in CATEGORY_ORDER:
-            rows = []
-            for sig in codes:
-                if sig.get("category") != cat:
-                    continue
-                seen = counts.get(sig["code"], {})
-                rows.append({
-                    **sig,
-                    "companies": seen.get("companies", 0),
-                    "observations": seen.get("observations", 0),
-                })
-            if rows:
-                meta = CATEGORY_META.get(cat, {})
-                groups.append({
-                    "key": cat,
-                    "label": meta.get("label", cat.title()),
-                    "blurb": meta.get("blurb", ""),
-                    "signals": rows,
-                })
-        for sig in codes:
-            summary[sig.get("status", "proposed")] = (
-                summary.get(sig.get("status", "proposed"), 0) + 1
-            )
-
-        return {"summary": summary, "groups": groups, "total": len(codes)}
+        return await (await _queries().ready()).signals()
     except Exception as e:
         logger.exception("signals load failed")
         return {"error": str(e), "groups": [], "summary": {}}
@@ -2052,30 +1755,14 @@ async def set_signals_status(request: Request):
 async def preview_cohort(request: Request):
     """How many companies carry ALL these signals and none of those.
 
-    The payoff for confirming signals: a cohort is a query, not a list. Set
-    intersection happens in SQL — intersecting in JS over a capped fetch
-    silently returns the wrong answer.
+    The payoff for confirming signals: a cohort is a query, not a list.
     """
     try:
         body = await request.json()
         require = [c for c in (body.get("require") or []) if c]
-        exclude = [c for c in (body.get("exclude") or []) if c]
         if not require:
             return {"size": 0, "companies": []}
-
-        state = _state()
-        await state.init_db()
-        ids = await state.cohort(require, exclude, limit=1000)
-        if not ids:
-            return {"size": 0, "companies": []}
-
-        placeholders = ",".join("?" for _ in ids[:200])
-        rows = await query_db(
-            f"SELECT id, name, domain, industry, location FROM companies "
-            f"WHERE id IN ({placeholders})",
-            tuple(ids[:200]),
-        )
-        return {"size": len(ids), "companies": rows}
+        return await (await _queries().ready()).cohort(require, body.get("exclude") or [])
     except Exception as e:
         return JSONResponse({"size": 0, "companies": [], "error": str(e)}, status_code=500)
 
@@ -2084,10 +1771,7 @@ async def preview_cohort(request: Request):
 async def get_runs_api():
     """The collector run log — what ran, when, what it produced and cost."""
     try:
-        state = _state()
-        await state.init_db()
-        await state.sweep_stale_runs()
-        return await state.get_runs(limit=25)
+        return await (await _queries().ready()).runs()
     except Exception as e:
         return {"error": str(e)}
 

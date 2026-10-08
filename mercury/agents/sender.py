@@ -5,9 +5,12 @@ Native flow:
   1. Draft campaigns are STAGED: merge variables rendered per prospect,
      one outbox row per (prospect, step) with a scheduled send_at.
      Rows start as pending_review (copilot) or approved (autopilot).
-  2. Each heartbeat DRAINS due approved rows: kill-switch check, stop-on-
-     reply check, out-of-office pause check, deterministic pre-send gate,
-     then provider.send_email with jittered pacing and the daily cap.
+  2. Each heartbeat DRAINS due approved rows: pause/hold check, stop-on-
+     reply check, deterministic pre-send gate, then provider.send_email
+     with jittered pacing and the daily cap. The pause/hold check runs
+     again right before each claim (mercury/holds.py), so a pause or a
+     shutdown that lands mid-drain stops the next email; the one already
+     claimed finishes.
   3. With channels.email.thread_followups (default on), a sent step hands
      its Message-ID and thread to the later steps, which go out as replies
      ("Re: <first subject>", In-Reply-To, References chain, Gmail threadId).
@@ -25,6 +28,7 @@ import time
 import re
 from datetime import date, datetime, timedelta, timezone
 
+from mercury import holds
 from mercury.brain import Brain
 from mercury.config import MercuryConfig, EnvConfig
 from mercury.demos import check_campaign as demo_check_campaign
@@ -100,6 +104,8 @@ def spread_budget(remaining: int, now_local: datetime, quiet_start: str,
     cycles_left = max(1, math.ceil(minutes_left / max(1, int(interval_minutes or 15))))
     return math.ceil(remaining / cycles_left)
 
+# The bounce kill switch (a health hold). The operator pause has its own key:
+# mercury/holds.py.
 KILL_SWITCH_KEY = "sending_paused"
 BOUNCE_COUNT_KEY = "bounce_count"
 
@@ -162,6 +168,9 @@ class Sender:
         # Naive UTC now. Tests replace it to move through a vacation pause.
         self.clock = lambda: datetime.now(timezone.utc).replace(tzinfo=None)
         self._last_drain_at: float | None = None  # monotonic, for spread_sends
+        # Set by the heartbeat on SIGTERM: claim nothing new, let the email
+        # in flight finish, skip the pacing sleep.
+        self.stop_event: asyncio.Event | None = None
         # Naive-UTC "now" for scheduling decisions; tests substitute their own.
         self.clock = lambda: datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -435,12 +444,9 @@ class Sender:
     async def _run_native(self):
         """Stage new campaigns into the outbox, then drain what's due."""
         await self._resume_due_pauses()
-        paused = await self.state.get_setting(KILL_SWITCH_KEY)
-        if paused:
-            logger.warning(
-                f"Sender: SENDING PAUSED ({paused}). Resume from the dashboard "
-                "or `mercury sending resume` once the cause is fixed."
-            )
+        kind, reason = await holds.blocking(self.state)
+        if kind:
+            self._log_blocked(kind, reason)
             return
 
         for campaign in await self.state.get_campaigns_by_status("draft"):
@@ -453,6 +459,41 @@ class Sender:
             await self._promote_followups()
 
         await self._drain_due()
+
+    @staticmethod
+    def _log_blocked(kind: str, reason: str):
+        if kind == "operator":
+            logger.warning(f"Sender: SENDING PAUSED ({reason}). Resume from the dashboard "
+                           "or `mercury sending resume`.")
+        else:
+            logger.warning(f"Sender: SENDING ON HOLD ({reason}). Resume does not lift it: "
+                           "fix the cause, then `mercury sending clear-hold`.")
+
+    def _stopping(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    async def _may_claim(self) -> bool:
+        """Checked right before every claim: a pause, a hold or a shutdown
+        that arrived while this drain ran stops the next email."""
+        if self._stopping():
+            logger.info("Sender: shutting down; the rest of the due mail stays queued.")
+            return False
+        kind, reason = await holds.blocking(self.state)
+        if kind:
+            self._log_blocked(kind, reason)
+            return False
+        return True
+
+    async def _pace(self):
+        """The human-ish gap between sends, cut short by a shutdown."""
+        delay = random.uniform(*SEND_JITTER_SECONDS)
+        if self.stop_event is None:
+            await asyncio.sleep(delay)
+            return
+        try:
+            await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
 
     async def _promote_followups(self):
         """auto_approve_followups: a follow-up rides on its approved opener.
@@ -804,6 +845,12 @@ class Sender:
                 )
                 continue
 
+            # Pause before claim: nothing new is claimed once a person pauses,
+            # a hold lands or the agent is told to stop. Past this point the
+            # row is in flight and finishes (mercury/holds.py).
+            if not await self._may_claim():
+                break
+
             # The reviewed text and its generation must stay together during
             # the provider call. A stale due scan cannot send a replaced draft.
             # Exclusions, company holds and company limits are re-checked in
@@ -926,8 +973,8 @@ class Sender:
             logger.info(f"Sender: sent step {item['step']} to {item['to_email']} via {via}.")
             # Human-ish pacing BETWEEN sends (not after the last, and never
             # in tests where pacing is disabled).
-            if self.send_pacing and sent < budget:
-                await asyncio.sleep(random.uniform(*SEND_JITTER_SECONDS))
+            if self.send_pacing and sent < budget and not self._stopping():
+                await self._pace()
 
         if sent:
             capacity = min(max_daily, pool.capacity_on(today))

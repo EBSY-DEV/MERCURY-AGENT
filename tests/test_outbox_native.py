@@ -328,6 +328,11 @@ async def test_send_claim_rejects_stale_and_duplicate_snapshots(state):
     stale = await state.get_outbox_item(item_id)
     assert await state.edit_outbox_item(item_id, subject="reviewed subject", manually_edited=1)
     assert not await state.claim_outbox_item(stale, "mercury@x.co")
+    # The edit sent it back to review; only a new approval lets it go.
+    current = await state.get_outbox_item(item_id)
+    assert current["status"] == "pending_review" and current["revision"] == 2
+    assert not await state.claim_outbox_item(current, "mercury@x.co")
+    assert await state.approve_outbox(item_id, 2)
     current = await state.get_outbox_item(item_id)
     assert await state.claim_outbox_item(current, "mercury@x.co")
     assert not await state.claim_outbox_item(current, "mercury@x.co")

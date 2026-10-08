@@ -154,6 +154,8 @@ async def test_vacation_reply_pauses_followups_until_the_return_date_then_sends_
     sender.clock = lambda: expected + timedelta(hours=1)
     await sender._run_native()
     assert [m["subject"] for m in provider.sent] == ["hi Jane 1", "Re: hi Jane 1"]
+    assert provider.sent[1]["in_reply_to"] == "<m1@x>"
+    assert provider.sent[1]["references"] == "<m1@x>"
     rows = await steps(state, pid)
     assert rows[2]["status"] == "sent"
     assert rows[3]["status"] == "approved"
