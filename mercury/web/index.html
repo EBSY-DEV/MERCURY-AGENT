@@ -12,6 +12,7 @@
 <link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
 <link rel="stylesheet" href="/static/app.css">
 <link rel="stylesheet" href="/static/personas.css">
+<link rel="stylesheet" href="/static/outbox.css">
 <link rel="stylesheet" href="/static/pains.css">
 </head>
 <body>
@@ -375,21 +376,21 @@
   <div id="campaigns-list"></div>
 </div>
 
-<!-- Outbox: the decisions desk -->
+<!-- Outbox: every email waits for a yes (outbox.js) -->
 <div id="outbox" class="section">
-  <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
+  <div class="section-head ob-head">
     <div>
       <h2>Outbox</h2>
-      <p>Every outgoing email stops here. Read one, decide, move on &mdash;
-         <kbd>A</kbd> approve, <kbd>R</kbd> reject, <kbd>J</kbd>/<kbd>K</kbd> to move.</p>
+      <p>Every email waits here for your yes before it goes out.</p>
     </div>
-    <div style="display:flex;gap:8px;flex-shrink:0" id="outbox-actions"></div>
+    <div class="ob-head-actions" id="outbox-actions"></div>
   </div>
+  <div class="ob-pause-mobile" id="outbox-pause-mobile"></div>
   <div id="outbox-banner"></div>
-  <div id="outbox-desk"></div>
+  <div class="ob-views-row" id="outbox-views"></div>
+  <div id="outbox-content"></div>
   <div id="outbox-away"></div>
-  <div id="outbox-mailboxes"></div>
-  <div id="outbox-list"></div>
+  <div class="ob-mobile" id="outbox-mobile" hidden></div>
 </div>
 
 <!-- Exclusions: addresses and domains Mercury never emails, and company holds -->
@@ -801,6 +802,7 @@
 <script src="/static/personas.js"></script>
 <script src="/static/exclusions.js"></script>
 <script src="/static/away.js"></script>
+<script src="/static/outbox.js"></script>
 <script src="/static/pains.js"></script>
 </body>
 </html>

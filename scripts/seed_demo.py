@@ -71,6 +71,8 @@ from mercury.models.prospect import Prospect  # noqa: E402
 from mercury.state import StateManager  # noqa: E402
 from demo_pains import extend_config as extend_pain_config, seed_pains  # noqa: E402
 
+import demo_outbox  # noqa: E402  (scripts/demo_outbox.py: offers, pains, review drafts)
+
 DEFAULT_DB = ROOT / "data" / "demo.db"
 REAL_DB = ROOT / "data" / "mercury.db"
 
@@ -379,6 +381,7 @@ def demo_config(template: Path) -> dict:
     })
     cfg["compliance"] = {"postal_address": "1550 Wewatta St, Denver, CO 80202"}
     cfg["offers"] = [{"key": VOICE_OFFER, "requires_demo": True, "demo_kind": "voice"}]
+    cfg["offers"] += demo_outbox.demo_offers()
     cfg.setdefault("usage", {}).setdefault("quiet_hours", {})["timezone"] = "UTC"
     extend_pain_config(cfg)
     return cfg
@@ -548,6 +551,7 @@ def main(argv: list[str]) -> int:
     target.parent.mkdir(parents=True, exist_ok=True)
     counts = asyncio.run(seed(target))
     config_path = write_demo_config(target)
+    counts.update(asyncio.run(demo_outbox.seed_outbox_review(target, config_path)))
     print(f"Seeded {target}: {counts['prospects']} prospects, "
           f"{len(COMPANIES)} companies, {counts['conversations']} conversations, "
           f"{counts['outbox']} outbox rows, {counts['history_sends']} historical sends, "

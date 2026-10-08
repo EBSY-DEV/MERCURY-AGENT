@@ -61,14 +61,14 @@ mercury demos request EMAIL --offer voice       # register one to build
 mercury demos retire EMAIL                      # its emails wait for a new demo
 ```
 
-The Outbox tab has the same: a **Waiting for a demo** list and a **Mark ready** drawer to attach the link or recording. A demo that is ready is retired `demos.retire_after_days` (default 14) after the last email to a contact who never replied, once nothing is queued for them. A break-up email that says the demo "stays ready" should quote that number. Instantly deploys a whole sequence at once, so there a demo offer's campaign stays in draft until every contact in it has a ready demo. Building the demo itself is not Mercury's job; this is the bookkeeping and the gate.
+The Outbox tab has the same: a held email shows "Held until the demo is ready" under **Scheduled** (or a note on the draft under **To review**), and **Mark demo ready** opens a drawer to attach the link or recording. A demo that is ready is retired `demos.retire_after_days` (default 14) after the last email to a contact who never replied, once nothing is queued for them. A break-up email that says the demo "stays ready" should quote that number. Instantly deploys a whole sequence at once, so there a demo offer's campaign stays in draft until every contact in it has a ready demo. Building the demo itself is not Mercury's job; this is the bookkeeping and the gate.
 
 Temporary failures (timeouts, connection errors, 4xx deferrals, rate limiting) keep the row approved and retry up to 3 times, 30, 60 and 90 minutes later. Permanent errors mark it `failed`.
 
-**Reviewing.** In the dashboard's Outbox tab you can, for each pending draft:
+**Reviewing.** The dashboard's Outbox tab has four views: **To review** (drafts waiting for you), **Scheduled** (approved, grouped by day), **Sent today** (the last 24 hours, the window the daily caps count) and **Didn't send** (failed, stopped or blocked, with the reason). To review shows one draft at a time: the queue on the left (flagged drafts first, under "Needs a look"), the email in the middle, and on the right **Why this email**: the offer and why it was picked, the pain, the facts the Writer was given, what the email asks for and what it was told to keep out, read from the prompt the draft was written from (`brief` on each `/api/outbox` row), plus the rest of its sequence and the contact. Keys: <kbd>J</kbd>/<kbd>K</kbd> move, <kbd>A</kbd> approves, <kbd>R</kbd> rejects. For each pending draft you can:
 
 - **Edit** the subject and body. Pending and approved rows can be edited; an edited approved row goes back to `pending_review`. Approving saves unsaved edits first.
-- **Regenerate** with an optional instruction ("shorter", "mention their reviews"). The new draft goes back to `pending_review`.
+- **Regenerate** with an optional instruction ("shorter", "mention their reviews"), asked for in a dialog. A draft over its word limit also offers **Rewrite shorter**. The new draft goes back to `pending_review`.
 - **Approve** or **reject**. Rejecting a sequence step also rejects every later step of that sequence for that prospect.
 
 `mercury outbox` does the same from the terminal (see [Getting started](getting-started.md#8-review-the-outbox)). The Calendar tab can reschedule a pending or approved email to a future time; a rescheduled approved email needs approval again.
