@@ -517,45 +517,75 @@ def cmd_health(args):
 
 def cmd_outbox(args):
     """Review and approve queued outgoing emails."""
+    from mercury.config import load_config
+    from mercury.control.context import OperatorContext
+    from mercury.control.errors import Conflict, NotFound
+    from mercury.control.outbox import OutboxService
+    from mercury.control.sending import SendingService
     from mercury.state import StateManager, wire_subject
 
     async def _outbox():
         state = StateManager()
         await state.init_db()
-
-        if args.approve_all:
-            n = await state.approve_outbox()
-            print(f"\n  Approved {n} email(s). They'll send on schedule.\n")
-            return
-        if args.approve:
-            n = await state.approve_outbox(args.approve)
-            print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
-            return
-        if args.reject:
-            n = await state.reject_outbox_item(args.reject)
-            print(f"\n  Rejected {n} email(s), later steps of the same sequence included.\n"
-                  if n else "\n  No queued item with that id.\n")
-            return
-
-        paused = await state.get_setting("sending_paused")
-        if paused:
-            print(f"\n  ⚠ SENDING PAUSED: {paused}")
-            print("  Resume with: mercury sending resume")
-
-        from mercury.config import load_config
-        from mercury.demos import annotate_outbox, waiting_for_demo
-
+        ctx = OperatorContext.local("cli")
         try:
             config = load_config()
         except Exception:
             config = None  # the demo gate fails closed without its config
+        outbox = OutboxService(ctx, state, config)
+
+        if args.approve_all:
+            # A frozen batch of what is pending now: anything that changes
+            # before its turn stays in review.
+            snapshot = await outbox.pending_snapshot()
+            if not snapshot:
+                print("\n  Nothing awaiting review.\n")
+                return
+            result = await outbox.approve_all(snapshot)
+            print(f"\n  Approved {result['approved']} email(s). They'll send on schedule.")
+            if result["failed"]:
+                print(f"  {result['failed']} changed while approving and stay in review.")
+            print()
+            return
+        for action in ("approve", "reject"):
+            item_id = getattr(args, action)
+            if not item_id:
+                continue
+            revision = getattr(args, "revision", None)
+            try:
+                if revision is None:
+                    # No revision given: act on the revision printed here, so
+                    # what was approved is what this command showed.
+                    item = await outbox.get(item_id)
+                    revision = int(item.get("revision") or 1)
+                    print(f"\n  [{item['id']}] rev {revision} → {item['to_email']}")
+                    print(f"  Subject: {item['subject']}")
+                if action == "approve":
+                    await outbox.approve(item_id, revision)
+                    print(f"\n  Approved revision {revision}.\n")
+                else:
+                    n = (await outbox.reject(item_id, revision))["rejected"]
+                    print(f"\n  Rejected {n} email(s), later steps of the same sequence included.\n")
+            except Conflict as e:
+                if e.code == "stale_revision":
+                    print(f"\n  {e}. Run 'mercury outbox' to see the current draft.\n")
+                else:
+                    print(f"\n  No {'pending' if action == 'approve' else 'queued'} item with that id.\n")
+            except NotFound:
+                print(f"\n  No {'pending' if action == 'approve' else 'queued'} item with that id.\n")
+            return
+
+        sending = await SendingService(ctx, state, config).status()
+        if sending["blocked"]:
+            print("\n  ⚠ SENDING STOPPED (mercury sending status):")
+            _print_sending(sending)
+
+        from mercury.demos import annotate_outbox, waiting_for_demo
+
         pending = await state.get_outbox(status="pending_review", limit=50)
         approved = await state.get_outbox(status="approved", limit=10)
-        try:
-            from mercury.config import load_config
-            threaded = load_config().channels.email.thread_followups
-        except Exception:
-            threaded = True
+        threaded = getattr(getattr(getattr(config, "channels", None), "email", None),
+                           "thread_followups", True)
         await annotate_outbox(state, config, pending)
         print(f"\n  Outbox — {len(pending)} awaiting approval, "
               f"{len(approved)}+ approved/scheduled")
@@ -564,21 +594,21 @@ def cmd_outbox(args):
             print(f"  {len(waiting)} contact(s) waiting for a demo: mercury demos")
         print("  " + "=" * 60)
         for item in pending:
-            print(f"\n  [{item['id']}] step {item['step']} ({item['kind']}) "
+            print(f"\n  [{item['id']}] rev {item.get('revision') or 1} step {item['step']} ({item['kind']}) "
                   f"→ {item['to_email']}  (send {item['send_at'][:16]})")
+            if item.get("demo") and item["demo"]["held"]:
+                print(f"  Held: {item['demo']['reason']}")
             subject = wire_subject(item, threaded)
             print(f"  Subject: {subject}")
             if subject != item["subject"]:
                 # A threaded follow-up: the writer's subject stays for review.
                 print(f"  (reply in the first email's thread; drafted subject: {item['subject']})")
-            if item.get("demo") and item["demo"]["held"]:
-                print(f"  Held: {item['demo']['reason']}")
             body_preview = (item["body"][:200] + "...") if len(item["body"]) > 200 else item["body"]
             for line in body_preview.splitlines():
                 print(f"    {line}")
         if pending:
-            print("\n  Approve: mercury outbox --approve <id>   |   all: mercury outbox --approve-all")
-            print("  Reject:  mercury outbox --reject <id>\n")
+            print("\n  Approve: mercury outbox --approve <id> [--revision <rev>]   |   all: mercury outbox --approve-all")
+            print("  Reject:  mercury outbox --reject <id> [--revision <rev>]\n")
         else:
             print("  Nothing awaiting review.\n")
 
@@ -613,16 +643,18 @@ def cmd_profile(args):
 def cmd_discover(args):
     """Find businesses. The only stage that spends money, so it estimates first."""
     from mercury.state import StateManager
-    from mercury.config import load_config
-    from mercury.collectors.discover import (
-        PROVIDERS, build_queries, provider_menu, run_discovery,
-    )
+    from mercury.collectors.discover import PROVIDERS
+    from mercury.control.context import OperatorContext
+    from mercury.control.discovery import DiscoveryService
+    from mercury.control.errors import Invalid
 
     async def _discover():
+        state = StateManager()
+        discovery = DiscoveryService(OperatorContext.local("cli"), state)
         if args.providers:
             print("\n  Discovery providers")
             print("  " + "=" * 68)
-            for m in provider_menu():
+            for m in discovery.menu():
                 mark = "ready" if m["configured"] else "needs setup"
                 print(f"\n  {m['label']}  [{m['key']}]  ({mark})")
                 print(f"    {m['blurb']}")
@@ -635,29 +667,24 @@ def cmd_discover(args):
             print("\n  Run one with: mercury discover --provider <key> --estimate\n")
             return
 
-        if args.provider not in PROVIDERS:
+        # Semicolons, not commas: "Denver, CO" is one city, not two.
+        cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
+        try:
+            plan = discovery.plan(args.provider, cities, depth=args.depth, limit=args.limit)
+        except Invalid:
             print(f"\n  Unknown provider {args.provider!r}. "
                   f"See: mercury discover --providers\n")
             return
+        await discovery.ready()
+        queries = plan.queries
 
-        config = load_config()
-        state = StateManager()
-        await state.init_db()
-
-        # Semicolons, not commas: "Denver, CO" is one city, not two.
-        cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
-        queries = build_queries(config, cities=cities,
-                                depth=args.depth, limit=args.limit)
-
-        report = await run_discovery(state, config, args.provider, queries,
-                                     max_spend=args.max_spend, dry_run=True)
         print(f"\n  {len(queries)} queries via {PROVIDERS[args.provider].label}")
         for q in queries[:8]:
             print(f"    - {q.keyword()}" + ("" if q.coordinate else
                   "   (no coordinates — add icp.geo_coordinates for radius search)"))
         if len(queries) > 8:
             print(f"    ... and {len(queries) - 8} more")
-        print(f"\n  Estimated cost: ${report.estimated_cost:.4f}"
+        print(f"\n  Estimated cost: ${plan.estimated_cost:.4f}"
               f"   (cap: ${args.max_spend:.2f})")
 
         if args.estimate:
@@ -665,12 +692,7 @@ def cmd_discover(args):
             return
 
         print("\n  Running...\n")
-        from mercury.pipeline import run_prospecting
-
-        result = await run_prospecting(
-            state, config, args.provider, queries,
-            max_spend=args.max_spend, profile=not args.no_profile,
-        )
+        result = await discovery.run(plan, max_spend=args.max_spend, profile=not args.no_profile)
         r = result.discover or {}
         print(f"  DISCOVER — {r.get('found', 0)} results across "
               f"{r.get('queries', 0)} queries")
@@ -1167,6 +1189,20 @@ def cmd_demos(args):
         sys.exit(1)
 
 
+def _print_sending(status: dict) -> None:
+    """The same reasons the dashboard's Outbox banner lists."""
+    if status["paused"]:
+        print(f"  Paused by you: {status['reason']}")
+    for hold in status["holds"]:
+        where = hold.get("mailbox") or "all mail"
+        print(f"  On hold ({where}): {hold['reason']}")
+    for item in status["in_flight"]:
+        note = "interrupted, re-queued next cycle" if item["interrupted"] else "finishing"
+        print(f"  In flight: step {item['step']} to {item['to_email']} ({note})")
+    if not status["blocked"]:
+        print("  Sending: active" + (" (some inboxes are on hold)" if status["holds"] else ""))
+
+
 def cmd_exclusions(args):
     """Exclusions: addresses and domains Mercury never emails."""
     import json
@@ -1349,23 +1385,40 @@ def _load_config_quiet():
 
 
 def cmd_sending(args):
-    """Pause/resume the sending kill switch."""
+    """Pause/resume sending, or clear a health hold."""
+    from mercury.config import load_config
+    from mercury.control.context import OperatorContext
+    from mercury.control.sending import SendingService
     from mercury.state import StateManager
 
+    try:
+        config = load_config()
+    except Exception:
+        config = None  # the compliance hold is then not listed
+
     async def _run():
-        state = StateManager()
-        await state.init_db()
-        if args.sending_action == "pause":
-            await state.set_setting("sending_paused", "paused manually")
-            print("\n  Sending paused. Nothing will leave the outbox.\n")
-        elif args.sending_action == "resume":
-            await state.set_setting("sending_paused", "")
-            from mercury.bounces import reset_counters
-            await reset_counters(state)
-            print("\n  Sending resumed (bounce counters reset).\n")
+        sending = await SendingService(OperatorContext.local("cli"), StateManager(), config).ready()
+        action = args.sending_action
+        if action == "pause":
+            status = await sending.pause()
+            print("\n  Sending paused. Nothing new leaves the outbox.")
+        elif action == "resume":
+            status = await sending.resume()
+            print("\n  Your pause is lifted." if not status["blocked"]
+                  else "\n  Your pause is lifted, but sending is still on hold.")
+            if any(h["kind"] == "bounce_kill_switch" for h in status["holds"]):
+                print("  Bounce counters were kept. Fix the cause, then: mercury sending clear-hold")
+        elif action == "clear-hold":
+            status = await sending.clear_hold()
+            if status["cleared"]:
+                print("\n  Bounce hold cleared; the bounce count starts again from zero.")
+            else:
+                print("\n  No bounce hold to clear. Counters left as they are.")
         else:
-            paused = await state.get_setting("sending_paused")
-            print(f"\n  Sending: {'PAUSED — ' + paused if paused else 'active'}\n")
+            status = await sending.status()
+            print()
+        _print_sending(status)
+        print()
 
     asyncio.run(_run())
 
@@ -1490,6 +1543,8 @@ def main():
     sub.add_argument("--approve", metavar="ID", default="", help="Approve one item")
     sub.add_argument("--approve-all", action="store_true", help="Approve all pending")
     sub.add_argument("--reject", metavar="ID", default="", help="Reject one item")
+    sub.add_argument("--revision", type=int, default=None,
+                     help="The revision you reviewed (shown as 'rev N'); fails if it changed since")
     sub.set_defaults(func=cmd_outbox)
 
     # mercury import FILE / mercury imports
@@ -1673,9 +1728,10 @@ def main():
     sub.add_argument("--json", action="store_true", help="Machine-readable output")
     sub.set_defaults(func=cmd_demos)
 
-    sub = subparsers.add_parser("sending", help="Kill switch: pause/resume sending")
+    sub = subparsers.add_parser(
+        "sending", help="Pause/resume sending (your pause only), or clear a bounce hold")
     sub.add_argument("sending_action", nargs="?", default="status",
-                     choices=["pause", "resume", "status"])
+                     choices=["pause", "resume", "status", "clear-hold"])
     sub.set_defaults(func=cmd_sending)
 
     # mercury usage

@@ -18,6 +18,18 @@ function awayDay(ymdStr) {
     year: y === new Date().getFullYear() ? undefined : 'numeric'});
 }
 
+// Sending time can fall after their stated return day because of weekends
+// and the configured buffer. Stored naive timestamps are UTC.
+function awayResumeWhen(p) {
+  if (!p.resume_at) return '';
+  const raw = String(p.resume_at).replace(' ', 'T');
+  const stamp = new Date(/(Z|[+-]\d{2}:\d{2})$/i.test(raw) ? raw : raw + 'Z');
+  if (isNaN(stamp)) return '';
+  const tz = p.display_timezone || _away.timezone || 'UTC';
+  return stamp.toLocaleString('en-US', {timeZone: tz, weekday: 'short', month: 'short',
+    day: 'numeric', hour: 'numeric', minute: '2-digit'}) + ' (' + tz + ')';
+}
+
 function awayBadge(p) {
   return p.review_state === 'scheduled'
     ? toneBadge('waiting', 'Away')
@@ -42,8 +54,8 @@ async function loadAway() {
     return;
   }
   el.innerHTML = '<div class="card"><h2>Away</h2>' +
-    '<p class="lede">They sent an out-of-office reply, so their follow-ups wait. On the day they are back ' +
-    'the next step goes out under the usual caps and pacing, and later steps keep their gaps. ' +
+    '<p class="lede">They sent an out-of-office reply, so their follow-ups wait. After they return, ' +
+    'the next step follows your quiet hours and business-day buffer, caps and pacing. Later steps keep their gaps. ' +
     'Mercury never guesses a date it cannot read.</p>' +
     '<div class="table-card"><table><thead><tr><th>Contact</th><th>Back</th><th>State</th>' +
     '<th>From their reply</th><th class="num">Queued</th><th></th></tr></thead><tbody>' +
@@ -80,8 +92,9 @@ async function awayOpen(i) {
       ['Email', escHtml(d.prospect_email || '')],
       ['Company', escHtml(d.company || 'Not known')],
       ['Back', scheduled && d.back_on
-        ? escHtml(awayDay(d.back_on)) + ' <span class="muted">at 9:00, ' + escHtml(tz) + '</span>'
+        ? escHtml(awayDay(d.back_on))
         : '<span class="muted">' + escHtml(d.review_text || 'Not set') + '</span>'],
+      ['Sequence resumes', scheduled ? escHtml(awayResumeWhen(d)) : 'When you set a date'],
       ['Their reply said', d.return_text ? '"' + escHtml(d.return_text) + '"' : 'No date'],
       ['Set by', d.manual_override ? 'You' + (d.override_by ? ' (' + escHtml(d.override_by) + ')' : '')
         : 'Read from their reply' + (scheduled ? ' <span class="num">' + Math.round((d.confidence || 0) * 100) +
@@ -90,8 +103,8 @@ async function awayOpen(i) {
       ['Queued follow-ups', '<span class="num">' + Number(d.queued || 0) + '</span>'],
     ]) +
     '<div class="drawer-section"><h4>' + (scheduled ? 'Correct the return date' : 'Set the return date') + '</h4>' +
-      '<p class="drawer-note">Their sequence picks up that day at 9:00 in ' + escHtml(tz) +
-        '. Approvals stay as they are: a draft still waits for your review.</p>' +
+      '<p class="drawer-note">Their sequence resumes when quiet hours end on a business day in ' + escHtml(tz) +
+        ', with your configured buffer. A draft still waits for your review.</p>' +
       '<div class="form-group" style="margin-top:12px"><label class="form-label" for="away-date">Back on</label>' +
         '<input class="form-input" type="date" id="away-date" min="' + today + '" value="' +
           escAttr(d.back_on || '') + '"></div>' +
@@ -116,7 +129,7 @@ async function awaySetDate(id) {
   const note = ((document.getElementById('away-note') || {}).value || '').trim();
   const res = await impSend('/api/pauses/' + encodeURIComponent(id) + '/return-date', { date: day, note });
   if (!res.ok) { showToast(res.error.message, 'error'); return; }
-  showToast('Saved. Their sequence picks up ' + awayDay(res.data.back_on) + '.', 'success');
+  showToast('Saved. Their sequence resumes ' + awayResumeWhen(res.data) + '.', 'success');
   closeDrawer();
   loadAway();
 }

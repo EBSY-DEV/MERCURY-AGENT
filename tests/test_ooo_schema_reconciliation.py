@@ -113,3 +113,8 @@ async def test_operator_return_day_survives_weekend_and_business_day_buffer(tmp_
     assert result["resume_at"] == "2026-10-20T11:00:00"
     await state.init_db()
     assert (await service.get(pause["id"]))["back_on"] == "2026-10-16"
+
+    # A legacy caller passes a timestamp without a separate calendar date;
+    # the presentation must derive the new date instead of keeping the old one.
+    await state.override_pause("contact_a", datetime(2026, 10, 26, 11), now=datetime(2026, 10, 9, 12))
+    assert (await service.get(pause["id"]))["back_on"] == "2026-10-26"
