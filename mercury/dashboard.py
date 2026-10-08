@@ -32,6 +32,7 @@ from mercury.control.outbox import OutboxService, with_from_mailbox  # noqa: E40
 from mercury.control.queries import (  # noqa: E402
     SIGNAL_CATEGORIES, SIGNAL_CATEGORY_ORDER, QueryService,
 )
+from mercury.exclusions_api import router as exclusions_router  # noqa: E402
 # MERCURY_DB_PATH points the dashboard at another database (e.g. the demo
 # DB from scripts/seed_demo.py) without touching the real one.
 DB_PATH = Path(os.environ.get("MERCURY_DB_PATH") or (PROJECT_ROOT / "data" / "mercury.db"))
@@ -44,6 +45,7 @@ app = FastAPI(title="Mercury Dashboard")
 app.include_router(personas_router)
 app.include_router(imports_router)
 app.include_router(demos_router)
+app.include_router(exclusions_router)
 
 _env_lock = asyncio.Lock()
 # Everything this server does, it does for the person at this machine.
@@ -1613,6 +1615,29 @@ async def get_today():
                 "action": "See who is waiting", "tab": "outbox",
             })
 
+        blocked = await state.get_outbox(status="blocked", limit=200)
+        if blocked:
+            items.append({
+                "key": "blocked", "tone": "warn",
+                "title": (f"{len(blocked)} email blocked by an exclusion" if len(blocked) == 1
+                          else f"{len(blocked)} emails blocked by exclusions"),
+                "detail": ("They were queued before the address or domain was excluded. "
+                           "Nothing goes out unless you lift the rule and approve again."),
+                "action": "Review exclusions", "tab": "exclusions",
+            })
+
+        holds = await state.list_company_holds()
+        held_mail = sum(h["queued"] for h in holds)
+        if holds:
+            items.append({
+                "key": "company-holds", "tone": "good",
+                "title": (f"{len(holds)} company on hold" if len(holds) == 1
+                          else f"{len(holds)} companies on hold"),
+                "detail": ("Someone there replied or you paused it, so cold mail to their "
+                           f"colleagues waits ({held_mail} queued). Replies still go out."),
+                "action": "Review holds", "tab": "exclusions",
+            })
+
         if open_convos:
             items.append({
                 "key": "replies", "tone": "good",
@@ -1934,7 +1959,8 @@ async def update_warmup_inbox(email: str, request: Request):
 WEB_DIR = (Path(__file__).resolve().parent / "web")
 
 
-TEXT_TYPES = {".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml"}
+TEXT_TYPES = {".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml",
+              ".webmanifest": "application/manifest+json"}
 BINARY_TYPES = {".woff2": "font/woff2", ".woff": "font/woff", ".png": "image/png"}
 
 

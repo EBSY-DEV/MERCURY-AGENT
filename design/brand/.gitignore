@@ -1,0 +1,11 @@
+# Exploration work stays local: every concept iteration, test render and
+# comparison sheet. The approved system is final/, kit/, book/ and tools/.
+concepts/
+concepts*.png
+concepts*.svg
+tiles*/
+tiles*.png
+ladder*.png
+wordmark/
+book/pages/
+__pycache__/
