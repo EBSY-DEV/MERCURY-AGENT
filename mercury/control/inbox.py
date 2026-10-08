@@ -185,7 +185,8 @@ WITH conv AS (
 rows AS (
   SELECT conv.*,
     COALESCE(NULLIF(inbound_mailbox, ''), NULLIF(sent_mailbox, ''), '') AS mailbox,
-    MAX({_t("created_at")}, {_t("last_inbound_at")}, {_t("last_sent_at")}) AS last_activity_at,
+    substr(MAX({_t("created_at")}, {_t("last_inbound_at")}, {_t("last_sent_at")}), 1, 19)
+      AS last_activity_at,
     CASE WHEN read_at IS NULL THEN 1
          WHEN {_t("COALESCE(last_inbound_at, created_at)")} > {_t("read_at")} THEN 1
          ELSE 0 END AS unread,
