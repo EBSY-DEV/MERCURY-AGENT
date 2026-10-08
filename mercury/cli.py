@@ -517,38 +517,49 @@ def cmd_health(args):
 
 def cmd_outbox(args):
     """Review and approve queued outgoing emails."""
+    from mercury.config import load_config
+    from mercury.control.context import OperatorContext
+    from mercury.control.errors import Conflict, NotFound
+    from mercury.control.outbox import OutboxService
+    from mercury.control.sending import SendingService
     from mercury.state import StateManager
 
     async def _outbox():
         state = StateManager()
         await state.init_db()
-
-        if args.approve_all:
-            n = await state.approve_outbox()
-            print(f"\n  Approved {n} email(s). They'll send on schedule.\n")
-            return
-        if args.approve:
-            n = await state.approve_outbox(args.approve)
-            print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
-            return
-        if args.reject:
-            n = await state.reject_outbox_item(args.reject)
-            print(f"\n  Rejected {n} email(s), later steps of the same sequence included.\n"
-                  if n else "\n  No queued item with that id.\n")
-            return
-
-        paused = await state.get_setting("sending_paused")
-        if paused:
-            print(f"\n  ⚠ SENDING PAUSED: {paused}")
-            print("  Resume with: mercury sending resume")
-
-        from mercury.config import load_config
-        from mercury.demos import annotate_outbox, waiting_for_demo
-
+        ctx = OperatorContext.local("cli")
         try:
             config = load_config()
         except Exception:
             config = None  # the demo gate fails closed without its config
+        outbox = OutboxService(ctx, state, config)
+
+        if args.approve_all:
+            n = (await outbox.approve_all())["approved"]
+            print(f"\n  Approved {n} email(s). They'll send on schedule.\n")
+            return
+        if args.approve:
+            try:
+                await outbox.approve(args.approve)
+                print("\n  Approved.\n")
+            except (NotFound, Conflict):
+                print("\n  No pending item with that id.\n")
+            return
+        if args.reject:
+            try:
+                n = (await outbox.reject(args.reject))["rejected"]
+                print(f"\n  Rejected {n} email(s), later steps of the same sequence included.\n")
+            except (NotFound, Conflict):
+                print("\n  No queued item with that id.\n")
+            return
+
+        paused = (await SendingService(ctx, state).status())["reason"]
+        if paused:
+            print(f"\n  ⚠ SENDING PAUSED: {paused}")
+            print("  Resume with: mercury sending resume")
+
+        from mercury.demos import annotate_outbox, waiting_for_demo
+
         pending = await state.get_outbox(status="pending_review", limit=50)
         approved = await state.get_outbox(status="approved", limit=10)
         await annotate_outbox(state, config, pending)
@@ -604,16 +615,18 @@ def cmd_profile(args):
 def cmd_discover(args):
     """Find businesses. The only stage that spends money, so it estimates first."""
     from mercury.state import StateManager
-    from mercury.config import load_config
-    from mercury.collectors.discover import (
-        PROVIDERS, build_queries, provider_menu, run_discovery,
-    )
+    from mercury.collectors.discover import PROVIDERS
+    from mercury.control.context import OperatorContext
+    from mercury.control.discovery import DiscoveryService
+    from mercury.control.errors import Invalid
 
     async def _discover():
+        state = StateManager()
+        discovery = DiscoveryService(OperatorContext.local("cli"), state)
         if args.providers:
             print("\n  Discovery providers")
             print("  " + "=" * 68)
-            for m in provider_menu():
+            for m in discovery.menu():
                 mark = "ready" if m["configured"] else "needs setup"
                 print(f"\n  {m['label']}  [{m['key']}]  ({mark})")
                 print(f"    {m['blurb']}")
@@ -626,29 +639,24 @@ def cmd_discover(args):
             print("\n  Run one with: mercury discover --provider <key> --estimate\n")
             return
 
-        if args.provider not in PROVIDERS:
+        # Semicolons, not commas: "Denver, CO" is one city, not two.
+        cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
+        try:
+            plan = discovery.plan(args.provider, cities, depth=args.depth, limit=args.limit)
+        except Invalid:
             print(f"\n  Unknown provider {args.provider!r}. "
                   f"See: mercury discover --providers\n")
             return
+        await discovery.ready()
+        queries = plan.queries
 
-        config = load_config()
-        state = StateManager()
-        await state.init_db()
-
-        # Semicolons, not commas: "Denver, CO" is one city, not two.
-        cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
-        queries = build_queries(config, cities=cities,
-                                depth=args.depth, limit=args.limit)
-
-        report = await run_discovery(state, config, args.provider, queries,
-                                     max_spend=args.max_spend, dry_run=True)
         print(f"\n  {len(queries)} queries via {PROVIDERS[args.provider].label}")
         for q in queries[:8]:
             print(f"    - {q.keyword()}" + ("" if q.coordinate else
                   "   (no coordinates — add icp.geo_coordinates for radius search)"))
         if len(queries) > 8:
             print(f"    ... and {len(queries) - 8} more")
-        print(f"\n  Estimated cost: ${report.estimated_cost:.4f}"
+        print(f"\n  Estimated cost: ${plan.estimated_cost:.4f}"
               f"   (cap: ${args.max_spend:.2f})")
 
         if args.estimate:
@@ -656,12 +664,7 @@ def cmd_discover(args):
             return
 
         print("\n  Running...\n")
-        from mercury.pipeline import run_prospecting
-
-        result = await run_prospecting(
-            state, config, args.provider, queries,
-            max_spend=args.max_spend, profile=not args.no_profile,
-        )
+        result = await discovery.run(plan, max_spend=args.max_spend, profile=not args.no_profile)
         r = result.discover or {}
         print(f"  DISCOVER — {r.get('found', 0)} results across "
               f"{r.get('queries', 0)} queries")
@@ -1290,21 +1293,20 @@ def _load_config_quiet():
 
 def cmd_sending(args):
     """Pause/resume the sending kill switch."""
+    from mercury.control.context import OperatorContext
+    from mercury.control.sending import SendingService
     from mercury.state import StateManager
 
     async def _run():
-        state = StateManager()
-        await state.init_db()
+        sending = await SendingService(OperatorContext.local("cli"), StateManager()).ready()
         if args.sending_action == "pause":
-            await state.set_setting("sending_paused", "paused manually")
+            await sending.pause()
             print("\n  Sending paused. Nothing will leave the outbox.\n")
         elif args.sending_action == "resume":
-            await state.set_setting("sending_paused", "")
-            from mercury.bounces import reset_counters
-            await reset_counters(state)
+            await sending.resume()
             print("\n  Sending resumed (bounce counters reset).\n")
         else:
-            paused = await state.get_setting("sending_paused")
+            paused = (await sending.status())["reason"]
             print(f"\n  Sending: {'PAUSED — ' + paused if paused else 'active'}\n")
 
     asyncio.run(_run())
