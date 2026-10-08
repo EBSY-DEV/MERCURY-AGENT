@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="design/brand/kit/lockup/mercury-lockup-horizontal-white.svg">
+    <img src="design/brand/kit/lockup/mercury-lockup-horizontal-black.svg" alt="Mercury Agent" width="320">
+  </picture>
+</p>
+
 # Mercury Agent
 
 An outreach agent that runs on your Claude Code subscription.

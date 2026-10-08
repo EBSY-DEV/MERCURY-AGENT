@@ -180,6 +180,26 @@ def test_missing_scope_is_refused_before_anything_changes(client):
 # ── Queries ──
 
 
+def test_outbox_service_preserves_exclusions_and_company_holds(client):
+    company_id, pid = _seed(client.sm)
+    pending = _queue(client.sm, pid, step=1)
+    approved = _queue(client.sm, pid, step=2, status="approved")
+    _run(client.sm.hold_company(company_id, reason="operator", actor="test"))
+
+    response = client.get("/api/outbox")
+    assert response.status_code == 200
+    queues = response.json()
+    for key, item_id in (("pending", pending), ("approved", approved)):
+        row = next(row for row in queues[key] if row["id"] == item_id)
+        assert row["policy"]["code"] == "company_hold"
+    assert client.get(f"/api/outbox/{pending}").json()["policy"]["code"] == "company_hold"
+
+    _run(client.sm.add_suppression("email", "pat@example.com", source="manual"))
+    queues = client.get("/api/outbox").json()
+    assert {row["id"] for row in queues["blocked"]} == {pending, approved}
+    assert all(row["policy"]["code"] == "excluded" for row in queues["blocked"])
+
+
 @pytest.mark.parametrize("path, call", [
     ("/api/stats", lambda q, ids: q.stats()),
     ("/api/companies", lambda q, ids: q.companies()),
