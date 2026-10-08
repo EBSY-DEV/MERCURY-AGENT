@@ -53,6 +53,7 @@ channels:
     send_to_risky: false        # also send to catch-all domains (off = safest)
     max_bounce_rate: 0.02       # pause all sending if bounces exceed this (after 50 sends)
     auto_approve_followups: false  # approving a first email also approves its follow-ups
+    thread_followups: true      # follow-ups go out as replies in the first email's thread
     spread_sends: false         # pace the day's sends until quiet hours, not in bursts
     ooo_resume_buffer_days: 0   # out-of-office: resume N business days after their return date
     max_new_contacts_per_company_per_day: 0  # first emails per company per 24 hours (0 = no limit)

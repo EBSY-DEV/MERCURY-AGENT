@@ -28,6 +28,7 @@ from mercury.control.errors import Conflict, Invalid, ProhibitedField
 
 # Dotted path -> type. bool is checked before int: True is an int in Python.
 EDITABLE: dict[str, type] = {
+    "channels.email.thread_followups": bool,
     "channels.email.require_approval": bool,
     "channels.email.auto_approve_followups": bool,
     "channels.email.send_to_risky": bool,

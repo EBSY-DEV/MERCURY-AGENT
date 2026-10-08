@@ -135,6 +135,7 @@ class GmailProvider(MailProvider):
         body: str,
         thread_ref: str = "",
         in_reply_to: str = "",
+        references: str = "",
     ) -> SendResult:
         msg = EmailMessage()
         persona = self.config.persona
@@ -143,7 +144,8 @@ class GmailProvider(MailProvider):
         msg["Subject"] = subject
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
-            msg["References"] = in_reply_to
+            # The whole chain when known (a step 3 lists step 1, then step 2).
+            msg["References"] = references or in_reply_to
         msg.set_content(body)
 
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()

@@ -123,6 +123,16 @@ class OutboxService:
             return "", None
         return self.pool.legacy.email, {mb.email for mb in self.pool.mailboxes}
 
+    def _with_wire_subject(self, rows: list[dict]) -> list[dict]:
+        """Expose the actual reply subject consistently to every client."""
+        from mercury.state import wire_subject
+
+        email = getattr(getattr(self.config, "channels", None), "email", None)
+        threaded = getattr(email, "thread_followups", True)
+        for row in rows:
+            row["wire_subject"] = wire_subject(row, threaded)
+        return rows
+
     async def _rows(self, sql: str, params: tuple = ()) -> list[dict]:
         async with self.state._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -149,7 +159,7 @@ class OutboxService:
         pending = await state.get_outbox(status="pending_review", limit=100)
         approved = await state.get_outbox(status="approved", limit=50)
         await annotate_outbox(state, self.config, pending + approved)
-        return {
+        data = {
             "paused": (await blocking(state))[1],
             "pending": await self._with_policy(
                 await with_from_mailbox(state, pending, legacy, known)),
@@ -166,6 +176,9 @@ class OutboxService:
                 "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
                 "ORDER BY updated_at DESC LIMIT 25"),
         }
+        for bucket in ("pending", "approved", "blocked", "sending", "sent", "failed"):
+            self._with_wire_subject(data[bucket])
+        return data
 
     async def _item(self, item_id: str) -> dict:
         item = await self.state.get_outbox_item(item_id or "")
@@ -183,7 +196,8 @@ class OutboxService:
             await annotate_outbox(self.state, self.config, [item])
         await self._with_policy([item])
         legacy, known = self._mailboxes()
-        return (await with_from_mailbox(self.state, [item], legacy, known))[0]
+        rows = await with_from_mailbox(self.state, [item], legacy, known)
+        return self._with_wire_subject(rows)[0]
 
     # ── Review ──
 
@@ -465,4 +479,4 @@ class OutboxService:
         trail.record(item_id, revision, updated.get("revision"),
                      approval_cleared=item.get("status") == "approved",
                      generation_id=updated.get("generation_id") or "")
-        return (await PersonaStore(state).enrich([updated]))[0]
+        return self._with_wire_subject(await PersonaStore(state).enrich([updated]))[0]

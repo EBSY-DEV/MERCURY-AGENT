@@ -126,6 +126,7 @@ class SmtpImapProvider(MailProvider):
         body: str,
         thread_ref: str = "",
         in_reply_to: str = "",
+        references: str = "",
     ) -> SendResult:
         persona = self.config.persona
         # From must be the mailbox we authenticate as: SPF/DKIM align on its
@@ -139,7 +140,8 @@ class SmtpImapProvider(MailProvider):
         msg["Message-ID"] = message_id
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
-            msg["References"] = in_reply_to
+            # The whole chain when known (a step 3 lists step 1, then step 2).
+            msg["References"] = references or in_reply_to
         # RFC 2369 opt-out header in mailto form. RFC 8058 one-click needs an
         # HTTPS endpoint we do not run, so List-Unsubscribe-Post is omitted.
         msg["List-Unsubscribe"] = f"<mailto:{sender_addr}?subject=unsubscribe>"

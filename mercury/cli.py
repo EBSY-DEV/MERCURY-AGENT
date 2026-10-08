@@ -522,7 +522,7 @@ def cmd_outbox(args):
     from mercury.control.errors import Conflict, NotFound
     from mercury.control.outbox import OutboxService
     from mercury.control.sending import SendingService
-    from mercury.state import StateManager
+    from mercury.state import StateManager, wire_subject
 
     async def _outbox():
         state = StateManager()
@@ -584,6 +584,8 @@ def cmd_outbox(args):
 
         pending = await state.get_outbox(status="pending_review", limit=50)
         approved = await state.get_outbox(status="approved", limit=10)
+        threaded = getattr(getattr(getattr(config, "channels", None), "email", None),
+                           "thread_followups", True)
         await annotate_outbox(state, config, pending)
         print(f"\n  Outbox — {len(pending)} awaiting approval, "
               f"{len(approved)}+ approved/scheduled")
@@ -596,7 +598,11 @@ def cmd_outbox(args):
                   f"→ {item['to_email']}  (send {item['send_at'][:16]})")
             if item.get("demo") and item["demo"]["held"]:
                 print(f"  Held: {item['demo']['reason']}")
-            print(f"  Subject: {item['subject']}")
+            subject = wire_subject(item, threaded)
+            print(f"  Subject: {subject}")
+            if subject != item["subject"]:
+                # A threaded follow-up: the writer's subject stays for review.
+                print(f"  (reply in the first email's thread; drafted subject: {item['subject']})")
             body_preview = (item["body"][:200] + "...") if len(item["body"]) > 200 else item["body"]
             for line in body_preview.splitlines():
                 print(f"    {line}")
