@@ -128,6 +128,15 @@ class OutboxService:
             async with db.execute(sql, params) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
 
+    async def _with_policy(self, rows: list[dict]) -> list[dict]:
+        """Keep exclusion and company-limit explanations on the review desk."""
+        from mercury.policy import ContactPolicy
+
+        policy = ContactPolicy(self.state, self.config)
+        for row in rows:
+            row["policy"] = (await policy.explain(row)).as_dict()
+        return rows
+
     async def overview(self) -> dict:
         """The review desk: every queue the Outbox tab shows, plus the kill switch."""
         self.ctx.require("read")
@@ -140,10 +149,12 @@ class OutboxService:
         approved = await state.get_outbox(status="approved", limit=50)
         await annotate_outbox(state, self.config, pending + approved)
         return {
-            # Why nothing is claimed (operator pause or health hold), or ''.
             "paused": (await blocking(state))[1],
-            "pending": await with_from_mailbox(state, pending, legacy, known),
-            "approved": await with_from_mailbox(state, approved, legacy, known),
+            "pending": await self._with_policy(
+                await with_from_mailbox(state, pending, legacy, known)),
+            "approved": await self._with_policy(
+                await with_from_mailbox(state, approved, legacy, known)),
+            "blocked": await self._with_policy(await state.get_outbox(status="blocked", limit=50)),
             "waiting_demo": await waiting_for_demo(state, self.config),
             "sending": await with_from_mailbox(
                 state, await state.get_outbox(status="sending", limit=50), legacy, known),
@@ -169,6 +180,7 @@ class OutboxService:
         item = await self._item(item_id)
         if item["status"] in EDITABLE_STATUSES:
             await annotate_outbox(self.state, self.config, [item])
+        await self._with_policy([item])
         legacy, known = self._mailboxes()
         return (await with_from_mailbox(self.state, [item], legacy, known))[0]
 

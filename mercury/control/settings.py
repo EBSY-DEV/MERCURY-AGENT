@@ -112,19 +112,25 @@ class ConfigService:
         self.ctx, self.state = ctx, state
         self.source, self.target = Path(source), Path(target or source)
 
-    def _load(self):
+    def _current_source(self) -> Path:
+        # Another service may have created the private override after this
+        # instance was constructed. Always review and revise the active file.
+        return self.target if self.target.exists() else self.source
+
+    def _load(self, text: str):
         from mercury.config import MercuryConfig
 
         import yaml
-        return MercuryConfig(**(yaml.safe_load(self.source.read_text()) or {}))
+        return MercuryConfig(**(yaml.safe_load(text) or {}))
 
     async def get(self) -> dict:
         """Every editable field and its current value."""
         self.ctx.require("read")
-        text = self.source.read_text()
-        config = self._load()
+        source = self._current_source()
+        text = source.read_text()
+        config = self._load(text)
         return {"fields": {path: _lookup(config, path) for path in EDITABLE},
-                "config_file": str(self.source), "revision": config_revision(text)}
+                "config_file": str(source), "revision": config_revision(text)}
 
     def validate(self, changes) -> dict:
         """The changes, type-checked, or the first reason they can't apply.
@@ -165,7 +171,7 @@ class ConfigService:
         from mercury.config import MercuryConfig
         from mercury.inbox_settings import _plain, atomic_write
 
-        text = self.source.read_text()
+        text = self._current_source().read_text()
         current = config_revision(text)
         if expected_revision.strip() != current:
             raise Conflict("the configuration changed since you read it; reload it and try again",
