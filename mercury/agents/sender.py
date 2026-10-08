@@ -34,6 +34,7 @@ from mercury.config import MercuryConfig, EnvConfig
 from mercury.demos import check_campaign as demo_check_campaign
 from mercury.demos import check_outbox_item as demo_check_item
 from mercury.demos import register_requests as register_demo_requests
+from mercury.draft_rules import decode_flags, drop_greeting, word_limit
 from mercury.gate import pre_send_check
 from mercury.offers import blocked_references
 from mercury.integrations.instantly import InstantlyClient
@@ -522,10 +523,12 @@ class Sender:
             getattr(self.config.persona, "email", "") or "",
         )
 
-    def _render(self, text: str, prospect) -> str:
-        """Fill merge variables. The pre-send gate rejects any leftovers."""
+    def _render(self, text: str, prospect, first_name: str | None = None) -> str:
+        """Fill merge variables. The pre-send gate rejects any leftovers.
+        ``first_name`` overrides the contact's own (a name the registry
+        gave an unnamed inbox)."""
         replacements = {
-            "first_name": prospect.first_name,
+            "first_name": prospect.first_name if first_name is None else first_name,
             "last_name": prospect.last_name,
             "company": prospect.company,
             "title": prospect.title,
@@ -538,6 +541,24 @@ class Sender:
 
     def _with_legal_footer(self, body: str) -> str:
         return with_legal_footer(self.config, body)
+
+    async def _greeting_for(self, prospect) -> tuple[str | None, bool]:
+        """(first name to render, drop the template's greeting line). A
+        contact with a name of their own, or an accepted registry name, is
+        greeted by it. A shared inbox with no name, or a contact with no
+        usable first name, is not greeted at all. Falls back to the contact's
+        own record if the lookup cannot be made."""
+        try:
+            from mercury.registry.resolver import resolve_contact_name
+
+            company = await self.state.get_company(prospect.company_id) if prospect.company_id else None
+            found = await resolve_contact_name(self.state, prospect, company)
+        except Exception as e:
+            logger.debug(f"Sender: could not resolve a greeting name for {prospect.email}: {e}")
+            return None, False
+        if found["status"] in ("named", "registry") and found["first_name"]:
+            return found["first_name"], False
+        return "", True
 
     async def _stage_campaign_native(self, campaign):
         """Render + schedule a draft campaign's emails into the outbox."""
@@ -593,17 +614,23 @@ class Sender:
                 logger.info(f"Sender: {email} is out of office; their emails are staged "
                             "but wait until the pause ends.")
 
+            # Who the template greets: the contact's own first name, or an
+            # accepted registry name, or nobody (an unnamed shared inbox gets
+            # no "Hi <business name>," line at all).
+            greet_as, drop = await self._greeting_for(prospect)
+
             cumulative_days = 0
             for step in campaign.sequence:
                 cumulative_days += max(0, step.delay_days)
                 send_at = start + timedelta(days=cumulative_days)
+                template = drop_greeting(step.body) if drop else step.body
                 item_id = await self.state.add_outbox_item(
                     prospect_id=prospect.id,
                     campaign_id=campaign.id,
                     step=step.step,
                     to_email=email,
-                    subject=self._render(step.subject, prospect),
-                    body=self._render(step.body, prospect),
+                    subject=self._render(step.subject, prospect, greet_as),
+                    body=self._render(template, prospect, greet_as),
                     send_at=send_at.isoformat(),
                     status=initial_status,
                     provider=self.provider.name,
@@ -612,6 +639,9 @@ class Sender:
                     offer_key=campaign.offer_key,
                     company_id=company_id,
                     pain_code=step.pain_code,
+                    # The step's word limit, counted on the rendered body. Over
+                    # it, the row is flagged and waits for a person.
+                    word_limit=word_limit(self.config, step.step),
                 )
                 if item_id:
                     staged += 1
@@ -827,6 +857,8 @@ class Sender:
                 blocked_references=await blocked_references(self.state, self.config, item, prospect),
                 rejected_pains=[p for p in pains if p["status"] == "rejected"],
                 allowed_pains=[p for p in pains if p["status"] == "confirmed"],
+                unaccepted_flags=([] if item.get("flags_accepted_by")
+                                  else decode_flags(item.get("flags"))),
             )
             if not gate:
                 await self.state.update_outbox_item(

@@ -73,6 +73,26 @@ Temporary failures (timeouts, connection errors, 4xx deferrals, rate limiting) k
 
 `mercury outbox` does the same from the terminal (see [Getting started](getting-started.md#8-review-the-outbox)). The Calendar tab can reschedule a pending or approved email to a future time; a rescheduled approved email needs approval again.
 
+### Flagged drafts
+
+A draft that breaks a deterministic rule is never staged unflagged. Today those rules are the step's word limit (`writer.word_limits`, counted over the whole body with the greeting and the sign-off) and, for a named contact, a generic opening greeting. Each outbox row carries:
+
+| Field | Meaning |
+|---|---|
+| `word_count` | Words in the body as staged (measured on read for rows written before this existed). |
+| `word_limit` | The limit it was held to; `0` for replies, which have none. |
+| `flags` | Codes: `over_word_limit`, `generic_greeting`. Empty when clean. |
+| `flag_details` | `[{"code", "label"}]` for display: "Over the word limit", "Generic greeting". |
+| `needs_flag_approval` | Flagged and not yet accepted by a person. |
+
+A flagged row waits in `pending_review` even with `require_approval: false`; follow-up auto-approval and "Approve all" skip it. Approving one is an explicit choice:
+
+- `POST /api/outbox/{id}/approve` with `{"revision": n, "approve_flagged": true}`. Without it the answer is `409` with `"code": "flagged"`, `flags`, `word_count` and `word_limit`, and nothing changes.
+- `POST /api/outbox/approve-all` and `/api/outbox/batch`: add `"approve_flagged": true` to the item. An item without it fails with `flagged` and the rest of the batch goes on.
+- `mercury outbox --approve ID --approve-flagged`.
+
+The approval records who accepted the flags (`flags_accepted_by`). Saving an edit (`PUT /api/outbox/{id}`, which returns the new `word_count`, `word_limit`, `flags` and `needs_flag_approval`) or regenerating measures the draft again and drops the acceptance with the approval. As a last line, the pre-send gate fails a row whose flags nobody accepted, and the sender's claim refuses it.
+
 **Revisions.** Every outbox row has a revision. Changing what a reviewer reads (the text, the recipient, the sending mailbox, a send time you pick, a regenerated draft) makes a new revision and sends an approved email back to review. Approve, reject and every edit name the revision they were decided on, and fail with `stale_revision` if the email changed since, so two people reviewing at once can't overwrite each other or approve text they haven't seen. An approval records the revision and a hash of the content it covered; the sender re-checks both when it claims the email, so nothing goes out on an approval for an earlier version. **Approve all** approves exactly the list on screen, at the revisions shown. The sender's own timing (follow-up spacing, retries, out-of-office resumes) does not change the revision.
 
 **Audit.** Every review and config command is recorded in the `audit_log` table: who (operator and client), which email or file, the revisions before and after, the action, and how it ended, failures included. Secrets are redacted from these records and from error messages. A client may send an `Idempotency-Key` header (dashboard) or request id (MCP); repeating a command with the same key returns the first answer without running it again.
@@ -96,6 +116,7 @@ Prompts can be ignored, so the last check before any email leaves is determinist
 | Merge tags | No unrendered `{{...}}` or `{...}` left. |
 | Banned phrases | Spam triggers and AI tells such as "act now", "click here", "i hope this finds you well", "game-changer", "as an ai". |
 | Links | At most 1 URL. |
+| Flagged drafts | A draft flagged as over its word limit or opening with a generic greeting sends only after a person accepted its flags. See [Flagged drafts](#flagged-drafts). |
 | HTML | None. Mercury sends plain text only. |
 | Case studies | No configured case-study name or alias outside the email's offer and the prospect's market and segment (see [`offers`](configuration.md#offers)). If the scope cannot be worked out, every configured case study is blocked. |
 

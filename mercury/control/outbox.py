@@ -21,7 +21,16 @@ Every command is audited and may carry a request key for idempotent replay
 (control/audit.py). Failures raise ControlError subclasses with stable
 codes: not_found, not_pending, not_queued, not_editable, started_sending,
 stale_revision, revision_required, invalid_revision, unknown_mailbox,
-prospect_not_found, conversation_not_found, provider_failed.
+prospect_not_found, conversation_not_found, provider_failed, flagged.
+
+Flagged drafts. A draft that broke a deterministic rule (over its step's word
+limit, a generic greeting) is queued with ``flags``, its ``word_count`` and
+``word_limit`` (mercury/draft_rules.py), and is never approved by policy. A
+person approves it only by choosing to: ``approve(..., approve_flagged=True)``
+(HTTP: ``"approve_flagged": true``; batches name it per item). Without that
+choice the command fails with ``flagged`` and the draft stays in review, so
+"approve all" can never carry one through. Editing or regenerating a draft
+measures it again and drops any earlier acceptance.
 """
 
 from __future__ import annotations
@@ -35,6 +44,7 @@ import aiosqlite
 
 from mercury.control.audit import run_command
 from mercury.control.errors import Conflict, Invalid, NotFound, Unavailable
+from mercury.draft_rules import count_words, decode_flags, flag_details, word_limit
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +80,29 @@ def frozen_items(items) -> list[tuple[str, int]]:
     if not pairs or len(pairs) > BATCH_MAX:
         raise Invalid(f"give between 1 and {BATCH_MAX} items")
     return list(pairs.items())
+
+
+def accepted_flags(items) -> set[str]:
+    """Ids in a batch whose reviewer chose to approve them flagged."""
+    return {i["id"] for i in items or [] if isinstance(i, dict) and i.get("approve_flagged") is True
+            and isinstance(i.get("id"), str)}
+
+
+def with_draft_checks(rows: list[dict]) -> list[dict]:
+    """Give each row what the review desk shows about its rules: the
+    ``word_count`` (measured now when an old row has none), the ``word_limit``
+    it is held to (0 = none), ``flags`` (codes), ``flag_details`` ({code,
+    label}) and ``needs_flag_approval``: flagged and not yet accepted by a
+    person, so approving it takes ``approve_flagged``."""
+    for row in rows:
+        flags = decode_flags(row.get("flags"))
+        row["flags"] = flags
+        row["flag_details"] = flag_details(flags)
+        if row.get("word_count") is None:
+            row["word_count"] = count_words(row.get("body") or "")
+        row["word_limit"] = int(row.get("word_limit") or 0)
+        row["needs_flag_approval"] = bool(flags) and not row.get("flags_accepted_by")
+    return rows
 
 
 def _utc_naive_now() -> datetime:
@@ -181,7 +214,7 @@ class OutboxService:
 
         buckets = ("pending", "approved", "blocked", "sending", "sent", "failed")
         for bucket in buckets:
-            self._with_wire_subject(data[bucket])
+            self._with_wire_subject(with_draft_checks(data[bucket]))
             await annotate_offers(state, self.config, data[bucket])
         await annotate_pains(state, [row for bucket in buckets for row in data[bucket]])
         return data
@@ -209,7 +242,7 @@ class OutboxService:
         from mercury.pains import annotate_outbox as annotate_pains
 
         await annotate_pains(self.state, rows)
-        return self._with_wire_subject(rows)[0]
+        return self._with_wire_subject(with_draft_checks(rows))[0]
 
     # ── Review ──
 
@@ -255,18 +288,27 @@ class OutboxService:
         raise Conflict("this email changed while the command ran; reload it",
                        code="stale_revision", revision=int(item.get("revision") or 1))
 
-    async def _approve_one(self, item_id: str, revision: int, trail) -> dict:
+    async def _approve_one(self, item_id: str, revision: int, trail, approve_flagged: bool = False) -> dict:
         item = await self._item(item_id)
         if item["status"] != "pending_review":
             raise Conflict(f"only emails awaiting review can be approved; this one is {item['status']}",
                            code="not_pending", status=item["status"])
         self._current(item, revision)
-        if not await self.state.approve_outbox(item_id, revision, approved_by=self._approver()):
+        flags = decode_flags(item.get("flags"))
+        if flags and not approve_flagged:
+            raise Conflict("this draft is flagged (" + ", ".join(d["label"].lower() for d in flag_details(flags))
+                           + "). Edit it, regenerate it, or approve it anyway.",
+                           code="flagged", flags=flags, word_count=item.get("word_count"),
+                           word_limit=int(item.get("word_limit") or 0))
+        if not await self.state.approve_outbox(item_id, revision, approved_by=self._approver(),
+                                               accept_flags=approve_flagged):
             await self._lost_race(item_id, revision, ("pending_review",), "not_pending",
                                   "only emails awaiting review can be approved; this one is {status}")
         followups = await self._promote_followups(item)
-        trail.record(item_id, revision, revision, followups_approved=followups)
-        return {"id": item_id, "approved": 1, "followups_approved": followups, "revision": revision}
+        trail.record(item_id, revision, revision, followups_approved=followups,
+                     **({"flags_accepted": flags} if flags else {}))
+        return {"id": item_id, "approved": 1, "followups_approved": followups, "revision": revision,
+                **({"flags_accepted": flags} if flags else {})}
 
     async def _reject_one(self, item_id: str, revision: int, trail) -> dict:
         item = await self._item(item_id)
@@ -281,12 +323,15 @@ class OutboxService:
         trail.record(item_id, revision, revision, rejected=n)
         return {"id": item_id, "rejected": n, "revision": revision}
 
-    async def approve(self, item_id: str, expected_revision=None) -> dict:
-        """Approve one email awaiting review, at the revision the reviewer read."""
+    async def approve(self, item_id: str, expected_revision=None, approve_flagged: bool = False) -> dict:
+        """Approve one email awaiting review, at the revision the reviewer read.
+        A flagged draft needs ``approve_flagged=True`` (see the module notes)."""
         async def work(trail):
             await self._item(item_id)
-            return await self._approve_one(item_id, expected(expected_revision), trail)
-        return await self._run("approve", "approve", {"id": item_id, "revision": expected_revision},
+            return await self._approve_one(item_id, expected(expected_revision), trail,
+                                           approve_flagged is True)
+        return await self._run("approve", "approve", {"id": item_id, "revision": expected_revision,
+                                                      "approve_flagged": approve_flagged is True},
                                work, item_id, expected_revision)
 
     async def reject(self, item_id: str, expected_revision=None) -> dict:
@@ -297,13 +342,17 @@ class OutboxService:
         return await self._run("reject", "approve", {"id": item_id, "revision": expected_revision},
                                work, item_id, expected_revision)
 
-    async def _batch(self, action: str, pairs: list[tuple[str, int]], trail) -> dict:
+    async def _batch(self, action: str, pairs: list[tuple[str, int]], trail,
+                     flagged_ok: frozenset | set = frozenset()) -> dict:
         trail.batch_id = uuid.uuid4().hex[:12]
-        command = self._approve_one if action == "approve" else self._reject_one
         results, done = [], 0
         for item_id, revision in pairs:
             try:
-                results.append({"id": item_id, "ok": True, **await command(item_id, revision, trail)})
+                if action == "approve":
+                    outcome = await self._approve_one(item_id, revision, trail, item_id in flagged_ok)
+                else:
+                    outcome = await self._reject_one(item_id, revision, trail)
+                results.append({"id": item_id, "ok": True, **outcome})
                 done += 1
             except (NotFound, Conflict) as error:
                 trail.record(item_id, revision, None, outcome=error.code, message=str(error))
@@ -315,11 +364,13 @@ class OutboxService:
     async def batch(self, action: str, items) -> dict:
         """Approve or reject an explicit, frozen list of {id, revision}. Each
         item succeeds or fails on its own; one that changed since the list
-        was made fails with stale_revision and is left as it is."""
+        was made fails with stale_revision and is left as it is. An item may
+        add ``"approve_flagged": true`` to approve a flagged draft; one that
+        does not fails with ``flagged``."""
         async def work(trail):
             if action not in BATCH_ACTIONS:
                 raise Invalid(f"action must be one of {', '.join(BATCH_ACTIONS)}")
-            return await self._batch(action, frozen_items(items), trail)
+            return await self._batch(action, frozen_items(items), trail, accepted_flags(items))
         return await self._run(f"batch_{action}" if action in BATCH_ACTIONS else "batch",
                                "approve", {"action": action, "items": items}, work)
 
@@ -328,7 +379,7 @@ class OutboxService:
         the reviewer was shown (pending_snapshot builds one). Never "whatever
         is pending now": anything queued or changed since stays in review."""
         async def work(trail):
-            result = await self._batch("approve", frozen_items(items), trail)
+            result = await self._batch("approve", frozen_items(items), trail, accepted_flags(items))
             followups = sum(r.get("followups_approved", 0) for r in result["results"] if r["ok"])
             return {**result, "approved": result["succeeded"], "followups_approved": followups}
         return await self._run("approve_all", "approve", {"items": items}, work)
@@ -358,9 +409,12 @@ class OutboxService:
                                   "this draft has started sending")
         was_approved = item.get("status") == "approved"
         trail.record(item["id"], revision, new, approval_cleared=was_approved,
-                     fields=sorted(k for k in changes if k != "manually_edited"))
+                     fields=sorted(k for k in changes if k not in ("manually_edited", "word_limit")))
+        current = with_draft_checks([await self._item(item["id"])])[0]
         return {"id": item["id"], "revision": new, "status": "pending_review",
-                "approval_cleared": was_approved}
+                "approval_cleared": was_approved,
+                **{k: current[k] for k in ("word_count", "word_limit", "flags", "flag_details",
+                                           "needs_flag_approval")}}
 
     async def edit(self, item_id: str, subject: str, body: str, expected_revision=None) -> dict:
         """The reviewer edits a draft in place. An approved draft goes back to review."""
@@ -373,8 +427,12 @@ class OutboxService:
             if len(text) > SUBJECT_MAX or len(message) > BODY_MAX:
                 raise Invalid(f"subject is limited to {SUBJECT_MAX} characters and body to {BODY_MAX}")
             item = await self._editable(item_id, "edited", revision)
+            # Measured again against the limit this config sets for the step.
+            limit = int(item.get("word_limit") or 0)
+            if self.config is not None and item.get("kind") != "reply":
+                limit = word_limit(self.config, item.get("step") or 1)
             return await self._revise(item, revision, trail, subject=text, body=message,
-                                      manually_edited=1)
+                                      manually_edited=1, word_limit=limit)
         return await self._run("edit", "edit", {"id": item_id, "subject": subject, "body": body,
                                                 "revision": expected_revision},
                                work, item_id, expected_revision)
@@ -494,4 +552,4 @@ class OutboxService:
         from mercury.pains import annotate_outbox as annotate_pains
 
         rows = await annotate_pains(state, await PersonaStore(state).enrich([updated]))
-        return self._with_wire_subject(rows)[0]
+        return self._with_wire_subject(with_draft_checks(rows))[0]

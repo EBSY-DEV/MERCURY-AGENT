@@ -59,6 +59,7 @@ def pre_send_check(
     blocked_references: list[str] | None = None,
     rejected_pains: Iterable[dict] | None = None,
     allowed_pains: Iterable[dict] = (),
+    unaccepted_flags: Iterable[str] = (),
 ) -> GateResult:
     """Run every deterministic check. Returns ok=False with reasons on any hit.
 
@@ -69,6 +70,11 @@ def pre_send_check(
     ``rejected_pains`` (rows from ``state.list_pains(status="rejected")``)
     stops a draft that raises a pain a person rejected, whatever the model
     was told; ``allowed_pains`` are the pains whose vocabulary it may share.
+
+    ``unaccepted_flags`` are the flags a draft carries (over its word limit,
+    a generic greeting) that no person accepted. A flagged draft sends only
+    after a reviewer's explicit "approve anyway", so one that reaches the
+    gate without it is blocked.
     """
     reasons: list[str] = []
     subject = (subject or "").strip()
@@ -101,6 +107,10 @@ def pre_send_check(
     word_count = len(body.split())
     if word_count > MAX_BODY_WORDS:
         reasons.append(f"body too long ({word_count} words > {MAX_BODY_WORDS})")
+
+    flagged = sorted(set(unaccepted_flags))
+    if flagged:
+        reasons.append(f"flagged draft not accepted by a reviewer: {flagged}")
 
     # Unrendered merge tags — the classic mass-mail embarrassment
     leftover = MERGE_TAG_RE.findall(subject + " " + body)

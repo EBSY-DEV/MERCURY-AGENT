@@ -543,8 +543,12 @@ def cmd_outbox(args):
                 return
             result = await outbox.approve_all(snapshot)
             print(f"\n  Approved {result['approved']} email(s). They'll send on schedule.")
-            if result["failed"]:
-                print(f"  {result['failed']} changed while approving and stay in review.")
+            flagged = [r for r in result["results"] if not r["ok"] and r.get("code") == "flagged"]
+            if flagged:
+                print(f"  {len(flagged)} flagged draft(s) stay in review. Approve each one "
+                      "explicitly: mercury outbox --approve <id> --approve-flagged")
+            if result["failed"] - len(flagged):
+                print(f"  {result['failed'] - len(flagged)} changed while approving and stay in review.")
             print()
             return
         for action in ("approve", "reject"):
@@ -561,7 +565,7 @@ def cmd_outbox(args):
                     print(f"\n  [{item['id']}] rev {revision} → {item['to_email']}")
                     print(f"  Subject: {item['subject']}")
                 if action == "approve":
-                    await outbox.approve(item_id, revision)
+                    await outbox.approve(item_id, revision, approve_flagged=getattr(args, "approve_flagged", False))
                     print(f"\n  Approved revision {revision}.\n")
                 else:
                     n = (await outbox.reject(item_id, revision))["rejected"]
@@ -569,6 +573,8 @@ def cmd_outbox(args):
             except Conflict as e:
                 if e.code == "stale_revision":
                     print(f"\n  {e}. Run 'mercury outbox' to see the current draft.\n")
+                elif e.code == "flagged":
+                    print(f"\n  {e}\n  To approve it anyway: mercury outbox --approve {item_id} --approve-flagged\n")
                 else:
                     print(f"\n  No {'pending' if action == 'approve' else 'queued'} item with that id.\n")
             except NotFound:
@@ -587,6 +593,9 @@ def cmd_outbox(args):
         threaded = getattr(getattr(getattr(config, "channels", None), "email", None),
                            "thread_followups", True)
         await annotate_outbox(state, config, pending)
+        from mercury.control.outbox import with_draft_checks
+
+        with_draft_checks(pending)
         print(f"\n  Outbox — {len(pending)} awaiting approval, "
               f"{len(approved)}+ approved/scheduled")
         waiting = await waiting_for_demo(state, config)
@@ -603,6 +612,10 @@ def cmd_outbox(args):
             if subject != item["subject"]:
                 # A threaded follow-up: the writer's subject stays for review.
                 print(f"  (reply in the first email's thread; drafted subject: {item['subject']})")
+            if item.get("flags"):
+                count = f"{item.get('word_count')} / {item['word_limit']} words" if item.get("word_limit") else ""
+                print(f"  Flagged: {', '.join(d['label'] for d in item['flag_details'])}"
+                      + (f" ({count})" if count else ""))
             body_preview = (item["body"][:200] + "...") if len(item["body"]) > 200 else item["body"]
             for line in body_preview.splitlines():
                 print(f"    {line}")
@@ -1834,6 +1847,8 @@ def main():
     sub.add_argument("--approve", metavar="ID", default="", help="Approve one item")
     sub.add_argument("--approve-all", action="store_true", help="Approve all pending")
     sub.add_argument("--reject", metavar="ID", default="", help="Reject one item")
+    sub.add_argument("--approve-flagged", action="store_true",
+                     help="With --approve: approve a draft flagged as over its word limit anyway")
     sub.add_argument("--revision", type=int, default=None,
                      help="The revision you reviewed (shown as 'rev N'); fails if it changed since")
     sub.set_defaults(func=cmd_outbox)
