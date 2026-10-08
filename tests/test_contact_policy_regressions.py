@@ -6,6 +6,8 @@ import pytest_asyncio
 
 import mercury.state as state_module
 from mercury.control.exclusions import ExclusionService
+from mercury.control.context import OperatorContext
+from mercury.control.outbox import OutboxService
 from mercury.integrations.mail_provider import InboundMessage
 from mercury.state import StateManager
 from tests.test_contact_policy import add_campaign, add_company, add_person, sender_with, _utc
@@ -46,7 +48,11 @@ async def test_requeued_followup_waits_for_explicit_approval_after_restart(state
     assert (await state.get_outbox_item(blocked["id"]))["status"] == "pending_review"
 
     # A real approval, including Approve all, releases the review requirement.
-    assert await state.approve_outbox(None if approve_all else blocked["id"]) == 1
+    outbox = OutboxService(OperatorContext.local("cli"), state)
+    if approve_all:
+        assert (await outbox.approve_all(await outbox.pending_snapshot()))["approved"] == 1
+    else:
+        assert (await outbox.approve(blocked["id"], blocked["revision"]))["approved"] == 1
     await sender._run_native()
     assert len(provider.sent) == 2
     assert (await state.get_outbox_item(blocked["id"]))["status"] == "sent"
@@ -116,13 +122,16 @@ async def test_v14_blocked_mail_keeps_review_requirement_on_upgrade(tmp_path, mo
     monkeypatch.setattr(state_module, "MIGRATIONS", migrations[:14])
     state = StateManager(path)
     await state.init_db()
-    # Simulate rows created by the original version of the PR.
-    await state.add_outbox_item(
-        prospect_id="p", to_email="a@acme.com", subject="s", body="b",
-        send_at=_utc(), status="sent", campaign_id="c", step=1)
-    item_id = await state.add_outbox_item(
-        prospect_id="p", to_email="a@acme.com", subject="s", body="b",
-        send_at=_utc(), status="blocked", campaign_id="c", step=2)
+    # Simulate rows created by the original version of the PR. Raw SQL, since
+    # add_outbox_item writes columns later migrations add.
+    item_id = "blocked-step-2"
+    async with aiosqlite.connect(path) as db:
+        for row_id, step, status in (("sent-step-1", 1, "sent"), (item_id, 2, "blocked")):
+            await db.execute(
+                "INSERT INTO outbox (id, campaign_id, prospect_id, step, kind, to_email, "
+                "subject, body, status, send_at) VALUES (?, 'c', 'p', ?, 'sequence', "
+                "'a@acme.com', 's', 'b', ?, ?)", (row_id, step, status, _utc()))
+        await db.commit()
     monkeypatch.setattr(state_module, "MIGRATIONS", migrations)
     await state.init_db()
     assert (await state.get_outbox_item(item_id))["requires_manual_review"] == 1

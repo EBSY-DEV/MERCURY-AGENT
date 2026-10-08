@@ -131,6 +131,15 @@
     </div>
   </section>
 
+  <section class="panel" id="today-health">
+    <div class="panel-head">
+      <div><h3>Deliverability</h3><p>A verdict per sending domain, from its sends, replies and bounces.</p></div>
+      <button class="link-btn" onclick="goTab('mailboxes')">Mailboxes<i data-ph="arrow-right"></i></button>
+    </div>
+    <div id="health-body"><div class="chart-note">Loading deliverability…</div></div>
+    <div class="panel-foot health-foot" id="health-foot" hidden></div>
+  </section>
+
   <!-- Two independent columns: panels stack under each other instead of
        sitting in rows, so a short panel never leaves a hole beside a tall one. -->
   <div class="today-cols">
@@ -372,6 +381,7 @@
   </div>
   <div id="outbox-banner"></div>
   <div id="outbox-desk"></div>
+  <div id="outbox-pauses"></div>
   <div id="outbox-mailboxes"></div>
   <div id="outbox-list"></div>
 </div>

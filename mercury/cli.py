@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -124,8 +125,28 @@ def cmd_setup(args):
     asyncio.run(run_setup())
 
 
+def _print_limit_warnings() -> int:
+    """Print the inbox lifecycle warnings; returns how many there were."""
+    from mercury.config import load_config
+    from mercury.integrations.mailboxes import inbox_limit_warnings
+
+    warnings = inbox_limit_warnings(load_config())
+    for w in warnings:
+        print(f"  ! {w['message']}")
+    return len(warnings)
+
+
+def _refuse_strict() -> None:
+    print("\n  Refusing to continue under --strict. Fix mercury.yaml "
+          "(channels.email.mailboxes) or drop --strict.\n")
+    raise SystemExit(1)
+
+
 def cmd_run(args):
     """Start Mercury's heartbeat loop, or run a single cycle."""
+    # Without --strict the warnings are only logged at startup (main.py).
+    if getattr(args, "strict", False) and _print_limit_warnings():
+        _refuse_strict()
     if getattr(args, "once", False):
         from mercury.main import run_once_main
 
@@ -320,6 +341,18 @@ def cmd_mail(args):
     from mercury.config import load_config, load_env
     from mercury.integrations.mailboxes import MailboxPool, local_today
 
+    if args.mail_action == "placement":
+        cmd_mail_placement(args)
+        return
+
+    if args.mail_action == "limits":
+        print()
+        if not _print_limit_warnings():
+            print("  No inbox limit warnings.\n")
+        elif getattr(args, "strict", False):
+            _refuse_strict()
+        sys.exit(0)
+
     config = load_config()
     env = load_env()
     pool = MailboxPool.from_config(config, env)
@@ -345,46 +378,226 @@ def cmd_mail(args):
     asyncio.run(_test())
 
 
+def _placement_json(rep):
+    """A placement report without non-serializable bits, for --json."""
+    return json.loads(json.dumps(rep, default=str)) if rep else None
+
+
+def cmd_mail_placement(args):
+    """Inbox placement test: send email 1 to seed inboxes, read where it landed."""
+    from mercury import placement
+    from mercury.config import load_config, load_env
+    from mercury.integrations.mailboxes import MailboxPool
+    from mercury.state import StateManager
+
+    config = load_config()
+    env = load_env()
+    action = args.placement_action or "run"
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        await placement.ensure_schema(state.db_path)
+
+        if action in ("show", "check", "mark"):
+            run_id = await placement.resolve_run(state, args.run_id)
+            if not run_id:
+                print("\n  No placement test found"
+                      + (f" matching '{args.run_id}'." if args.run_id else
+                         ". Run one with: mercury mail placement") + "\n")
+                sys.exit(1)
+            if action == "check":
+                readers = placement.default_readers(placement.seeds_from_config(config, env))
+                await placement.check(state, run_id, readers)
+                await placement.finish(state, run_id)
+            elif action == "mark":
+                if not (args.seed and args.sender and args.folder):
+                    print("\n  mark needs --seed, --sender (an address, or 'control') and --folder.\n")
+                    sys.exit(2)
+                try:
+                    n = await placement.mark(state, run_id, args.seed, args.sender, args.folder)
+                except placement.PlacementError as e:
+                    print(f"\n  {e}\n")
+                    sys.exit(2)
+                if not n:
+                    print(f"\n  No copy from {args.sender} to {args.seed} in run {run_id}.\n")
+                    sys.exit(1)
+            rep = await placement.report(state, run_id)
+            if args.json:
+                print(json.dumps(_placement_json(rep), indent=2))
+            else:
+                print(placement.format_report(rep))
+            return
+
+        pool = MailboxPool.from_config(config, env)
+        if args.subject or args.body_file:
+            if not (args.subject and args.body_file):
+                print("\n  --subject and --body-file go together.\n")
+                sys.exit(2)
+            with open(args.body_file, encoding="utf-8") as f:
+                email = {"id": "", "subject": args.subject, "body": f.read()}
+        else:
+            email = await placement.pick_email(state, args.outbox_id)
+        if not email:
+            print("\n  No email 1 to test" + (f" matching '{args.outbox_id}'" if args.outbox_id else "")
+                  + ". Draft a campaign first, or pass --subject and --body-file.\n")
+            sys.exit(1)
+
+        p = placement.plan(config, env, pool, args.mailbox)
+        print("\n  Placement test")
+        print("  " + "=" * 52)
+        print(f"  Email:   {email['subject']!r}"
+              + (f"  (outbox {email['id'][:8]})" if email.get("id") else ""))
+        for f in p["fleet"]:
+            print(f"  From:    {f['email']}" + ("" if f["configured"] else "  (no password, skipped)"))
+        if p["control"]:
+            c = p["control"]
+            print(f"  Control: {c['email']}" + ("" if c["configured"] else "  (not ready, skipped)"))
+        else:
+            print("  Control: none configured (a spam result will be read as the copy)")
+        for s in p["seeds"]:
+            print(f"  Seed:    {s.email}  ({s.provider}"
+                  + (", read over IMAP)" if s.readable else ", record by hand)"))
+        senders = sum(1 for f in p["fleet"] if f["configured"]) + (
+            1 if p["control"] and p["control"]["configured"] else 0)
+        print(f"  {senders * len(p['seeds'])} test emails. None of them touch the outbox or a daily cap.")
+        if p["problems"]:
+            print()
+            for problem in p["problems"]:
+                print(f"  ✗ {problem}")
+            print()
+            sys.exit(1)
+        if args.dry_run:
+            print("\n  Dry run: nothing sent.\n")
+            return
+        print()
+        try:
+            res = await placement.run(
+                state, config, env, pool, subject=email["subject"], body=email["body"],
+                only=args.mailbox, wait_seconds=args.wait,
+                progress=lambda msg: print(f"  {msg}"),
+            )
+        except placement.PlacementError as e:
+            print(f"\n  ✗ {e}\n")
+            sys.exit(1)
+        rep = await placement.report(state, res["run_id"])
+        if args.json:
+            print(json.dumps(_placement_json(rep), indent=2))
+        else:
+            print(placement.format_report(rep))
+
+    asyncio.run(_run())
+
+
+def cmd_health(args):
+    """Deliverability health: a verdict per sending domain."""
+    from mercury import deliverability, placement
+    from mercury.config import load_config, load_env
+    from mercury.integrations.mailboxes import MailboxPool
+    from mercury.state import StateManager
+
+    config = load_config()
+    try:
+        pool = MailboxPool.from_config(config, load_env())
+    except Exception:
+        pool = None
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        report = await deliverability.domain_report(state, config, pool)
+        last = await placement.report(state)
+        if args.json:
+            print(json.dumps({**report, "placement": _placement_json(last)}, indent=2))
+        else:
+            print(deliverability.format_report(report, last))
+
+    asyncio.run(_run())
+
+
 def cmd_outbox(args):
     """Review and approve queued outgoing emails."""
+    from mercury.config import load_config
+    from mercury.control.context import OperatorContext
+    from mercury.control.errors import Conflict, NotFound
+    from mercury.control.outbox import OutboxService
+    from mercury.control.sending import SendingService
     from mercury.state import StateManager, wire_subject
 
     async def _outbox():
         state = StateManager()
         await state.init_db()
+        ctx = OperatorContext.local("cli")
+        try:
+            config = load_config()
+        except Exception:
+            config = None  # the demo gate fails closed without its config
+        outbox = OutboxService(ctx, state, config)
 
         if args.approve_all:
-            n = await state.approve_outbox()
-            print(f"\n  Approved {n} email(s). They'll send on schedule.\n")
+            # A frozen batch of what is pending now: anything that changes
+            # before its turn stays in review.
+            snapshot = await outbox.pending_snapshot()
+            if not snapshot:
+                print("\n  Nothing awaiting review.\n")
+                return
+            result = await outbox.approve_all(snapshot)
+            print(f"\n  Approved {result['approved']} email(s). They'll send on schedule.")
+            if result["failed"]:
+                print(f"  {result['failed']} changed while approving and stay in review.")
+            print()
             return
-        if args.approve:
-            n = await state.approve_outbox(args.approve)
-            print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
-            return
-        if args.reject:
-            n = await state.reject_outbox_item(args.reject)
-            print(f"\n  Rejected {n} email(s), later steps of the same sequence included.\n"
-                  if n else "\n  No queued item with that id.\n")
+        for action in ("approve", "reject"):
+            item_id = getattr(args, action)
+            if not item_id:
+                continue
+            revision = getattr(args, "revision", None)
+            try:
+                if revision is None:
+                    # No revision given: act on the revision printed here, so
+                    # what was approved is what this command showed.
+                    item = await outbox.get(item_id)
+                    revision = int(item.get("revision") or 1)
+                    print(f"\n  [{item['id']}] rev {revision} → {item['to_email']}")
+                    print(f"  Subject: {item['subject']}")
+                if action == "approve":
+                    await outbox.approve(item_id, revision)
+                    print(f"\n  Approved revision {revision}.\n")
+                else:
+                    n = (await outbox.reject(item_id, revision))["rejected"]
+                    print(f"\n  Rejected {n} email(s), later steps of the same sequence included.\n")
+            except Conflict as e:
+                if e.code == "stale_revision":
+                    print(f"\n  {e}. Run 'mercury outbox' to see the current draft.\n")
+                else:
+                    print(f"\n  No {'pending' if action == 'approve' else 'queued'} item with that id.\n")
+            except NotFound:
+                print(f"\n  No {'pending' if action == 'approve' else 'queued'} item with that id.\n")
             return
 
-        paused = await state.get_setting("sending_paused")
-        if paused:
-            print(f"\n  ⚠ SENDING PAUSED: {paused}")
-            print("  Resume with: mercury sending resume")
+        sending = await SendingService(ctx, state, config).status()
+        if sending["blocked"]:
+            print("\n  ⚠ SENDING STOPPED (mercury sending status):")
+            _print_sending(sending)
+
+        from mercury.demos import annotate_outbox, waiting_for_demo
 
         pending = await state.get_outbox(status="pending_review", limit=50)
         approved = await state.get_outbox(status="approved", limit=10)
-        try:
-            from mercury.config import load_config
-            threaded = load_config().channels.email.thread_followups
-        except Exception:
-            threaded = True
+        threaded = getattr(getattr(getattr(config, "channels", None), "email", None),
+                           "thread_followups", True)
+        await annotate_outbox(state, config, pending)
         print(f"\n  Outbox — {len(pending)} awaiting approval, "
               f"{len(approved)}+ approved/scheduled")
+        waiting = await waiting_for_demo(state, config)
+        if waiting:
+            print(f"  {len(waiting)} contact(s) waiting for a demo: mercury demos")
         print("  " + "=" * 60)
         for item in pending:
-            print(f"\n  [{item['id']}] step {item['step']} ({item['kind']}) "
+            print(f"\n  [{item['id']}] rev {item.get('revision') or 1} step {item['step']} ({item['kind']}) "
                   f"→ {item['to_email']}  (send {item['send_at'][:16]})")
+            if item.get("demo") and item["demo"]["held"]:
+                print(f"  Held: {item['demo']['reason']}")
             subject = wire_subject(item, threaded)
             print(f"  Subject: {subject}")
             if subject != item["subject"]:
@@ -394,8 +607,8 @@ def cmd_outbox(args):
             for line in body_preview.splitlines():
                 print(f"    {line}")
         if pending:
-            print("\n  Approve: mercury outbox --approve <id>   |   all: mercury outbox --approve-all")
-            print("  Reject:  mercury outbox --reject <id>\n")
+            print("\n  Approve: mercury outbox --approve <id> [--revision <rev>]   |   all: mercury outbox --approve-all")
+            print("  Reject:  mercury outbox --reject <id> [--revision <rev>]\n")
         else:
             print("  Nothing awaiting review.\n")
 
@@ -430,16 +643,18 @@ def cmd_profile(args):
 def cmd_discover(args):
     """Find businesses. The only stage that spends money, so it estimates first."""
     from mercury.state import StateManager
-    from mercury.config import load_config
-    from mercury.collectors.discover import (
-        PROVIDERS, build_queries, provider_menu, run_discovery,
-    )
+    from mercury.collectors.discover import PROVIDERS
+    from mercury.control.context import OperatorContext
+    from mercury.control.discovery import DiscoveryService
+    from mercury.control.errors import Invalid
 
     async def _discover():
+        state = StateManager()
+        discovery = DiscoveryService(OperatorContext.local("cli"), state)
         if args.providers:
             print("\n  Discovery providers")
             print("  " + "=" * 68)
-            for m in provider_menu():
+            for m in discovery.menu():
                 mark = "ready" if m["configured"] else "needs setup"
                 print(f"\n  {m['label']}  [{m['key']}]  ({mark})")
                 print(f"    {m['blurb']}")
@@ -452,29 +667,24 @@ def cmd_discover(args):
             print("\n  Run one with: mercury discover --provider <key> --estimate\n")
             return
 
-        if args.provider not in PROVIDERS:
+        # Semicolons, not commas: "Denver, CO" is one city, not two.
+        cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
+        try:
+            plan = discovery.plan(args.provider, cities, depth=args.depth, limit=args.limit)
+        except Invalid:
             print(f"\n  Unknown provider {args.provider!r}. "
                   f"See: mercury discover --providers\n")
             return
+        await discovery.ready()
+        queries = plan.queries
 
-        config = load_config()
-        state = StateManager()
-        await state.init_db()
-
-        # Semicolons, not commas: "Denver, CO" is one city, not two.
-        cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
-        queries = build_queries(config, cities=cities,
-                                depth=args.depth, limit=args.limit)
-
-        report = await run_discovery(state, config, args.provider, queries,
-                                     max_spend=args.max_spend, dry_run=True)
         print(f"\n  {len(queries)} queries via {PROVIDERS[args.provider].label}")
         for q in queries[:8]:
             print(f"    - {q.keyword()}" + ("" if q.coordinate else
                   "   (no coordinates — add icp.geo_coordinates for radius search)"))
         if len(queries) > 8:
             print(f"    ... and {len(queries) - 8} more")
-        print(f"\n  Estimated cost: ${report.estimated_cost:.4f}"
+        print(f"\n  Estimated cost: ${plan.estimated_cost:.4f}"
               f"   (cap: ${args.max_spend:.2f})")
 
         if args.estimate:
@@ -482,12 +692,7 @@ def cmd_discover(args):
             return
 
         print("\n  Running...\n")
-        from mercury.pipeline import run_prospecting
-
-        result = await run_prospecting(
-            state, config, args.provider, queries,
-            max_spend=args.max_spend, profile=not args.no_profile,
-        )
+        result = await discovery.run(plan, max_spend=args.max_spend, profile=not args.no_profile)
         r = result.discover or {}
         print(f"  DISCOVER — {r.get('found', 0)} results across "
               f"{r.get('queries', 0)} queries")
@@ -910,6 +1115,94 @@ def cmd_imports(args):
         sys.exit(1)
 
 
+def cmd_demos(args):
+    """Per-prospect demos: who is waiting, mark one ready, retire one."""
+    import json
+
+    from mercury.config import load_config
+    from mercury.control.demos import DemoError, DemoService
+    from mercury.state import StateManager
+
+    def line(d):
+        who = d.get("email") or d["prospect_id"]
+        when = (d.get("ready_at") or d.get("created_at") or "").replace("T", " ")[:16]
+        artifact = d.get("demo_url") or d.get("recording_path") or d.get("agent_id") or ""
+        print(f"  {d['id']:<13} {d['status']:<10} {d['offer_key']:<10} {who:<34} {when:<17} {artifact}")
+
+    async def _run():
+        action = args.demos_action or "list"
+        try:
+            config = load_config()
+        except Exception:
+            if action != "list":
+                raise
+            config = None  # listing fails closed: every offer row shows held
+        service = await DemoService(StateManager(), config).ready()
+        if action != "list" and not args.target:
+            raise DemoError("invalid", f"Which demo? mercury demos {action} EMAIL_OR_ID")
+        if action == "list":
+            overview = await service.overview(include_retired=args.all)
+            if args.json:
+                return print(json.dumps(overview, indent=2, default=str))
+            waiting, demos = overview["waiting"], overview["demos"]
+            if not overview["offers"] and not demos and not waiting:
+                return print("\n  No offer needs a demo. Add one under offers: in mercury.yaml "
+                             "with requires_demo: true.\n")
+            print(f"\n  Waiting for a demo: {len(waiting)}")
+            for w in waiting:
+                print(f"    {w['to_email']:<34} {w['offer_key']:<10} step {w['step']}  "
+                      f"{w['status']:<15} {w['reason']}")
+            if waiting:
+                print("  Mark one ready: mercury demos ready EMAIL --url URL (or --recording PATH)")
+            print(f"\n  Demos: {len(demos)}" + ("" if args.all else " (retired hidden; --all shows them)"))
+            for d in demos:
+                line(d)
+            if overview["retire_after_days"]:
+                print(f"\n  Ready demos retire {overview['retire_after_days']} days after the last "
+                      "email to a contact who never replied.")
+            print()
+        elif action == "ready":
+            fields = {"demo_url": args.url, "recording_path": args.recording,
+                      "agent_id": args.agent_id, "built_by": args.by, "notes": args.notes}
+            demo = await service.mark_ready(args.target, args.offer,
+                                            **{k: v for k, v in fields.items() if v is not None})
+            if args.json:
+                return print(json.dumps(demo, indent=2, default=str))
+            print(f"\n  Demo {demo['id']} ({demo['offer_key']}) is ready. Its held emails go out "
+                  "on the next heartbeat, once approved.\n")
+        elif action == "request":
+            demo = await service.request(args.target, args.offer)
+            if args.json:
+                return print(json.dumps(demo, indent=2, default=str))
+            print(f"\n  Demo {demo['id']} ({demo['offer_key']}) is {demo['status']}.\n")
+        elif action == "retire":
+            demo = await service.retire(args.target, args.offer, args.reason)
+            if args.json:
+                return print(json.dumps(demo, indent=2, default=str))
+            print(f"\n  Demo {demo['id']} retired. Emails of its offer to this contact now wait "
+                  "for a new demo.\n")
+
+    try:
+        asyncio.run(_run())
+    except DemoError as error:
+        print(f"\n  {error}\n", file=sys.stderr)
+        sys.exit(1)
+
+
+def _print_sending(status: dict) -> None:
+    """The same reasons the dashboard's Outbox banner lists."""
+    if status["paused"]:
+        print(f"  Paused by you: {status['reason']}")
+    for hold in status["holds"]:
+        where = hold.get("mailbox") or "all mail"
+        print(f"  On hold ({where}): {hold['reason']}")
+    for item in status["in_flight"]:
+        note = "interrupted, re-queued next cycle" if item["interrupted"] else "finishing"
+        print(f"  In flight: step {item['step']} to {item['to_email']} ({note})")
+    if not status["blocked"]:
+        print("  Sending: active" + (" (some inboxes are on hold)" if status["holds"] else ""))
+
+
 def cmd_exclusions(args):
     """Exclusions: addresses and domains Mercury never emails."""
     import json
@@ -1041,23 +1334,40 @@ def _load_config_quiet():
 
 
 def cmd_sending(args):
-    """Pause/resume the sending kill switch."""
+    """Pause/resume sending, or clear a health hold."""
+    from mercury.config import load_config
+    from mercury.control.context import OperatorContext
+    from mercury.control.sending import SendingService
     from mercury.state import StateManager
 
+    try:
+        config = load_config()
+    except Exception:
+        config = None  # the compliance hold is then not listed
+
     async def _run():
-        state = StateManager()
-        await state.init_db()
-        if args.sending_action == "pause":
-            await state.set_setting("sending_paused", "paused manually")
-            print("\n  Sending paused. Nothing will leave the outbox.\n")
-        elif args.sending_action == "resume":
-            await state.set_setting("sending_paused", "")
-            from mercury.bounces import reset_counters
-            await reset_counters(state)
-            print("\n  Sending resumed (bounce counters reset).\n")
+        sending = await SendingService(OperatorContext.local("cli"), StateManager(), config).ready()
+        action = args.sending_action
+        if action == "pause":
+            status = await sending.pause()
+            print("\n  Sending paused. Nothing new leaves the outbox.")
+        elif action == "resume":
+            status = await sending.resume()
+            print("\n  Your pause is lifted." if not status["blocked"]
+                  else "\n  Your pause is lifted, but sending is still on hold.")
+            if any(h["kind"] == "bounce_kill_switch" for h in status["holds"]):
+                print("  Bounce counters were kept. Fix the cause, then: mercury sending clear-hold")
+        elif action == "clear-hold":
+            status = await sending.clear_hold()
+            if status["cleared"]:
+                print("\n  Bounce hold cleared; the bounce count starts again from zero.")
+            else:
+                print("\n  No bounce hold to clear. Counters left as they are.")
         else:
-            paused = await state.get_setting("sending_paused")
-            print(f"\n  Sending: {'PAUSED — ' + paused if paused else 'active'}\n")
+            status = await sending.status()
+            print()
+        _print_sending(status)
+        print()
 
     asyncio.run(_run())
 
@@ -1086,6 +1396,12 @@ def main():
         "--once",
         action="store_true",
         help="Run a single cycle and exit (for cron/scheduled runs)",
+    )
+    sub.add_argument(
+        "--strict",
+        action="store_true",
+        help="Refuse to start when mailboxes break the inbox limits "
+             "(inboxes per domain, provider daily ceiling, 14-day warm-up)",
     )
     sub.add_argument(
         "--ignore-quiet-hours",
@@ -1136,18 +1452,48 @@ def main():
                      help="auth: one-time OAuth; test: verify connection")
     sub.set_defaults(func=cmd_gmail)
 
-    # mercury mail test
-    sub = subparsers.add_parser("mail", help="Test the configured mail provider")
+    # mercury mail test | mercury mail placement [run|show|check|mark] [RUN]
+    sub = subparsers.add_parser(
+        "mail", help="Test the mail provider, or run an inbox placement test")
     sub.add_argument(
-        "mail_action", choices=["test"], help="test: verify send/receive credentials"
+        "mail_action", choices=["test", "limits", "placement"],
+        help="test: verify send/receive credentials; limits: check the inbox limits; "
+             "placement: send email 1 to your seed inboxes and read where it landed",
     )
+    sub.add_argument("--strict", action="store_true",
+                     help="With limits: exit 1 when any limit is broken")
+    sub.add_argument("placement_action", nargs="?", default="run",
+                     choices=["run", "show", "check", "mark"],
+                     help="placement: run a test (default), show a result, check the "
+                          "seeds again, or mark a folder by hand")
+    sub.add_argument("run_id", nargs="?", default="", help="Placement run id (default: the last)")
+    sub.add_argument("--dry-run", action="store_true", help="Show who would send to whom; send nothing")
+    sub.add_argument("--mailbox", action="append", metavar="EMAIL_OR_DOMAIN",
+                     help="Only test these mailboxes or domains (repeatable)")
+    sub.add_argument("--outbox-id", default="", help="Test this outbox email instead of the newest email 1")
+    sub.add_argument("--subject", default="", help="Test this subject (with --body-file)")
+    sub.add_argument("--body-file", default="", help="Test the body in this file (with --subject)")
+    sub.add_argument("--wait", type=int, default=None,
+                     help="Seconds to look for the emails in the seeds (default: placement.wait_seconds)")
+    sub.add_argument("--seed", default="", help="mark: the seed inbox")
+    sub.add_argument("--sender", default="", help="mark: the address it came from, or 'control'")
+    sub.add_argument("--folder", default="", help="mark: primary, inbox, promotions, other_tab, spam, missing")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
     sub.set_defaults(func=cmd_mail)
+
+    # mercury health
+    sub = subparsers.add_parser(
+        "health", help="Deliverability verdict per sending domain (the 1%% rule)")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub.set_defaults(func=cmd_health)
 
     # mercury outbox
     sub = subparsers.add_parser("outbox", help="Review/approve queued emails")
     sub.add_argument("--approve", metavar="ID", default="", help="Approve one item")
     sub.add_argument("--approve-all", action="store_true", help="Approve all pending")
     sub.add_argument("--reject", metavar="ID", default="", help="Reject one item")
+    sub.add_argument("--revision", type=int, default=None,
+                     help="The revision you reviewed (shown as 'rev N'); fails if it changed since")
     sub.set_defaults(func=cmd_outbox)
 
     # mercury import FILE / mercury imports
@@ -1303,9 +1649,27 @@ def main():
         p.add_argument("--version", type=int, default=None, help="Revision number (default: latest)")
         p.add_argument("--instruction", default="", help='One-off instruction, e.g. "shorter"')
 
-    sub = subparsers.add_parser("sending", help="Kill switch: pause/resume sending")
+    sub = subparsers.add_parser(
+        "demos", help="Per-prospect demos: who is waiting, mark ready, retire")
+    sub.add_argument("demos_action", nargs="?", default="list",
+                     choices=["list", "ready", "request", "retire"])
+    sub.add_argument("target", nargs="?", default="",
+                     help="Demo id, contact id or email, or an outbox email id")
+    sub.add_argument("--offer", default="", help="Offer key, when the contact has several")
+    sub.add_argument("--url", default=None, help="ready: where the demo lives (https://...)")
+    sub.add_argument("--recording", default=None, help="ready: path to the call recording")
+    sub.add_argument("--agent-id", default=None, help="ready: the voice agent's id")
+    sub.add_argument("--by", default=None, help="ready: who built it")
+    sub.add_argument("--notes", default=None, help="ready: anything worth knowing")
+    sub.add_argument("--reason", default="", help="retire: why")
+    sub.add_argument("--all", action="store_true", help="list: include retired demos")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub.set_defaults(func=cmd_demos)
+
+    sub = subparsers.add_parser(
+        "sending", help="Pause/resume sending (your pause only), or clear a bounce hold")
     sub.add_argument("sending_action", nargs="?", default="status",
-                     choices=["pause", "resume", "status"])
+                     choices=["pause", "resume", "status", "clear-hold"])
     sub.set_defaults(func=cmd_sending)
 
     # mercury usage
