@@ -11,6 +11,8 @@ back to review, and nothing goes out on an approval for an earlier revision.
 import asyncio
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -556,6 +558,47 @@ async def test_config_services_follow_the_private_override_and_refuse_stale_revi
     latest = await second.update({"usage.heartbeat_interval_minutes": 30}, changed["revision"])
     assert latest["fields"]["channels.email.max_daily_sends"] == 20
     assert (await first.get())["revision"] == latest["revision"]
+
+
+@pytest.mark.asyncio
+async def test_config_revision_check_serializes_independent_clients(state, tmp_path, monkeypatch):
+    from mercury.control.settings import ConfigService
+    import mercury.inbox_settings as inbox_settings
+
+    source = tmp_path / "settings.yaml"
+    source.write_text(TEMPLATE.read_text())
+    seen = (await ConfigService(CLI, state, source=source).get())["revision"]
+    real_write = inbox_settings.atomic_write
+    writers = threading.Barrier(2)
+
+    def overlapping_write(path, text):
+        # Without serialization both clients reach the write having read
+        # the same revision. With it, the first writes after this timeout
+        # and the second observes that its revision is stale.
+        try:
+            writers.wait(timeout=1)
+        except threading.BrokenBarrierError:
+            pass
+        real_write(path, text)
+
+    monkeypatch.setattr(inbox_settings, "atomic_write", overlapping_write)
+
+    def update(value):
+        independent = StateManager(state.db_path)
+        service = ConfigService(CLI, independent, source=source)
+        try:
+            return asyncio.run(service.update({"channels.email.max_daily_sends": value}, seen))
+        except Conflict as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(update, value) for value in (20, 40)]
+        results = [future.result(timeout=10) for future in futures]
+    assert sum(isinstance(result, dict) for result in results) == 1
+    failures = [result for result in results if isinstance(result, Conflict)]
+    assert len(failures) == 1 and failures[0].code == "stale_revision"
+    winner = next(result for result in results if isinstance(result, dict))
+    assert (await ConfigService(CLI, state, source=source).get())["revision"] == winner["revision"]
 
 
 def test_config_changes_need_the_revision_that_was_read(tmp_path, monkeypatch):
