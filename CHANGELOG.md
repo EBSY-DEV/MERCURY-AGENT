@@ -7,8 +7,28 @@ minor versions can still change behaviour.
 
 ## [Unreleased]
 
+### Added
+
+- **Exclusions and company limits.** Exact-address and domain exclusions
+  (subdomains only when you ask), with a reason, a source and an append-only
+  history. Opt-outs and bounces are recorded as exclusions on the address, so
+  deleting, re-importing or rediscovering a contact never reactivates it.
+  Exclusions are re-checked in the transaction that claims each email, and
+  queued email they cover is blocked until you send it back to review. New
+  per-company limits (`max_new_contacts_per_company_per_day`,
+  `max_active_contacts_per_company`) and a company hold when someone replies
+  (`pause_company_on_reply`, on by default). Dashboard **Exclusions** tab,
+  reasons in the Outbox, and `mercury exclusions` / `mercury holds` commands.
+  Requeued exclusions require a fresh approval even with automatic follow-ups;
+  blocked sequences can be discarded without lifting their exclusion. Active
+  company limits count each contact once across campaigns.
+
 ### Changed
 
+- **`mercury run` opens with the logo.** The mark is drawn in the terminal with quadrant blocks (rasterised
+  from the symbol's own geometry), with the name, version and folder beside it. Printed only to a terminal,
+  not to a log file or a service journal, and not for `--once`. Narrow terminals get the plain dot and
+  name; terminals that cannot encode it get an ASCII fallback. `NO_COLOR` turns the colour off.
 - **`max_bounce_rate` now defaults to 2%** (was 5%), and the rate check starts
   after 50 sends (was 10). Configs that set the value keep it. `mercury sending
   resume` and the dashboard's Resume now clear the per-bucket counters too.

@@ -55,6 +55,9 @@ channels:
     auto_approve_followups: false  # approving a first email also approves its follow-ups
     spread_sends: false         # pace the day's sends until quiet hours, not in bursts
     ooo_resume_buffer_days: 0   # out-of-office: resume N business days after their return date
+    max_new_contacts_per_company_per_day: 0  # first emails per company per 24 hours (0 = no limit)
+    max_active_contacts_per_company: 0       # colleagues in an unfinished sequence at once (0 = no limit)
+    pause_company_on_reply: true  # a person replies: hold cold mail to their colleagues
     # smtp only: rotate cold email over several mailboxes on secondary domains.
     # Each thread stays on the mailbox it started from. Passwords go in .env
     # under the name given in password_env (MAILBOX_* or SMTP_PASSWORD).
