@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 330" width="1600" height="330" role="img">
+  <title>Mercury Agent heartbeat storyboard</title>
+  <rect x="8" y="8" width="304" height="314" rx="12" fill="#FFFFFF" stroke="#E8E3F5" stroke-width="2"/>
+  <path transform="translate(135 140) scale(0.85)" fill="#211C35" d="M-100 0C-100 -55.23 -55.23 -100 0 -100C55.23 -100 100 -55.23 100 0C100 55.23 55.23 100 0 100C-55.23 100 -100 55.23 -100 0Z"/>
+  <text x="32" y="286" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="20" font-weight="600" fill="#211C35">Asleep</text>
+  <text x="288" y="286" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="16" fill="#716A90" text-anchor="end">0.00 s</text>
+  <text x="32" y="306" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="15" fill="#716A90">Closed disc</text>
+  <rect x="328" y="8" width="304" height="314" rx="12" fill="#FFFFFF" stroke="#E8E3F5" stroke-width="2"/>
+  <path transform="translate(455 140) scale(0.85)" fill="#211C35" d="M-100 0C-100 -55.23 -55.23 -100 0 -100C55.23 -100 100 -55.23 100 0C100 55.23 55.23 100 0 100C-55.23 100 -100 55.23 -100 0ZM-36 0C-36 33.14 -9.14 60 24 60C57.14 60 84 33.14 84 0C84 -33.14 57.14 -60 24 -60C-9.14 -60 -36 -33.14 -36 0ZM-16 0C-16 -22.09 1.91 -40 24 -40C46.09 -40 64 -22.09 64 0C64 22.09 46.09 40 24 40C1.91 40 -16 22.09 -16 0Z"/>
+  <text x="352" y="286" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="20" font-weight="600" fill="#211C35">Wake</text>
+  <text x="608" y="286" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="16" fill="#716A90" text-anchor="end">0.29 s</text>
+  <text x="352" y="306" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="15" fill="#716A90">A dot appears inside</text>
+  <rect x="648" y="8" width="304" height="314" rx="12" fill="#FFFFFF" stroke="#E8E3F5" stroke-width="2"/>
+  <path transform="translate(775 140) scale(0.85)" fill="#211C35" d="M-100 0C-100 -55.23 -55.23 -100 0 -100C35.34 -100 66.39 -81.67 84.18 -54C76.27 -57.84 67.39 -60 58 -60C24.86 -60 -2 -33.14 -2 0C-2 33.14 24.86 60 58 60C67.39 60 76.27 57.84 84.18 54C66.39 81.67 35.34 100 0 100C-55.23 100 -100 55.23 -100 0ZM18 0C18 -22.09 35.91 -40 58 -40C80.09 -40 98 -22.09 98 0C98 22.09 80.09 40 58 40C35.91 40 18 22.09 18 0Z"/>
+  <text x="672" y="286" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="20" font-weight="600" fill="#211C35">Act</text>
+  <text x="928" y="286" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="16" fill="#716A90" text-anchor="end">0.45 s</text>
+  <text x="672" y="306" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="15" fill="#716A90">It crosses the rim</text>
+  <rect x="968" y="8" width="304" height="314" rx="12" fill="#FFFFFF" stroke="#E8E3F5" stroke-width="2"/>
+  <path transform="translate(1095 140) scale(0.85)" fill="#211C35" d="M-100 0C-100 -55.23 -55.23 -100 0 -100C32.72 -100 61.76 -84.29 80.01 -60H80C46.86 -60 20 -33.14 20 0C20 33.14 46.86 60 80 60H80.01C61.76 84.29 32.72 100 0 100C-55.23 100 -100 55.23 -100 0ZM40 0C40 -22.09 57.91 -40 80 -40C102.09 -40 120 -22.09 120 0C120 22.09 102.09 40 80 40C57.91 40 40 22.09 40 0Z"/>
+  <text x="992" y="286" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="20" font-weight="600" fill="#211C35">Ready</text>
+  <text x="1248" y="286" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="16" fill="#716A90" text-anchor="end">1.39–2.11 s</text>
+  <text x="992" y="306" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="15" fill="#716A90">Waits for your yes</text>
+  <rect x="1288" y="8" width="304" height="314" rx="12" fill="#FFFFFF" stroke="#E8E3F5" stroke-width="2"/>
+  <path transform="translate(1415 140) scale(0.85)" fill="#211C35" d="M-100 0C-100 -55.23 -55.23 -100 0 -100C46.39 -100 85.4 -68.41 96.7 -25.57C93.97 -26.5 91.04 -27 88 -27C73.09 -27 61 -14.91 61 0C61 14.91 73.09 27 88 27C91.04 27 93.97 26.5 96.7 25.57C85.4 68.41 46.39 100 0 100C-55.23 100 -100 55.23 -100 0ZM70 0C70 -9.94 78.06 -18 88 -18C97.94 -18 106 -9.94 106 0C106 9.94 97.94 18 88 18C78.06 18 70 9.94 70 0Z"/>
+  <text x="1312" y="286" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="20" font-weight="600" fill="#211C35">Sent</text>
+  <text x="1568" y="286" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="16" fill="#716A90" text-anchor="end">2.11–2.40 s</text>
+  <text x="1312" y="306" font-family="Geist, -apple-system, 'Segoe UI', sans-serif" font-size="15" fill="#716A90">Goes out, the disc heals</text>
+</svg>
