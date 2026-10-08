@@ -1457,11 +1457,11 @@ async function outboxSave(id, quiet) {
   if (!e.subject || !e.body) { showToast('Subject and body can\'t be empty.', 'error'); return false; }
   const data = await api('/api/outbox/' + encodeURIComponent(id), {
     method: 'PUT', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({subject: e.subject, body: e.body}),
+    body: JSON.stringify({subject: e.subject, body: e.body, revision: e.it.revision}),
   });
   if (data && data.success) {
     e.it.subject = e.subject; e.it.body = e.body;
-    e.it.manually_edited = 1;
+    e.it.manually_edited = 1; e.it.revision = data.revision;
     if (!quiet) showToast('Edits saved.', 'success');
     return true;
   }
@@ -1474,12 +1474,12 @@ async function outboxRegenerate(id) {
   const btn = document.getElementById('desk-regen-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = icon('sparkle') + 'Writing…'; }
   showToast('Rewriting — this can take up to a minute.', 'success');
+  const it = _desk.items.find(x => x.id === id);
   const data = await api('/api/outbox/' + encodeURIComponent(id) + '/regenerate', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({instruction: instruction.trim()}),
+    body: JSON.stringify({instruction: instruction.trim(), revision: it ? it.revision : null}),
   });
   if (data && data.success) {
-    const it = _desk.items.find(x => x.id === id);
     if (it) Object.assign(it, data);
     document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i);
     showToast('New draft ready. Review it before approving.', 'success');
@@ -1492,8 +1492,12 @@ async function outboxRegenerate(id) {
 async function outboxAct(id, action) {
   // Approving sends what is on screen, so unsaved edits go first.
   if (action === 'approve' && deskEdits(id) && !(await outboxSave(id, true))) return;
-  const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
-  if (data && data.success) {
+  // The revision on screen: if the email changed since, the server refuses.
+  const it = _desk.items.find(x => x.id === id);
+  const res = await postJSON('/api/outbox/' + encodeURIComponent(id) + '/' + action,
+    {revision: it ? it.revision : null});
+  const data = res.data;
+  if (res.ok && data) {
     if (action === 'approve') {
       const fu = Number(data.followups_approved || 0);
       showToast(fu ? 'Approved, with ' + fu + ' follow-up' + (fu === 1 ? '' : 's') + ' — they send on schedule.'
@@ -1503,7 +1507,8 @@ async function outboxAct(id, action) {
       showToast(later ? 'Rejected, with ' + later + ' later step' + (later === 1 ? '' : 's') + ' of the sequence.'
                       : 'Rejected.', 'success');
     }
-  } else showToast('Action failed.', 'error');
+  } else showToast(data && data.code === 'stale_revision'
+    ? 'This email changed since you opened it. Review it again.' : 'Action failed.', 'error');
   loadOutbox();
 }
 
@@ -1588,8 +1593,14 @@ async function pauseResume(id) {
 }
 
 async function outboxApproveAll() {
-  const data = await api('/api/outbox/approve-all', {method: 'POST'});
-  if (data && data.success) showToast('Approved ' + data.approved + ' email(s).', 'success');
+  // Exactly the emails on screen, at the revisions shown. Anything newer stays in review.
+  const items = _desk.items.map(x => ({id: x.id, revision: x.revision}));
+  if (!items.length) { showToast('Nothing awaiting review.', 'success'); return; }
+  const data = await api('/api/outbox/approve-all', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({items}),
+  });
+  if (data && data.success) showToast('Approved ' + data.approved + ' email(s).' + (data.failed
+    ? ' ' + data.failed + ' changed since you loaded them and stay in review.' : ''), 'success');
   else showToast('Approve-all failed.', 'error');
   loadOutbox();
 }
@@ -3203,7 +3214,9 @@ function openEventDrawer(id, fromProspect) {
 
 async function evAct(id, action) {
   document.querySelectorAll('#drawer-body [data-act]').forEach(b => { b.disabled = true; });
-  const res = await postJSON('/api/outbox/' + encodeURIComponent(id) + '/' + action);
+  const ev = _evIndex.get(String(id));
+  const res = await postJSON('/api/outbox/' + encodeURIComponent(id) + '/' + action,
+    {revision: ev ? ev.revision : null});
   if (res.ok) showToast(action === 'approve' ? 'Approved — it sends on schedule.' : 'Rejected — it won\'t send.', 'success');
   else showToast('Couldn\'t ' + action + ': ' + res.error, 'error');
   afterEventChange(id);
@@ -3215,9 +3228,11 @@ async function evReschedule(id) {
   if (!d || isNaN(d)) { showToast('Pick a date and time first.', 'error'); return; }
   if (d < new Date()) { showToast('Pick a time in the future.', 'error'); return; }
   document.querySelectorAll('#drawer-body [data-act]').forEach(b => { b.disabled = true; });
+  const ev = _evIndex.get(String(id));
   const res = await postJSON('/api/outbox/' + encodeURIComponent(id) + '/reschedule',
-    { send_at: d.toISOString().replace(/\.\d{3}Z$/, 'Z') });
-  if (res.ok) showToast('Rescheduled for ' + fullWhen(d) + '.', 'success');
+    { send_at: d.toISOString().replace(/\.\d{3}Z$/, 'Z'), revision: ev ? ev.revision : null });
+  if (res.ok) showToast('Rescheduled for ' + fullWhen(d) + '.' +
+    (res.data && res.data.approval_cleared ? ' It needs approval again.' : ''), 'success');
   else showToast('Couldn\'t reschedule: ' + res.error, 'error');
   afterEventChange(id);
 }

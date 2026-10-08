@@ -342,9 +342,10 @@ def test_reschedule_happy_path(client):
     item = _outbox(client.sm, pid, step=2, status="pending_review")
     target = (_now() + timedelta(days=3)).replace(second=0, microsecond=0)
     r = client.post(f"/api/outbox/{item}/reschedule",
-                    json={"send_at": target.strftime("%Y-%m-%dT%H:%M")})
+                    json={"send_at": target.strftime("%Y-%m-%dT%H:%M"), "revision": 1})
     assert r.status_code == 200
-    assert r.json() == {"success": True, "send_at": target.isoformat(timespec="seconds")}
+    assert r.json() == {"success": True, "send_at": target.isoformat(timespec="seconds"),
+                        "revision": 2, "status": "pending_review", "approval_cleared": False}
     assert _run(client.sm.get_outbox_item(item))["send_at"] == target.isoformat(timespec="seconds")
 
 
@@ -353,10 +354,10 @@ def test_reschedule_converts_offsets_to_utc(client):
     item = _outbox(client.sm, pid, step=2, status="approved")
     year = _now().year + 1
     r = client.post(f"/api/outbox/{item}/reschedule",
-                    json={"send_at": f"{year}-03-01T09:00:00-07:00"})
+                    json={"send_at": f"{year}-03-01T09:00:00-07:00", "revision": 1})
     assert r.json()["send_at"] == f"{year}-03-01T16:00:00"
     r = client.post(f"/api/outbox/{item}/reschedule",
-                    json={"send_at": f"{year}-03-01T09:00:00.123Z"})
+                    json={"send_at": f"{year}-03-01T09:00:00.123Z", "revision": 2})
     assert r.json()["send_at"] == f"{year}-03-01T09:00:00"
 
 
@@ -364,14 +365,14 @@ def test_reschedule_rejects_past(client):
     pid = _prospect(client.sm, "a@x.co", "queued")
     item = _outbox(client.sm, pid, step=2, status="approved")
     past = (_now() - timedelta(hours=2)).isoformat()
-    r = client.post(f"/api/outbox/{item}/reschedule", json={"send_at": past})
+    r = client.post(f"/api/outbox/{item}/reschedule", json={"send_at": past, "revision": 1})
     assert r.status_code == 400 and r.json()["success"] is False
 
 
 def test_reschedule_rejects_bad_input(client):
     pid = _prospect(client.sm, "a@x.co", "queued")
     item = _outbox(client.sm, pid, step=2, status="approved")
-    for body in ({}, {"send_at": "tomorrow"}, {"send_at": ""}):
+    for body in ({}, {"send_at": "tomorrow", "revision": 1}, {"send_at": "", "revision": 1}):
         r = client.post(f"/api/outbox/{item}/reschedule", json=body)
         assert r.status_code == 400 and r.json()["success"] is False
 
@@ -381,8 +382,20 @@ def test_reschedule_wrong_status(client, status):
     pid = _prospect(client.sm, "a@x.co", "contacted")
     item = _outbox(client.sm, pid, step=1, status=status)
     future = (_now() + timedelta(days=1)).isoformat()
-    r = client.post(f"/api/outbox/{item}/reschedule", json={"send_at": future})
+    r = client.post(f"/api/outbox/{item}/reschedule", json={"send_at": future, "revision": 1})
     assert r.status_code == 400 and r.json()["success"] is False
+    assert r.json()["code"] == "not_editable"
+
+
+def test_reschedule_needs_the_revision_on_screen(client):
+    pid = _prospect(client.sm, "a@x.co", "queued")
+    item = _outbox(client.sm, pid, step=2, status="pending_review")
+    future = (_now() + timedelta(days=1)).isoformat()
+    r = client.post(f"/api/outbox/{item}/reschedule", json={"send_at": future})
+    assert r.status_code == 400 and r.json()["code"] == "revision_required"
+    r = client.post(f"/api/outbox/{item}/reschedule", json={"send_at": future, "revision": 7})
+    assert r.status_code == 409 and r.json()["code"] == "stale_revision" and r.json()["revision"] == 1
+    assert _run(client.sm.get_outbox_item(item))["revision"] == 1
 
 
 def test_reschedule_unknown_item(client):

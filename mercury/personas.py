@@ -251,15 +251,21 @@ class PersonaStore:
             await db.commit()
         return generation_id
 
-    async def replace_draft(self, item_id, draft):
-        """Attach a regeneration atomically, refusing mail that left the review queue."""
+    async def replace_draft(self, item_id, draft, expected_revision=None):
+        """Attach a regeneration atomically, refusing mail that left the review
+        queue (or, given ``expected_revision``, changed since it was read). The
+        new draft is a new revision and goes back to review unapproved."""
         async with self.state._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
                 "UPDATE outbox SET subject = ?, body = ?, generation_id = ?, manually_edited = 0, "
-                "status = 'pending_review', updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = ? AND status IN ('pending_review', 'approved')",
-                (draft["subject"], draft["body"], draft.get("generation_id", ""), item_id),
+                "status = 'pending_review', revision = revision + 1, approved_revision = NULL, "
+                "approved_hash = '', approved_by = '', approved_at = NULL, "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND status IN ('pending_review', 'approved') "
+                "AND (? IS NULL OR revision = ?)",
+                (draft["subject"], draft["body"], draft.get("generation_id", ""), item_id,
+                 expected_revision, expected_revision),
             )
             if not cursor.rowcount:
                 raise ValueError("This email is no longer available for regeneration")

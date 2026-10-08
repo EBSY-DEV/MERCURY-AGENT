@@ -721,9 +721,9 @@ async def test_approving_an_opener_promotes_its_follow_ups_at_once(state, monkey
     monkeypatch.setattr(dashboard, "_state", lambda: state)
     monkeypatch.setattr("mercury.config.load_config", lambda *a, **k: cfg)
 
-    data = TestClient(dashboard.app).post(f"/api/outbox/{s1}/approve").json()
+    data = TestClient(dashboard.app).post(f"/api/outbox/{s1}/approve", json={"revision": 1}).json()
 
-    assert data == {"success": True, "followups_approved": 2}
+    assert data == {"success": True, "followups_approved": 2, "revision": 1}
     for i in (s2, s3):
         assert (await state.get_outbox_item(i))["status"] == "approved"
 

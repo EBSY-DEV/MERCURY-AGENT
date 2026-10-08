@@ -111,6 +111,19 @@ def _queue(sm, pid, step=1, status="pending_review", campaign_id="c1", kind="seq
     ))
 
 
+def _rev(sm, item_id):
+    """The revision a reviewer would have on screen right now."""
+    return _run(sm.get_outbox_item(item_id))["revision"]
+
+
+def _config(ctx=None, client=None):
+    return ConfigService(ctx or CLI, client.sm)
+
+
+def _config_rev(client):
+    return _run(_config(client=client).get())["revision"]
+
+
 def _seed(sm):
     company_id = _run(sm.add_company(Company(name="Example Co", domain="example.com",
                                              industry="segment_a", location="Denver, CO")))
@@ -154,7 +167,7 @@ def test_missing_scope_is_refused_before_anything_changes(client):
     item = _queue(client.sm, pid)
     reader = OperatorContext(client="mcp", scopes=frozenset({"read"}))
     with pytest.raises(Forbidden) as error:
-        _run(OutboxService(reader, client.sm).approve(item))
+        _run(OutboxService(reader, client.sm).approve(item, 1))
     assert error.value.code == "missing_scope"
     with pytest.raises(Forbidden):
         _run(SendingService(reader, client.sm).pause())
@@ -218,18 +231,21 @@ def test_approve_through_either_interface(client):
     a = _queue(client.sm, pid, campaign_id="c1")
     b = _queue(client.sm, pid, campaign_id="c2")
 
-    assert client.post(f"/api/outbox/{a}/approve").json() == {"success": True, "followups_approved": 0}
-    assert _run(OutboxService(CLI, client.sm).approve(b)) == {"id": b, "approved": 1, "followups_approved": 0}
+    assert client.post(f"/api/outbox/{a}/approve", json={"revision": 1}).json() == {
+        "success": True, "followups_approved": 0, "revision": 1}
+    assert _run(OutboxService(CLI, client.sm).approve(b, 1)) == {
+        "id": b, "approved": 1, "followups_approved": 0, "revision": 1}
     for item in (a, b):
         assert _run(client.sm.get_outbox_item(item))["status"] == "approved"
 
     # Approving again: the dashboard keeps its old answer, the service says why.
-    assert client.post(f"/api/outbox/{a}/approve").json() == {"success": False, "followups_approved": 0}
+    assert client.post(f"/api/outbox/{a}/approve", json={"revision": 1}).json() == {
+        "success": False, "followups_approved": 0}
     with pytest.raises(Conflict) as error:
-        _run(OutboxService(CLI, client.sm).approve(b))
+        _run(OutboxService(CLI, client.sm).approve(b, 1))
     assert error.value.code == "not_pending"
     with pytest.raises(NotFound):
-        _run(OutboxService(CLI, client.sm).approve("nope"))
+        _run(OutboxService(CLI, client.sm).approve("nope", 1))
 
 
 def test_approving_promotes_follow_ups_through_the_service(client):
@@ -237,7 +253,7 @@ def test_approving_promotes_follow_ups_through_the_service(client):
     opener = _queue(client.sm, pid, step=1)
     follow = _queue(client.sm, pid, step=2)
     config = SimpleNamespace(channels=SimpleNamespace(email=SimpleNamespace(auto_approve_followups=True)))
-    result = _run(OutboxService(CLI, client.sm, config).approve(opener))
+    result = _run(OutboxService(CLI, client.sm, config).approve(opener, 1))
     assert result["followups_approved"] == 1
     assert _run(client.sm.get_outbox_item(follow))["status"] == "approved"
 
@@ -247,11 +263,13 @@ def test_reject_cascades_the_same_way(client):
     one = [_queue(client.sm, pid, step=s, campaign_id="c1") for s in (1, 2, 3)]
     two = [_queue(client.sm, pid, step=s, campaign_id="c2") for s in (1, 2, 3)]
 
-    assert client.post(f"/api/outbox/{one[0]}/reject").json() == {"success": True, "rejected": 3}
-    assert _run(OutboxService(CLI, client.sm).reject(two[0]))["rejected"] == 3
-    assert client.post("/api/outbox/nope/reject").json() == {"success": True, "rejected": 0}
+    assert client.post(f"/api/outbox/{one[0]}/reject", json={"revision": 1}).json() == {
+        "success": True, "rejected": 3}
+    assert _run(OutboxService(CLI, client.sm).reject(two[0], 1))["rejected"] == 3
+    assert client.post("/api/outbox/nope/reject", json={"revision": 1}).json() == {
+        "success": True, "rejected": 0}
     with pytest.raises(Conflict) as error:
-        _run(OutboxService(CLI, client.sm).reject(two[0]))
+        _run(OutboxService(CLI, client.sm).reject(two[0], 1))
     assert error.value.code == "not_queued"
 
 
@@ -259,27 +277,28 @@ def test_edit_and_its_refusals_match(client):
     pid = _prospect(client.sm, "pat@example.com")
     a, b = _queue(client.sm, pid, campaign_id="c1"), _queue(client.sm, pid, campaign_id="c2")
 
-    assert client.put(f"/api/outbox/{a}", json={"subject": "New", "body": "Text"}).json() == {"success": True}
-    _run(OutboxService(CLI, client.sm).edit(b, "New", "Text"))
+    assert client.put(f"/api/outbox/{a}", json={"subject": "New", "body": "Text", "revision": 1}).json() == {
+        "success": True, "revision": 2, "status": "pending_review", "approval_cleared": False}
+    assert _run(OutboxService(CLI, client.sm).edit(b, "New", "Text", 1))["revision"] == 2
     for item in (a, b):
         row = _run(client.sm.get_outbox_item(item))
-        assert (row["subject"], row["body"], row["manually_edited"]) == ("New", "Text", 1)
+        assert (row["subject"], row["body"], row["manually_edited"], row["revision"]) == ("New", "Text", 1, 2)
 
-    r = client.put(f"/api/outbox/{a}", json={"subject": "", "body": "Text"})
+    r = client.put(f"/api/outbox/{a}", json={"subject": "", "body": "Text", "revision": 2})
     assert r.status_code == 400
     with pytest.raises(Invalid):
-        _run(OutboxService(CLI, client.sm).edit(b, "", "Text"))
+        _run(OutboxService(CLI, client.sm).edit(b, "", "Text", 2))
 
     _run(client.sm.update_outbox_item(a, status="sent"))
-    r = client.put(f"/api/outbox/{a}", json={"subject": "S", "body": "B"})
+    r = client.put(f"/api/outbox/{a}", json={"subject": "S", "body": "B", "revision": 2})
     assert r.status_code == 409
     with pytest.raises(Conflict) as error:
-        _run(OutboxService(CLI, client.sm).edit(a, "S", "B"))
+        _run(OutboxService(CLI, client.sm).edit(a, "S", "B", 2))
     assert error.value.code == "not_editable"
     # A missing draft keeps the dashboard's old 409; the service names it.
-    assert client.put("/api/outbox/nope", json={"subject": "S", "body": "B"}).status_code == 409
+    assert client.put("/api/outbox/nope", json={"subject": "S", "body": "B", "revision": 1}).status_code == 409
     with pytest.raises(NotFound):
-        _run(OutboxService(CLI, client.sm).edit("nope", "S", "B"))
+        _run(OutboxService(CLI, client.sm).edit("nope", "S", "B", 1))
 
 
 def test_reschedule_matches_and_is_logged_as_the_caller(client):
@@ -287,35 +306,44 @@ def test_reschedule_matches_and_is_logged_as_the_caller(client):
     a, b = _queue(client.sm, pid, campaign_id="c1"), _queue(client.sm, pid, campaign_id="c2")
     when = (_now() + timedelta(days=4)).replace(microsecond=0)
 
-    served = client.post(f"/api/outbox/{a}/reschedule", json={"send_at": when.isoformat()}).json()
-    direct = _run(OutboxService(CLI, client.sm).reschedule(b, when))
-    assert served == {"success": True, "send_at": direct["send_at"]}
+    served = client.post(f"/api/outbox/{a}/reschedule",
+                         json={"send_at": when.isoformat(), "revision": 1}).json()
+    direct = _run(OutboxService(CLI, client.sm).reschedule(b, when, 1))
+    assert served == {"success": True, "send_at": direct["send_at"], "revision": 2,
+                      "status": "pending_review", "approval_cleared": False}
     agents = {r["agent"] for r in _run(QueryService(CLI, client.sm).activity())
               if r["action_type"] == "outbox_reschedule"}
     assert agents == {"dashboard", "cli"}
 
     past = _now() - timedelta(hours=2)
-    assert client.post(f"/api/outbox/{a}/reschedule", json={"send_at": past.isoformat()}).status_code == 400
+    assert client.post(f"/api/outbox/{a}/reschedule",
+                       json={"send_at": past.isoformat(), "revision": 2}).status_code == 400
     with pytest.raises(Invalid):
-        _run(OutboxService(CLI, client.sm).reschedule(b, past))
-    assert client.post("/api/outbox/nope/reschedule", json={"send_at": when.isoformat()}).status_code == 404
+        _run(OutboxService(CLI, client.sm).reschedule(b, past, 2))
+    assert client.post("/api/outbox/nope/reschedule",
+                       json={"send_at": when.isoformat(), "revision": 1}).status_code == 404
 
 
 def test_batch_applies_to_explicit_ids_only(client):
     pid = _prospect(client.sm, "pat@example.com")
     a, b, c = (_queue(client.sm, pid, campaign_id=f"c{i}") for i in range(3))
 
-    served = client.post("/api/outbox/batch", json={"action": "approve", "ids": [a, "nope", a]}).json()
+    items = [{"id": a, "revision": 1}, {"id": "nope", "revision": 1}, {"id": a, "revision": 1}]
+    served = client.post("/api/outbox/batch", json={"action": "approve", "items": items}).json()
     assert served["success"] and served["succeeded"] == 1 and served["failed"] == 1
     assert [r["ok"] for r in served["results"]] == [True, False]
     assert served["results"][1]["code"] == "not_found"
-    direct = _run(OutboxService(CLI, client.sm).batch("reject", [b]))
+    direct = _run(OutboxService(CLI, client.sm).batch("reject", [{"id": b, "revision": 1}]))
     assert direct["succeeded"] == 1 and direct["results"][0]["rejected"] == 1
     # c was never named, so nothing touched it.
     assert _run(client.sm.get_outbox_item(c))["status"] == "pending_review"
 
-    assert client.post("/api/outbox/batch", json={"action": "send", "ids": [c]}).status_code == 400
-    assert client.post("/api/outbox/batch", json={"action": "approve", "ids": []}).status_code == 400
+    for body in ({"action": "send", "items": [{"id": c, "revision": 1}]},
+                 {"action": "approve", "items": []},
+                 {"action": "approve", "ids": [c]},                      # ids alone: no revisions
+                 {"action": "approve", "items": [{"id": c}]},
+                 {"action": "approve", "items": [{"id": c, "revision": 1}, {"id": c, "revision": 2}]}):
+        assert client.post("/api/outbox/batch", json=body).status_code == 400, body
     assert _run(client.sm.get_outbox_item(c))["status"] == "pending_review"
 
 
@@ -464,16 +492,17 @@ def _files(client):
 
 def test_config_read_matches(client):
     served = client.get("/api/config").json()
-    direct = _run(ConfigService(CLI).get())
-    assert served == _plain(direct)
+    direct = _run(_config(client=client).get())
+    assert served == _plain(direct) and len(served["revision"]) == 16
     assert set(served["fields"]) == set(EDITABLE)
     assert served["fields"]["channels.email.require_approval"] is True
 
 
 def test_config_change_goes_to_the_private_file(client):
     before = client.config_path.read_bytes()
-    r = client.patch("/api/config", json={"channels.email.require_approval": False,
-                                          "usage.quiet_hours.start": "21:30"})
+    revision = _config_rev(client)
+    r = client.patch("/api/config", json={"revision": revision, "changes": {
+        "channels.email.require_approval": False, "usage.quiet_hours.start": "21:30"}})
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["success"] and data["changed"] == {"channels.email.require_approval": False,
@@ -483,7 +512,9 @@ def test_config_change_goes_to_the_private_file(client):
     saved = config_module.load_config(str(client.local_path))
     assert saved.channels.email.require_approval is False and saved.usage.quiet_hours.start == "21:30"
     # The service now reads the change back.
-    assert _run(ConfigService(CLI).get())["fields"]["usage.quiet_hours.start"] == "21:30"
+    after = _run(_config(client=client).get())
+    assert after["fields"]["usage.quiet_hours.start"] == "21:30"
+    assert after["revision"] == data["revision"] != revision
 
 
 @pytest.mark.parametrize("changes, status, code", [
@@ -500,19 +531,21 @@ def test_config_change_goes_to_the_private_file(client):
 ])
 def test_refused_config_changes_write_nothing(client, changes, status, code):
     before = _files(client)
-    r = client.patch("/api/config", json=changes)
+    revision = _config_rev(client)
+    r = client.patch("/api/config", json={"revision": revision, "changes": changes})
     assert r.status_code == status and r.json()["success"] is False and r.json()["code"] == code
     assert "hunter2" not in r.text
     with pytest.raises(ControlError) as error:
-        _run(ConfigService(CLI).update(changes))
+        _run(_config(client=client).update(changes, revision))
     assert error.value.code == code
     assert _files(client) == before
+    assert "hunter2" not in json.dumps(_run(client.sm.get_audit()))
 
 
 def test_prohibited_fields_are_named(client):
     with pytest.raises(ProhibitedField) as error:
-        _run(ConfigService(CLI).update({"usage.heartbeat_interval_minutes": 5, "SERPER_API_KEY": "k",
-                                        "persona.name": "x"}))
+        _run(_config(client=client).update({"usage.heartbeat_interval_minutes": 5, "SERPER_API_KEY": "k",
+                                            "persona.name": "x"}, _config_rev(client)))
     # Any secret in the request makes it a secret refusal, naming only the secrets.
     assert error.value.code == "secret_field" and error.value.fields == ["SERPER_API_KEY"]
 
@@ -521,7 +554,8 @@ def test_config_edit_needs_the_edit_scope(client):
     before = _files(client)
     reader = OperatorContext(client="mcp", scopes=frozenset({"read"}))
     with pytest.raises(Forbidden):
-        _run(ConfigService(reader).update({"channels.email.require_approval": False}))
+        _run(_config(reader, client).update({"channels.email.require_approval": False},
+                                            _config_rev(client)))
     assert _files(client) == before
 
 
@@ -529,7 +563,10 @@ def test_explicit_config_is_written_in_place(tmp_path, monkeypatch):
     path = tmp_path / "state-config.yaml"
     path.write_text("# keep me\n" + TEMPLATE.read_text())
     monkeypatch.setenv("MERCURY_CONFIG", str(path))
-    _run(ConfigService(CLI).update({"channels.email.max_daily_sends": 12}))
+    sm = StateManager(db_path=str(tmp_path / "mercury.db"))
+    _run(sm.init_db())
+    service = ConfigService(CLI, sm)
+    _run(service.update({"channels.email.max_daily_sends": 12}, _run(service.get())["revision"]))
     assert path.read_text().startswith("# keep me\n")
     assert yaml.safe_load(path.read_text())["channels"]["email"]["max_daily_sends"] == 12
     assert not (tmp_path / "mercury.local.yaml").exists()
@@ -552,7 +589,8 @@ def test_cli_commands_go_through_the_services(client, monkeypatch, capsys):
 
     args = SimpleNamespace(approve=item, approve_all=False, reject="")
     cli.cmd_outbox(args)
-    assert "Approved." in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "rev 1" in out and "Subject: subject 1" in out and "Approved revision 1." in out
     cli.cmd_outbox(args)
     assert "No pending item with that id." in capsys.readouterr().out
     cli.cmd_outbox(SimpleNamespace(approve="", approve_all=False, reject="nope"))
