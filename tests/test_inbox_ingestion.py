@@ -325,7 +325,8 @@ def test_automatic_replies_recorded_before_the_upgrade_are_backfilled():
         import asyncio
         asyncio.run(StateManager(db).init_db())
         conn = sqlite3.connect(db)
-        # Roll the file back to v20, as an existing install would be.
+        # Roll the file back to the version before the inbox (v24), as an
+        # existing install would be.
         for table in ("inbound_messages", "inbox_state", "contact_notes", "inbox_reminders"):
             conn.execute(f"DROP TABLE {table}")
         conn.execute("DROP INDEX idx_outbox_conversation")
@@ -337,7 +338,7 @@ def test_automatic_replies_recorded_before_the_upgrade_are_backfilled():
             "('<ooo@example.org>', 'p1', 'jane@example.org', 'a@example.com', "
             "'out_of_office', 'Away', 'Back on Monday.', '2026-10-01T08:00:00', "
             "'2026-10-01T08:01:00')")
-        conn.execute("PRAGMA user_version = 20")
+        conn.execute("PRAGMA user_version = 24")
         conn.commit()
         conn.close()
 

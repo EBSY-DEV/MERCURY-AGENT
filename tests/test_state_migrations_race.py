@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 
+import aiosqlite
 import pytest
 
 from mercury.state import MIGRATIONS, StateManager, _split_sql, outbox_hash
@@ -133,6 +134,12 @@ def _assert_full_schema(db: str) -> None:
 async def test_main_line_db_upgrades_at_every_version(tmp_path, stamped):
     db = str(tmp_path / "main.db")
     _apply(db, MIGRATIONS[:stamped])
+    if stamped >= 20:
+        # v20 is applied by normalizing the pause schema; a database stamped
+        # past it already has auto_replies, which the inbox migration reads.
+        async with aiosqlite.connect(db) as conn:
+            await StateManager._normalize_ooo_schema(conn)
+            await conn.commit()
     await StateManager(db).init_db()
     _assert_full_schema(db)
 
