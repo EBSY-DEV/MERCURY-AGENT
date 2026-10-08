@@ -931,7 +931,7 @@ class Sender:
         for pause in await self.state.due_pauses(now):
             ended, moved = await self.state.resume_pause(
                 pause["id"], start_at=now, actor="sender",
-                reason="return date reached", now=now)
+                reason="return date reached", now=now, due_at=now)
             if ended is None:
                 continue
             prospect = await self.state.get_prospect(pause["prospect_id"])

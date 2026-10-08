@@ -466,6 +466,42 @@ async def test_closing_or_excluding_a_paused_contact_stops_the_resume(state):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("correction", ["operator", "newer_reply"])
+async def test_a_stale_pause_scan_respects_a_later_return_date(state, monkeypatch, correction):
+    pid, sender, provider, clock = await paused_contact(state)
+    clock.at(2026, 10, 20, 13, 5)
+    original_due = state.due_pauses
+
+    async def scan_then_extend(now):
+        due = await original_due(now)
+        assert len(due) == 1
+        if correction == "operator":
+            await PauseService(state, TzCfg(), clock=clock).set_return_date(
+                due[0]["id"], "2026-10-26", actor="test")
+        else:
+            provider.inbound = [vacation(
+                key="<ooo-extension@example.com>", date="Tue, 20 Oct 2026 09:01:00 -0400",
+                body="I am still out of the office. Back October 26.")]
+            await make_handler_at(state, provider, clock)._run_native()
+        return due
+
+    monkeypatch.setattr(state, "due_pauses", scan_then_extend)
+    await sender._run_native()
+
+    pause = await state.get_active_pause(pid)
+    assert pause is not None
+    assert pause["resume_at"] == "2026-10-26T13:00:00"
+    assert len(provider.sent) == 1
+    assert await actions(state, "ooo_resumed") == 0
+
+    monkeypatch.setattr(state, "due_pauses", original_due)
+    clock.at(2026, 10, 26, 13, 5)
+    await sender._run_native()
+    assert await state.get_active_pause(pid) is None
+    assert len(provider.sent) == 2
+
+
+@pytest.mark.asyncio
 async def test_a_stale_due_scan_cannot_claim_a_contact_paused_since(state):
     provider = FakeProvider()
     clock = Clock(2026, 10, 5, 14, 0)

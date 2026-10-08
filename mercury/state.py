@@ -2173,15 +2173,18 @@ class StateManager:
         return before, await self.get_pause(pause_id)
 
     async def resume_pause(self, pause_id: str, *, start_at: str, actor: str = "",
-                           reason: str = "", now: str | None = None) -> tuple[dict | None, int]:
+                           reason: str = "", now: str | None = None,
+                           due_at: str | None = None) -> tuple[dict | None, int]:
         """End a pause and move the held sequence so it restarts at ``start_at``.
 
         Per campaign, the next unsent step moves to ``start_at`` (never
         earlier than it was already due) and every later step moves by the
         same amount, so the gaps between steps stay what the sequence said.
         Only send_at changes: a draft waiting for review still waits.
+        Automatic resumes pass ``due_at`` to recheck the return date under
+        the write lock: a correction after the due scan must still hold mail.
         Returns (ended pause, rows rescheduled), or (None, 0) when the pause
-        was not active.
+        was not active or is no longer due.
         """
         now = now or _utcnow().isoformat()
         start = _parse_ts(start_at) or _parse_ts(now)
@@ -2201,6 +2204,13 @@ class StateManager:
                     await db.execute("ROLLBACK")
                     return None, 0
                 pause = dict(row)
+                if due_at is not None:
+                    resume_at = _parse_ts(pause["resume_at"])
+                    due = _parse_ts(due_at)
+                    if (pause["review_state"] != "scheduled" or resume_at is None
+                            or due is None or resume_at > due):
+                        await db.execute("ROLLBACK")
+                        return None, 0
                 async with db.execute(
                     f"SELECT id, campaign_id, step, send_at FROM outbox "
                     f"WHERE prospect_id = ? AND kind = 'sequence' AND status IN ({marks}) "
