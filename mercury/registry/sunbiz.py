@@ -28,7 +28,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 from mercury.registry.base import (
     EntityCandidate, EntityDetail, Officer, RegistryProvider,
-    RegistryUnavailable, LEGAL_SUFFIXES, display_name,
+    RegistryUnavailable, LEGAL_SUFFIXES, display_name, tidy_title,
 )
 
 logger = logging.getLogger("mercury.registry.sunbiz")
@@ -37,6 +37,19 @@ BASE = "https://search.sunbiz.org"
 USER_AGENT = ("MercuryAgent/0.2 (public registry lookup; "
               "+https://github.com/EBSY-DEV/MERCURY-AGENT)")
 TIMEOUT = httpx.Timeout(connect=8.0, read=20.0, write=8.0, pool=8.0)
+
+# The kind of record a search row points at, from the detail link's
+# `aggregateId` prefix (e.g. `aggregateId=flal-L15...-<uuid>`). Only these are
+# business entities. Everything else on the list is a different kind of
+# record: `trade-` trademarks, `reject-` rejected filings (listed as "Active"),
+# and any prefix not seen yet (fictitious names, partnerships, ...), which is
+# skipped rather than guessed at.
+ENTITY_KINDS = {
+    "flal": "Florida LLC or corporation",
+    "domp": "Florida profit corporation",
+    "domnp": "Florida non-profit corporation",
+    "forp": "Foreign profit corporation",
+}
 
 Fetch = Callable[[str], Awaitable[tuple[int, str]]]
 
@@ -74,7 +87,7 @@ def expand_title(code: str) -> str:
     rest = key[2:] if head else key
     if key.isalpha() and len(key) <= 4 and rest and all(c in _LETTER_TITLES for c in rest):
         return ", ".join(head + [_LETTER_TITLES[c] for c in rest])
-    return raw.title() if raw.isupper() else raw
+    return tidy_title(raw)
 
 
 def looks_like_entity(name: str) -> bool:
@@ -139,8 +152,14 @@ class SunbizProvider(RegistryProvider):
     # ── search ──
 
     def search_url(self, name: str) -> str:
-        term = quote(re.sub(r"\s+", " ", name).strip().upper(), safe="")
-        return f"{BASE}/Inquiry/CorporationSearch/SearchResults/EntityName/{term}/Page1"
+        """Shaped like the site's own "Next List" link. The site's search form
+        POSTs to /ByName; whether a bare GET of this URL starts a fresh search
+        has only been checked through a browser, not through this client."""
+        term = re.sub(r"\s+", " ", name).strip().lower()
+        order = re.sub(r"[^A-Z0-9]", "", term.upper())
+        return (f"{BASE}/Inquiry/CorporationSearch/SearchResults?InquiryType=EntityName"
+                f"&inquiryDirectionType=ForwardList&searchNameOrder={quote(order)}"
+                f"&SearchTerm={quote(term)}&listNameOrder={quote(order)}")
 
     async def search(self, name: str) -> list[EntityCandidate]:
         html = await self._get(self.search_url(name))
@@ -149,20 +168,27 @@ class SunbizProvider(RegistryProvider):
     def parse_search(self, html: str) -> list[EntityCandidate]:
         soup = BeautifulSoup(html, "html.parser")
         rows: list[EntityCandidate] = []
+        saw_rows = False
         for tr in soup.find_all("tr"):
             link = tr.find("a", href=re.compile(r"SearchResultDetail", re.I))
             cells = tr.find_all("td")
             if not link or len(cells) < 3:
                 continue
+            saw_rows = True
+            href = link["href"].replace("&amp;", "&")
+            kind = re.search(r"aggregateId=([a-z]+)-", href, re.I)
+            if not kind or kind.group(1).lower() not in ENTITY_KINDS:
+                logger.debug("skipping non-entity search row: %s", _clean(link.get_text(" "))[:40])
+                continue
             rows.append(EntityCandidate(
                 name=_clean(link.get_text(" ")),
                 document_number=_clean(cells[1].get_text(" ")).upper(),
                 status=_clean(cells[-1].get_text(" ")),
-                detail_url=urljoin(BASE, link["href"].replace("&amp;", "&")),
+                detail_url=urljoin(BASE, href),
             ))
             if len(rows) >= self.max_results:
                 break
-        if not rows and not _NO_RESULTS.search(soup.get_text(" ")):
+        if not rows and not saw_rows and not _NO_RESULTS.search(soup.get_text(" ")):
             # Neither a result table nor a plain "nothing found": the page
             # changed shape. Say so instead of reporting a false "no match".
             raise RegistryUnavailable("unrecognized Sunbiz search page")

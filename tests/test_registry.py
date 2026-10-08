@@ -114,6 +114,61 @@ def test_parse_search_and_detail():
     assert all("AGENT" not in o.name.upper() for o in d.officers)
 
 
+def test_search_rows_that_are_not_entities_never_become_candidates():
+    p = SunbizProvider(None)
+    html = fx.search_page(
+        ("EXAMPLE PALM ROOFING LLC", "L15000000001", "Active", "flal"),
+        ("EXAMPLE PALM ROOFING CORP", "100001", "Active", "domp"),
+        ("EXAMPLE PALM ROOFING FOUNDATION INC", "N15000000002", "Active", "domnp"),
+        ("EXAMPLE PALM ROOFING OF GEORGIA INC", "F15000000003", "Active", "forp"),
+        ("EXAMPLE PALM ROOFING & LOGO OF A PALM", "900001", "Active", "trade"),      # trademark
+        ("EXAMPLE PALM ROOFING LLC", "W15000000004", "Active", "reject"),            # rejected filing
+        ("EXAMPLE PALM ROOFING SERVICES", "G15000000005", "Active", "fict"),         # a kind not seen yet
+    )
+    names = [(r.document_number) for r in p.parse_search(html)]
+    assert names == ["L15000000001", "100001", "N15000000002", "F15000000003"]
+    # A page of only such rows is an answer (nothing), not a changed layout.
+    assert p.parse_search(fx.search_page(("X", "900001", "Active", "trade"))) == []
+
+
+@pytest.mark.parametrize("status,active", [
+    ("Active", True), ("ACTIVE", True), ("INACT", False), ("INACT/UA", False),
+    ("InActive", False), ("INACTIVE", False), ("NAME HS", False), ("", False),
+])
+def test_status_variants(status, active):
+    from mercury.registry.base import EntityCandidate
+    assert EntityCandidate("N", "1", status, "u").is_active is active
+
+
+def test_titles_written_as_words_and_suffixed_names():
+    p = SunbizProvider(None)
+    page = fx.detail_page("EXAMPLE PALM ROOFING INC", "100001", people=[
+        ("SVP, Secretary", "ROE, RICK W."),
+        ("EXECUTIVE VP & CFO", "POE, PAT"),
+        ("SVP", "LOE, LEE"),
+        ("VP, Real Estate Assets", "MOE, MARY, IV"),
+        ("CEO", "Doe, Jane Q."),
+        ("President", "Hoe, Hal L., Jr."),
+        ("MGRM", "O'NEIL, SAM"),
+    ])
+    got = [(o.name, o.title) for o in p.parse_detail(page).officers]
+    assert got == [
+        ("Rick W. Roe", "SVP, Secretary"),
+        ("Pat Poe", "Executive VP & CFO"),
+        ("Lee Loe", "SVP"),
+        ("Mary Moe IV", "VP, Real Estate Assets"),
+        ("Jane Q. Doe", "CEO"),
+        ("Hal L. Hoe Jr.", "President"),
+        ("Sam O'Neil", "Managing Member"),
+    ]
+
+
+def test_ceo_and_president_are_two_leads_so_the_registry_abstains():
+    people = merge_people(_officers([("CEO", "DOE, JANE"), ("President", "ROE, RICK"),
+                                     ("VP, Facilities", "POE, PAT")]))
+    assert pick_person(people) == (None, "several_people")
+
+
 def test_parse_search_no_results_vs_unrecognized_page():
     p = SunbizProvider(None)
     assert p.parse_search(fx.NO_RESULTS) == []

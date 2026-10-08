@@ -37,7 +37,7 @@ class EntityCandidate:
 
     @property
     def is_active(self) -> bool:
-        return self.status.strip().lower() in ("active", "act", "active/noncompliance")
+        return self.status.strip().lower() in ("active", "act")
 
 
 @dataclass
@@ -60,7 +60,7 @@ class EntityDetail:
 
     @property
     def is_active(self) -> bool:
-        return self.status.strip().lower() in ("active", "act", "active/noncompliance")
+        return self.status.strip().lower() in ("active", "act")
 
 
 class RegistryProvider(ABC):
@@ -199,20 +199,43 @@ def location_city(location: str) -> str:
     return head
 
 
+_NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv", "v", "esq", "md", "phd", "dds", "cpa"})
+_ROMAN = frozenset({"II", "III", "IV"})
+
+
 def display_name(raw: str) -> str:
-    """"DOE, JANE Q" -> "Jane Q Doe"; "JANE DOE" -> "Jane Doe"."""
-    raw = re.sub(r"\s+", " ", (raw or "").strip())
+    """"DOE, JANE Q" -> "Jane Q Doe"; "ROE, RICK W., IV" -> "Rick W. Roe IV"."""
+    raw = re.sub(r"\s+", " ", (raw or "").replace("\xa0", " ").strip())
     if "," in raw:
-        last, _, rest = raw.partition(",")
-        raw = f"{rest.strip()} {last.strip()}"
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        suffix = ""
+        if len(parts) > 2 and parts[-1].strip(".").lower() in _NAME_SUFFIXES:
+            suffix = parts.pop()
+        raw = f"{' '.join(parts[1:])} {parts[0]} {suffix}".strip() if len(parts) > 1 else parts[0]
     return " ".join(_cap(w) for w in raw.split())
 
 
 def _cap(word: str) -> str:
     if not word.isupper() and not word.islower():
         return word
+    if word.strip(".") in _ROMAN:
+        return word
     if len(word) <= 2 and "." in word:
         return word.upper()
     out = word.lower().title()
     out = re.sub(r"(?<=\bMc)([a-z])", lambda m: m.group(1).upper(), out)
     return out
+
+
+_ACRONYMS = frozenset({"VP", "SVP", "EVP", "AVP", "CEO", "CFO", "COO", "CTO", "CMO",
+                       "CIO", "CRO", "LLC", "MD", "HR", "IT"})
+
+
+def tidy_title(raw: str) -> str:
+    """"EXECUTIVE VP & CFO" -> "Executive VP & CFO". Mixed-case text is the
+    registry's own wording and is left alone."""
+    raw = re.sub(r"\s+", " ", (raw or "").replace("\xa0", " ")).strip()
+    if not raw.isupper():
+        return raw
+    return " ".join(w if w.strip(",&") in _ACRONYMS or w == "&" else w.title()
+                    for w in raw.split())
