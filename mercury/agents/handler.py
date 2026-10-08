@@ -12,6 +12,7 @@ mailbox or domain; and past the kill-switch thresholds the global switch
 flips, so a bad list can't torch the sending domain while nobody's watching.
 """
 
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -22,7 +23,11 @@ from mercury import ooo
 from mercury.brain import Brain
 from mercury.config import MercuryConfig, EnvConfig
 from mercury.integrations.instantly import InstantlyClient
-from mercury.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from mercury.integrations.mail_provider import (
+    NATIVE_PROVIDERS,
+    InboundMessage,
+    get_mail_provider,
+)
 from mercury.integrations.mailboxes import (
     MailboxPool,
     build_rotation_pool,
@@ -37,7 +42,7 @@ from mercury.ooo import (
     resume_time,
 )
 from mercury.policy import ContactPolicy
-from mercury.state import PAUSE_ENDING_STATUSES, StateManager
+from mercury.state import INBOUND_MAX_ATTEMPTS, PAUSE_ENDING_STATUSES, StateManager
 from mercury.personas import PersonaStore, voice_instructions
 
 logger = logging.getLogger("mercury.handler")
@@ -276,21 +281,43 @@ class Handler:
         if not lead_email or not reply_text:
             return False
 
-        # Dedup: skip if we already processed this reply
-        if reply_uuid and await self.state.is_reply_processed(reply_uuid):
-            logger.debug(f"Handler: Reply {reply_uuid} already processed. Skipping.")
-            return False
+        # Stored first, so the inbox keeps it whatever happens next. The row
+        # is also the dedup: a reply seen before (or handled before replies
+        # were stored, per processed_replies) is not 'received'.
+        inbound_id = ""
+        if reply_uuid:
+            row, _created = await self.state.record_inbound(
+                provider="instantly", mailbox=str(reply.get("eaccount") or ""),
+                external_id=reply_uuid, from_email=lead_email,
+                subject=str(reply.get("subject") or ""), body=reply_text,
+                legacy_key=reply_uuid,
+            )
+            if row["status"] != "received":
+                logger.debug(f"Handler: Reply {reply_uuid} already processed. Skipping.")
+                return False
+            inbound_id = row["id"]
 
         logger.info(f"Handler: Reply from {lead_email}")
 
+        done = False
         try:
-            await self._process_reply(lead_email, reply_text, reply_uuid, campaign.id)
+            await self._process_reply(
+                lead_email, reply_text, reply_uuid, campaign.id,
+                reply_meta={"inbound_id": inbound_id} if inbound_id else None,
+            )
+            done = True
         finally:
             # ALWAYS mark processed — even on early exits (opt-out, OOO,
             # unknown prospect) — so the same reply is never re-handled
-            # or double-replied on the next cycle.
+            # or double-replied on the next cycle. Instantly sends the
+            # answer itself, so a failed reply is kept as 'failed' for a
+            # person rather than retried into a second answer.
             if reply_uuid:
                 await self.state.mark_reply_processed(reply_uuid)
+            if inbound_id:
+                await self.state.finish_inbound(
+                    inbound_id, "processed" if done else "failed",
+                    "" if done else "handling failed; Instantly replies are not retried")
         return True
 
     async def _process_reply(
@@ -301,12 +328,19 @@ class Handler:
         campaign_id: str = "",
         reply_meta: dict | None = None,
     ):
-        """Classify, record, and respond to a single reply."""
+        """Classify, record, and respond to a single reply.
+
+        Safe to run again for the same stored message (``inbound_id`` in
+        reply_meta): a retry after a failure does not append the reply to
+        its conversation twice, advance the stage twice, count it twice or
+        queue a second answer."""
+        inbound_id = (reply_meta or {}).get("inbound_id", "")
         # Find the prospect by email (indexed lookup)
         prospect = await self.state.get_prospect_by_email(lead_email)
         if not prospect:
             logger.warning(f"Handler: No prospect found for {lead_email}")
             return
+        await self.state.link_inbound(inbound_id, prospect_id=prospect.id)
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
@@ -324,10 +358,13 @@ class Handler:
         else:
             intent = await self._classify_intent(reply_text, prospect)
         logger.info(f"Handler: Intent for {lead_email}: {intent}")
+        await self.state.link_inbound(inbound_id, intent=intent)
 
         if intent == "ooo":
             # Not a human answer: pause the sequence until they are back, and
             # open nothing (no conversation, no reply metric).
+            await self.state.link_inbound(inbound_id, kind="automatic",
+                                          auto_kind="out_of_office")
             await self._out_of_office(prospect, own_words, reply_meta, "classifier")
             return
 
@@ -346,7 +383,8 @@ class Handler:
         if prospect.status not in ("meeting", "closed"):
             await self.state.update_prospect_status(prospect.id, "replied")
         try:
-            cancelled = await self.state.cancel_pending_outbox_for_prospect(prospect.id)
+            cancelled = await self.state.cancel_pending_outbox_for_prospect(
+                prospect.id, keep_answering=inbound_id)
             if cancelled:
                 logger.info(
                     f"Handler: cancelled {cancelled} queued email(s) for "
@@ -356,49 +394,29 @@ class Handler:
             logger.debug(f"Handler: outbox cancel failed: {e}")
         await self._hold_company_on_reply(prospect, intent)
 
-        # The timestamped event the trends chart counts (replies / positive).
-        try:
-            await self.state.log_action(
-                action_type="reply_received",
-                agent="handler",
-                details={"prospect_id": prospect.id, "prospect_email": lead_email,
-                         "intent": intent, "campaign_id": campaign_id,
-                         "mailbox": ((reply_meta or {}).get("mailbox") or "").lower()},
-            )
-        except Exception as e:
-            logger.debug(f"Handler: reply_received log failed: {e}")
-
-        # 2. Get or create conversation
-        existing_convos = await self.state.get_conversations_by_status("open")
-        convo = next(
-            (c for c in existing_convos if c.prospect_id == prospect.id), None
+        # 2. Get or create conversation, and link the stored message to it in
+        # the same transaction. A retried message is already attached.
+        convo, attached_now = await self.state.attach_inbound_to_conversation(
+            inbound_id, prospect_id=prospect.id, campaign_id=campaign_id,
+            message=Message(sender="prospect", content=reply_text), intent=intent,
         )
 
-        if not convo:
-            convo = Conversation(
-                id="",
-                prospect_id=prospect.id,
-                campaign_id=campaign_id,
-                channel="email",
-                thread=[
-                    Message(sender="prospect", content=reply_text),
-                ],
-                intent=intent,
-                status="open",
-            )
-            convo.id = await self.state.add_conversation(convo)
-        else:
-            convo.thread.append(Message(sender="prospect", content=reply_text))
-            convo.intent = intent
-            await self.state.update_conversation(
-                convo.id,
-                thread_json=convo.thread_json(),
-                intent=intent,
-            )
+        # The timestamped event the trends chart counts (replies / positive).
+        if attached_now:
+            try:
+                await self.state.log_action(
+                    action_type="reply_received",
+                    agent="handler",
+                    details={"prospect_id": prospect.id, "prospect_email": lead_email,
+                             "intent": intent, "campaign_id": campaign_id,
+                             "mailbox": ((reply_meta or {}).get("mailbox") or "").lower()},
+                )
+            except Exception as e:
+                logger.debug(f"Handler: reply_received log failed: {e}")
 
         # 2b. Advance conversation stage based on intent
         new_stage = self._determine_stage(intent, convo.stage, reply_text)
-        if new_stage != convo.stage:
+        if attached_now and new_stage != convo.stage:
             logger.info(f"Handler: Stage for {lead_email}: {convo.stage} -> {new_stage}")
             await self.state.update_conversation(convo.id, stage=new_stage)
             convo.stage = new_stage
@@ -446,6 +464,11 @@ class Handler:
 
         if intent not in AUTO_REPLY_INTENTS:
             logger.warning(f"Handler: No auto-reply policy for intent '{intent}'. Skipping reply.")
+            return
+
+        # A retry of a message whose answer was already queued stops here.
+        if inbound_id and await self.state.outbox_answering(inbound_id):
+            logger.info(f"Handler: a reply to this message from {lead_email} is already queued.")
             return
 
         # For interested, objection, question, wrong_person — generate a reply
@@ -498,7 +521,9 @@ class Handler:
             return
 
         # One unreachable inbox must not hide the replies sitting in the rest.
-        inbound = []
+        # Every message is stored before any is handled: handling then runs
+        # from the stored rows, so a failure leaves the message there to be
+        # tried again next cycle (even once the provider stops returning it).
         for mailbox in mailboxes:
             try:
                 fetched = await mailbox.provider.get_replies()
@@ -510,48 +535,99 @@ class Handler:
                 continue
             for msg in fetched:
                 msg.mailbox = mailbox.email
-            inbound.extend(fetched)
+                await self._store(msg, mailbox.provider.name)
 
         handled = 0
-        for msg in inbound:
-            dedup_key = msg.provider_id or msg.message_id
-            if not dedup_key or await self.state.is_reply_processed(dedup_key):
-                continue
-            keep_for_retry = False
+        for row in await self.state.pending_inbound(exclude_provider="instantly"):
             try:
-                if msg.is_bounce:
-                    await self._handle_bounce(msg)
-                elif auto_kind := ooo.classify_automatic(msg.subject, msg.body, msg.headers):
-                    # Not a human answer, and no Claude call is spent on it.
-                    await self._handle_automatic(msg, auto_kind)
-                elif msg.body.strip():
-                    await self._process_reply(
-                        msg.from_email,
-                        msg.body.strip(),
-                        reply_uuid="",
-                        reply_meta=self._reply_meta(msg),
-                    )
-                handled += 1
+                if await self._handle_stored(row):
+                    handled += 1
             except Exception as e:
-                logger.error(f"Handler: error processing {msg.from_email}: {e}")
-                if msg.is_bounce:
-                    # A bounce we could not account for is a reputation signal
-                    # we never saw. Stop sending until someone looks; if even
-                    # that cannot be saved, leave the bounce unread so the next
-                    # heartbeat tries again instead of dropping it.
-                    keep_for_retry = not await bounce_policy.engage_kill_switch(
-                        self.state,
-                        f"a bounce could not be processed ({e}). Review the "
-                        "log before clearing the hold",
-                    )
-            finally:
-                if not keep_for_retry:
-                    await self.state.mark_reply_processed(dedup_key)
+                # Even the bookkeeping failed. The row stays pending and the
+                # next cycle tries again.
+                logger.error(f"Handler: could not record the outcome for a message "
+                             f"from {row.get('from_email')}: {e}")
 
         if handled:
             logger.info(f"Handler: processed {handled} inbound message(s).")
         else:
             logger.info("Handler: no new replies.")
+
+    async def _store(self, msg, provider_name: str) -> None:
+        """Keep one fetched message. A storage failure is logged and the
+        message is not handled: the provider returns it again next cycle."""
+        external_id = (msg.provider_id or msg.message_id or "").strip()
+        if not external_id:
+            return
+        try:
+            await self.state.record_inbound(
+                provider=provider_name, mailbox=getattr(msg, "mailbox", ""),
+                external_id=external_id, rfc_message_id=msg.message_id,
+                in_reply_to=msg.in_reply_to, thread_references=getattr(msg, "references", ""),
+                thread_ref=msg.thread_ref, from_email=msg.from_email, subject=msg.subject,
+                body=msg.body, headers=msg.headers, date_header=getattr(msg, "date", ""),
+                kind="bounce" if msg.is_bounce else "message",
+                # The id processed_replies keyed it by before messages were stored.
+                legacy_key=external_id,
+            )
+        except Exception as e:
+            logger.error(f"Handler: could not store a message from {msg.from_email} ({e}); "
+                         "it is read again next cycle.")
+
+    @staticmethod
+    def _message_from_row(row: dict) -> InboundMessage:
+        try:
+            headers = json.loads(row.get("headers_json") or "{}")
+        except (TypeError, ValueError):
+            headers = {}
+        return InboundMessage(
+            provider_id=row["external_id"], from_email=row.get("from_email") or "",
+            subject=row.get("subject") or "", body=row.get("body") or "",
+            message_id=row.get("rfc_message_id") or "", in_reply_to=row.get("in_reply_to") or "",
+            thread_ref=row.get("thread_ref") or "", date=row.get("date_header") or "",
+            is_bounce=row.get("kind") == "bounce", headers=headers if isinstance(headers, dict) else {},
+            mailbox=row.get("mailbox") or "", references=row.get("thread_references") or "",
+        )
+
+    async def _handle_stored(self, row: dict) -> bool:
+        """Handle one stored message. True when it was handled."""
+        msg = self._message_from_row(row)
+        attempt = await self.state.start_inbound_attempt(row["id"])
+        try:
+            if msg.is_bounce:
+                await self._handle_bounce(msg, row["id"])
+            elif auto_kind := ooo.classify_automatic(msg.subject, msg.body, msg.headers):
+                # Not a human answer, and no Claude call is spent on it.
+                await self.state.link_inbound(row["id"], kind="automatic", auto_kind=auto_kind)
+                await self._handle_automatic(msg, auto_kind, row["id"])
+            elif msg.body.strip():
+                await self._process_reply(
+                    msg.from_email,
+                    msg.body.strip(),
+                    reply_uuid="",
+                    reply_meta={**self._reply_meta(msg), "inbound_id": row["id"]},
+                )
+        except Exception as e:
+            logger.error(f"Handler: error processing {msg.from_email}: {e}")
+            gave_up = attempt >= INBOUND_MAX_ATTEMPTS
+            if msg.is_bounce:
+                # A bounce we could not account for is a reputation signal
+                # we never saw. Stop sending until someone looks; if even
+                # that cannot be saved, the bounce stays pending so the next
+                # heartbeat tries again instead of dropping it.
+                gave_up = gave_up or await bounce_policy.engage_kill_switch(
+                    self.state,
+                    f"a bounce could not be processed ({e}). Review the "
+                    "log before clearing the hold",
+                )
+            if gave_up:
+                logger.error(f"Handler: gave up on the message from {msg.from_email}; "
+                             "it stays in the inbox, marked failed.")
+            await self.state.finish_inbound(row["id"], "failed" if gave_up else "retry",
+                                            f"{type(e).__name__}: {e}")
+            return False
+        await self.state.finish_inbound(row["id"], "processed")
+        return True
 
     # ── Automatic replies and out-of-office pauses ──
 
@@ -574,6 +650,7 @@ class Handler:
         return {
             "thread_ref": msg.thread_ref,
             "message_id": msg.message_id,
+            "references": getattr(msg, "references", "") or "",
             "subject": msg.subject,
             "mailbox": getattr(msg, "mailbox", ""),
             "date": getattr(msg, "date", ""),
@@ -593,8 +670,10 @@ class Handler:
                 prospect = await self.state.get_prospect(sent["prospect_id"])
         return prospect
 
-    async def _handle_automatic(self, msg, kind: str):
+    async def _handle_automatic(self, msg, kind: str, inbound_id: str = ""):
         prospect = await self._inbound_prospect(msg)
+        if prospect is not None:
+            await self.state.link_inbound(inbound_id, prospect_id=prospect.id)
         await self.state.log_action("auto_reply", "handler", {
             "kind": "ooo" if kind == "out_of_office" else kind, "from": msg.from_email,
             "prospect_id": prospect.id if prospect else "", "subject": (msg.subject or "")[:120],
@@ -834,7 +913,7 @@ class Handler:
                          "prospect_email": prospect.email, "intent": intent},
             )
 
-    async def _handle_bounce(self, msg):
+    async def _handle_bounce(self, msg, inbound_id: str = ""):
         """A bounce is a data bug AND a reputation threat. Fix both."""
         headers = getattr(msg, "headers", None) or {}
         outbox_item = await self.state.find_outbox_by_message_id(msg.in_reply_to)
@@ -862,6 +941,10 @@ class Handler:
                 prospect = await self.state.get_prospect_by_email(cand)
                 if prospect is not None:
                     break
+
+        await self.state.link_inbound(
+            inbound_id, prospect_id=prospect.id if prospect else "",
+            outbox_id=(outbox_item or {}).get("id", ""))
 
         # What the bounce says (RFC 3463 code) decides what it costs: a dead
         # address is one prospect, a blocked sender is the mailbox or domain.
@@ -952,6 +1035,10 @@ class Handler:
         subject = reply_meta.get("subject", "")
         if subject and not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
+        # The whole chain this answer continues, for its References header.
+        chain = (reply_meta.get("references") or "").split()
+        if reply_meta.get("message_id") and reply_meta["message_id"] not in chain:
+            chain.append(reply_meta["message_id"])
 
         item_id = await self.state.add_outbox_item(
             prospect_id=prospect.id,
@@ -966,8 +1053,10 @@ class Handler:
             provider=self.provider.name if self.provider else "",
             thread_ref=reply_meta.get("thread_ref", ""),
             in_reply_to=reply_meta.get("message_id", ""),
+            thread_references=" ".join(chain),
             # Answer from the inbox the message arrived in.
             mailbox=reply_meta.get("mailbox", ""),
+            answers_inbound_id=reply_meta.get("inbound_id", ""),
         )
         if item_id:
             mode = "queued for your approval" if require_approval else "queued to send"

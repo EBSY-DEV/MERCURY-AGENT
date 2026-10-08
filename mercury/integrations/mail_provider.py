@@ -45,6 +45,8 @@ class InboundMessage:
     # The mailbox this arrived in (set by the handler when several are
     # polled); Mercury's answer goes out from the same address.
     mailbox: str = ""
+    # RFC References header: the Message-ID chain this message replies to.
+    references: str = ""
 
 
 BOUNCE_SENDERS = ("mailer-daemon", "postmaster", "mail delivery subsystem")

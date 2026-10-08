@@ -217,6 +217,7 @@ class GmailProvider(MailProvider):
             body=body[:5000],
             message_id=headers.get("message-id", ""),
             in_reply_to=headers.get("in-reply-to", ""),
+            references=" ".join(headers.get("references", "").split()),
             thread_ref=data.get("threadId", ""),
             date=headers.get("date", ""),
             is_bounce=bounce,

@@ -903,6 +903,114 @@ MIGRATIONS: list[str] = [
     ALTER TABLE outbox ADD COLUMN flags TEXT NOT NULL DEFAULT '';
     ALTER TABLE outbox ADD COLUMN flags_accepted_by TEXT NOT NULL DEFAULT '';
     """,
+    # ── v25: the unified inbox: stored inbound mail and local triage state ──
+    """
+    -- Every message read from a mailbox, kept BEFORE it is handled, so a
+    -- failure part way through never loses a reply: the row stays 'retry'
+    -- and the next heartbeat handles it again from here.
+    -- One row per copy: (provider, mailbox, external_id) is the dedup key,
+    -- so two inboxes whose providers reuse an id never collide. The same
+    -- RFC Message-ID delivered to a second inbox is kept as a 'duplicate'
+    -- of the first and handled once.
+    --   status: received -> processed
+    --           | retry (failed, tried again next cycle) -> failed (gave up)
+    --           | duplicate (another inbox has the same message)
+    --           | skipped (handled before this table existed)
+    -- kind: message | bounce | automatic (vacation reply, receipt)
+    -- outbox_id is our sent email it answers (In-Reply-To / References).
+    -- received_at comes from the Date header, NULL when it is unreadable;
+    -- created_at is when Mercury stored it.
+    CREATE TABLE inbound_messages (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL DEFAULT '',
+        mailbox TEXT NOT NULL DEFAULT '',
+        external_id TEXT NOT NULL,
+        rfc_message_id TEXT DEFAULT '',
+        in_reply_to TEXT DEFAULT '',
+        thread_references TEXT DEFAULT '',
+        thread_ref TEXT DEFAULT '',
+        from_email TEXT DEFAULT '',
+        subject TEXT DEFAULT '',
+        body TEXT DEFAULT '',
+        headers_json TEXT DEFAULT '{}',
+        date_header TEXT DEFAULT '',
+        received_at TIMESTAMP,
+        kind TEXT NOT NULL DEFAULT 'message',
+        auto_kind TEXT DEFAULT '',
+        prospect_id TEXT DEFAULT '',
+        conversation_id TEXT DEFAULT '',
+        outbox_id TEXT DEFAULT '',
+        intent TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'received'
+            CHECK (status IN ('received', 'processed', 'retry', 'failed',
+                              'duplicate', 'skipped')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT DEFAULT '',
+        duplicate_of TEXT DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'poll',
+        created_at TIMESTAMP NOT NULL,
+        processed_at TIMESTAMP,
+        UNIQUE (provider, mailbox, external_id)
+    );
+    CREATE INDEX idx_inbound_conversation ON inbound_messages(conversation_id, created_at);
+    CREATE INDEX idx_inbound_prospect ON inbound_messages(prospect_id, created_at);
+    CREATE INDEX idx_inbound_rfc ON inbound_messages(rfc_message_id) WHERE rfc_message_id != '';
+    CREATE INDEX idx_inbound_pending ON inbound_messages(status, created_at)
+        WHERE status IN ('received', 'retry');
+    -- A reply draft names the inbound message it answers.
+    ALTER TABLE outbox ADD COLUMN answers_inbound_id TEXT DEFAULT '';
+    CREATE INDEX idx_outbox_conversation ON outbox(conversation_id) WHERE conversation_id != '';
+    CREATE INDEX idx_outbox_message_id ON outbox(message_id) WHERE message_id != '';
+    -- Automatic replies recorded before this table existed are real inbound
+    -- mail with honest metadata: keep them as history. Their excerpt is the
+    -- sender's own words, not the full body.
+    INSERT OR IGNORE INTO inbound_messages
+        (id, provider, mailbox, external_id, rfc_message_id, from_email, subject, body,
+         received_at, kind, auto_kind, prospect_id, status, source, created_at, processed_at)
+        SELECT lower(hex(randomblob(6))), '', COALESCE(mailbox, ''), message_key,
+               CASE WHEN message_key LIKE '<%>' THEN message_key ELSE '' END,
+               COALESCE(from_email, ''), COALESCE(subject, ''), COALESCE(excerpt, ''),
+               received_at, 'automatic', kind, COALESCE(prospect_id, ''), 'processed',
+               'backfill', COALESCE(created_at, CURRENT_TIMESTAMP), created_at
+        FROM auto_replies;
+
+    -- Local triage state. None of it is synchronized with the provider: a
+    -- conversation read here is still unread in Gmail, and the reverse.
+    -- Unread = no read_at, or an inbound message stored after it. A snooze
+    -- ends at snoozed_until, or earlier when a new message arrives.
+    CREATE TABLE inbox_state (
+        conversation_id TEXT PRIMARY KEY,
+        read_at TIMESTAMP,
+        snoozed_until TIMESTAMP,
+        snoozed_at TIMESTAMP,
+        updated_at TIMESTAMP
+    );
+    CREATE TABLE contact_notes (
+        id TEXT PRIMARY KEY,
+        prospect_id TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_by TEXT DEFAULT '',
+        created_at TIMESTAMP NOT NULL,
+        updated_at TIMESTAMP NOT NULL,
+        deleted_at TIMESTAMP
+    );
+    CREATE INDEX idx_contact_notes_prospect ON contact_notes(prospect_id, created_at);
+    -- A reminder only flags a conversation in the inbox and on Today. It
+    -- never sends or queues anything.
+    CREATE TABLE inbox_reminders (
+        id TEXT PRIMARY KEY,
+        conversation_id TEXT NOT NULL,
+        prospect_id TEXT DEFAULT '',
+        due_at TIMESTAMP NOT NULL,
+        note TEXT DEFAULT '',
+        created_by TEXT DEFAULT '',
+        created_at TIMESTAMP NOT NULL,
+        done_at TIMESTAMP,
+        done_by TEXT DEFAULT ''
+    );
+    CREATE INDEX idx_inbox_reminders_open ON inbox_reminders(due_at) WHERE done_at IS NULL;
+    CREATE INDEX idx_inbox_reminders_conversation ON inbox_reminders(conversation_id);
+    """,
 ]
 
 
@@ -1151,6 +1259,29 @@ def _parse_ts(value) -> datetime | None:
         return datetime.fromisoformat(str(value).replace(" ", "T"))
     except ValueError:
         return None
+
+
+def header_time(date_header: str) -> str | None:
+    """An inbound Date header as a naive-UTC ISO timestamp, or None when it
+    is missing or unreadable. Never "now": a stored time is a claim."""
+    from email.utils import parsedate_to_datetime
+
+    try:
+        when = parsedate_to_datetime(date_header or "")
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when is None:
+        return None
+    return _ts(when)
+
+
+# Inbound rows the handler still has to (re)try.
+INBOUND_PENDING = ("received", "retry")
+# How many times one inbound message is attempted before it is left as
+# 'failed' for a person to look at.
+INBOUND_MAX_ATTEMPTS = 5
+# Queued reply drafts: an answer that has not gone out yet.
+DRAFT_STATUSES = ("pending_review", "approved", "blocked", "sending")
 
 
 # Queued sequence mail a pause holds and a resume reschedules. 'blocked'
@@ -1783,6 +1914,8 @@ class StateManager:
         pain_code: str = "",
         word_limit: int = 0,
         flags: list[str] | None = None,
+        thread_references: str = "",
+        answers_inbound_id: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard.
@@ -1810,11 +1943,11 @@ class StateManager:
                     to_email, subject, body, status, send_at, provider,
                     thread_ref, in_reply_to, mailbox, generation_id, company_id, offer_key,
                     approved_revision, approved_hash, approved_by, approved_at, pain_code,
-                    word_count, word_limit, flags)
+                    word_count, word_limit, flags, thread_references, answers_inbound_id)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                            COALESCE(NULLIF(?, ''),
                                     (SELECT offer_key FROM campaigns WHERE id = ?), ''),
-                           ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
@@ -1827,6 +1960,7 @@ class StateManager:
                     _utcnow().isoformat() if approved else None,
                     (pain_code or "").strip().upper(),
                     count_words(body), word_limit, encode_flags(flags),
+                    thread_references, answers_inbound_id,
                 ),
             )
             inserted = cursor.rowcount > 0
@@ -2165,14 +2299,17 @@ class StateManager:
             return n
 
     async def cancel_pending_outbox_for_prospect(
-        self, prospect_id: str, reason: str = "stop_on_reply"
+        self, prospect_id: str, reason: str = "stop_on_reply", keep_answering: str = ""
     ) -> int:
-        """Stop-on-reply: cancel everything queued for a prospect who replied."""
+        """Stop-on-reply: cancel everything queued for a prospect who replied.
+        ``keep_answering`` spares the draft that answers that inbound message
+        (a retried message must not cancel the answer its first try queued)."""
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
-                "WHERE prospect_id = ? AND status IN ('pending_review', 'approved', 'blocked')",
-                (reason, _utcnow().isoformat(), prospect_id),
+                "WHERE prospect_id = ? AND status IN ('pending_review', 'approved', 'blocked') "
+                "AND (? = '' OR COALESCE(answers_inbound_id, '') != ?)",
+                (reason, _utcnow().isoformat(), prospect_id, keep_answering, keep_answering),
             )
             await db.commit()
             return cursor.rowcount
@@ -3938,6 +4075,386 @@ class StateManager:
                 (reply_id,),
             )
             await db.commit()
+
+    # ── Inbound mail (stored before it is handled) ──
+
+    async def record_inbound(
+        self, *, provider: str, mailbox: str, external_id: str, rfc_message_id: str = "",
+        in_reply_to: str = "", thread_references: str = "", thread_ref: str = "",
+        from_email: str = "", subject: str = "", body: str = "", headers: dict | None = None,
+        date_header: str = "", kind: str = "message", legacy_key: str = "",
+    ) -> tuple[dict, bool]:
+        """Store one message as read from one mailbox. Returns (row, created).
+
+        The key is (provider, mailbox, external_id): the same id in another
+        inbox is another message. A new row starts 'received', except:
+        'skipped' when ``legacy_key`` was handled before this table existed
+        (processed_replies), and 'duplicate' when another inbox already holds
+        the same RFC Message-ID. It is linked to the sent email it answers."""
+        now = _ts()
+        mailbox, provider = _norm(mailbox), (provider or "").strip().lower()
+        async with aiosqlite.connect(
+            self.db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
+        ) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                new_id = _new_id()
+                cursor = await db.execute(
+                    """INSERT OR IGNORE INTO inbound_messages
+                       (id, provider, mailbox, external_id, rfc_message_id, in_reply_to,
+                        thread_references, thread_ref, from_email, subject, body, headers_json,
+                        date_header, received_at, kind, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (new_id, provider, mailbox, external_id, (rfc_message_id or "").strip(),
+                     (in_reply_to or "").strip(), (thread_references or "").strip(),
+                     thread_ref or "", _norm(from_email), subject or "", body or "",
+                     json.dumps(headers or {}, default=str), date_header or "",
+                     header_time(date_header), kind, now))
+                created = cursor.rowcount > 0
+                if created:
+                    await self._classify_new_inbound(db, new_id, legacy_key)
+                async with db.execute(
+                    "SELECT * FROM inbound_messages WHERE provider = ? AND mailbox = ? "
+                    "AND external_id = ?", (provider, mailbox, external_id),
+                ) as cur:
+                    row = dict(await cur.fetchone())
+                await db.execute("COMMIT")
+                return row, created
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    async def _classify_new_inbound(db, row_id: str, legacy_key: str) -> None:
+        async with db.execute("SELECT * FROM inbound_messages WHERE id = ?", (row_id,)) as cur:
+            row = dict(await cur.fetchone())
+        status, duplicate_of, note = "received", "", ""
+        if legacy_key:
+            async with db.execute("SELECT 1 FROM processed_replies WHERE reply_id = ?",
+                                  (legacy_key,)) as cur:
+                if await cur.fetchone():
+                    status, note = "skipped", "handled before inbound messages were stored"
+        if status == "received" and row["rfc_message_id"]:
+            async with db.execute(
+                "SELECT id FROM inbound_messages WHERE rfc_message_id = ? AND id != ? "
+                "AND status NOT IN ('duplicate', 'skipped') ORDER BY created_at, rowid LIMIT 1",
+                (row["rfc_message_id"], row_id),
+            ) as cur:
+                first = await cur.fetchone()
+            if first:
+                status, duplicate_of = "duplicate", first[0]
+        # The sent email it answers: In-Reply-To first, then the References
+        # chain from the newest id back.
+        outbox_id = ""
+        for ref in [row["in_reply_to"], *reversed(row["thread_references"].split())]:
+            if not ref:
+                continue
+            async with db.execute("SELECT id FROM outbox WHERE message_id = ? LIMIT 1",
+                                  (ref,)) as cur:
+                hit = await cur.fetchone()
+            if hit:
+                outbox_id = hit[0]
+                break
+        await db.execute(
+            "UPDATE inbound_messages SET status = ?, duplicate_of = ?, last_error = ?, "
+            "outbox_id = ?, processed_at = CASE WHEN ? = 'received' THEN NULL ELSE ? END "
+            "WHERE id = ?",
+            (status, duplicate_of, note, outbox_id, status, _ts(), row_id))
+
+    async def get_inbound(self, inbound_id: str) -> dict | None:
+        if not inbound_id:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM inbound_messages WHERE id = ?",
+                                  (inbound_id,)) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def pending_inbound(self, limit: int = 200, exclude_provider: str = "") -> list[dict]:
+        """Stored messages still to handle: new ones and retries, oldest first."""
+        marks = ", ".join("?" for _ in INBOUND_PENDING)
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"SELECT * FROM inbound_messages WHERE status IN ({marks}) "
+                "AND attempts < ? AND provider != ? ORDER BY created_at, rowid LIMIT ?",
+                (*INBOUND_PENDING, INBOUND_MAX_ATTEMPTS, exclude_provider, int(limit)),
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def start_inbound_attempt(self, inbound_id: str) -> int:
+        """Count an attempt before handling, so a crash mid-way still counts."""
+        async with self._connect() as db:
+            await db.execute("UPDATE inbound_messages SET attempts = attempts + 1 WHERE id = ?",
+                             (inbound_id,))
+            async with db.execute("SELECT attempts FROM inbound_messages WHERE id = ?",
+                                  (inbound_id,)) as cur:
+                row = await cur.fetchone()
+            await db.commit()
+            return int(row[0]) if row else 0
+
+    async def finish_inbound(self, inbound_id: str, status: str, error: str = "") -> None:
+        """processed, retry (try again next cycle) or failed (gave up)."""
+        if status not in ("processed", "retry", "failed"):
+            raise ValueError(f"unknown inbound status {status!r}")
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE inbound_messages SET status = ?, last_error = ?, processed_at = ? "
+                "WHERE id = ?", (status, (error or "")[:500], _ts(), inbound_id))
+            await db.commit()
+
+    _INBOUND_LINKS = frozenset({"prospect_id", "conversation_id", "outbox_id", "intent",
+                                "kind", "auto_kind"})
+
+    async def link_inbound(self, inbound_id: str, **fields) -> None:
+        """What handling learned about a message: its contact, conversation,
+        the email it answers, its intent and kind. Empty values are ignored."""
+        fields = {k: v for k, v in fields.items() if k in self._INBOUND_LINKS and v}
+        if not inbound_id or not fields:
+            return
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        async with self._connect() as db:
+            await db.execute(f"UPDATE inbound_messages SET {sets} WHERE id = ?",
+                             (*fields.values(), inbound_id))
+            await db.commit()
+
+    async def attach_inbound_to_conversation(
+        self, inbound_id: str, *, prospect_id: str, campaign_id: str, message: Message,
+        intent: str,
+    ) -> tuple[Conversation, bool]:
+        """Put a reply in its contact's open conversation (opening one if
+        none is open) and link the stored message to it, in one transaction.
+        Returns (conversation, attached_now). A message already attached by
+        an earlier attempt is not appended again: attached_now is False."""
+        now = _utcnow()
+        async with aiosqlite.connect(
+            self.db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
+        ) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                done = ""
+                if inbound_id:
+                    async with db.execute(
+                        "SELECT conversation_id FROM inbound_messages WHERE id = ?",
+                        (inbound_id,)) as cur:
+                        row = await cur.fetchone()
+                    done = (row[0] if row else "") or ""
+                if done:
+                    # An earlier attempt got this far. If that conversation
+                    # was deleted since, attach again as if for the first time.
+                    async with db.execute("SELECT * FROM conversations WHERE id = ?",
+                                          (done,)) as cur:
+                        found = await cur.fetchone()
+                    if found:
+                        await db.execute(
+                            "UPDATE conversations SET intent = ?, updated_at = ? WHERE id = ?",
+                            (intent, now.isoformat(), done))
+                        await db.execute("COMMIT")
+                        d = dict(found)
+                        d["thread"] = Conversation.thread_from_json(d.pop("thread_json"))
+                        d["intent"] = intent
+                        return Conversation(**d), False
+                async with db.execute(
+                    "SELECT * FROM conversations WHERE prospect_id = ? AND status = 'open' "
+                    "ORDER BY rowid LIMIT 1", (prospect_id,)) as cur:
+                    found = await cur.fetchone()
+                if found:
+                    d = dict(found)
+                    d["thread"] = Conversation.thread_from_json(d.pop("thread_json"))
+                    convo = Conversation(**d)
+                    convo.thread.append(message)
+                    convo.intent = intent
+                    await db.execute(
+                        "UPDATE conversations SET thread_json = ?, intent = ?, updated_at = ? "
+                        "WHERE id = ?", (convo.thread_json(), intent, now.isoformat(), convo.id))
+                else:
+                    convo = Conversation(id=_new_id(), prospect_id=prospect_id,
+                                         campaign_id=campaign_id, channel="email",
+                                         thread=[message], intent=intent, status="open")
+                    await db.execute(
+                        """INSERT INTO conversations
+                           (id, prospect_id, campaign_id, channel, thread_json,
+                            intent, stage, status, created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (convo.id, prospect_id, campaign_id, "email", convo.thread_json(),
+                         intent, convo.stage, convo.status, convo.created_at.isoformat(),
+                         convo.updated_at.isoformat()))
+                if inbound_id:
+                    await db.execute(
+                        "UPDATE inbound_messages SET conversation_id = ?, prospect_id = ?, "
+                        "intent = ? WHERE id = ?", (convo.id, prospect_id, intent, inbound_id))
+                await db.execute("COMMIT")
+                return convo, True
+            except BaseException:
+                await db.execute("ROLLBACK")
+                raise
+
+    async def outbox_answering(self, inbound_id: str) -> dict | None:
+        """The reply draft (in any state) queued to answer this message."""
+        if not inbound_id:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE answers_inbound_id = ? ORDER BY created_at LIMIT 1",
+                (inbound_id,)) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    # ── Inbox: local read state, snoozes, notes and reminders ──
+    #
+    # Local to Mercury. None of it touches the provider's read flags.
+
+    async def set_conversations_read(self, conversation_ids: list[str], read: bool,
+                                     now: str | None = None) -> int:
+        ids = [c for c in dict.fromkeys(conversation_ids) if c]
+        if not ids:
+            return 0
+        now = now or _ts()
+        async with self._connect() as db:
+            for cid in ids:
+                await db.execute(
+                    "INSERT INTO inbox_state (conversation_id, read_at, updated_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET "
+                    "read_at = excluded.read_at, updated_at = excluded.updated_at",
+                    (cid, now if read else None, now))
+            await db.commit()
+        return len(ids)
+
+    async def snooze_conversation(self, conversation_id: str, until: str | None,
+                                  now: str | None = None) -> None:
+        """Snooze until a naive-UTC time, or clear it with None."""
+        now = now or _ts()
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO inbox_state (conversation_id, snoozed_until, snoozed_at, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET "
+                "snoozed_until = excluded.snoozed_until, snoozed_at = excluded.snoozed_at, "
+                "updated_at = excluded.updated_at",
+                (conversation_id, until, now if until else None, now))
+            await db.commit()
+
+    async def get_inbox_state(self, conversation_id: str) -> dict:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM inbox_state WHERE conversation_id = ?",
+                                  (conversation_id,)) as cur:
+                row = await cur.fetchone()
+        return dict(row) if row else {"conversation_id": conversation_id, "read_at": None,
+                                      "snoozed_until": None, "snoozed_at": None,
+                                      "updated_at": None}
+
+    async def add_contact_note(self, prospect_id: str, body: str, created_by: str = "") -> dict:
+        now = _ts()
+        note = {"id": _new_id(), "prospect_id": prospect_id, "body": body,
+                "created_by": created_by, "created_at": now, "updated_at": now,
+                "deleted_at": None}
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO contact_notes (id, prospect_id, body, created_by, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (note["id"], prospect_id, body, created_by, now, now))
+            await db.commit()
+        return note
+
+    async def get_contact_note(self, note_id: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM contact_notes WHERE id = ? "
+                                  "AND deleted_at IS NULL", (note_id,)) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def update_contact_note(self, note_id: str, body: str) -> dict | None:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE contact_notes SET body = ?, updated_at = ? "
+                "WHERE id = ? AND deleted_at IS NULL", (body, _ts(), note_id))
+            await db.commit()
+            if not cursor.rowcount:
+                return None
+        return await self.get_contact_note(note_id)
+
+    async def delete_contact_note(self, note_id: str) -> bool:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE contact_notes SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+                (_ts(), note_id))
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def list_contact_notes(self, prospect_id: str) -> list[dict]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM contact_notes WHERE prospect_id = ? AND deleted_at IS NULL "
+                "ORDER BY created_at DESC, id", (prospect_id,)) as cur:
+                return [dict(r) for r in await cur.fetchall()]
+
+    async def add_reminder(self, conversation_id: str, due_at: str, *, prospect_id: str = "",
+                           note: str = "", created_by: str = "") -> dict:
+        reminder = {"id": _new_id(), "conversation_id": conversation_id,
+                    "prospect_id": prospect_id, "due_at": due_at, "note": note,
+                    "created_by": created_by, "created_at": _ts(), "done_at": None,
+                    "done_by": ""}
+        async with self._connect() as db:
+            await db.execute(
+                "INSERT INTO inbox_reminders (id, conversation_id, prospect_id, due_at, note, "
+                "created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                tuple(reminder[k] for k in ("id", "conversation_id", "prospect_id", "due_at",
+                                            "note", "created_by", "created_at")))
+            await db.commit()
+        return reminder
+
+    async def get_reminder(self, reminder_id: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM inbox_reminders WHERE id = ?",
+                                  (reminder_id,)) as cur:
+                row = await cur.fetchone()
+                return dict(row) if row else None
+
+    async def complete_reminder(self, reminder_id: str, done_by: str = "") -> bool:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE inbox_reminders SET done_at = ?, done_by = ? "
+                "WHERE id = ? AND done_at IS NULL", (_ts(), done_by, reminder_id))
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def delete_reminder(self, reminder_id: str) -> bool:
+        async with self._connect() as db:
+            cursor = await db.execute("DELETE FROM inbox_reminders WHERE id = ?",
+                                      (reminder_id,))
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def list_reminders(self, *, conversation_id: str = "", due_before: str | None = None,
+                             include_done: bool = False, limit: int = 200) -> list[dict]:
+        where, params = [], []
+        if conversation_id:
+            where.append("r.conversation_id = ?")
+            params.append(conversation_id)
+        if not include_done:
+            where.append("r.done_at IS NULL")
+        if due_before:
+            where.append("r.due_at <= ?")
+            params.append(due_before)
+        sql = ("SELECT r.*, p.email AS prospect_email, p.first_name, p.last_name, "
+               "p.company FROM inbox_reminders r "
+               "LEFT JOIN conversations c ON c.id = r.conversation_id "
+               "LEFT JOIN prospects p ON p.id = COALESCE(NULLIF(r.prospect_id, ''), c.prospect_id)")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY r.due_at, r.id LIMIT ?"
+        params.append(int(limit))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cur:
+                return [dict(r) for r in await cur.fetchall()]
 
     # ── Campaigns ──
 
