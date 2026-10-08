@@ -772,6 +772,22 @@
   </div>
 </div>
 
+<!-- Prompt dialog: one instruction field, used by Regenerate -->
+<div class="modal-wrap sheet" id="prompt-modal" aria-hidden="true">
+  <div class="modal-scrim" onclick="closePrompt(false)"></div>
+  <div class="modal prompt-modal" role="dialog" aria-modal="true" aria-labelledby="prompt-title" aria-describedby="prompt-copy">
+    <h3 id="prompt-title"></h3>
+    <p id="prompt-copy"></p>
+    <label class="sr-only" for="prompt-input">Instruction</label>
+    <textarea class="form-input prompt-input" id="prompt-input" rows="4"></textarea>
+    <div class="prompt-suggest" id="prompt-suggest"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary btn-sm" onclick="closePrompt(false)">Cancel</button>
+      <button class="btn btn-primary btn-sm" id="prompt-ok" onclick="closePrompt(true)">Continue</button>
+    </div>
+  </div>
+</div>
+
 <div class="menu" id="move-menu" role="menu" hidden></div>
 
 <script src="/static/icons.js"></script>

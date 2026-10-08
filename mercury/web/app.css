@@ -13,6 +13,11 @@
       round. Nothing else.
    4. Every figure is monospaced and tabular, so columns line up and a
       changing value doesn't shift the layout.
+   5. Action tints are the one exception to rule 1: an icon-only toolbar
+      button may carry the hue of what it does (reminders amber, snooze
+      blue, read state violet, everything else neutral). They are only
+      for those buttons, never for status, primary actions or decoration,
+      and every tinted button still has a tooltip naming the action.
    ══════════════════════════════════════════════════════════════ */
 
 @font-face {
@@ -1095,6 +1100,19 @@ details[open] summary::before { content: '– '; }
   .drawer { top: 0; right: 0; bottom: 0; width: 100vw; border-radius: 0; border: none; }
 }
 
+/* ── Action tints (rule 5) ──────────────────────────────────── */
+
+:root {
+  --tint-amber-bg: var(--s-wait-bg);   --tint-amber-line: var(--s-wait-line);   --tint-amber-fg: var(--s-wait);
+  --tint-blue-bg:  var(--s-active-bg); --tint-blue-line:  var(--s-active-line); --tint-blue-fg:  var(--s-active);
+  --tint-violet-bg: var(--accent-soft); --tint-violet-line: var(--accent-line); --tint-violet-fg: var(--accent-deep);
+}
+.btn-square.tint-amber  { background: var(--tint-amber-bg);  border-color: var(--tint-amber-line);  color: var(--tint-amber-fg); }
+.btn-square.tint-blue   { background: var(--tint-blue-bg);   border-color: var(--tint-blue-line);   color: var(--tint-blue-fg); }
+.btn-square.tint-violet { background: var(--tint-violet-bg); border-color: var(--tint-violet-line); color: var(--tint-violet-fg); }
+.btn-square.tint-amber:hover, .btn-square.tint-blue:hover, .btn-square.tint-violet:hover { filter: saturate(1.15); border-color: currentColor; }
+.btn-square.tint-amber.on, .btn-square.tint-blue.on, .btn-square.tint-violet.on { border-color: currentColor; }
+
 /* ── Confirm dialog ──────────────────────────────────────────── */
 
 .modal-wrap { position: fixed; inset: 0; z-index: 80; display: none; place-items: center; padding: 16px; }
@@ -1109,6 +1127,31 @@ details[open] summary::before { content: '– '; }
 .modal h3 { font-size: 15.5px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.35; }
 .modal p { font-size: 13.5px; color: var(--text-2); margin: 6px 0 18px; text-wrap: pretty; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* Prompt dialog: one instruction field (Regenerate). On a phone it rises
+   from the bottom as a sheet, with the primary action full width. */
+.modal.prompt-modal { width: min(460px, 100%); }
+.modal.prompt-modal p { margin-bottom: 14px; }
+.prompt-input { width: 100%; min-height: 96px; resize: vertical; font-size: 13.5px; line-height: 1.5; }
+.prompt-suggest { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 10px 0 18px; }
+.prompt-suggest:empty { display: none; }
+.prompt-suggest .try { font-size: 12px; color: var(--text-3); margin-right: 2px; }
+@media (max-width: 640px) {
+  .modal-wrap.sheet { place-items: end stretch; padding: 0; }
+  .modal-wrap.sheet .modal {
+    width: 100%; border-radius: var(--r-md) var(--r-md) 0 0; border-bottom: none;
+    padding: 10px 16px calc(18px + env(safe-area-inset-bottom));
+    animation: sheet-up .22s cubic-bezier(.16,1,.3,1);
+  }
+  .modal-wrap.sheet .modal::before {
+    content: ''; display: block; width: 36px; height: 4px; border-radius: var(--r-pill);
+    background: var(--border-strong); margin: 0 auto 12px;
+  }
+  .modal-wrap.sheet .modal-actions .btn { padding: 10px 14px; font-size: 13.5px; }
+  .modal-wrap.sheet .modal-actions .btn-primary { flex: 1; justify-content: center; }
+  .modal-wrap.sheet .prompt-input { font-size: 15px; }
+}
+@keyframes sheet-up { from { transform: translateY(24px); opacity: .6; } to { transform: none; opacity: 1; } }
 
 /* ── Calendar ────────────────────────────────────────────────── */
 

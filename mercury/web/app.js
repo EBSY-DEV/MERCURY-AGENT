@@ -2578,6 +2578,72 @@ function closeModal(result) {
   if (resolve) resolve(!!result);
 }
 
+// ── Prompt dialog: one instruction field (Regenerate) ──
+//
+// promptModal({title, copy, placeholder, value, suggestions, ok, required})
+// resolves to the trimmed text, or null when cancelled. Suggestions are
+// small buttons that add their words to the field. Cmd/Ctrl+Enter submits.
+
+let _promptResolve = null, _promptPrevFocus = null, _promptRequired = false;
+
+function promptOpen() {
+  const m = document.getElementById('prompt-modal');
+  return !!m && m.classList.contains('open');
+}
+
+function promptModal(opts) {
+  if (_promptResolve) _promptResolve(null);
+  const m = document.getElementById('prompt-modal');
+  document.getElementById('prompt-title').textContent = opts.title || '';
+  document.getElementById('prompt-copy').textContent = opts.copy || '';
+  const input = document.getElementById('prompt-input');
+  input.value = opts.value || '';
+  input.placeholder = opts.placeholder || '';
+  const sug = document.getElementById('prompt-suggest');
+  const list = opts.suggestions || [];
+  sug.innerHTML = list.length
+    ? '<span class="try">Try:</span>' + list.map((t, i) =>
+        '<button type="button" class="btn btn-secondary btn-sm" data-i="' + i + '">' + escHtml(t) + '</button>').join('')
+    : '';
+  sug.querySelectorAll('button').forEach(b => b.onclick = () => {
+    const word = list[+b.dataset.i];
+    const cur = input.value.trim();
+    input.value = cur ? cur.replace(/[.\s]*$/, '') + '. ' + word : word;
+    input.focus();
+  });
+  document.getElementById('prompt-ok').innerHTML = (opts.icon ? icon(opts.icon) : '') + escHtml(opts.ok || 'Continue');
+  _promptRequired = opts.required !== false;
+  _promptPrevFocus = document.activeElement;
+  m.classList.add('open');
+  m.setAttribute('aria-hidden', 'false');
+  setTimeout(() => input.focus(), 0);
+  return new Promise(resolve => { _promptResolve = resolve; });
+}
+
+function closePrompt(ok) {
+  const m = document.getElementById('prompt-modal');
+  if (!m.classList.contains('open')) return;
+  const text = document.getElementById('prompt-input').value.trim();
+  if (ok && _promptRequired && !text) { document.getElementById('prompt-input').focus(); return; }
+  m.classList.remove('open');
+  m.setAttribute('aria-hidden', 'true');
+  const resolve = _promptResolve;
+  _promptResolve = null;
+  if (_promptPrevFocus && document.contains(_promptPrevFocus)) _promptPrevFocus.focus({preventScroll: true});
+  if (resolve) resolve(ok ? text : null);
+}
+
+// Regenerate one draft: ask what should change, then hand the instruction on.
+function regeneratePrompt(name) {
+  return promptModal({
+    title: name ? 'Regenerate ' + name + '’s ' + 'email' : 'Regenerate this email',
+    copy: 'Tell Mercury what to change. The new draft replaces this one and waits for your review again.',
+    placeholder: 'Shorter, warmer, ask about something else...',
+    suggestions: ['Shorter', 'Warmer', 'One question only'],
+    ok: 'Regenerate', icon: 'sparkle', required: false,
+  });
+}
+
 // ── Pipeline: a board of every contact ──
 //
 // The first three columns (New, Queued, Contacted) are Mercury's bookkeeping —
@@ -3304,6 +3370,17 @@ document.getElementById('drawer-body').addEventListener('click', e => {
 });
 
 document.addEventListener('keydown', e => {
+  if (promptOpen()) {
+    if (e.key === 'Escape') { e.preventDefault(); closePrompt(false); return; }
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); closePrompt(true); return; }
+    if (e.key === 'Tab') {
+      const els = [...document.querySelectorAll('#prompt-modal .modal textarea, #prompt-modal .modal button')];
+      const i = els.indexOf(document.activeElement);
+      e.preventDefault();
+      els[(i + (e.shiftKey ? -1 : 1) + els.length) % els.length].focus();
+    }
+    return;
+  }
   if (e.key === 'Escape') {
     if (modalOpen()) { e.preventDefault(); closeModal(false); return; }
     const menu = document.getElementById('move-menu');
