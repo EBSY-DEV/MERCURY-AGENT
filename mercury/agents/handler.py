@@ -1,6 +1,10 @@
 """Handler — monitors replies and manages conversations.
 
 Works against Instantly (legacy) or a native mail provider (Gmail/SMTP).
+A vacation reply pauses the contact's cold sequence until they are back
+(see mercury/ooo.py); receipts and acknowledgements are kept as records and
+change nothing. Neither opens a conversation or counts as a reply.
+
 The native path also owns bounce handling (see mercury/bounces.py): each
 bounce is bucketed by its DSN status code. A dead address is marked invalid
 and its queued sends cancelled; a sender or reputation block pauses the
@@ -14,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 from mercury import bounces as bounce_policy
+from mercury import ooo
 from mercury.brain import Brain
 from mercury.config import MercuryConfig, EnvConfig
 from mercury.integrations.instantly import InstantlyClient
@@ -125,33 +130,12 @@ def strip_quoted(text: str, extra_markers: tuple[str, ...] = ()) -> str:
             cut = i
     return text[:cut].strip()
 
-AUTO_REPLY_SUBJECTS = (
-    "out of office", "out-of-office", "automatic reply", "auto-reply", "autoreply",
-    "fuera de la oficina", "respuesta automática", "respuesta automatica",
-    # Delivery and read acknowledgements are machines too.
-    "read receipt", "delivery receipt", "return receipt",
-    "we have received your", "we've received your", "acuse de recibo",
-)
-# Outlook-style receipts put the original subject after one of these.
-AUTO_REPLY_PREFIXES = ("read:", "delivered:", "leído:", "leido:", "entregado:")
-
-
 def _is_auto_reply(msg) -> bool:
-    """Vacation and out-of-office responders, detected from headers first."""
-    h = {k.lower(): (v or "").lower() for k, v in (getattr(msg, "headers", None) or {}).items()}
-    if h.get("auto-submitted", "no") not in ("", "no"):
-        return True
-    if h.get("precedence") in ("bulk", "auto_reply", "junk"):
-        return True
-    if "x-autoreply" in h or "x-autorespond" in h:
-        return True
-    subject = (getattr(msg, "subject", "") or "").lower().strip()
-    if any(m in subject for m in AUTO_REPLY_SUBJECTS) or subject.startswith(AUTO_REPLY_PREFIXES):
-        return True
-    # Read and delivery receipts are automatic too: not a person answering.
-    return is_receipt(getattr(msg, "subject", "") or "", getattr(msg, "headers", None))
+    """Responders, receipts and acknowledgements, detected from headers first."""
+    return ooo.is_automatic(getattr(msg, "subject", "") or "", getattr(msg, "headers", None))
 
 
+SEQUENCE_OVER = ooo.SEQUENCE_OVER | PAUSE_ENDING_STATUSES
 def received_at(date_header: str) -> datetime:
     """When an inbound message was sent, as naive UTC, from its Date header.
 
@@ -212,6 +196,8 @@ class Handler:
             else get_mail_provider(config, env)
         )
         self.skills = ""
+        # Naive UTC now. Tests replace it to move through a vacation.
+        self.clock = lambda: datetime.now(timezone.utc).replace(tzinfo=None)
 
     def _pool(self) -> MailboxPool | None:
         if self.mailboxes is not None:
@@ -324,11 +310,7 @@ class Handler:
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
-        compliance = getattr(self.config, "compliance", None)
-        own_words = strip_quoted(
-            reply_text,
-            (compliance.opt_out_line_en, compliance.opt_out_line_es) if compliance else (),
-        )
+        own_words = self._own_words(reply_text)
         text_lower = own_words.lower()
         first_line = re.sub(r"[^\w ]", " ", text_lower.split("\n", 1)[0]).strip()
         if (
@@ -344,29 +326,15 @@ class Handler:
         logger.info(f"Handler: Intent for {lead_email}: {intent}")
 
         if intent == "ooo":
-            # Not a human answer: no conversation, no reply metrics. The
-            # sequence is paused until they are back, not cancelled.
-            meta = reply_meta or {}
-            if self.is_native:
-                await self._pause_for_ooo(
-                    prospect, "", reply_text,
-                    message_id=meta.get("message_id") or meta.get("dedup_key") or "",
-                    received=received_at(meta.get("date", "")),
-                )
-            else:
-                # Instantly owns sequencing there and Mercury has no pause
-                # for it: say so rather than claim a pause that did not happen.
-                logger.warning(
-                    f"Handler: out-of-office from {lead_email}, but the Instantly "
-                    "path cannot pause a remote sequence; it keeps sending."
-                )
-                await self.state.log_action(
-                    action_type="sequence_pause_unavailable",
-                    agent="handler",
-                    details={"prospect_id": prospect.id, "prospect_email": lead_email,
-                             "reason": "legacy Instantly sequences cannot be paused from Mercury"},
-                )
+            # Not a human answer: pause the sequence until they are back, and
+            # open nothing (no conversation, no reply metric).
+            await self._out_of_office(prospect, own_words, reply_meta, "classifier")
             return
+
+        # A person answered, opted out or escalated: a vacation pause on them
+        # is over and must never resume the sequence.
+        await self._end_pause(
+            prospect, "they opted out" if intent == "unsubscribe" else f"they replied ({intent})")
 
         # A human answered, so every queued sequence email for them is now
         # wrong to send. This used to run before classification, so an
@@ -476,10 +444,6 @@ class Handler:
             logger.info(f"Handler: {lead_email} not interested. Closing. One no is enough.")
             return
 
-        if intent == "ooo":
-            logger.info(f"Handler: {lead_email} is OOO. Will follow up later.")
-            return
-
         if intent not in AUTO_REPLY_INTENTS:
             logger.warning(f"Handler: No auto-reply policy for intent '{intent}'. Skipping reply.")
             return
@@ -557,24 +521,15 @@ class Handler:
             try:
                 if msg.is_bounce:
                     await self._handle_bounce(msg)
-                elif _is_auto_reply(msg):
-                    # Not a human answer, and no Claude call is spent
-                    # classifying it. A vacation notice pauses the sequence;
-                    # every other automatic message is only recorded.
-                    await self._handle_auto_reply(msg, dedup_key)
+                elif auto_kind := ooo.classify_automatic(msg.subject, msg.body, msg.headers):
+                    # Not a human answer, and no Claude call is spent on it.
+                    await self._handle_automatic(msg, auto_kind)
                 elif msg.body.strip():
                     await self._process_reply(
                         msg.from_email,
                         msg.body.strip(),
                         reply_uuid="",
-                        reply_meta={
-                            "thread_ref": msg.thread_ref,
-                            "message_id": msg.message_id,
-                            "subject": msg.subject,
-                            "mailbox": getattr(msg, "mailbox", ""),
-                            "date": getattr(msg, "date", ""),
-                            "dedup_key": dedup_key,
-                        },
+                        reply_meta=self._reply_meta(msg),
                     )
                 handled += 1
             except Exception as e:
@@ -598,6 +553,158 @@ class Handler:
         else:
             logger.info("Handler: no new replies.")
 
+    # ── Automatic replies and out-of-office pauses ──
+
+    def _own_words(self, text: str) -> str:
+        compliance = getattr(self.config, "compliance", None)
+        return strip_quoted(
+            text or "",
+            (compliance.opt_out_line_en, compliance.opt_out_line_es) if compliance else (),
+        )
+
+    def _timezone(self) -> str:
+        """The configured timezone: return dates with no zone of their own
+        are read in it (the recipient's is not known)."""
+        usage = getattr(self.config, "usage", None)
+        quiet = getattr(usage, "quiet_hours", None)
+        return getattr(quiet, "timezone", "") or "UTC"
+
+    @staticmethod
+    def _reply_meta(msg) -> dict:
+        return {
+            "thread_ref": msg.thread_ref,
+            "message_id": msg.message_id,
+            "subject": msg.subject,
+            "mailbox": getattr(msg, "mailbox", ""),
+            "date": getattr(msg, "date", ""),
+            "from_email": msg.from_email,
+            # The RFC Message-ID is the same in every mailbox that receives
+            # the message; the provider id is the fallback.
+            "message_key": (msg.message_id or msg.provider_id or "").strip(),
+        }
+
+    async def _inbound_prospect(self, msg):
+        """The contact a message is from: by address, else (an assistant or
+        alias answering for them) by the email of ours it answers."""
+        prospect = await self.state.get_prospect_by_email(msg.from_email)
+        if prospect is None and msg.in_reply_to:
+            sent = await self.state.find_outbox_by_message_id(msg.in_reply_to)
+            if sent:
+                prospect = await self.state.get_prospect(sent["prospect_id"])
+        return prospect
+
+    async def _handle_automatic(self, msg, kind: str):
+        prospect = await self._inbound_prospect(msg)
+        await self.state.log_action("auto_reply", "handler", {
+            "kind": "ooo" if kind == "out_of_office" else kind, "from": msg.from_email,
+            "prospect_id": prospect.id if prospect else "", "subject": (msg.subject or "")[:120],
+            "message_id": msg.message_id or msg.provider_id,
+            "mailbox": (getattr(msg, "mailbox", "") or "").lower(),
+        })
+        if prospect is None:
+            logger.info(f"Handler: automatic message from {msg.from_email} ignored "
+                        "(not one of your contacts).")
+            return
+        own_words = self._own_words(msg.body)
+        meta = self._reply_meta(msg)
+        if kind == "out_of_office":
+            await self._out_of_office(prospect, own_words, meta, "headers")
+            return
+        now = self.clock()
+        received = ooo.message_time(meta["date"], now)
+        await self.state.record_auto_reply(
+            message_key=meta["message_key"] or f"{msg.from_email}:{received.isoformat()}",
+            kind=kind, received_at=received.isoformat(), prospect_id=prospect.id,
+            from_email=msg.from_email, mailbox=meta["mailbox"], subject=msg.subject,
+            excerpt=own_words, detected_by="headers", now=now.isoformat(),
+        )
+        what = "read or delivery receipt" if kind == "receipt" else "automatic acknowledgement"
+        logger.info(f"Handler: {what} from {prospect.email} recorded; the sequence continues.")
+
+    async def _out_of_office(self, prospect, own_words: str, meta: dict | None,
+                             detected_by: str):
+        """Pause the contact's cold sequence until their return date, or until
+        a person sets one when the reply does not give a usable date."""
+        meta = meta or {}
+        if not self.is_native:
+            # Instantly runs the sequence on its own servers. Mercury has no
+            # way to hold it, so it says so rather than claim a pause.
+            logger.warning(
+                f"Handler: {prospect.email} is out of office, but Instantly sends this "
+                "sequence itself and Mercury cannot pause it there. Pause the lead in "
+                "Instantly, or switch channels.email.provider to gmail or smtp.")
+            await self.state.log_action("sequence_pause_unavailable", "handler", {
+                "prospect_id": prospect.id, "prospect_email": prospect.email,
+                "reason": "legacy Instantly sequences cannot be paused from Mercury"})
+            await self.state.log_action(
+                action_type="ooo_pause_unavailable", agent="handler",
+                details={"prospect_id": prospect.id, "prospect_email": prospect.email,
+                         "provider": self.config.channels.email.provider})
+            return
+
+        now = self.clock()
+        received = ooo.message_time(meta.get("date", ""), now)
+        tz_name, quiet_end = operator_clock(self.config)
+        source = f"{meta.get('subject', '')}. {own_words}"
+        found = extract_return_date(source, received, tz_name)
+        buffer = getattr(self.config.channels.email, "ooo_resume_buffer_days", 0)
+        parsed = {
+            "resume_at": resume_time(found.date, tz_name, quiet_end, buffer).isoformat()
+                         if found.ok else None,
+            "confidence": found.confidence, "text": found.text,
+            "review_reason": "no_date" if found.status == "none" else found.status,
+            "timezone": tz_name, "local_date": found.date.isoformat() if found.ok else "",
+        }
+        can_pause = (prospect.status not in SEQUENCE_OVER
+                     and (prospect.email_status or "") != "invalid")
+        outcome, pause = await self.state.record_auto_reply(
+            message_key=meta.get("message_key") or f"{prospect.email}:{received.isoformat()}",
+            kind="out_of_office", received_at=received.isoformat(), prospect_id=prospect.id,
+            from_email=meta.get("from_email") or prospect.email,
+            mailbox=meta.get("mailbox", ""), subject=meta.get("subject", ""),
+            excerpt=own_words, detected_by=detected_by, parsed=parsed,
+            can_pause=can_pause, now=now.isoformat(),
+        )
+        if outcome in ("paused", "updated"):
+            await self.state.log_action("sequence_paused", "handler", {
+                "prospect_id": prospect.id, "prospect_email": prospect.email,
+                "change": "created" if outcome == "paused" else "updated",
+                "state": pause["state"], "resume_at": pause["resume_at"],
+                "return_text": pause["return_text"], "confidence": pause["confidence"],
+                "review_reason": pause["review_reason"], "message_id": meta.get("message_key", ""),
+            })
+            when = (f"until {found.date.isoformat()} ({pause['timezone']})"
+                    if pause["review_state"] == "scheduled"
+                    else "until you set a return date ("
+                         + ooo.REVIEW_REASONS.get(pause["review_reason"], "no date") + ")")
+            logger.info(f"Handler: {prospect.email} is out of office. Their sequence is "
+                        f"paused {when}.")
+            await self.state.log_action(
+                action_type="ooo_paused" if outcome == "paused" else "ooo_pause_updated",
+                agent="handler",
+                details={"prospect_id": prospect.id, "prospect_email": prospect.email,
+                         "pause_id": pause["id"], "resume_at": pause["resume_at"],
+                         "review_state": pause["review_state"],
+                         "review_reason": pause["review_reason"],
+                         "return_text": pause["return_text"], "detected_by": detected_by,
+                         "mailbox": (meta.get("mailbox") or "").lower()})
+        elif outcome == "kept":
+            logger.info(f"Handler: another out-of-office reply from {prospect.email}; "
+                        "the pause keeps its return date.")
+        elif outcome == "ignored":
+            logger.info(f"Handler: out-of-office reply from {prospect.email} recorded; "
+                        "nothing to pause (their sequence is over, or this reply is "
+                        "older than a pause that already ended).")
+
+    async def _end_pause(self, prospect, reason: str):
+        ended = await self.state.end_pause(prospect.id, reason=reason, actor="handler")
+        if ended:
+            logger.info(f"Handler: out-of-office pause for {prospect.email} ended: {reason}. "
+                        "The sequence will not resume.")
+            await self.state.log_action(
+                action_type="ooo_pause_ended", agent="handler",
+                details={"prospect_id": prospect.id, "prospect_email": prospect.email,
+                         "pause_id": ended["id"], "reason": reason})
     async def _handle_auto_reply(self, msg, dedup_key: str = ""):
         """An automatic message from a prospect's mailbox.
 
@@ -805,7 +912,7 @@ class Handler:
                     "email", prospect.email, source="bounce", prospect_id=prospect.id,
                     reason="hard bounce", actor="handler",
                 )
-                await self.state.supersede_pause(prospect.id, "bounced")
+                await self._end_pause(prospect, "their address bounced")
                 logger.warning(
                     f"Handler: BOUNCE for {prospect.email} — marked invalid, "
                     f"cancelled {cancelled} queued email(s)."

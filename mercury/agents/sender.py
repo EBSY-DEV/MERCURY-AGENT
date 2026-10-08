@@ -14,6 +14,10 @@ Native flow:
   3. With channels.email.thread_followups (default on), a sent step hands
      its Message-ID and thread to the later steps, which go out as replies
      ("Re: <first subject>", In-Reply-To, References chain, Gmail threadId).
+
+A contact who sent a vacation reply has an active pause (see mercury/ooo.py):
+their sequence rows are held, approved or not, until the return time. Then
+the next unsent step becomes due and later steps move with it, gaps intact.
 """
 
 import asyncio
@@ -39,6 +43,7 @@ from mercury.integrations.mailboxes import (
     local_today,
     rotation_configured,
 )
+from mercury.ooo import parse_stored
 from mercury.policy import ContactPolicy, capability
 from mercury.state import (
     THREAD_FIELDS,
@@ -160,6 +165,8 @@ class Sender:
         self.policy = ContactPolicy(state, config)
         # Disabled in tests to skip inter-send sleeps.
         self.send_pacing = True
+        # Naive UTC now. Tests replace it to move through a vacation pause.
+        self.clock = lambda: datetime.now(timezone.utc).replace(tzinfo=None)
         self._last_drain_at: float | None = None  # monotonic, for spread_sends
         # Set by the heartbeat on SIGTERM: claim nothing new, let the email
         # in flight finish, skip the pacing sleep.
@@ -434,31 +441,6 @@ class Sender:
 
     # ── Native provider flow (Gmail / SMTP via the outbox) ──
 
-    async def _resume_due_pauses(self):
-        """Release out-of-office pauses whose return time has come. This only
-        moves their queued steps' send times; approvals are untouched and the
-        drain below still applies pacing, caps and every gate."""
-        try:
-            resumed = await self.state.resume_due_pauses(self.clock())
-        except Exception as e:
-            logger.error(f"Sender: resuming out-of-office pauses failed: {e}")
-            return
-        for pause in resumed:
-            logger.info(
-                f"Sender: out-of-office pause for prospect {pause['prospect_id']} ended; "
-                f"{pause.get('rescheduled', 0)} queued step(s) rescheduled."
-            )
-            try:
-                await self.state.log_action(
-                    action_type="sequence_resumed",
-                    agent="sender",
-                    details={"prospect_id": pause["prospect_id"], "by": "return date",
-                             "resume_at": pause.get("resume_at") or "",
-                             "rescheduled": pause.get("rescheduled", 0)},
-                )
-            except Exception as e:
-                logger.debug(f"Sender: sequence_resumed log failed: {e}")
-
     async def _run_native(self):
         """Stage new campaigns into the outbox, then drain what's due."""
         await self._resume_due_pauses()
@@ -599,21 +581,21 @@ class Sender:
             seen_emails.add(email)
             company_id = await self.policy.company_for(prospect)
 
-            # A prospect on an out-of-office pause is staged normally (the
-            # drafts still wait for review) but the sequence starts after
-            # their return; the drain holds it until the pause ends anyway.
-            base = now
+            # Someone away gets the sequence scheduled from their return day.
+            # The drain holds it either way while the pause lasts.
+            start = now
             pause = await self.state.get_active_pause(prospect.id)
-            if pause and pause.get("resume_at"):
-                try:
-                    base = max(base, datetime.fromisoformat(pause["resume_at"]))
-                except ValueError:
-                    pass
+            if pause:
+                back = parse_stored(pause.get("resume_at"))
+                if back and back > now:
+                    start = back
+                logger.info(f"Sender: {email} is out of office; their emails are staged "
+                            "but wait until the pause ends.")
 
             cumulative_days = 0
             for step in campaign.sequence:
                 cumulative_days += max(0, step.delay_days)
-                send_at = base + timedelta(days=cumulative_days)
+                send_at = start + timedelta(days=cumulative_days)
                 item_id = await self.state.add_outbox_item(
                     prospect_id=prospect.id,
                     campaign_id=campaign.id,
@@ -723,6 +705,9 @@ class Sender:
             return
 
         now = self.clock().isoformat()
+        # Pauses whose return day has come resume before the scan, so their
+        # next step is due in this pass; the rest are held below.
+        paused = await self.state.paused_prospect_ids()
         # The whole due set, not a budget-sized slice: rows pinned to a
         # mailbox at its cap are skipped below, and a slice of the oldest
         # rows could be nothing but those while other mailboxes sat idle.
@@ -768,6 +753,13 @@ class Sender:
                     item["id"], status="cancelled",
                     error=f"prospect status '{prospect.status}'",
                 )
+                continue
+
+            # Out of office: the sequence waits. Approval status is not
+            # touched; claim_for_send re-checks under the write lock.
+            if item["kind"] == "sequence" and item["prospect_id"] in paused:
+                logger.debug(f"Sender: holding step {item['step']} to {item['to_email']}: "
+                             "they are out of office.")
                 continue
 
             # Sequence order: step N never leaves before step N-1 was sent.
@@ -913,10 +905,7 @@ class Sender:
                 if attempt <= 3 and (raised or _smtp_error_is_transient(err)):
                     # A connection hiccup or a 4xx deferral is not a verdict
                     # on the address: keep the row approved and try later.
-                    retry_at = datetime.fromtimestamp(
-                        datetime.now(timezone.utc).timestamp() + 1800 * attempt,
-                        tz=timezone.utc,
-                    ).replace(tzinfo=None).isoformat()
+                    retry_at = (self.clock() + timedelta(seconds=1800 * attempt)).isoformat()
                     await self.state.update_outbox_item(
                         item["id"], status="approved", send_at=retry_at,
                         error=f"retry {attempt}/3: {err[:250]}",
@@ -997,6 +986,9 @@ class Sender:
         to = item["to_email"]
         if claim == "suppressed":
             logger.warning(f"Sender: blocked email to {to}: {detail['error']}.")
+        elif claim == "ooo_pause":
+            logger.info(f"Sender: holding step {item['step']} to {to}: they are out of "
+                        "office (paused while this email was being picked).")
         elif claim == "company_hold":
             logger.info(f"Sender: holding step {item['step']} to {to}: cold mail to "
                         "this company is paused.")
@@ -1006,6 +998,53 @@ class Sender:
         elif claim == "company_active_limit":
             logger.info(f"Sender: holding first email to {to}: its company has "
                         f"{detail['active']}/{detail['limit']} contacts in a sequence.")
+
+    async def _resume_due_pauses(self, now: str | None = None):
+        """End out-of-office pauses. Any whose contact has left the sequence
+        since (replied, opted out, bounced, excluded, closed) is superseded
+        and never resumes; any whose return time has come resumes now, with
+        its next step due and the later steps moved by the same amount."""
+        now = now or self.clock().isoformat()
+        for pause in await self.state.list_pauses():
+            over = ""
+            if pause["prospect_status"] in STOP_STATUSES:
+                over = f"their status is now '{pause['prospect_status']}'"
+            elif pause["prospect_email_status"] == "invalid":
+                over = "their address is invalid"
+            elif pause["prospect_email"] and await self.policy.exclusion_for(
+                    pause["prospect_email"]):
+                over = "their address is excluded"
+            if not over:
+                continue
+            ended = await self.state.end_pause(pause["prospect_id"], reason=over,
+                                               actor="sender", now=now)
+            if ended:
+                logger.info(f"Sender: out-of-office pause for {pause['prospect_email']} "
+                            f"ended: {over}. The sequence will not resume.")
+                await self.state.log_action(
+                    "ooo_pause_ended", "sender",
+                    {"prospect_id": pause["prospect_id"],
+                     "prospect_email": pause["prospect_email"],
+                     "pause_id": pause["id"], "reason": over})
+        for pause in await self.state.due_pauses(now):
+            ended, moved = await self.state.resume_pause(
+                pause["id"], start_at=now, actor="sender",
+                reason="return date reached", now=now, due_at=now)
+            if ended is None:
+                continue
+            prospect = await self.state.get_prospect(pause["prospect_id"])
+            email = prospect.email if prospect else pause["prospect_id"]
+            logger.info(f"Sender: {email} is back; their sequence resumes with the next "
+                        f"step ({moved} email(s) rescheduled, gaps kept).")
+            await self.state.log_action(
+                "sequence_resumed", "sender",
+                {"prospect_id": pause["prospect_id"], "by": "return date",
+                 "resume_at": pause["resume_at"], "rescheduled": moved})
+            await self.state.log_action(
+                "ooo_resumed", "sender",
+                {"prospect_id": pause["prospect_id"], "prospect_email": email,
+                 "pause_id": pause["id"], "resume_at": pause["resume_at"],
+                 "rescheduled": moved, "by": "return date"})
 
     def _mailbox_for(self, item, prev, pool, remaining, sent_this_cycle, today):
         """(mailbox, verdict): verdict is "send" or "hold" (try a later cycle).

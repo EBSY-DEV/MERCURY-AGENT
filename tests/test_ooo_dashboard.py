@@ -129,10 +129,10 @@ def test_activity_feed_names_the_new_events(client):
 
 def test_today_flags_pauses_that_need_a_return_date(client):
     quiet = client.get("/api/today").json()
-    assert not any(i["key"] == "pauses" for i in quiet["items"])
+    assert not any(i["key"] == "away-review" for i in quiet["items"])
     _paused(client, "a@acme.com", state="needs_review")
     _paused(client, "b@acme.com", state="paused", days=5)
     items = client.get("/api/today").json()["items"]
-    item = next(i for i in items if i["key"] == "pauses")
-    assert item["title"].startswith("1 contact is out of office")
+    item = next(i for i in items if i["key"] == "away-review")
+    assert item["title"].startswith("1 contact is away")
     assert item["tab"] == "outbox"

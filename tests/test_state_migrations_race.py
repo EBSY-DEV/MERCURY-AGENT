@@ -95,7 +95,7 @@ async def test_pre_merge_dev_db_gets_the_mailbox_column(tmp_path):
 def test_migration_order_contact_policy_v14_v15_then_pauses_v16_demos_v17():
     # main shipped v14/v15 (exclusions, manual review) first; the
     # integration/p0 work (out-of-office pauses, demo gate) comes after.
-    assert len(MIGRATIONS) == 19
+    assert len(MIGRATIONS) == 20
     assert "CREATE TABLE suppressions" in MIGRATIONS[13]
     assert "requires_manual_review" in MIGRATIONS[14]
     assert "CREATE TABLE IF NOT EXISTS sequence_pauses" in MIGRATIONS[15]

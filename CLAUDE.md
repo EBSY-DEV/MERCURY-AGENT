@@ -319,6 +319,7 @@ mercury mail limits [--strict] # Inbox limit warnings (2 per domain, provider ce
 mercury exclusions            # Never-email list: add / remove / check / import / export (opt-outs and bounces land here too)
 mercury holds                 # Companies whose cold mail is paused (after a reply, or by you); release HOLD_ID to resume
 mercury sending pause|resume  # Kill switch for all outbound
+mercury paused                # Contacts paused by an out-of-office reply; set-date ID DATE / resume ID
 mercury health                # Deliverability verdict per sending domain (too young / not enough data / keep / cancel candidate)
 mercury mail placement        # Send email 1 to your seed inboxes and read where it landed; --dry-run, show / check / mark
 mercury demos                 # Demo gate: who waits for a demo; ready / request / retire EMAIL_OR_ID

@@ -356,6 +356,12 @@ const ACTIVITY_LABELS = {
   email_sent: ['paper-plane-tilt', 'Email sent'],
   pipeline_move: ['kanban', 'Moved a contact in the pipeline'],
   outbox_reschedule: ['calendar-blank', 'Rescheduled an email'],
+  ooo_paused: ['pause-circle', 'Paused a sequence: out of office'],
+  ooo_pause_updated: ['pause-circle', 'Updated an out-of-office return date'],
+  ooo_return_date_set: ['calendar-blank', 'Set an out-of-office return date'],
+  ooo_resumed: ['play', 'Resumed a sequence after out of office'],
+  ooo_pause_ended: ['x-circle', 'Ended an out-of-office pause'],
+  ooo_pause_unavailable: ['warning-circle', 'Could not pause an out-of-office contact'],
   auto_reply: ['envelope-simple', 'Automatic reply received'],
   sequence_paused: ['pause-circle', 'Paused a sequence (out of office)'],
   sequence_resumed: ['arrow-circle-right', 'Resumed a sequence'],
@@ -1326,11 +1332,10 @@ async function loadUsage() {
 let _mailboxes = null;
 
 async function loadOutbox() {
-  const [data, mbox, pauses, sending] = await Promise.all([
-    api('/api/outbox'), api('/api/mailboxes'), api('/api/pauses'), api('/api/sending/status')]);
+  const [data, mbox, sending] = await Promise.all([
+    api('/api/outbox'), api('/api/mailboxes'), api('/api/sending/status')]);
   _mailboxes = mbox && !mbox.error ? mbox : null;
-  const pausesEl = document.getElementById('outbox-pauses');
-  if (pausesEl) pausesEl.innerHTML = renderPauses(pauses);
+  if (typeof loadAway === 'function') loadAway();
   const mboxEl = document.getElementById('outbox-mailboxes');
   if (mboxEl) mboxEl.innerHTML = mbox && mbox.error
     ? '<section class="panel"><div class="panel-head"><div><h3 class="icon-title">' + icon('warning-circle') +
@@ -1554,86 +1559,6 @@ async function outboxAct(id, action) {
     }
   } else showToast(data && data.code === 'stale_revision'
     ? 'This email changed since you opened it. Review it again.' : 'Action failed.', 'error');
-  loadOutbox();
-}
-
-// ── Paused for out-of-office ──
-//
-// A contact who sent a vacation notice has their remaining follow-ups held
-// back. With a readable return date they resume on their own; without one they
-// stay paused until someone sets a date or resumes them.
-
-const PAUSE_REVIEW_COPY = {
-  none: 'No return date in their message',
-  ambiguous: 'The date in their message can be read two ways',
-  invalid: 'The date in their message does not exist',
-  past: 'The date in their message has already passed',
-  too_far: 'The date in their message is more than a year away',
-};
-
-function pauseDay(iso) {
-  const d = iso ? new Date(iso + 'T12:00:00') : null;
-  return d && !isNaN(d) ? d.toLocaleDateString('en-US', {weekday: 'short', month: 'short', day: 'numeric'}) : '';
-}
-
-function renderPauses(data) {
-  const rows = (data && data.pauses) || [];
-  if (!rows.length) return '';
-  const review = rows.filter(p => p.state === 'needs_review').length;
-  const body = rows.map(p => {
-    const review_ = p.state === 'needs_review';
-    const status = review_
-      ? toneBadge('waiting', 'Return date needs review')
-      : toneBadge('active', 'Back ' + (pauseDay(p.resume_local) || 'later'));
-    const why = review_
-      ? (PAUSE_REVIEW_COPY[p.review_reason] || PAUSE_REVIEW_COPY.none)
-      : (p.return_text ? 'They wrote &ldquo;' + escHtml(p.return_text) + '&rdquo;' : '')
-        + (p.manual_override ? (p.return_text ? ' &middot; ' : '') + 'Date set by you' : '');
-    const id = escAttr(p.prospect_id);
-    return '<tr>' +
-      '<td>' + escHtml(p.name) + '<div class="muted mb-sub">' +
-        escHtml([p.company, p.email].filter(Boolean).join(' · ')) + '</div></td>' +
-      '<td>' + status + '<div class="muted mb-sub">' + why + '</div></td>' +
-      '<td class="num">' + fmtN(p.queued_count) + '</td>' +
-      '<td><div class="pause-actions">' +
-        '<input type="date" class="form-input" id="pause-date-' + id + '" value="' +
-          escAttr(p.resume_local || '') + '" aria-label="Return date for ' + escAttr(p.name) + '">' +
-        '<button class="btn btn-secondary btn-sm" onclick="pauseSetDate(\'' + id + '\')">' +
-          icon('calendar-blank') + 'Set date</button>' +
-        '<button class="btn btn-secondary btn-sm" onclick="pauseResume(\'' + id + '\')">' +
-          icon('arrow-circle-right') + 'Resume now</button>' +
-      '</div></td></tr>';
-  }).join('');
-  return '<section class="panel"><div class="panel-head"><div>' +
-      '<h3 class="icon-title">' + icon('pause-circle') + 'Paused for out-of-office</h3>' +
-      '<p>' + (review
-        ? '<b>' + review + '</b> without a usable return date. They stay paused until you set one or resume them. '
-        : 'Their follow-ups resume on the return date. ') +
-        'Dates are in ' + escHtml(data.timezone || 'your timezone') + '.</p>' +
-    '</div></div><div class="panel-body"><div class="table-card"><table><thead><tr>' +
-      '<th>Contact</th><th>Status</th><th class="num">Queued</th><th>Return date</th></tr></thead><tbody>' +
-      body + '</tbody></table></div></div></section>';
-}
-
-async function pauseSetDate(id) {
-  const el = document.getElementById('pause-date-' + id);
-  if (!el || !el.value) { showToast('Pick a return date first.', 'error'); return; }
-  const res = await postJSON('/api/pauses/' + encodeURIComponent(id) + '/return-date', {return_date: el.value});
-  if (res.ok) showToast('Return date saved. Their follow-ups resume then.', 'success');
-  else showToast(res.error || 'Could not save the date.', 'error');
-  loadOutbox();
-}
-
-async function pauseResume(id) {
-  const ok = await confirmModal({
-    title: 'Resume this contact now?',
-    copy: 'Their next follow-up goes out on normal pacing. Later steps keep their usual gaps.',
-    ok: 'Resume',
-  });
-  if (!ok) return;
-  const res = await postJSON('/api/pauses/' + encodeURIComponent(id) + '/resume');
-  if (res.ok) showToast('Resumed. Their next follow-up is back in the queue.', 'success');
-  else showToast(res.error || 'Could not resume.', 'error');
   loadOutbox();
 }
 

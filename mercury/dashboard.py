@@ -34,6 +34,7 @@ from mercury.control.queries import (  # noqa: E402
     SIGNAL_CATEGORIES, SIGNAL_CATEGORY_ORDER, QueryService,
 )
 from mercury.exclusions_api import router as exclusions_router  # noqa: E402
+from mercury.pauses_api import router as pauses_router  # noqa: E402
 # MERCURY_DB_PATH points the dashboard at another database (e.g. the demo
 # DB from scripts/seed_demo.py) without touching the real one.
 DB_PATH = Path(os.environ.get("MERCURY_DB_PATH") or (PROJECT_ROOT / "data" / "mercury.db"))
@@ -47,6 +48,7 @@ app.include_router(personas_router)
 app.include_router(imports_router)
 app.include_router(demos_router)
 app.include_router(exclusions_router)
+app.include_router(pauses_router)
 
 _env_lock = asyncio.Lock()
 # Everything this server does, it does for the person at this machine.
@@ -979,95 +981,6 @@ def _pause_view(row: dict, tz_name: str) -> dict:
     }
 
 
-@app.get("/api/pauses")
-async def get_pauses():
-    """Contacts whose cold sequence is paused for an out-of-office reply."""
-    try:
-        state = _state()
-        await state.init_db()
-        tz_name, _end = _operator_clock()
-        rows = await state.list_pauses()
-        return {"timezone": tz_name, "pauses": [_pause_view(r, tz_name) for r in rows]}
-    except Exception as e:
-        return {"error": str(e), "pauses": []}
-
-
-@app.post("/api/pauses/{prospect_id}/resume")
-async def resume_pause_api(prospect_id: str):
-    """Resume a paused contact now. Their next unsent step goes out under the
-    normal pacing; later steps keep their gaps."""
-    try:
-        state = _state()
-        await state.init_db()
-        before = await state.get_active_pause(prospect_id)
-        if before is None:
-            return JSONResponse(
-                {"success": False, "error": "this contact has no active pause"}, status_code=404)
-        pause = await state.resume_pause(prospect_id, reason="operator")
-        if pause is None:
-            return JSONResponse(
-                {"success": False, "error": "this contact has no active pause"}, status_code=404)
-        await state.log_action("sequence_resumed", "dashboard", {
-            "prospect_id": prospect_id, "by": "operator",
-            "was": before["state"], "resume_at": before.get("resume_at") or "",
-            "rescheduled": pause.get("rescheduled", 0),
-        })
-        return {"success": True, "rescheduled": pause.get("rescheduled", 0)}
-    except Exception as e:
-        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
-
-
-@app.post("/api/pauses/{prospect_id}/return-date")
-async def set_pause_return_date(prospect_id: str, request: Request):
-    """Correct a contact's return date (YYYY-MM-DD, the operator's calendar).
-    Sending resumes at the first sending time on that day, weekends skipped.
-    The date is kept: replaying an older message will not overwrite it."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    raw = str((body or {}).get("return_date") or "").strip() if isinstance(body, dict) else ""
-    day = _parse_day(raw)
-    if day is None:
-        return JSONResponse(
-            {"success": False, "error": "return_date must be YYYY-MM-DD"}, status_code=400)
-    try:
-        from mercury.ooo import MAX_DAYS_AHEAD, resume_time
-
-        tz_name, quiet_end = _operator_clock()
-        import pytz
-
-        today = datetime.now(pytz.timezone(tz_name)).date()
-        if day < today:
-            return JSONResponse(
-                {"success": False,
-                 "error": "that date has already passed; use Resume to continue now"},
-                status_code=400)
-        if (day - today).days > MAX_DAYS_AHEAD:
-            return JSONResponse(
-                {"success": False, "error": f"return date is more than {MAX_DAYS_AHEAD} days away"},
-                status_code=400)
-        state = _state()
-        await state.init_db()
-        before = await state.get_active_pause(prospect_id)
-        if before is None:
-            return JSONResponse(
-                {"success": False, "error": "this contact has no active pause"}, status_code=404)
-        when = resume_time(day, tz_name, quiet_end)
-        pause = await state.override_pause(prospect_id, when)
-        if pause is None:
-            return JSONResponse(
-                {"success": False, "error": "this contact has no active pause"}, status_code=404)
-        await state.log_action("pause_date_changed", "dashboard", {
-            "prospect_id": prospect_id, "by": "operator",
-            "from": before.get("resume_at") or "", "was": before["state"],
-            "to": pause.get("resume_at") or "", "now": pause["state"],
-        })
-        return {"success": True, "state": pause["state"], "resume_at": pause.get("resume_at") or ""}
-    except Exception as e:
-        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
-
-
 # ── Pipeline board + calendar ──
 
 PIPELINE_COLUMNS = [
@@ -1704,18 +1617,6 @@ async def get_today():
                 "action": "Open the decisions desk", "tab": "outbox",
             })
 
-        review = (await state.count_active_pauses()).get("needs_review", 0)
-        if review:
-            items.append({
-                "key": "pauses", "tone": "warn",
-                "title": (f"{review} contact is out of office with no usable return date"
-                          if review == 1 else
-                          f"{review} contacts are out of office with no usable return date"),
-                "detail": ("Their sequences are paused and stay paused until you set a "
-                           "return date or resume them."),
-                "action": "Review paused contacts", "tab": "outbox",
-            })
-
         from mercury.demos import waiting_for_demo
 
         waiting_demo = await waiting_for_demo(state, _demo_config())
@@ -1752,6 +1653,28 @@ async def get_today():
                 "detail": ("Someone there replied or you paused it, so cold mail to their "
                            f"colleagues waits ({held_mail} queued). Replies still go out."),
                 "action": "Review holds", "tab": "exclusions",
+            })
+
+        pauses = await state.list_pauses()
+        undated = sum(1 for p in pauses if p["review_state"] == "needs_review")
+        if undated:
+            items.append({
+                "key": "away-review", "tone": "warn",
+                "title": (f"{undated} contact is away with no clear return date" if undated == 1
+                          else f"{undated} contacts are away with no clear return date"),
+                "detail": ("Their follow-ups wait until you set the day they are back "
+                           "or resume them. Mercury will not guess."),
+                "action": "Set return dates", "tab": "outbox",
+            })
+        if len(pauses) > undated:
+            n = len(pauses) - undated
+            items.append({
+                "key": "away", "tone": "good",
+                "title": (f"{n} contact is out of office" if n == 1
+                          else f"{n} contacts are out of office"),
+                "detail": ("Their follow-ups wait until they are back, then the sequence "
+                           "picks up with the next step."),
+                "action": "Review", "tab": "outbox",
             })
 
         if open_convos:

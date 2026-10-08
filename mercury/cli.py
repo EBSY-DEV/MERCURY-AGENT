@@ -1325,6 +1325,57 @@ def cmd_holds(args):
         sys.exit(1)
 
 
+def cmd_paused(args):
+    """Contacts whose sequence is paused by an out-of-office reply."""
+    import json
+
+    from mercury.control.pauses import PauseError, PauseService
+    from mercury.state import StateManager
+
+    async def _run():
+        service = await PauseService(StateManager(), _load_config_quiet()).ready()
+        action = args.paused_action
+        if action != "list" and not args.target:
+            raise PauseError("invalid", f"Missing argument: mercury paused {action} PAUSE_ID")
+        if action == "list":
+            pauses = await service.list(ended=args.ended)
+            if args.json:
+                return print(json.dumps(pauses, indent=2))
+            note = service.capability()["note"]
+            if note:
+                print(f"\n  {note}")
+            if not pauses:
+                return print("\n  Nobody is paused for being out of office.\n")
+            print(f"\n  {'Pause':<13} {'Back on':<11} {'Queued':>6}  Contact")
+            for p in pauses:
+                back = p["back_on"] or "needs date"
+                why = f"  ({p['review_text']})" if p["review_text"] else ""
+                print(f"  {p['id']:<13} {back:<11} {p['queued']:>6}  "
+                      f"{p['prospect_email']}{why}")
+            print(f"\n  Dates are in {service.timezone()}. Set one: mercury paused set-date "
+                  "PAUSE_ID YYYY-MM-DD; resume now: mercury paused resume PAUSE_ID\n")
+        elif action == "set-date":
+            if not args.date:
+                raise PauseError("invalid", "Missing the date: mercury paused set-date "
+                                            "PAUSE_ID YYYY-MM-DD")
+            pause = await service.set_return_date(args.target, args.date, note=args.note,
+                                                  actor="cli")
+            print(json.dumps(pause, indent=2) if args.json else
+                  f"\n  Saved. Their sequence picks up on {pause['back_on']} "
+                  f"({service.timezone()}). Drafts still wait for review.\n")
+        elif action == "resume":
+            pause = await service.resume(args.target, note=args.note, actor="cli")
+            print(json.dumps(pause, indent=2) if args.json else
+                  f"\n  Resumed. The next step is due now ({pause['rescheduled']} email(s) "
+                  "rescheduled, gaps kept). Drafts still wait for review.\n")
+
+    try:
+        asyncio.run(_run())
+    except PauseError as error:
+        print(f"\n  {error}\n")
+        sys.exit(1)
+
+
 def _load_config_quiet():
     try:
         from mercury.config import load_config
@@ -1559,6 +1610,17 @@ def main():
     sub.add_argument("--released", action="store_true", help="list: show past holds")
     sub.add_argument("--json", action="store_true", help="Machine-readable output")
     sub.set_defaults(func=cmd_holds)
+
+    sub = subparsers.add_parser(
+        "paused", help="Out-of-office pauses: list, set-date, resume")
+    sub.add_argument("paused_action", nargs="?", default="list",
+                     choices=["list", "set-date", "resume"])
+    sub.add_argument("target", nargs="?", default="", help="the pause id")
+    sub.add_argument("date", nargs="?", default="", help="set-date: YYYY-MM-DD")
+    sub.add_argument("--note", default="", help="Why (kept in the activity log)")
+    sub.add_argument("--ended", action="store_true", help="list: show past pauses")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub.set_defaults(func=cmd_paused)
 
     # mercury sending pause|resume|status
     sub = subparsers.add_parser("discover", help="Find businesses matching your ICP")

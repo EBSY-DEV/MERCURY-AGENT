@@ -558,7 +558,7 @@ def operator_clock(config) -> tuple[str, str]:
     return tz_name, end
 
 
-def resume_time(return_date: date, tz_name: str = "UTC", quiet_end: str = "07:00",
+def resume_time(return_date: date, tz_name: str = "UTC", quiet_end: str = "09:00",
                 buffer_days: int = 0) -> datetime:
     """First sending time on or after ``return_date``, as naive UTC.
 
@@ -586,3 +586,27 @@ def resume_time(return_date: date, tz_name: str = "UTC", quiet_end: str = "07:00
             day += timedelta(days=1)
     local = tz.localize(datetime.combine(day, at.replace(tzinfo=None)))
     return local.astimezone(pytz.UTC).replace(tzinfo=None)
+
+
+# Backward-compatible date-result API used by the pause history service.
+# Runtime scheduling uses extract_return_date + resume_time above, including
+# configured quiet hours, weekends and the optional business-day buffer.
+from mercury.ooo_legacy import (
+    MAX_AWAY_DAYS, RESUME_HOUR, REVIEW_REASONS, SEQUENCE_OVER,
+    local_day, message_time, parse_return_date, parse_stored,
+    is_automatic as _legacy_is_automatic,
+    classify_automatic as _legacy_classify_automatic,
+)
+
+
+def is_automatic(subject: str, headers: dict | None) -> bool:
+    return _legacy_is_automatic(subject, headers) or is_receipt(subject, headers)
+
+
+def classify_automatic(subject: str, body: str, headers: dict | None) -> str | None:
+    if not is_automatic(subject, headers):
+        return None
+    kind = classify_auto_reply(subject, body, headers)
+    if kind == "acknowledgement" and not _ACK_MARKERS.search(_fold(body)):
+        return _legacy_classify_automatic(subject, body, headers) or kind
+    return "out_of_office" if kind == "ooo" else kind
