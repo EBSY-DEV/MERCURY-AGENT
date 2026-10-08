@@ -69,6 +69,7 @@ from mercury.models.company import Company  # noqa: E402
 from mercury.models.conversation import Conversation, Message  # noqa: E402
 from mercury.models.prospect import Prospect  # noqa: E402
 from mercury.state import StateManager  # noqa: E402
+from demo_pains import extend_config as extend_pain_config, seed_pains  # noqa: E402
 
 DEFAULT_DB = ROOT / "data" / "demo.db"
 REAL_DB = ROOT / "data" / "mercury.db"
@@ -299,6 +300,7 @@ async def seed(db_path: Path) -> dict:
     counts.update(await seed_history(sm))
     counts.update(await seed_warmup(sm))
     counts.update(await seed_placement(sm))
+    counts.update(await seed_pains(sm))
     return counts
 
 
@@ -378,6 +380,7 @@ def demo_config(template: Path) -> dict:
     cfg["compliance"] = {"postal_address": "1550 Wewatta St, Denver, CO 80202"}
     cfg["offers"] = [{"key": VOICE_OFFER, "requires_demo": True, "demo_kind": "voice"}]
     cfg.setdefault("usage", {}).setdefault("quiet_hours", {})["timezone"] = "UTC"
+    extend_pain_config(cfg)
     return cfg
 
 
@@ -549,7 +552,8 @@ def main(argv: list[str]) -> int:
           f"{len(COMPANIES)} companies, {counts['conversations']} conversations, "
           f"{counts['outbox']} outbox rows, {counts['history_sends']} historical sends, "
           f"{counts['history_events']} reply/bounce events, "
-          f"{counts['warmup_inboxes']} warm-up overlays.")
+          f"{counts['warmup_inboxes']} warm-up overlays, "
+          f"{counts['pains']} pains ({counts['pain_emails']} emails tagged).")
     print(f"Demo mail config: {config_path}")
     print(f"Run: MERCURY_DB_PATH={target} MERCURY_CONFIG={config_path} "
           f"{DEMO_PASSWORD_ENV}=demo env -u APPIMAGE .venv/bin/mercury dashboard")
