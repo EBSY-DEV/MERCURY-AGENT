@@ -13,7 +13,7 @@ are audited, and may be replayed safely with a request key (audit.py).
 
   outbox     list, get, approve, reject, batch, approve_all, edit,
              reschedule, reroute, regenerate (revisioned, see outbox.py)
-  sending    the global send switch: status, pause, resume
+  sending    operator pause vs. health holds: status, pause, resume, clear_hold
   discovery  provider menu, plan/estimate, background run, profile, stop
   runtime    the agent process: status, start, stop, log tail
   settings   the allowlisted mercury.yaml fields (secrets are refused)

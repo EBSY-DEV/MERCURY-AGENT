@@ -29,8 +29,9 @@ classified bounces (after 30 of them), or the overall bounce rate above
 ``channels.email.max_bounce_rate`` (after 50 sends). LIST bounces alone never
 trip the share rule.
 
-Counters live in the ``settings`` table and are cleared with the kill switch
-(``reset_counters``), so resuming starts a clean count. Nothing here needs a
+Counters live in the ``settings`` table. They are reset only when a person
+clears the kill switch explicitly (``mercury.holds.clear_health_hold``), never
+by a resume, so the evidence behind a hold survives it. Nothing here needs a
 schema change: the code and bucket ride in the bounce action's JSON, and the
 per-mailbox throttle and per-domain verdict are settings keys.
 """
@@ -178,15 +179,15 @@ def kill_switch_reason(
     if classified >= SHARE_MIN_CLASSIFIED and bad / classified > SHARE_LIMIT:
         return (
             f"{bad} of {classified} classified bounces are sender or reputation "
-            f"blocks ({bad / classified:.0%}, limit {SHARE_LIMIT:.0%}) — "
-            "check the Mailboxes tab and your DNS before resuming"
+            f"blocks ({bad / classified:.0%}, limit {SHARE_LIMIT:.0%}). "
+            "Check the Mailboxes tab and your DNS before clearing the hold"
         )
     countable = max(0, int(bounce_total) - counts[NOISE])
     if max_rate and max_rate > 0 and total_sent >= MIN_SENDS_FOR_RATE \
             and countable / total_sent > max_rate:
         return (
             f"bounce rate {countable}/{total_sent} exceeded "
-            f"{max_rate:.0%} — check list quality before resuming"
+            f"{max_rate:.0%}. Check list quality before clearing the hold"
         )
     return ""
 
@@ -206,7 +207,7 @@ async def record_bucket(state, bucket: str) -> int:
 
 
 async def reset_counters(state) -> None:
-    """Start a clean count (called whenever the kill switch is resumed)."""
+    """Start a clean count (only when the kill switch is cleared explicitly)."""
     await state.set_setting(BOUNCE_COUNT_KEY, "0")
     for bucket in BUCKETS:
         await state.set_setting(_BUCKET_KEY + bucket, "0")
@@ -215,8 +216,14 @@ async def reset_counters(state) -> None:
 async def engage_kill_switch(state, reason: str) -> bool:
     """Flip the global kill switch. An existing reason is kept (the first
     cause is the useful one). Returns True when the switch is set afterwards,
-    False if the write failed, so a caller can refuse to drop the evidence."""
+    False if the write failed, so a caller can refuse to drop the evidence.
+
+    An operator pause lives under its own key (``mercury.holds``), so a pause
+    already in place never hides this hold."""
+    from mercury.holds import migrate_legacy
+
     try:
+        await migrate_legacy(state)
         if not await state.get_setting(KILL_SWITCH_KEY):
             await state.set_setting(KILL_SWITCH_KEY, reason)
         logger.error(f"Bounces: KILL SWITCH ENGAGED — {reason}")

@@ -123,7 +123,7 @@ When the CLI runs as root (typical in hosted runners), the Brain sets `IS_SANDBO
 | `actions` | The event log (also the source for reply and bounce metrics). |
 | `usage_events` | Per-call token usage. |
 | `email_patterns` | Learned address patterns per domain. |
-| `settings` | Key/value flags: `sending_paused`, `bounce_count`, `discovery_provider`, cached geocodes and DNS results. |
+| `settings` | Key/value flags: `operator_pause` (your pause), `sending_paused` (the bounce kill switch, a health hold), `bounce_count`, `discovery_provider`, cached geocodes and DNS results. See `mercury/holds.py`. |
 | `warmup_inboxes` | The warm-up overlay: manual or automatic pause, checklist, notes. |
 
 Migrations are a list of SQL scripts in `MIGRATIONS` (`mercury/state.py`). The schema version is `PRAGMA user_version`; `init_db()` takes a write lock, re-reads the version, and applies each pending script and its version bump inside one transaction. Never edit or reorder a released migration; append a new one.
