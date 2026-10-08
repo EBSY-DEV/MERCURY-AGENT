@@ -81,6 +81,47 @@ minor versions can still change behaviour.
   classified ones (after 30). The Mailboxes drawer shows the breakdown. No schema
   change.
 
+- **Out-of-office pauses** (#4). A vacation auto-reply no longer lets the
+  follow-ups keep landing while the person is away. On the native Gmail/SMTP
+  path Mercury pauses that contact's remaining cold steps, reads the return date
+  (English and Spanish: "until October 20", "hasta el 20 de octubre", "back
+  Monday", "for two weeks") against the time the message arrived in your
+  `usage.quiet_hours.timezone`, and resumes at the end of quiet hours on that
+  day (Monday if it falls on a weekend), or `channels.email.ooo_resume_buffer_days`
+  business days later if you set one. A missing, ambiguous, impossible or
+  past date pauses the contact into a "return date needs review" state that
+  never resumes by itself. The pause is stored in the new `sequence_pauses`
+  table (migration v14), survives restarts, leaves approvals and drafts alone,
+  and is ended by a human reply, opt-out, bounce or closing the contact.
+  Paused contacts show on the Outbox tab, where you can set a date or resume
+  them. Acknowledgements, ticket replies and read receipts are recorded as
+  `auto_reply` events and change nothing. The Instantly path cannot pause a
+  remote sequence and says so in the activity log.
+
+- **Demo gate** (#62). An offer under `offers:` with `requires_demo: true`
+  holds every sequence email that carries its key until the prospect's demo
+  is marked ready, so an email never claims something was built before it
+  was. A `demos` table tracks each demo (requested, ready, retired) with its
+  link, recording, agent id and builder. `mercury demos` lists who is waiting
+  and marks demos ready or retired; the Outbox shows why an email waits with
+  a Mark ready drawer, and Today counts the contacts waiting. The gate fails
+  closed on an unknown offer or a failed check. Ready demos retire
+  `demos.retire_after_days` after the last email to a contact who never
+  replied. Campaigns and outbox rows gain an `offer_key` for the offer router
+  (#57) to fill.
+
+- **Deliverability health and a placement test** (#53). `mercury health`, a
+  Deliverability card on Today and a verdict per domain on the Mailboxes tab
+  show each sending domain's sends, replies and bounces over 7, 14 and 30 days,
+  its sending age, and a verdict: too young (under 30 days), not enough data
+  (under 200 sends for the reply rate, 50 for bounces), keep (1% replies after
+  200) or cancel candidate (0 replies on 150+, under 1% after 200, or a burned
+  bounce code once bounces are classified). `mercury mail placement` sends the
+  real email 1 from every mailbox, plus a control sender, to seed inboxes you
+  own, reads where each copy landed over IMAP and says whether it is the domain
+  or the copy. It never touches the outbox or a daily cap. Results go in a new
+  `placement_tests` table (created on first use) and show next to the DNS
+  checklist. Configure under `channels.email.placement`.
 - **CSV contact import** (#3). Dashboard (Contacts → Import CSV), `mercury import`
   share one service. It has a read-only preview
   with per-row outcomes (new, needs enrichment, duplicate, invalid), column

@@ -3,6 +3,7 @@ let companyDrill = false;      // true while viewing a single company's contacts
 let _companies = [], _prospects = [], _campaigns = [];
 let _signals = null;           // last /api/signals payload, for the cohort builder
 let _desk = { items: [], i: 0 };
+let _outbox = null;            // last /api/outbox payload, for the demo drawer
 
 // ── Appearance ──
 //
@@ -203,7 +204,7 @@ function toggleSidebar(open) {
 
 function loadCurrentTab() {
   switch (currentTab) {
-    case 'today': loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); loadTrend(); loadHeatmap(); break;
+    case 'today': loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); loadTrend(); loadHeatmap(); loadHealth(); break;
     case 'help': break;
     case 'mailboxes': loadMailboxes(); break;
     case 'signals': loadSignals(); break;
@@ -355,11 +356,20 @@ const ACTIVITY_LABELS = {
   email_sent: ['paper-plane-tilt', 'Email sent'],
   pipeline_move: ['kanban', 'Moved a contact in the pipeline'],
   outbox_reschedule: ['calendar-blank', 'Rescheduled an email'],
+  auto_reply: ['envelope-simple', 'Automatic reply received'],
+  sequence_paused: ['pause-circle', 'Paused a sequence (out of office)'],
+  sequence_resumed: ['arrow-circle-right', 'Resumed a sequence'],
+  pause_date_changed: ['calendar-blank', 'Changed a return date'],
+  sequence_pause_unavailable: ['warning-circle', 'Out of office, sequence not paused'],
   write_campaign: ['pencil-simple', 'Drafted a campaign'],
   send_campaign: ['paper-plane-tilt', 'Sent a campaign'],
   analyze: ['chart-line-up', 'Updated analytics'],
   discover: ['compass', 'Discovered businesses'],
   profile: ['buildings', 'Read company websites'],
+  demo_ready: ['check-circle', 'Marked a demo ready'],
+  demo_retired: ['archive', 'Retired a demo'],
+  demos_retired: ['archive', 'Retired demos nobody answered'],
+  sending_hold_cleared: ['shield-check', 'Cleared the bounce hold'],
 };
 
 function activityLabel(type) {
@@ -948,7 +958,7 @@ function openInboxEditor(index) {
     input('name', 'Sender name', 'text', b ? b.name : '', 'autocomplete="off" placeholder="Uses your default sender name"') + '</div>' +
     input('password', b && b.password_set ? 'Change password' : 'Password / app password', 'password', '',
       'autocomplete="new-password" placeholder="' + (b && b.password_set ? 'Leave blank to keep the saved password' : 'Can be added later') + '"') +
-    '<div class="form-row">' + input('cap', 'Daily sending limit', 'number', b ? b.daily_cap : 30, 'required min="0" step="1"') +
+    '<div class="form-row">' + input('cap', 'Daily sending limit', 'number', b ? b.daily_cap : 15, 'required min="0" step="1"') +
     input('start', 'Warm-up start date', 'date', b ? b.warmup_start || '' : _inboxSettings.today) + '</div>' +
     '<p class="muted inbox-field-hint">Clear the date only if this inbox is already warmed up.</p>' +
     '<details class="inbox-servers"' + (!defaults.smtp_host || b && !b.configured ? ' open' : '') + '><summary>Server settings</summary>' +
@@ -1109,10 +1119,12 @@ async function loadMercuryStatus() {
   document.getElementById('control-dot').className = 'dot ' + (running ? 'running' : 'stopped');
   const label = document.getElementById('control-label');
   label.className = 'label ' + (running ? 'running' : 'stopped');
-  label.textContent = running ? 'Running' : 'Stopped';
+  label.textContent = running ? (data.stopping ? 'Stopping' : 'Running') : 'Stopped';
 
   const meta = document.getElementById('control-meta');
-  if (running && data.pid) {
+  if (running && data.stopping) {
+    meta.innerHTML = 'Finishing the step it is on, then it stops. Asked ' + formatDate(data.stop_requested_at) + '.';
+  } else if (running && data.pid) {
     let info = 'PID ' + escHtml(String(data.pid));
     if (data.started_at) info += ' &middot; started ' + formatDate(data.started_at);
     meta.innerHTML = info;
@@ -1138,7 +1150,8 @@ async function stopMercury() {
   const btn = document.getElementById('btn-stop');
   btn.disabled = true;
   const data = await api('/api/mercury/stop', {method: 'POST'});
-  if (data && data.success) showToast('Mercury stopped.', 'success');
+  if (data && data.success) showToast(data.stopping
+    ? 'Mercury is finishing the step it is on, then it stops.' : 'Mercury stopped.', 'success');
   else showToast((data && data.message) || 'Failed to stop.', 'error');
   btn.disabled = false;
   loadMercuryStatus();
@@ -1313,8 +1326,11 @@ async function loadUsage() {
 let _mailboxes = null;
 
 async function loadOutbox() {
-  const [data, mbox] = await Promise.all([api('/api/outbox'), api('/api/mailboxes')]);
+  const [data, mbox, pauses, sending] = await Promise.all([
+    api('/api/outbox'), api('/api/mailboxes'), api('/api/pauses'), api('/api/sending/status')]);
   _mailboxes = mbox && !mbox.error ? mbox : null;
+  const pausesEl = document.getElementById('outbox-pauses');
+  if (pausesEl) pausesEl.innerHTML = renderPauses(pauses);
   const mboxEl = document.getElementById('outbox-mailboxes');
   if (mboxEl) mboxEl.innerHTML = mbox && mbox.error
     ? '<section class="panel"><div class="panel-head"><div><h3 class="icon-title">' + icon('warning-circle') +
@@ -1325,6 +1341,7 @@ async function loadOutbox() {
   const list = document.getElementById('outbox-list');
   const actions = document.getElementById('outbox-actions');
   if (!data) { desk.innerHTML = offlineState(); list.innerHTML = ''; return; }
+  _outbox = data;
 
   const pending = data.pending || [];
   _desk.items = pending;
@@ -1332,24 +1349,21 @@ async function loadOutbox() {
   navCount('nav-outbox', pending.length);
   navCount('nav-exclusions', (data.blocked || []).length);
 
+  const send = sending && !sending.error && sending.holds ? sending : null;
+  const blocked = send ? send.blocked : !!data.paused;
   actions.innerHTML =
-    (pending.length && !data.paused
+    (pending.length && !blocked
       ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()">Approve all ' +
         pending.length + '</button>' : '') +
-    (data.paused
+    (send && send.paused
       ? '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'resume\')">' +
         'Resume sending</button>'
       : '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'pause\')">' +
         'Pause all sending</button>');
 
-  // The kill switch gets a banner only when it's actually on — a permanent
-  // bar for a thing that isn't happening is just noise.
-  banner.innerHTML = data.paused
-    ? '<div class="card" style="border-color:var(--s-bad-line);margin-bottom:16px">' +
-        '<h2 class="icon-title" style="color:var(--s-bad)">' + icon('pause-circle') + 'Sending is paused</h2>' +
-        '<p style="color:var(--text-2);font-size:13px">' + escHtml(data.paused) +
-        '. Approved mail stays queued until you resume.</p></div>'
-    : '';
+  // A banner only when something holds mail back: a permanent bar for a
+  // thing that isn't happening is just noise.
+  banner.innerHTML = send ? renderSendingHolds(send) : '';
 
   desk.innerHTML = pending.length ? renderDesk(pending, _desk.i) :
     '<div class="card">' + emptyState('tray', 'Nothing to review',
@@ -1368,6 +1382,7 @@ async function loadOutbox() {
   };
 
   list.innerHTML =
+    demoWaitingCard(data.waiting_demo || []) +
     table('Sending', data.sending, [
       ['To', r => r.to_email], ['Subject', r => outSubject(r)],
       ['From', r => r.from_mailbox || r.mailbox || '—', true],
@@ -1378,7 +1393,8 @@ async function loadOutbox() {
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => outSubject(r)],
       ['From', r => fromCell(r), true, true],
       ['Persona', r => personaChip(r), false, true],
-      ['Sends', r => formatDate(r.send_at) + policyNote(r.policy), true, true],
+      ['Sends', r => (r.demo && r.demo.held ? toneBadge('waiting', 'Waiting for demo')
+        : formatDate(r.send_at)) + policyNote(r.policy), true, true],
     ]) +
     table('Blocked by an exclusion', data.blocked, [
       ['To', r => r.to_email], ['Subject', r => outSubject(r)],
@@ -1386,7 +1402,7 @@ async function loadOutbox() {
       ['', r => '<button class="btn btn-secondary btn-sm" onclick="exRequeue(\'' + escAttr(r.id) +
         '\').then(loadOutbox)">Send back to review</button> ' +
         '<button class="btn btn-secondary btn-sm" onclick="exDiscard(\'' + escAttr(r.id) +
-        '\')">Discard</button>', false, true],
+        '\',' + Number(r.revision) + ')">Discard</button>', false, true],
     ]) +
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => outSubject(r)],
@@ -1418,6 +1434,7 @@ function renderDesk(items, i) {
         '</div>' +
       followupNote(cur) +
       threadNote(cur) +
+      demoNote(cur) +
       (policyNote(cur.policy, true) ? '<div class="desk-policy">' + policyNote(cur.policy, true) + '</div>' : '') +
       '<div class="desk-persona">' + personaChip(cur) +
         (cur.manually_edited ? '<span class="muted">Edited before sending</span>' : '') + '</div>' +
@@ -1485,11 +1502,11 @@ async function outboxSave(id, quiet) {
   if (!e.subject || !e.body) { showToast('Subject and body can\'t be empty.', 'error'); return false; }
   const data = await api('/api/outbox/' + encodeURIComponent(id), {
     method: 'PUT', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({subject: e.subject, body: e.body}),
+    body: JSON.stringify({subject: e.subject, body: e.body, revision: e.it.revision}),
   });
   if (data && data.success) {
     e.it.subject = e.subject; e.it.body = e.body;
-    e.it.manually_edited = 1;
+    e.it.manually_edited = 1; e.it.revision = data.revision;
     if (!quiet) showToast('Edits saved.', 'success');
     return true;
   }
@@ -1502,12 +1519,12 @@ async function outboxRegenerate(id) {
   const btn = document.getElementById('desk-regen-btn');
   if (btn) { btn.disabled = true; btn.innerHTML = icon('sparkle') + 'Writing…'; }
   showToast('Rewriting — this can take up to a minute.', 'success');
+  const it = _desk.items.find(x => x.id === id);
   const data = await api('/api/outbox/' + encodeURIComponent(id) + '/regenerate', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({instruction: instruction.trim()}),
+    body: JSON.stringify({instruction: instruction.trim(), revision: it ? it.revision : null}),
   });
   if (data && data.success) {
-    const it = _desk.items.find(x => x.id === id);
     if (it) Object.assign(it, data);
     document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i);
     showToast('New draft ready. Review it before approving.', 'success');
@@ -1520,8 +1537,12 @@ async function outboxRegenerate(id) {
 async function outboxAct(id, action) {
   // Approving sends what is on screen, so unsaved edits go first.
   if (action === 'approve' && deskEdits(id) && !(await outboxSave(id, true))) return;
-  const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
-  if (data && data.success) {
+  // The revision on screen: if the email changed since, the server refuses.
+  const it = _desk.items.find(x => x.id === id);
+  const res = await postJSON('/api/outbox/' + encodeURIComponent(id) + '/' + action,
+    {revision: it ? it.revision : null});
+  const data = res.data;
+  if (res.ok && data) {
     if (action === 'approve') {
       const fu = Number(data.followups_approved || 0);
       showToast(fu ? 'Approved, with ' + fu + ' follow-up' + (fu === 1 ? '' : 's') + ' — they send on schedule.'
@@ -1531,21 +1552,149 @@ async function outboxAct(id, action) {
       showToast(later ? 'Rejected, with ' + later + ' later step' + (later === 1 ? '' : 's') + ' of the sequence.'
                       : 'Rejected.', 'success');
     }
-  } else showToast('Action failed.', 'error');
+  } else showToast(data && data.code === 'stale_revision'
+    ? 'This email changed since you opened it. Review it again.' : 'Action failed.', 'error');
+  loadOutbox();
+}
+
+// ── Paused for out-of-office ──
+//
+// A contact who sent a vacation notice has their remaining follow-ups held
+// back. With a readable return date they resume on their own; without one they
+// stay paused until someone sets a date or resumes them.
+
+const PAUSE_REVIEW_COPY = {
+  none: 'No return date in their message',
+  ambiguous: 'The date in their message can be read two ways',
+  invalid: 'The date in their message does not exist',
+  past: 'The date in their message has already passed',
+  too_far: 'The date in their message is more than a year away',
+};
+
+function pauseDay(iso) {
+  const d = iso ? new Date(iso + 'T12:00:00') : null;
+  return d && !isNaN(d) ? d.toLocaleDateString('en-US', {weekday: 'short', month: 'short', day: 'numeric'}) : '';
+}
+
+function renderPauses(data) {
+  const rows = (data && data.pauses) || [];
+  if (!rows.length) return '';
+  const review = rows.filter(p => p.state === 'needs_review').length;
+  const body = rows.map(p => {
+    const review_ = p.state === 'needs_review';
+    const status = review_
+      ? toneBadge('waiting', 'Return date needs review')
+      : toneBadge('active', 'Back ' + (pauseDay(p.resume_local) || 'later'));
+    const why = review_
+      ? (PAUSE_REVIEW_COPY[p.review_reason] || PAUSE_REVIEW_COPY.none)
+      : (p.return_text ? 'They wrote &ldquo;' + escHtml(p.return_text) + '&rdquo;' : '')
+        + (p.manual_override ? (p.return_text ? ' &middot; ' : '') + 'Date set by you' : '');
+    const id = escAttr(p.prospect_id);
+    return '<tr>' +
+      '<td>' + escHtml(p.name) + '<div class="muted mb-sub">' +
+        escHtml([p.company, p.email].filter(Boolean).join(' · ')) + '</div></td>' +
+      '<td>' + status + '<div class="muted mb-sub">' + why + '</div></td>' +
+      '<td class="num">' + fmtN(p.queued_count) + '</td>' +
+      '<td><div class="pause-actions">' +
+        '<input type="date" class="form-input" id="pause-date-' + id + '" value="' +
+          escAttr(p.resume_local || '') + '" aria-label="Return date for ' + escAttr(p.name) + '">' +
+        '<button class="btn btn-secondary btn-sm" onclick="pauseSetDate(\'' + id + '\')">' +
+          icon('calendar-blank') + 'Set date</button>' +
+        '<button class="btn btn-secondary btn-sm" onclick="pauseResume(\'' + id + '\')">' +
+          icon('arrow-circle-right') + 'Resume now</button>' +
+      '</div></td></tr>';
+  }).join('');
+  return '<section class="panel"><div class="panel-head"><div>' +
+      '<h3 class="icon-title">' + icon('pause-circle') + 'Paused for out-of-office</h3>' +
+      '<p>' + (review
+        ? '<b>' + review + '</b> without a usable return date. They stay paused until you set one or resume them. '
+        : 'Their follow-ups resume on the return date. ') +
+        'Dates are in ' + escHtml(data.timezone || 'your timezone') + '.</p>' +
+    '</div></div><div class="panel-body"><div class="table-card"><table><thead><tr>' +
+      '<th>Contact</th><th>Status</th><th class="num">Queued</th><th>Return date</th></tr></thead><tbody>' +
+      body + '</tbody></table></div></div></section>';
+}
+
+async function pauseSetDate(id) {
+  const el = document.getElementById('pause-date-' + id);
+  if (!el || !el.value) { showToast('Pick a return date first.', 'error'); return; }
+  const res = await postJSON('/api/pauses/' + encodeURIComponent(id) + '/return-date', {return_date: el.value});
+  if (res.ok) showToast('Return date saved. Their follow-ups resume then.', 'success');
+  else showToast(res.error || 'Could not save the date.', 'error');
+  loadOutbox();
+}
+
+async function pauseResume(id) {
+  const ok = await confirmModal({
+    title: 'Resume this contact now?',
+    copy: 'Their next follow-up goes out on normal pacing. Later steps keep their usual gaps.',
+    ok: 'Resume',
+  });
+  if (!ok) return;
+  const res = await postJSON('/api/pauses/' + encodeURIComponent(id) + '/resume');
+  if (res.ok) showToast('Resumed. Their next follow-up is back in the queue.', 'success');
+  else showToast(res.error || 'Could not resume.', 'error');
   loadOutbox();
 }
 
 async function outboxApproveAll() {
-  const data = await api('/api/outbox/approve-all', {method: 'POST'});
-  if (data && data.success) showToast('Approved ' + data.approved + ' email(s).', 'success');
+  // Exactly the emails on screen, at the revisions shown. Anything newer stays in review.
+  const items = _desk.items.map(x => ({id: x.id, revision: x.revision}));
+  if (!items.length) { showToast('Nothing awaiting review.', 'success'); return; }
+  const data = await api('/api/outbox/approve-all', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({items}),
+  });
+  if (data && data.success) showToast('Approved ' + data.approved + ' email(s).' + (data.failed
+    ? ' ' + data.failed + ' changed since you loaded them and stay in review.' : ''), 'success');
   else showToast('Approve-all failed.', 'error');
   loadOutbox();
 }
 
+// Your pause and the health holds are separate: resume lifts only your pause,
+// and a bounce hold is cleared on its own, after the cause is fixed.
+function renderSendingHolds(s) {
+  const rows = [];
+  if (s.paused) rows.push([toneBadge('waiting', 'Paused by you'), s.reason]);
+  for (const h of s.holds) {
+    const label = h.scope === 'global' ? 'Health hold'
+      : h.source === 'operator' ? 'Inbox paused' : 'Inbox on hold';
+    rows.push([toneBadge(h.scope === 'global' ? 'bad' : 'waiting', label),
+      (h.mailbox ? h.mailbox + ': ' : '') + h.reason]);
+  }
+  if (!rows.length) return '';
+  const flight = s.in_flight.filter(i => !i.interrupted).length;
+  if (flight && s.blocked) rows.push([toneBadge('active', 'In flight'),
+    flight + (flight === 1 ? ' email was' : ' emails were') + ' already being sent and will finish.']);
+  const killSwitch = s.holds.some(h => h.kind === 'bounce_kill_switch');
+  const title = !s.blocked ? 'Some inboxes are on hold'
+    : s.holds.some(h => h.scope === 'global') ? 'Sending is on hold' : 'Sending is paused';
+  const lede = !s.blocked ? 'Other inboxes keep sending. Resume an inbox from the Mailboxes tab.'
+    : s.paused && s.holds.some(h => h.scope === 'global')
+      ? 'Resuming lifts your pause only. Approved mail stays queued until every hold is cleared.'
+      : s.paused ? 'Approved mail stays queued until you resume.'
+      : 'Resuming does not lift a health hold. Approved mail stays queued until it is cleared.';
+  return '<section class="panel"><div class="panel-head"><div><h3 class="icon-title">' +
+      icon('pause-circle') + escHtml(title) + '</h3><p>' + escHtml(lede) + '</p></div>' +
+      (killSwitch ? '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'clear-hold\')">' +
+        'Clear bounce hold</button>' : '') +
+    '</div><div class="panel-body"><div class="hold-list">' +
+      rows.map(r => '<div>' + r[0] + '<span>' + escHtml(r[1]) + '</span></div>').join('') +
+    '</div></div></section>';
+}
+
 async function sendingToggle(action) {
+  if (action === 'clear-hold' && !await confirmModal({
+    title: 'Clear the bounce hold?',
+    copy: 'Only clear it once the cause is fixed (list quality, DNS, the inbox Mercury was told about). ' +
+      'The bounce count starts again from zero. Your own pause and paused inboxes stay as they are.',
+    ok: 'Clear hold'})) return;
   const data = await api('/api/sending/' + action, {method: 'POST'});
-  if (data && data.success) showToast(action === 'pause' ? 'Sending paused.' : 'Sending resumed.', 'success');
-  else showToast('Failed.', 'error');
+  if (data && data.success) {
+    const msg = action === 'pause' ? 'Sending paused.'
+      : action === 'clear-hold' ? (data.cleared ? 'Bounce hold cleared.' : 'There was no bounce hold to clear.')
+      : data.blocked ? 'Your pause is lifted. Sending is still on hold.' : 'Sending resumed.';
+    showToast(msg, 'success');
+  } else showToast((data && data.message) || 'Failed.', 'error');
   loadOutbox();
 }
 
@@ -1594,6 +1743,130 @@ function followupNote(it) {
     'This email was blocked by an exclusion and needs your approval again.</div>';
   return autoFollowups(it)
     ? '<div class="desk-note">' + icon('info') + 'Approving this also approves its follow-ups.</div>' : '';
+}
+
+// ── Demo gate ──
+//
+// An offer that promises something already built for one business (a voice
+// line, a draft site) holds its emails until that demo is marked ready. The
+// gate itself runs in the sender; this only shows why an email waits and
+// lets you mark the demo ready.
+
+// Codes the user can clear by marking the demo ready. The rest (an offer
+// missing from mercury.yaml, an unreadable config) need a config fix.
+const DEMO_FIXABLE = new Set(['no_demo', 'demo_requested']);
+const DEMO_KIND = { voice: 'Voice line demo', website: 'Website demo' };
+
+function demoBadge(code) {
+  return {
+    demo_requested: toneBadge('waiting', 'Requested'),
+    no_demo: toneBadge('idle', 'Not registered'),
+    unknown_offer: toneBadge('bad', 'Offer not set up'),
+    no_config: toneBadge('bad', 'Config unreadable'),
+    no_prospect: toneBadge('bad', 'No contact'),
+    error: toneBadge('bad', 'Check failed'),
+  }[code] || toneBadge('waiting', 'Waiting');
+}
+
+function demoNote(it) {
+  const d = it.demo;
+  if (!d || !d.held) return '';
+  return '<div class="desk-note hold">' + toneBadge('waiting', 'Waiting for demo') +
+    '<span>' + escHtml(d.reason) + (DEMO_FIXABLE.has(d.code) ? ' You can still approve it now.' : '') + '</span>' +
+    (DEMO_FIXABLE.has(d.code)
+      ? '<button class="btn btn-secondary btn-sm" onclick="demoOpen(\'' + escAttr(it.id) + '\')">' +
+          icon('check-circle') + 'Mark demo ready</button>' : '') +
+    '</div>';
+}
+
+function demoWaitingCard(rows) {
+  if (!rows.length) return '';
+  const body = rows.map(w =>
+    '<tr><td>' + (w.name ? escHtml(w.name) + '<div class="muted mb-sub mono-sm">' + escHtml(w.to_email) + '</div>'
+                         : '<span class="mono-sm">' + escHtml(w.to_email) + '</span>') + '</td>' +
+      '<td>' + escHtml(w.offer_key) + (DEMO_KIND[w.kind] ? '<div class="muted mb-sub">' + DEMO_KIND[w.kind] + '</div>' : '') + '</td>' +
+      '<td>' + demoBadge(w.code) + '</td>' +
+      '<td class="muted">Step ' + escHtml(w.step) + ' &middot; ' + badge(w.status) + '</td>' +
+      '<td>' + (DEMO_FIXABLE.has(w.code)
+        ? '<button class="btn btn-secondary btn-sm" onclick="demoOpen(\'' + escAttr(w.outbox_id) + '\')">Mark ready</button>'
+        : '<span class="muted mb-sub">' + escHtml(w.reason) + '</span>') + '</td></tr>').join('');
+  return '<div class="card"><h2>Waiting for a demo</h2>' +
+    '<p class="lede">These emails say something was already built for the business. ' +
+      'They stay in the outbox until its demo is marked ready, then send on the next run.</p>' +
+    '<div class="table-card"><table><thead><tr><th>Contact</th><th>Offer</th><th>Demo</th><th>Email</th><th></th>' +
+    '</tr></thead><tbody>' + body + '</tbody></table></div></div>';
+}
+
+// The waiting entry for an outbox row, from the last /api/outbox payload.
+function demoFind(id) {
+  const data = _outbox || {};
+  const w = (data.waiting_demo || []).find(x => x.outbox_id === id);
+  if (w) return w;
+  const it = [...(data.pending || []), ...(data.approved || [])].find(x => x.id === id);
+  if (!it || !it.demo) return null;
+  return { outbox_id: it.id, to_email: it.to_email, name: '', offer_key: it.demo.offer_key, kind: '',
+           step: it.step, status: it.status, code: it.demo.code, reason: it.demo.reason };
+}
+
+function demoOpen(id) {
+  const w = demoFind(id);
+  if (!w) { showToast('That email is no longer waiting for a demo.', 'success'); loadOutbox(); return; }
+  const field = (key, label, type, placeholder, hint) => '<div class="form-group"><label class="form-label" for="demo-' +
+    key + '">' + label + '</label><input class="form-input" id="demo-' + key + '" type="' + type +
+    '" placeholder="' + escAttr(placeholder) + '" autocomplete="off">' + (hint ? '<p class="mb-hint">' + hint + '</p>' : '') + '</div>';
+  const html = facts([
+      ['To', '<span class="mono">' + escHtml(w.to_email) + '</span>'],
+      ['Offer', escHtml(w.offer_key) + (DEMO_KIND[w.kind] ? ' <span class="muted">&middot; ' + DEMO_KIND[w.kind] + '</span>' : '')],
+      ['Demo', demoBadge(w.code)],
+      ['Held', 'Step ' + escHtml(w.step) + ' &middot; ' + badge(w.status)],
+    ]) +
+    '<form id="demo-form" class="mb-settings" onsubmit="demoSubmit(event, \'' + escAttr(w.outbox_id) + '\')" autocomplete="off">' +
+      '<div class="drawer-section"><h4>What was built</h4>' +
+        field('url', 'Demo link', 'url', 'https://', 'Where the business can see it.') +
+        field('recording', 'Recording', 'text', 'demos/acme-call.mp3',
+          'The short recording the email offers to send, if it has one.') +
+        (w.kind === 'website' ? '' : field('agent', 'Voice agent id', 'text', '', '')) +
+        field('by', 'Built by', 'text', '', '') +
+        '<div class="form-group"><label class="form-label" for="demo-notes">Notes</label>' +
+          '<textarea class="form-input" id="demo-notes" rows="3"></textarea></div>' +
+        '<p class="drawer-note">Everything here is optional. You can mark it ready now and add the recording later.</p>' +
+      '</div>' +
+      '<p class="form-error" id="demo-error" role="alert" hidden></p>' +
+      '<div class="drawer-actions mb-settings-foot">' +
+        '<button type="submit" class="btn btn-primary btn-sm" id="demo-save">' + icon('check-circle') + 'Mark ready</button>' +
+        '<button type="button" class="btn btn-secondary btn-sm" onclick="closeDrawer()">Cancel</button>' +
+        '<span class="mb-hint">Approved emails send on the next run.</span>' +
+      '</div>' +
+    '</form>';
+  openDrawer('Demo', w.name || w.to_email, escHtml(w.reason), html);
+  const first = document.getElementById('demo-url');
+  if (first) first.focus({ preventScroll: true });
+}
+
+async function demoSubmit(e, id) {
+  e.preventDefault();
+  const val = key => { const el = document.getElementById('demo-' + key); return el ? el.value.trim() : ''; };
+  const body = { target: id };
+  for (const [key, name] of [['url', 'demo_url'], ['recording', 'recording_path'], ['agent', 'agent_id'],
+                             ['by', 'built_by'], ['notes', 'notes']]) {
+    if (val(key)) body[name] = val(key);
+  }
+  const btn = document.getElementById('demo-save');
+  const err = document.getElementById('demo-error');
+  if (btn) btn.disabled = true;
+  const res = await postJSON('/api/demos/ready', body);
+  if (btn) btn.disabled = false;
+  if (!res.ok) {
+    const detail = res.data && res.data.detail;
+    if (err) {
+      err.textContent = (detail && detail.message) || res.error || 'Could not mark the demo ready.';
+      err.hidden = false;
+    }
+    return;
+  }
+  closeDrawer();
+  showToast('Demo marked ready. Its emails send on the next run.', 'success');
+  loadOutbox();
 }
 
 function mailboxStage(m) {
@@ -3045,7 +3318,9 @@ function openEventDrawer(id, fromProspect) {
 
 async function evAct(id, action) {
   document.querySelectorAll('#drawer-body [data-act]').forEach(b => { b.disabled = true; });
-  const res = await postJSON('/api/outbox/' + encodeURIComponent(id) + '/' + action);
+  const ev = _evIndex.get(String(id));
+  const res = await postJSON('/api/outbox/' + encodeURIComponent(id) + '/' + action,
+    {revision: ev ? ev.revision : null});
   if (res.ok) showToast(action === 'approve' ? 'Approved — it sends on schedule.' : 'Rejected — it won\'t send.', 'success');
   else showToast('Couldn\'t ' + action + ': ' + res.error, 'error');
   afterEventChange(id);
@@ -3057,9 +3332,11 @@ async function evReschedule(id) {
   if (!d || isNaN(d)) { showToast('Pick a date and time first.', 'error'); return; }
   if (d < new Date()) { showToast('Pick a time in the future.', 'error'); return; }
   document.querySelectorAll('#drawer-body [data-act]').forEach(b => { b.disabled = true; });
+  const ev = _evIndex.get(String(id));
   const res = await postJSON('/api/outbox/' + encodeURIComponent(id) + '/reschedule',
-    { send_at: d.toISOString().replace(/\.\d{3}Z$/, 'Z') });
-  if (res.ok) showToast('Rescheduled for ' + fullWhen(d) + '.', 'success');
+    { send_at: d.toISOString().replace(/\.\d{3}Z$/, 'Z'), revision: ev ? ev.revision : null });
+  if (res.ok) showToast('Rescheduled for ' + fullWhen(d) + '.' +
+    (res.data && res.data.approval_cleared ? ' It needs approval again.' : ''), 'success');
   else showToast('Couldn\'t reschedule: ' + res.error, 'error');
   afterEventChange(id);
 }
@@ -3413,6 +3690,103 @@ function renderTrend() {
     : 'Nothing sent in the last ' + (d.days || n) + ' days';
 }
 
+// ── Deliverability health: a verdict per sending domain ──
+//
+// /api/health (mercury/deliverability.py): per domain, outreach sends,
+// replies and bounces over 7, 14 and 30 days, how long it has been sending,
+// and a verdict on a ladder that never says "keep" without 200 sends of
+// evidence. The last placement test (mercury/placement.py) sits under it.
+
+let _health = { data: null, key: '', seq: 0 };
+
+const PLACEMENT_TONE = {
+  primary: 'good', inbox: 'good', promotions: 'waiting', other_tab: 'waiting',
+  spam: 'bad', missing: 'idle', unchecked: 'idle', send_failed: 'bad',
+};
+
+function healthAge(r) {
+  if (r.age_days === null || r.age_days === undefined) return '<span class="muted">Not started</span>';
+  return '<span class="hl-n">' + fmtN(r.age_days) + '</span> day' + (r.age_days === 1 ? '' : 's');
+}
+
+function healthCounts(w) {
+  w = w || {};
+  return fmtN(w.replies) + ' repl' + (Number(w.replies) === 1 ? 'y' : 'ies') + ', ' +
+    fmtN(w.bounces) + ' bounce' + (Number(w.bounces) === 1 ? '' : 's');
+}
+
+function healthFlags(r) {
+  return (r.flags || []).map(f => '<small class="hl-flag t-' + escHtml(f.tone) + '">' +
+    icon(TONE_ICON[f.tone] || 'warning-circle') + '<span>' + escHtml(f.text) + '</span></small>').join('');
+}
+
+async function loadHealth(quiet) {
+  const body = document.getElementById('health-body');
+  if (!body) return;
+  const seq = ++_health.seq;
+  const res = await getJSON('/api/health');
+  if (seq !== _health.seq) return;
+  const foot = document.getElementById('health-foot');
+  if (!res.ok || !res.data || !Array.isArray(res.data.domains)) {
+    if (quiet && _health.data) return;            // keep the last good card on a blip
+    _health.data = null; _health.key = '';
+    body.innerHTML = unavailableState(res, 'shield-check', 'Deliverability');
+    foot.hidden = true;
+    return;
+  }
+  const { generated_at, ...rest } = res.data;
+  const key = JSON.stringify(rest);
+  if (quiet && key === _health.key) return;       // unchanged; keep an open "how it works"
+  _health.data = res.data; _health.key = key;
+  renderHealth();
+}
+
+function renderHealth() {
+  const d = _health.data;
+  const body = document.getElementById('health-body');
+  const foot = document.getElementById('health-foot');
+  const rows = d.domains || [];
+  if (!rows.length) {
+    body.innerHTML = emptyState('shield-check', 'No sending domain yet',
+      'Once Mercury sends from a mailbox, each sending domain gets a verdict here: keep it, ' +
+      'give it more time, or test where its mail lands.');
+    foot.hidden = true;
+    return;
+  }
+  const win = d.window_days || 30;
+  const keys = (d.short_windows || [7, 14]).map(n => n + 'd').concat([win + 'd']);
+  body.innerHTML = '<div class="health-table"><table><thead><tr><th>Domain</th><th>Sending for</th>' +
+    keys.map((k, i) => '<th class="num' + (i < keys.length - 1 ? ' hl-short' : '') + '">Sent, last ' + k.slice(0, -1) + ' days</th>').join('') +
+    '<th>Verdict</th></tr></thead><tbody>' +
+    rows.map(r => '<tr>' +
+      '<td><span class="mono">' + escHtml(r.domain) + '</span><small class="hl-sub">' +
+        fmtN((r.mailboxes || []).length) + ' inbox' + ((r.mailboxes || []).length === 1 ? '' : 'es') + '</small></td>' +
+      '<td class="hl-age">' + healthAge(r) + '</td>' +
+      keys.map((k, i) => '<td class="num' + (i < keys.length - 1 ? ' hl-short' : '') + '"><span class="hl-n">' + fmtN((r.windows[k] || {}).sent) + '</span>' +
+        '<small class="hl-sub">' + healthCounts(r.windows[k]) + '</small></td>').join('') +
+      '<td class="hl-verdict">' + toneBadge(r.tone, r.label) +
+        '<small class="hl-reason">' + escHtml(r.reason) + '</small>' + healthFlags(r) + '</td>' +
+    '</tr>').join('') + '</tbody></table></div>' +
+    '<details class="health-rules"><summary>How the verdict works</summary><ul>' +
+      (d.thresholds_text || []).map(t => '<li>' + escHtml(t) + '</li>').join('') +
+      '<li>The verdict reads the last ' + win + ' days. Sending age counts from the first send or the warm-up start.</li>' +
+      (d.bounces_classified ? '' : '<li>No bounce in the window carries an SMTP code yet, so a burned domain only shows up as missing replies.</li>') +
+    '</ul></details>';
+  foot.hidden = false;
+  foot.innerHTML = placementLine(d.placement);
+}
+
+function placementLine(p) {
+  if (!p) {
+    return '<span class="health-pl">' + toneBadge('idle', 'No placement test yet') +
+      '<span>Run <span class="mono">mercury mail placement</span> to see whether email 1 lands in the inbox or in spam.</span></span>';
+  }
+  const s = p.summary || {};
+  return '<span class="health-pl">' + toneBadge(s.tone || 'idle', s.label || 'Placement test') +
+    '<span>' + escHtml(s.text || '') + '</span></span>' +
+    (p.created_at ? '<span class="muted nowrap">Placement test &middot; ' + escHtml(agoShort(parseUTC(p.created_at))) + '</span>' : '');
+}
+
 // ── Mailboxes: every inbox Mercury sends from ──
 //
 // Which inboxes exist, their daily caps and their ramp (warmup_start, then
@@ -3526,9 +3900,12 @@ function mbBusy() {
 async function loadMailboxes(quiet) {
   const body = document.getElementById('mb-body');
   const seq = ++_mb.seq;
-  const [res, voices] = await Promise.all([getJSON('/api/warmup'), getJSON('/api/voices')]);
+  const [res, voices, health] = await Promise.all([getJSON('/api/warmup'), getJSON('/api/voices'), getJSON('/api/health')]);
   if (seq !== _mb.seq) return;
   if (voices.ok) { _mb.voices = voices.data.mailboxes; _mb.voicePersonas = voices.data.personas; _mb.voiceDefault = voices.data.default_id; }
+  // Verdicts and the last placement test are extras: without them the tab still works.
+  if (health.ok && health.data && Array.isArray(health.data.domains)) _mb.health = health.data;
+  else if (!quiet) _mb.health = null;
   if (!res.ok || !res.data || !Array.isArray(res.data.inboxes)) {
     if (quiet && _mb.data) return;
     _mb.data = null; _mb.key = '';
@@ -3536,8 +3913,10 @@ async function loadMailboxes(quiet) {
     return;
   }
   const key = JSON.stringify(res.data);
-  if (quiet && key === _mb.key) return;
-  _mb.data = res.data; _mb.key = key;
+  const { generated_at, ...healthRest } = _mb.health || {};
+  const healthKey = JSON.stringify(healthRest);
+  if (quiet && key === _mb.key && healthKey === _mb.healthKey) return;
+  _mb.data = res.data; _mb.key = key; _mb.healthKey = healthKey;
   mbNavFlag();
   renderMailboxes();
   if (quiet) mbRefreshDrawer();
@@ -3575,6 +3954,7 @@ function renderMailboxes() {
   }
   if (!document.getElementById('mb-table')) {
     body.innerHTML = '<div class="kpis kpis-3" id="mb-summary"></div>' +
+      '<div class="mb-limits" id="mb-limits"></div>' +
       '<div class="toolbar mb-toolbar">' +
         '<label class="search-field">' + icon('magnifying-glass') +
           '<input type="search" id="mb-search" placeholder="Search ' + list.length + ' inboxes" autocomplete="off" ' +
@@ -3587,12 +3967,27 @@ function renderMailboxes() {
   const search = document.getElementById('mb-search');
   if (search) search.placeholder = 'Search ' + list.length + ' inbox' + (list.length === 1 ? '' : 'es');
   document.getElementById('mb-summary').innerHTML = mbSummary();
+  document.getElementById('mb-limits').innerHTML = mbLimitNotes();
   document.getElementById('mb-filters').innerHTML = MB_FILTERS.map(([k, label]) => {
     const n = list.filter(b => mbInFilter(b, k)).length;
     return '<button role="tab" aria-selected="' + (_mb.filter === k) + '" class="' + (_mb.filter === k ? 'on' : '') +
       '" onclick="mbSetFilter(\'' + k + '\')">' + label + '<span class="mb-count' + (k === 'needs' && n ? ' bad' : '') + '">' + n + '</span></button>';
   }).join('');
   renderMbTable();
+}
+
+// Inbox lifecycle limits the config breaks (too many inboxes on a domain, a
+// cap over the provider ceiling, an inbox younger than two weeks). Advisory:
+// nothing is lowered, so the operator decides.
+function mbLimitNotes() {
+  const w = (_mb.data && _mb.data.limit_warnings) || [];
+  if (!w.length) return '';
+  return '<section class="panel"><div class="panel-head"><div><h3>Inbox limits</h3><p>' + w.length +
+    (w.length === 1 ? ' limit is' : ' limits are') + ' broken. Mercury still sends at the configured caps.</p></div></div>' +
+    '<div class="panel-body mb-limit-list">' + w.map(x =>
+      '<div>' + toneBadge('waiting', x.code === 'domain_inboxes' ? 'Too many inboxes'
+        : x.code === 'cap_over_ceiling' ? 'Cap too high' : 'Young inbox') +
+      '<span>' + escHtml(x.message) + '</span></div>').join('') + '</div></section>';
 }
 
 function mbSearch(v) { _mb.q = v || ''; renderMbTable(); }
@@ -3631,6 +4026,8 @@ function mbSummary() {
   list.filter(b => b.status === 'paused').forEach(b => issues.push(['bad', b.email + ' is paused']));
   const held = list.filter(b => mbStage(b).key === 'hold').length;
   if (held) issues.push(['waiting', held + ' ramp' + (held === 1 ? '' : 's') + ' on hold from bounces']);
+  const limits = ((d.limit_warnings) || []).length;
+  if (limits) issues.push(['waiting', limits + ' inbox limit' + (limits === 1 ? '' : 's') + ' broken']);
   const noPw = list.filter(b => b.configured === false).length;
   if (noPw) issues.push(['bad', noPw + ' inbox' + (noPw === 1 ? '' : 'es') + ' missing a password']);
   const needs = kpi('Needs you',
@@ -3691,7 +4088,7 @@ function renderMbTable() {
         '" onclick="mbToggleDomain(' + mbArg(dm) + ')">' + icon(open ? 'caret-down' : 'caret-right') + '</button>' +
       '<button class="mb-domain mono" onclick="mbOpenDomain(' + mbArg(dm) + ')">' + escHtml(dm) + '</button>' +
       '<span class="mb-group-meta">' + all.length + ' inbox' + (all.length === 1 ? '' : 'es') + ' &middot; <span class="mono">' + fmtN(sent) + '/' + fmtN(cap) + '</span> today</span>' +
-      mbDnsMini(dm) + flags.join('') +
+      mbDnsMini(dm) + mbVerdictBadge(dm) + flags.join('') +
       '<button class="link-btn mb-group-open" onclick="mbOpenDomain(' + mbArg(dm) + ')">Domain' + icon('arrow-right') + '</button>' +
     '</div></td></tr>';
     if (!open) return head;
@@ -3804,6 +4201,7 @@ function mbInboxBody(b) {
       '<div class="mb-legend"><span><i class="mb-s-sent"></i>' + fmtN(sent) + ' sent</span>' +
         '<span><i class="mb-s-left"></i>' + fmtN(Math.max(0, cap - sent)) + ' left today</span>' +
         (locked ? '<span><i class="mb-s-lock"></i>' + fmtN(locked) + ' unlock as it warms</span>' : '') + '</div>' : '') +
+    (b.cap_reason ? '<p class="drawer-note">Limit: ' + escHtml(b.cap_reason) + '</p>' : '') +
     '</div>';
 
   if ((b.plan || []).length) {
@@ -4054,7 +4452,7 @@ async function mbOpenSettings(email) {
           'Only needed when the mailbox reads replies with a different password.') +
       '</details></div>' +
     '<div class="drawer-section"><h4>Sending</h4><div class="form-row">' +
-      input('cap', 'Daily limit at full volume', 'number', v('daily_cap', 30), 'required min="0" step="1"',
+      input('cap', 'Daily limit at full volume', 'number', v('daily_cap', 15), 'required min="0" step="1"',
         'All inboxes share the overall limit of ' + fmtN(s.max_daily_sends) + ' a day.') +
       input('start', 'Warm-up start date', 'date', b ? (b.warmup_start || '') : s.today, '',
         'Clear the date only if this inbox is already warmed up.') + '</div></div>' +
@@ -4173,6 +4571,7 @@ function mbOpenDomain(domain, inPlace) {
       '<button class="link-btn" id="mb-dns-recheck" onclick="mbLoadDns(' + mbArg(domain) + ', true)">' + icon('arrow-clockwise') + 'Re-check</button></div>' +
       '<p class="drawer-note">Add these at your domain registrar. One fix covers every inbox on ' + escHtml(domain) + '.</p>' +
       '<div class="mb-dns-list" id="mb-dns-list"><div class="loading-note">Checking DNS…</div></div></div>' +
+    mbDomainHealth(domain) + mbDomainPlacement(domain) +
     '<div class="drawer-section"><div class="mb-sec-head"><h4>Inboxes on this domain</h4><span class="muted mono">' +
       fmtN(boxes.reduce((s, b) => s + Number(b.sent_today || 0), 0)) + '/' + fmtN(boxes.reduce((s, b) => s + Number(b.today_cap || 0), 0)) + ' today</span></div>' +
       '<div class="ev-list">' + boxes.map(b => {
@@ -4184,6 +4583,73 @@ function mbOpenDomain(domain, inPlace) {
   mbDrawerActions('');
   if (_mb.dns[domain]) mbRenderDns(domain);
   mbLoadDns(domain, false);
+}
+
+// ── Deliverability verdict and placement test, per domain ──
+
+const mbHealthOf = dm => ((_mb.health && _mb.health.domains) || []).find(d => d.domain === dm) || null;
+
+function mbVerdictBadge(dm) {
+  const h = mbHealthOf(dm);
+  return h ? '<span class="mb-verdict" title="' + escHtml(h.reason) + '">' + toneBadge(h.tone, h.label) + '</span>' : '';
+}
+
+function mbDomainHealth(dm) {
+  const h = mbHealthOf(dm);
+  let html = '<div class="drawer-section"><div class="mb-sec-head"><h4>Deliverability</h4>' +
+    (h ? toneBadge(h.tone, h.label) : '') + '</div>';
+  if (!h) {
+    return html + '<p class="drawer-note">' + (_mb.health ? 'Nothing sent from this domain yet.'
+      : 'The verdict isn\'t available on this server yet.') + '</p></div>';
+  }
+  const win = (_mb.health && _mb.health.window_days) || 30;
+  const keys = ((_mb.health && _mb.health.short_windows) || [7, 14]).map(n => n + 'd').concat([win + 'd']);
+  html += '<p class="hl-lead">' + escHtml(h.reason) + '</p>' +
+    '<div class="mb-stats hl-stats">' + keys.map(k => {
+      const w = h.windows[k] || {};
+      return '<div><span>Sent, last ' + k.slice(0, -1) + ' days</span><b>' + fmtN(w.sent) + '</b>' +
+        '<small>' + healthCounts(w) + '</small></div>';
+    }).join('') + '</div>' +
+    '<p class="drawer-note">' + escHtml(h.next) + ' Sending for ' +
+      (h.age_days === null || h.age_days === undefined ? 'no days yet' : fmtN(h.age_days) + ' day' + (h.age_days === 1 ? '' : 's')) + '.</p>' +
+    healthFlags(h);
+  return html + '</div>';
+}
+
+function mbDomainPlacement(dm) {
+  const p = _mb.health && _mb.health.placement;
+  const pd = p && p.domains && p.domains[dm];
+  let html = '<div class="drawer-section"><div class="mb-sec-head"><h4>Placement test</h4>' +
+    (pd ? toneBadge(pd.tone, pd.label) : '') + '</div>';
+  if (!pd) {
+    return html + '<p class="drawer-note">' + (p ? 'The last placement test didn\'t send from this domain. ' : '') +
+      'Run <span class="mono">mercury mail placement</span> to send email 1 to your seed inboxes and see where it lands.</p></div>';
+  }
+  // One row per seed inbox, one column per sender: this domain's mailboxes, then the control.
+  const labels = p.folder_labels || {};
+  const rows = (pd.rows || []).concat(p.control || []);
+  const senders = [...new Set(rows.map(r => r.sender))];
+  const seeds = [...new Set(rows.map(r => r.seed))];
+  const cell = (seed, sender) => {
+    const r = rows.find(x => x.seed === seed && x.sender === sender);
+    return r ? toneBadge(PLACEMENT_TONE[r.folder] || 'idle', labels[r.folder] || r.folder) : '<span class="muted">Not sent</span>';
+  };
+  const head = s => {
+    const ctl = (p.control || []).some(r => r.sender === s);
+    return '<th title="' + escHtml(s) + '">' + (ctl ? 'Control' : '<span class="mono">' + escHtml(s.split('@')[0]) + '@</span>') + '</th>';
+  };
+  const seedName = seed => {
+    const r = rows.find(x => x.seed === seed) || {};
+    const prov = { gmail: 'Gmail', outlook: 'Outlook', yahoo: 'Yahoo', icloud: 'iCloud' }[r.seed_provider] || 'Seed';
+    return '<td><b>' + prov + '</b><small class="hl-sub mono">' + escHtml(seed) + '</small></td>';
+  };
+  return html + '<p class="drawer-note">' + escHtml(pd.text) + '</p>' +
+    '<div class="mb-dns-list pl-table"><table><thead><tr><th>Seed inbox</th>' + senders.map(head).join('') +
+      '</tr></thead><tbody>' + seeds.map(seed => '<tr>' + seedName(seed) +
+        senders.map(s => '<td>' + cell(seed, s) + '</td>').join('') + '</tr>').join('') + '</tbody></table>' +
+      (p.created_at ? '<p class="dns-checked mb-dns-when">Tested ' + escHtml(agoShort(parseUTC(p.created_at))) +
+        ' &middot; run <span class="mono">' + escHtml(p.run_id) + '</span></p>' : '') +
+    '</div></div>';
 }
 
 function mbDomainSub(domain) {
@@ -4368,6 +4834,7 @@ loadRuns();
 loadTodayActivity();
 loadTrend();
 loadHeatmap();
+loadHealth();
 loadMercuryStatus();
 
 // Agent status: quick poll
@@ -4389,7 +4856,7 @@ setInterval(async () => {
 setInterval(() => {
   if (document.hidden) return;
   switch (currentTab) {
-    case 'today': loadToday(); loadRuns(); loadTodayActivity(); loadTrend(true); loadHeatmap(true); break;
+    case 'today': loadToday(); loadRuns(); loadTodayActivity(); loadTrend(true); loadHeatmap(true); loadHealth(true); break;
     case 'mailboxes': if (!mbBusy()) loadMailboxes(true); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;
