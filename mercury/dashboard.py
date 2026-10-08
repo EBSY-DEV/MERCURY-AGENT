@@ -35,6 +35,7 @@ from mercury.control.queries import (  # noqa: E402
     SIGNAL_CATEGORIES, SIGNAL_CATEGORY_ORDER, QueryService,
 )
 from mercury.exclusions_api import router as exclusions_router  # noqa: E402
+from mercury.experiments_api import router as experiments_router  # noqa: E402
 from mercury.inbox_api import router as inbox_router  # noqa: E402
 from mercury.pauses_api import router as pauses_router  # noqa: E402
 from mercury.registry_api import router as registry_router  # noqa: E402
@@ -55,6 +56,7 @@ app.include_router(exclusions_router)
 app.include_router(pauses_router)
 app.include_router(registry_router)
 app.include_router(inbox_router)
+app.include_router(experiments_router)
 
 _env_lock = asyncio.Lock()
 # Everything this server does, it does for the person at this machine.
