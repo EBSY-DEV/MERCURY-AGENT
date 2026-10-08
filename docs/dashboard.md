@@ -12,7 +12,10 @@ The dashboard reads and writes the same SQLite database as `mercury run`, and th
 
 ## Today
 
-![Today](images/today.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/today-dark.png">
+  <img src="images/today.png" alt="Today">
+</picture>
 
 The landing page answers "is anything waiting on me?"
 
@@ -24,7 +27,10 @@ The landing page answers "is anything waiting on me?"
 - **Pipeline**: a funnel from businesses found to profiled, contacts, drafted emails and live conversations.
 - **Recent activity**, **Quick actions** (confirm signals, find businesses, review the outbox, see the calendar, export prospects), the setup checklist while setup is incomplete, and **Collector runs** (the latest discovery and profiling jobs with what they found and cost).
 
-![Sending activity heatmap](images/heatmap.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/heatmap-dark.png">
+  <img src="images/heatmap.png" alt="Sending activity heatmap">
+</picture>
 
 How the numbers are counted (`mercury/metrics.py`), all by UTC day:
 
@@ -61,7 +67,10 @@ Everyone Mercury has found or you imported, with title, company, email status an
 
 ## Pipeline
 
-![Pipeline](images/pipeline.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/pipeline-dark.png">
+  <img src="images/pipeline.png" alt="Pipeline">
+</picture>
 
 Every contact as a card in one of seven columns:
 
@@ -88,7 +97,10 @@ Cancelling stops follow-ups from going to someone you are already talking to or 
 
 ## Calendar
 
-![Calendar](images/calendar.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/calendar-dark.png">
+  <img src="images/calendar.png" alt="Calendar">
+</picture>
 
 Every email Mercury has sent or will send, including follow-ups and replies, in your browser's local time. Switch between Month and Agenda views; filter by Sent, Scheduled, Needs approval, Cancelled and Failed. Click an email to read it and, while it is pending or approved, approve, reject or **reschedule** it to a new time (not in the past). With mailbox rotation, each email shows which address it goes out from.
 
@@ -125,7 +137,10 @@ assign experiment variants or calculate persona conversion rates.
 
 ## Outbox
 
-![Outbox](images/outbox.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/outbox-dark.png">
+  <img src="images/outbox.png" alt="Outbox">
+</picture>
 
 The decisions desk. Every outgoing email stops here while `require_approval` is on. The desk shows one pending email at a time with its recipient, step, scheduled time and sending mailbox.
 
@@ -147,7 +162,10 @@ Below the desk: sending capacity per mailbox (today's cap after warm-up and heal
 
 ## Mailboxes
 
-![Mailboxes](images/mailboxes.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/mailboxes-dark.png">
+  <img src="images/mailboxes.png" alt="Mailboxes">
+</picture>
 
 Every sending inbox (gmail or smtp; Instantly runs its own warm-up) in one table, built to stay readable with dozens of inboxes:
 
