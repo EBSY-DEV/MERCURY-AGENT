@@ -36,7 +36,7 @@ clears it explicitly.
 
 from __future__ import annotations
 
-from mercury.bounces import BOUNCE_COUNT_KEY, KILL_SWITCH_KEY, load_counts, reset_counters
+from mercury.bounces import BOUNCE_COUNT_KEY, BUCKETS, KILL_SWITCH_KEY, load_counts
 
 OPERATOR_KEY = "operator_pause"
 HEALTH_KEY = KILL_SWITCH_KEY
@@ -58,9 +58,23 @@ async def migrate_legacy(state) -> None:
     legacy = await state.get_setting(HEALTH_KEY)
     if legacy not in LEGACY_OPERATOR_REASONS:
         return
-    if not await state.get_setting(OPERATOR_KEY):
-        await state.set_setting(OPERATOR_KEY, legacy)
-    await state.set_setting(HEALTH_KEY, "")
+    async with state._connect() as db:
+        # Re-read under the writer lock: another reader may already have
+        # migrated the pause and the bounce monitor engaged a new hold.
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT value FROM settings WHERE key = ?", (HEALTH_KEY,)) as c:
+            row = await c.fetchone()
+        if not row or row[0] not in LEGACY_OPERATOR_REASONS:
+            return
+        await db.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = CURRENT_TIMESTAMP WHERE COALESCE(settings.value, '') = ''",
+            (OPERATOR_KEY, row[0]),
+        )
+        await db.execute("UPDATE settings SET value = '', updated_at = CURRENT_TIMESTAMP "
+                         "WHERE key = ?", (HEALTH_KEY,))
+        await db.commit()
 
 
 async def operator_pause(state) -> str:
@@ -115,12 +129,33 @@ async def clear_health_hold(state) -> dict | None:
     Returns the counters as they stood before the reset, or None when there
     was no hold (the counters are then left alone: they feed the next check).
     """
-    reason = await health_hold(state)
-    if not reason:
-        return None
-    before = await bounce_counters(state)
-    await state.set_setting(HEALTH_KEY, "")
-    await reset_counters(state)
+    await migrate_legacy(state)
+    async with state._connect() as db:
+        # No sender may observe the hold cleared before its counter reset
+        # succeeds. The snapshot and every write commit (or roll back) together.
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT key, value FROM settings") as c:
+            settings = dict(await c.fetchall())
+        reason = settings.get(HEALTH_KEY)
+        if not reason:
+            return None
+
+        def count(key):
+            try:
+                return int(settings.get(key) or 0)
+            except ValueError:
+                return 0
+
+        before = {"bounces": count(BOUNCE_COUNT_KEY),
+                  "buckets": {bucket: count("bounce_bucket:" + bucket) for bucket in BUCKETS}}
+        await db.execute("UPDATE settings SET value = '', updated_at = CURRENT_TIMESTAMP "
+                         "WHERE key = ?", (HEALTH_KEY,))
+        await db.executemany(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, '0', CURRENT_TIMESTAMP) "
+            "ON CONFLICT(key) DO UPDATE SET value = '0', updated_at = CURRENT_TIMESTAMP",
+            [(BOUNCE_COUNT_KEY,), *[("bounce_bucket:" + bucket,) for bucket in BUCKETS]],
+        )
+        await db.commit()
     return {"reason": reason, **before}
 
 

@@ -21,7 +21,7 @@ import mercury.dashboard as dash
 from mercury import bounces, holds, warmup
 from mercury.control import runtime as runtime_mod
 from mercury.control.context import OperatorContext
-from mercury.control.errors import Forbidden
+from mercury.control.errors import Forbidden, Unavailable
 from mercury.control.runtime import RuntimeService
 from mercury.control.sending import SendingService
 from mercury.integrations.mail_provider import SendResult
@@ -170,6 +170,48 @@ async def test_a_hold_landing_mid_drain_also_stops_the_next_claim(state):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hold_key", ["operator_pause", "sending_paused"])
+async def test_pause_committed_after_last_check_still_prevents_claim(state, monkeypatch, hold_key):
+    """A dashboard pause may win the database write lock after _may_claim's
+    read. The claim must enforce it in the same transaction as 'sending'."""
+    await _two_due(state)
+    sender = make_sender(state, FakeProvider(), require_approval=False)
+    original_claim = state.claim_outbox_item
+
+    async def pause_then_claim(item, mailbox):
+        await state.set_setting(hold_key, "paused for QA")
+        return await original_claim(item, mailbox)
+
+    monkeypatch.setattr(state, "claim_outbox_item", pause_then_claim)
+    await sender._run_native()
+    assert sender.provider.sent == []
+    assert await state.get_outbox(status="sending") == []
+
+
+@pytest.mark.asyncio
+async def test_mailbox_pause_mid_drain_prevents_further_cold_claims(state):
+    await _two_due(state)
+    provider = PausingProvider(
+        state, lambda: warmup.set_paused(state, "mercury@x.co", "paused manually"))
+    await make_sender(state, provider, require_approval=False)._run_native()
+    assert len(provider.sent) == 1
+    assert len([row for row in await state.get_outbox(status="approved")
+                if row["step"] == 1]) == 1
+
+
+@pytest.mark.asyncio
+async def test_mailbox_pause_still_allows_reply_claims(state):
+    prospect_id = await seed_prospect(state, email="recipient@example.com")
+    item_id = await state.add_outbox_item(
+        prospect_id=prospect_id, to_email="recipient@example.com", subject="Reply",
+        body="Thanks for your message.", send_at="2026-01-01T00:00:00",
+        status="approved", kind="reply")
+    await warmup.set_paused(state, "sender@example.com", "paused manually")
+    assert await state.claim_outbox_item(
+        await state.get_outbox_item(item_id), "sender@example.com")
+
+
+@pytest.mark.asyncio
 async def test_an_interrupted_claim_is_reported_as_such(state):
     await _two_due(state)
     await make_sender(state, FakeProvider())._run_native()  # stage only (approval on)
@@ -212,6 +254,45 @@ async def test_an_old_free_text_reason_stays_a_health_hold(state):
     status = await SendingService(CLI, state).resume()
     assert status["blocked"] and not status["paused"]
     assert status["holds"][0]["kind"] == "bounce_kill_switch"
+
+
+@pytest.mark.asyncio
+async def test_legacy_migration_does_not_clear_a_newer_health_hold(state, monkeypatch):
+    await state.set_setting("sending_paused", "paused manually")
+    original_get = state.get_setting
+    injected = False
+
+    async def read_then_engage(key, default=""):
+        nonlocal injected
+        value = await original_get(key, default)
+        if key == "sending_paused" and not injected:
+            injected = True
+            # Another connection has already migrated the old pause and
+            # committed a health hold after this reader saw the old value.
+            await state.set_setting("operator_pause", value)
+            await state.set_setting("sending_paused", KILL)
+        return value
+
+    monkeypatch.setattr(state, "get_setting", read_then_engage)
+    await holds.migrate_legacy(state)
+    assert await original_get("sending_paused") == KILL
+
+
+@pytest.mark.asyncio
+async def test_failed_counter_reset_keeps_health_hold_and_evidence(state):
+    import sqlite3
+
+    await _seed_bounce_hold(state)
+    before = await holds.bounce_counters(state)
+    async with state._connect() as db:
+        await db.execute("""CREATE TRIGGER fail_reset BEFORE UPDATE ON settings
+            WHEN NEW.key = 'bounce_bucket:SENDER' AND NEW.value = '0'
+            BEGIN SELECT RAISE(ABORT, 'counter reset failed'); END""")
+        await db.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="counter reset failed"):
+        await SendingService(CLI, state).clear_hold()
+    assert await state.get_setting("sending_paused") == KILL
+    assert await holds.bounce_counters(state) == before
 
 
 # ── Cooperative stop ──
@@ -304,6 +385,50 @@ def test_runtime_force_stop_is_explicit(client, monkeypatch):  # noqa: F811
     forced = client.post("/api/mercury/stop?force=true").json()
     assert forced["stopped"] and forced["forced"]
     assert child.wait(timeout=5) is not None
+
+
+def test_failed_force_stop_keeps_runtime_tracking(client, monkeypatch):  # noqa: F811
+    import signal
+
+    dash.PID_FILE.write_text("123456789")
+    service = RuntimeService(CLI, dash.PROJECT_ROOT, dash.PID_FILE, dash.LOG_FILE)
+
+    def denied_kill(pid, sig):
+        if sig == signal.SIGKILL:
+            raise PermissionError("signal denied")
+
+    monkeypatch.setattr(runtime_mod.os, "kill", denied_kill)
+    with pytest.raises(Unavailable, match="signal denied"):
+        _run(service.stop(wait_seconds=0, force=True))
+    assert dash.PID_FILE.exists()
+    assert _run(service.status())["stopping"]
+
+
+def test_force_stop_reports_stopping_until_process_exits(client, monkeypatch):  # noqa: F811
+    dash.PID_FILE.write_text("123456789")
+    service = RuntimeService(CLI, dash.PROJECT_ROOT, dash.PID_FILE, dash.LOG_FILE)
+    monkeypatch.setattr(runtime_mod.os, "kill", lambda *args: None)
+
+    async def no_wait(*args):
+        pass
+
+    monkeypatch.setattr(runtime_mod.asyncio, "sleep", no_wait)
+    result = _run(service.stop(wait_seconds=0, force=True))
+    assert result["stopping"] and result["forced"] and not result["stopped"]
+    assert dash.PID_FILE.exists()
+
+
+def test_unwritable_stop_marker_does_not_send_untracked_sigterm(client, monkeypatch):  # noqa: F811
+    import signal
+
+    dash.PID_FILE.write_text("123456789")
+    service = RuntimeService(CLI, dash.PROJECT_ROOT, dash.PID_FILE, dash.LOG_FILE)
+    service.stop_file.mkdir()  # an unwritable marker; cannot remember the first signal
+    sent = []
+    monkeypatch.setattr(runtime_mod.os, "kill", lambda pid, sig: sent.append(sig))
+    with pytest.raises(Unavailable):
+        _run(service.stop(wait_seconds=0))
+    assert signal.SIGTERM not in sent
 
 
 # ── One status for every interface ──

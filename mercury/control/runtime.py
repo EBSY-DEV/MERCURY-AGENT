@@ -54,8 +54,10 @@ class RuntimeService:
         try:
             os.kill(pid, 0)
             return True
-        except (ProcessLookupError, PermissionError):
+        except ProcessLookupError:
             return False
+        except PermissionError:
+            return True  # it exists, even though this caller cannot signal it
 
     def _stop_requested(self, pid: int | None) -> str | None:
         """When a stop of ``pid`` was requested, or None. Clears a marker left
@@ -85,7 +87,9 @@ class RuntimeService:
                 pid = int(self.pid_file.read_text().strip())
                 os.kill(pid, 0)  # Check if process exists
                 return pid
-            except (ValueError, ProcessLookupError, PermissionError):
+            except PermissionError:
+                return pid
+            except (ValueError, ProcessLookupError):
                 self.pid_file.unlink(missing_ok=True)
         return None
 
@@ -143,18 +147,22 @@ class RuntimeService:
 
         requested = self._stop_requested(pid)
         if requested is None:
+            # Persist before signalling: without a marker another stop
+            # could send a second SIGTERM and interrupt an in-flight email.
+            requested = datetime.now().isoformat(timespec="seconds")
+            try:
+                self.stop_file.write_text(f"{pid} {requested}")
+            except OSError as e:
+                raise Unavailable(f"Cannot record the stop request: {e}",
+                                  code="stop_failed") from e
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
             except PermissionError as e:
+                self.stop_file.unlink(missing_ok=True)
                 raise Unavailable(f"Cannot signal Mercury (pid {pid}): {e}",
                                   code="stop_failed") from e
-            requested = datetime.now().isoformat(timespec="seconds")
-            try:
-                self.stop_file.write_text(f"{pid} {requested}")
-            except OSError as e:
-                logger.warning("Could not write the stop marker: %s", e)
 
         wait_seconds = STOP_WAIT_SECONDS if wait_seconds is None else wait_seconds
         waited = 0.0
@@ -171,13 +179,21 @@ class RuntimeService:
             forced = True
             try:
                 os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+            except ProcessLookupError:
                 pass
-            if _process and _process.pid == pid:
-                try:
-                    _process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
+            except PermissionError as e:
+                raise Unavailable(f"Cannot force stop Mercury (pid {pid}): {e}",
+                                  code="stop_failed") from e
+            # A successful signal is not proof of exit, especially for a
+            # process stuck in kernel I/O. Keep tracking it until it is gone.
+            force_waited = 0.0
+            while self._alive(pid) and force_waited < 2.0:
+                await asyncio.sleep(step)
+                force_waited += step
+                waited += step
+            if self._alive(pid):
+                return {"pid": pid, "stopped": False, "stopping": True, "forced": True,
+                        "stop_requested_at": requested, "waited": waited}
 
         self._stopped()
         return {"pid": pid, "stopped": True, "stopping": False, "forced": forced,
