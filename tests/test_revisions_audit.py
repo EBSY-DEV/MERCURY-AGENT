@@ -532,6 +532,32 @@ def test_dashboard_payloads_carry_revisions(tmp_path, monkeypatch):
 # ── Config revisions ──
 
 
+@pytest.mark.asyncio
+async def test_config_services_follow_the_private_override_and_refuse_stale_revisions(state, tmp_path):
+    from mercury.control.settings import ConfigService
+
+    source, target = tmp_path / "mercury.yaml", tmp_path / "mercury.local.yaml"
+    source.write_text(TEMPLATE.read_text())
+    first = ConfigService(CLI, state, source=source, target=target)
+    second = ConfigService(DASH, state, source=source, target=target)
+    seen = (await first.get())["revision"]
+    changed = await first.update({"channels.email.max_daily_sends": 20}, seen)
+
+    # A long-lived service and one constructed before another client saved
+    # must both read the active private file after its first creation.
+    for service in (first, second):
+        current = await service.get()
+        assert current["revision"] == changed["revision"]
+        assert current["fields"]["channels.email.max_daily_sends"] == 20
+        with pytest.raises(Conflict) as error:
+            await service.update({"channels.email.max_daily_sends": 40}, seen)
+        assert error.value.code == "stale_revision"
+
+    latest = await second.update({"usage.heartbeat_interval_minutes": 30}, changed["revision"])
+    assert latest["fields"]["channels.email.max_daily_sends"] == 20
+    assert (await first.get())["revision"] == latest["revision"]
+
+
 def test_config_changes_need_the_revision_that_was_read(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
     seen = client.get("/api/config").json()["revision"]
