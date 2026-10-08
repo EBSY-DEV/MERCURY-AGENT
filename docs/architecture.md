@@ -28,7 +28,7 @@ Mercury Agent is a single Python process that wakes up on a timer, decides what 
 - **Scout** finds people. Python does the searching (Serper, Tavily, DuckDuckGo, Bing, Google), the scraping, the inbox sweep over discovered companies, tech detection and email resolution; Claude only scores and personalizes contacts that were already found.
 - **Writer** turns verified `new` prospects into three-step sequences (opener, follow-up, break-up) and stores them as draft campaigns. It can also regenerate a single outbox email on request. With `offers:` configured, it first routes each prospect to one offer (`mercury/offers.py`, deterministic: first matching rule, else the default), groups campaigns by offer, and writes from that offer's brief only.
 - **Sender** stages draft campaigns into the outbox and drains due, approved rows through the mailbox pool and the gate. On the legacy Instantly path it deploys campaigns through the Instantly API instead.
-- **Handler** polls inboxes, separates bounces from human replies, classifies intent, advances conversation stages, queues replies, handles bounces and the kill switch.
+- **Handler** polls inboxes, stores every message before handling it (a failure is retried next cycle, not dropped), separates bounces from human replies, classifies intent, advances conversation stages, queues replies, handles bounces and the kill switch.
 - **Analyst** writes `data/analytics.json` with pipeline and campaign stats. No Claude calls.
 
 ## Data flow
@@ -118,6 +118,8 @@ When the CLI runs as root (typical in hosted runners), the Brain sets `IS_SANDBO
 | `campaigns` | Draft and active sequences. |
 | `outbox` | Every native email: kind (`sequence` or `reply`), step, schedule, status, sending mailbox, provider ids. |
 | `conversations` | Reply threads, intent, stage. |
+| `inbound_messages` | Every message read from a mailbox, stored before it is handled: ids, mailbox, headers, body, what it answers, and whether handling succeeded, is to be retried or gave up. |
+| `inbox_state`, `contact_notes`, `inbox_reminders` | The inbox's local read state, snoozes, notes and reminders. Never synced to a provider. |
 | `signal_codes`, `observations` | The signal vocabulary and every fact collected. A trigger rejects observations with unknown codes. |
 | `runs` | Collector runs: provider, records, cost, status. |
 | `actions` | The event log (also the source for reply and bounce metrics). |

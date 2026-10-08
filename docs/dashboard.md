@@ -20,7 +20,7 @@ The landing page answers "is anything waiting on me?"
 - **Rates**: reply rate, positive reply rate and bounce rate over the trend window selected below, each with the change against the previous window of the same length. Rates are fractions of outreach emails sent. Bounce rate turns red at 5%.
 - **Outreach trend**: emails sent, replies and bounces per day over 7, 30 or 90 days. Click a legend item to hide a series.
 - **Sending activity**: a year-long grid of outreach emails sent per day, with total, active days, the current and longest streak, and the best day.
-- **Needs you**: decisions only you can make, most blocking first: sending paused, setup incomplete, signals awaiting confirmation, no companies yet, companies not profiled, emails waiting for approval, live conversations.
+- **Needs you**: decisions only you can make, most blocking first: sending paused, setup incomplete, signals awaiting confirmation, no companies yet, companies not profiled, emails waiting for approval, replies Mercury could not process, inbox reminders that are due, live conversations. A reminder only flags its conversation; nothing is sent from Today.
 - **Pipeline**: a funnel from businesses found to profiled, contacts, drafted emails and live conversations.
 - **Recent activity**, **Quick actions** (confirm signals, find businesses, review the outbox, see the calendar, export prospects), the setup checklist while setup is incomplete, and **Collector runs** (the latest discovery and profiling jobs with what they found and cost).
 
@@ -167,6 +167,25 @@ See [Mailbox rotation](email-and-deliverability.md#mailbox-rotation), [Warm-up r
 ## Conversations
 
 Every reply thread, the intent Mercury assigned, its stage, and Mercury's responses.
+
+### Inbox API
+
+The unified inbox (one place to triage conversations from every mailbox and answer them) has its data layer under `/api/inbox/`; the screen itself is still being designed. What it relies on:
+
+- **Every inbound message is stored before it is handled** (`inbound_messages`): provider, receiving mailbox, external and RFC ids, In-Reply-To and References, Date, sender, body, and the sent email it answers. Duplicates are recognised per provider, mailbox and id, so two inboxes never collide, and one message delivered to two inboxes is handled once. A failure while handling leaves the message to be retried next cycle; after five attempts it is kept as failed and flagged on Today.
+- **Threads** combine emails that were really sent with stored inbound mail, each once and in order. Queued and failed drafts are listed apart. Conversations from before inbound storage show their saved text as partial history, with no mailbox or ids, and a message of ours found only there is marked recorded, never sent.
+- **Read, snooze, notes and reminders are local.** They live in Mercury's database and do not change read flags in Gmail or on the IMAP server.
+- **Replies go through the outbox.** A draft is bound to the contact, the mailbox the thread runs through, the message it answers and its thread headers. It starts in review whatever `require_approval` says, saving it with an old revision fails instead of overwriting newer text, and editing or regenerating an approved draft sends it back to review. The sender's gates (exclusions, opt-outs, holds, pauses, the pre-send check) apply as to any email. Escalated and opted-out conversations stay listed, but composing to them is refused with the reason.
+
+| Route | Does |
+|---|---|
+| `GET /api/inbox/conversations` | A page of conversations with `total`, `next_offset` and facet counts. Filters: `q`, `mailbox`, `intent`, `stage`, `prospect_status`, `status`, `read`, `attention`, `response`, `snoozed` (`exclude` by default), `reminder`, plus `limit` and `offset`. |
+| `GET /api/inbox/conversations/{id}` | The thread, drafts, unsent mail, notes, reminders, local state, restrictions and what composing would do. |
+| `POST .../{id}/read`, `.../unread`, `.../snooze`, `DELETE .../snooze` | Local read state and snooze. |
+| `GET/POST /api/inbox/contacts/{prospect_id}/notes`, `PATCH/DELETE /api/inbox/notes/{id}` | Contact notes. |
+| `POST .../{id}/reminders`, `GET /api/inbox/reminders`, `POST /api/inbox/reminders/{id}/done`, `DELETE /api/inbox/reminders/{id}` | Reminders. |
+| `POST .../{id}/drafts`, `PUT .../drafts/{item}`, `POST .../drafts/{item}/regenerate`, `/approve`, `/schedule`, `/discard` | Compose through the outbox. Every change names the `revision` it was made on. |
+| `POST /api/inbox/bulk` | Read, unread, snooze, unsnooze or exclude an explicit list of conversations, with one result per conversation. Exclude needs `"confirm": true`. |
 
 ## Activity
 
