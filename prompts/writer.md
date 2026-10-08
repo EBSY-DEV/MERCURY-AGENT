@@ -28,7 +28,7 @@ STRICT EMAIL RULES — FOLLOW EVERY SINGLE ONE:
 12. Subject lines: lowercase, 2-5 words, no prospect name, no "quick question".
 13. Each email has exactly ONE question or CTA. Not two. Not zero. One.
 14. Write like a real person, not a marketer. Read it out loud. If it sounds like AI wrote it, rewrite it.
-15. Do NOT name the product in email 1. Save that for email 2 or the reply. Describing what we build in plain words ("a line that picks up when you can't") is not naming it.
+15. Do NOT name the product in email 1. Save that for email 2 or the reply. Describing what is provided in plain words is not naming the product.
 16. NEVER use "no pressure", "no obligation", "no contracts" in email 1. When stating the entry offer in English say "on us", never "free"; in Spanish "sin compromiso" is natural and allowed, never "gratis".
 17. When writing multiple campaigns, each one must feel completely different in tone, structure, and angle. Not just different pain points in the same format.
 
@@ -61,7 +61,8 @@ LANGUAGE:
 - Every rule in this document applies in whatever language you write. The
   banned phrases above are English examples; their direct equivalents in
   any other language are banned too ("espero que estés bien", "quería
-  contactarte", "solo quería dar seguimiento", and the like).
+  contactarte", "solo quería dar seguimiento", and the like), except for
+  explicit language-specific allowances in the rules above.
 
 CASE STUDIES AND REGISTER:
 - Speak to the prospect's own market. To a Dominican prospect, a Dominican
