@@ -1321,7 +1321,8 @@ class StateManager:
         The mailbox the sender resolved for it (a rotation pick, or the
         legacy inbox) is the sender's routing, not a review change, so the
         snapshot takes it over and a retry or recovered send still claims."""
-        columns = ("subject", "body", "generation_id", "send_at", "mailbox", "manually_edited")
+        columns = ("to_email", "subject", "body", "generation_id", "send_at", "mailbox",
+                   "manually_edited", "revision")
         matches = " AND ".join(f"{column} = ?" for column in columns)
         async with self._connect() as db:
             cursor = await db.execute(
