@@ -36,6 +36,7 @@ from mercury.control.queries import (  # noqa: E402
 )
 from mercury.exclusions_api import router as exclusions_router  # noqa: E402
 from mercury.pauses_api import router as pauses_router  # noqa: E402
+from mercury.registry_api import router as registry_router  # noqa: E402
 # MERCURY_DB_PATH points the dashboard at another database (e.g. the demo
 # DB from scripts/seed_demo.py) without touching the real one.
 DB_PATH = Path(os.environ.get("MERCURY_DB_PATH") or (PROJECT_ROOT / "data" / "mercury.db"))
@@ -51,6 +52,7 @@ app.include_router(demos_router)
 app.include_router(pains_router)
 app.include_router(exclusions_router)
 app.include_router(pauses_router)
+app.include_router(registry_router)
 
 _env_lock = asyncio.Lock()
 # Everything this server does, it does for the person at this machine.

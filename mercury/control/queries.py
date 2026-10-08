@@ -101,14 +101,22 @@ class QueryService:
             FROM companies c ORDER BY c.created_at DESC LIMIT ?
         """, (int(limit),))
 
+    async def _with_registry(self, rows: list[dict]) -> list[dict]:
+        """Each contact carries its public-registry result under ``registry``."""
+        if rows:
+            from mercury.registry.contacts import attach_registry
+            await attach_registry(self.state, rows)
+        return rows
+
     async def company_contacts(self, company_id: str) -> list[dict]:
         self.ctx.require("read")
-        return await self._rows("SELECT * FROM prospects WHERE company_id = ? ORDER BY score DESC",
-                                (company_id,))
+        return await self._with_registry(await self._rows(
+            "SELECT * FROM prospects WHERE company_id = ? ORDER BY score DESC", (company_id,)))
 
     async def prospects(self, limit: int = 200) -> list[dict]:
         self.ctx.require("read")
-        return await self._rows("SELECT * FROM prospects ORDER BY created_at DESC LIMIT ?", (int(limit),))
+        return await self._with_registry(await self._rows(
+            "SELECT * FROM prospects ORDER BY created_at DESC LIMIT ?", (int(limit),)))
 
     async def campaigns(self, limit: int = 100) -> list[dict]:
         self.ctx.require("read")

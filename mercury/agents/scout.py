@@ -119,6 +119,7 @@ class Scout:
         self._queries_this_cycle = 0
         self._seen_prospect_keys = set()
         self._seen_domains = set()
+        self._registry_lookups_this_cycle = 0
 
         prospects_found = 0
 
@@ -144,12 +145,52 @@ class Scout:
             except Exception as e:
                 logger.warning(f"Scout: strategy '{name}' failed: {e}")
 
+        service = getattr(self, "_registry_service", None)
+        if service is not None:
+            await service.aclose()
+
         await self.state.log_action(
             action_type="prospect",
             agent="scout",
             details={"prospects_found": prospects_found},
         )
         logger.info(f"Scout: Found {prospects_found} new prospects this cycle.")
+
+    # ── Public-registry evidence ──
+
+    # Each fresh lookup is a handful of polite, spaced requests to a public
+    # registry; cap how many one cycle makes. Cached answers cost nothing.
+    REGISTRY_LOOKUPS_PER_CYCLE = 5
+
+    async def _attach_registry_evidence(self, company_id: str) -> None:
+        """Look the company up in its public registry, if one covers it.
+
+        Evidence only: observations and a cached result are recorded, and the
+        prospect that was just created is left exactly as it was. Runs only
+        when the CONTACT_FOUND signal is confirmed, only for companies a
+        registry's jurisdiction covers, and never fails the cycle.
+        """
+        if getattr(self, "_registry_lookups_this_cycle", 0) >= self.REGISTRY_LOOKUPS_PER_CYCLE:
+            return
+        try:
+            from mercury.registry.service import RegistryService, default_providers
+
+            service = getattr(self, "_registry_service", None)
+            if service is None:
+                service = self._registry_service = RegistryService(
+                    self.state, default_providers())
+            company = await self.state.get_company(company_id)
+            if company is None or service.provider_for(company.location) is None:
+                return
+            if await service.cached(company) is None:
+                self._registry_lookups_this_cycle = \
+                    getattr(self, "_registry_lookups_this_cycle", 0) + 1
+            result = await service.lookup(company)
+            if result.status in ("matched", "ambiguous", "no_match") and not result.cached:
+                logger.info(f"Scout: registry {result.status} for {company.name} "
+                            f"({result.reason})")
+        except Exception as e:
+            logger.debug(f"Registry lookup failed for {company_id}: {e}")
 
     # ── Prospect dedup helpers ──
 
@@ -881,6 +922,8 @@ class Scout:
                 )
             except Exception as e:
                 logger.debug(f"add_prospect failed for {prospect.email}: {e}")
+                continue
+            await self._attach_registry_evidence(row["id"])
         return added
 
     async def _prospect_via_company_discovery(self) -> int:

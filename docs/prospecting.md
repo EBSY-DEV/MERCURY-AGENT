@@ -129,6 +129,39 @@ While reading sites, Mercury also detects the tools a site runs (HubSpot, Shopif
 
 For each named person, the address is found pattern-first and verified once. See [Address verification](email-and-deliverability.md#address-verification) for the order and the `verified` / `risky` / `guess` / `invalid` statuses. Only sendable prospects (verified, plus risky with `send_to_risky`) are handed to the Writer.
 
+## Public registry lookup
+
+Many small businesses publish only a shared inbox (`info@`, `office@`), so the Scout has an address but no name. For companies a public business registry covers, it reads the registry's own record of who is behind the company. This is public data only; nothing here touches LinkedIn or social profiles.
+
+**Jurisdiction, not targeting.** A company is eligible when the registry's jurisdiction covers its location. The first registry is the Florida Division of Corporations (search.sunbiz.org), so a company located in Florida is eligible and anything else is `not_eligible` and costs no request. This does not change who the campaign targets. A registry is a small provider class (`mercury/registry/base.py`); adding a state adds a class, and eligibility follows its `jurisdiction`.
+
+**Governance.** Nothing is looked up until `CONTACT_FOUND` is confirmed (`mercury signals --confirm CONTACT_FOUND`). `REGISTRY_VERIFIED` and `LIKELY_OWNER` are written only when they are confirmed too.
+
+**How a company is matched.**
+
+1. Names are normalized on both sides: lowercase, no accents or punctuation, `&` as `and`, no "the", no trailing `LLC`, `Inc`, `Corp`, `Co`, `Ltd` and similar. On our side a branch suffix after a spaced dash or a pipe ("Acme Roofing - Tampa") is dropped as well.
+2. The registry is searched by name, and only entities whose normalized name equals ours are kept.
+3. Only **active** entities count. An inactive entity (dissolved, revoked, withdrawn) is never opened: its people are not answering anything, and a dead filing with the same name is how a wrong person gets matched. If only inactive entities exist the answer is `no_match` (`inactive_only`). Status on the detail page wins over the search list.
+4. Each remaining entity's page is read, and the one whose principal or mailing city is the company's city is the match. Exactly one is `matched` (confidence 0.95 when both cities agree, 0.9 when one does). Several is `ambiguous`; none is `no_match`; a company with no city to check is `ambiguous` too, because a name alone is not enough.
+
+Abstaining is an answer and is stored like one. The stored row keeps the entities that were considered, so a reviewer can see why Mercury matched or held back.
+
+**What is stored.** Each matched person becomes a `CONTACT_FOUND` observation (`Jane Doe - Manager`) whose evidence URL is the registry page and whose confidence is the match confidence. The structured provenance (provider, entity name, document number, the registry's title code, the match rule) is in the observation's `detail_json`. A company with exactly one person on file also gets `LIKELY_OWNER`, at no more than 0.8 confidence. When a scraped contact's full name is on the registry page, that contact gets `REGISTRY_VERIFIED`. The registered agent is never read as an officer, and an LLC or trust listed as a manager is not a person.
+
+**Cache and politeness.** One lookup per company: the result (including `no_match` and `ambiguous`) is stored in `registry_lookups` and reused. `mercury registry lookup COMPANY --force`, or `POST /api/companies/{id}/registry/refresh`, fetches again. Requests are spaced at least three seconds apart (plus jitter) with an identifying `User-Agent`, and the Scout makes at most five fresh lookups per cycle. If the registry refuses or fails the result is `unavailable`, never `no_match`; it is retried after a day, it never replaces an earlier real answer, and the session stops asking.
+
+**Sunbiz sits behind a bot challenge.** A plain HTTP client is often answered with a "Just a moment" page. Mercury reports that as `unavailable` and does not try to get around it. If you hit it in practice, supply a different fetch function to `SunbizProvider`, or use the Division's bulk data files.
+
+**When a registry name is used.** A registry name is evidence, not a rewrite: it is never written onto the prospect, and it never replaces a name that came from a better source (a team page, an import, a personal address).
+
+- A contact that has its own name is `named`, always.
+- A shared-inbox contact with no name of its own (the inbox sweep stores the business name as the first name) can take the registry person, but only when exactly one person qualifies: the sole person on file, or the single holder of a lead title (President, CEO, Manager, Managing Member, Authorized Person/Member). Two leads, or none, is no name. A first name that is only an initial is no name.
+- That name starts as `registry_pending` and is not used to greet anyone until a person accepts it (`POST /api/contacts/{id}/registry-name` with `accepted`). `dismissed` ends it. A decision belongs to that person: if a later lookup finds someone else, the review starts over.
+- `resolve_contact_name(state, prospect, company, require_review=True)` in `mercury/registry/resolver.py` returns `{first_name, full_name, title, source, source_url, status}` with `status` one of `named`, `registry`, `registry_pending`, `none`. `first_name` is empty unless the status is `named` or `registry`. Pass `require_review=False` to use a unique matched name without waiting for an accept.
+- `is_shared_inbox(email)` uses one list, `SHARED_LOCAL_PARTS`, in the same file.
+
+Every contact in `/api/prospects` and `/api/companies/{id}/contacts` carries a `registry` object (`status`, `reason`, `provider_label`, `entity_name`, `document_number`, `source_url`, `confidence`, `looked_up_at`, `person`, `shared_inbox`, `has_own_name`, `name_status`, `review`). `mercury registry show COMPANY` prints the same thing; `mercury registry lookup COMPANY` runs it.
+
 ## Importing a list
 
 Already have a list? Import it from a CSV in the dashboard (Contacts → **Import CSV**) or with `mercury import`. Both run the same checks and give the same row outcomes.

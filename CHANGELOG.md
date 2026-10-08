@@ -33,6 +33,18 @@ minor versions can still change behaviour.
   flags unknown or unconfirmed signal codes; `mercury offers route EMAIL`
   explains one prospect's offer. Configs without offers, or with offers that
   only set the demo gate, write exactly as before.
+- **Public registry lookup for contact names.** For companies a public business
+  registry covers (the Florida Division of Corporations first, chosen by the
+  registry's jurisdiction and not by campaign targeting), the Scout matches the
+  company by normalized name and city, only against active entities, and
+  abstains when the match is ambiguous. Officers, managers and authorized
+  persons become `CONTACT_FOUND` observations with the registry page as
+  evidence. Lookups need `CONTACT_FOUND` confirmed, are rate limited, and are
+  cached once per company, including "no match" and "ambiguous".
+  `mercury registry`, a `registry` object on every contact in the dashboard API,
+  and a resolver the Writer can call. A registry name is never written onto a
+  contact and waits for an accept before it is used. See
+  [Public registry lookup](docs/prospecting.md#public-registry-lookup).
 - **Follow-ups thread under the first email.** With `channels.email.thread_followups`
   (on by default, also a switch on the Settings tab), steps 2 and 3 go out as
   replies to the email before them: `In-Reply-To`, a `References` header with
