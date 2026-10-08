@@ -141,8 +141,8 @@ class OutboxService:
     async def overview(self) -> dict:
         """The review desk: every queue the Outbox tab shows, plus the kill switch."""
         self.ctx.require("read")
-        from mercury.bounces import KILL_SWITCH_KEY
         from mercury.demos import annotate_outbox, waiting_for_demo
+        from mercury.holds import blocking
 
         state = self.state
         legacy, known = self._mailboxes()
@@ -150,7 +150,7 @@ class OutboxService:
         approved = await state.get_outbox(status="approved", limit=50)
         await annotate_outbox(state, self.config, pending + approved)
         return {
-            "paused": await state.get_setting(KILL_SWITCH_KEY),
+            "paused": (await blocking(state))[1],
             "pending": await self._with_policy(
                 await with_from_mailbox(state, pending, legacy, known)),
             "approved": await self._with_policy(

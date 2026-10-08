@@ -2527,9 +2527,15 @@ class StateManager:
                     f"updated_at = ? WHERE id = ? AND status = 'approved' AND {matches} "
                     "AND approved_revision = revision "
                     f"AND approved_hash = {_OUTBOX_HASH_SQL} "
+                    "AND NOT EXISTS (SELECT 1 FROM settings "
+                    "WHERE key IN ('operator_pause', 'sending_paused') "
+                    "AND COALESCE(value, '') != '') "
+                    "AND (outbox.kind = 'reply' OR NOT EXISTS ("
+                    "SELECT 1 FROM warmup_inboxes WHERE email = ? AND status = 'paused')) "
                     # A pause set after the due scan still holds this email back.
                     f"AND NOT {_PAUSED_OUTBOX_SQL}",
-                    (mailbox, company_id, mailbox, now, item["id"], *(item[c] for c in columns)))
+                    (mailbox, company_id, mailbox, now, item["id"],
+                     *(item[c] for c in columns), _norm(mailbox)))
                 if not cursor.rowcount:
                     await db.execute("ROLLBACK")
                     return "stale", {}

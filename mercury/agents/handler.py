@@ -586,8 +586,8 @@ class Handler:
                     # heartbeat tries again instead of dropping it.
                     keep_for_retry = not await bounce_policy.engage_kill_switch(
                         self.state,
-                        f"a bounce could not be processed ({e}) — review the "
-                        "log before resuming",
+                        f"a bounce could not be processed ({e}). Review the "
+                        "log before clearing the hold",
                     )
             finally:
                 if not keep_for_retry:

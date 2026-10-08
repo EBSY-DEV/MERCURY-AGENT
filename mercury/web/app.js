@@ -369,6 +369,7 @@ const ACTIVITY_LABELS = {
   demo_ready: ['check-circle', 'Marked a demo ready'],
   demo_retired: ['archive', 'Retired a demo'],
   demos_retired: ['archive', 'Retired demos nobody answered'],
+  sending_hold_cleared: ['shield-check', 'Cleared the bounce hold'],
 };
 
 function activityLabel(type) {
@@ -1088,10 +1089,12 @@ async function loadMercuryStatus() {
   document.getElementById('control-dot').className = 'dot ' + (running ? 'running' : 'stopped');
   const label = document.getElementById('control-label');
   label.className = 'label ' + (running ? 'running' : 'stopped');
-  label.textContent = running ? 'Running' : 'Stopped';
+  label.textContent = running ? (data.stopping ? 'Stopping' : 'Running') : 'Stopped';
 
   const meta = document.getElementById('control-meta');
-  if (running && data.pid) {
+  if (running && data.stopping) {
+    meta.innerHTML = 'Finishing the step it is on, then it stops. Asked ' + formatDate(data.stop_requested_at) + '.';
+  } else if (running && data.pid) {
     let info = 'PID ' + escHtml(String(data.pid));
     if (data.started_at) info += ' &middot; started ' + formatDate(data.started_at);
     meta.innerHTML = info;
@@ -1117,7 +1120,8 @@ async function stopMercury() {
   const btn = document.getElementById('btn-stop');
   btn.disabled = true;
   const data = await api('/api/mercury/stop', {method: 'POST'});
-  if (data && data.success) showToast('Mercury stopped.', 'success');
+  if (data && data.success) showToast(data.stopping
+    ? 'Mercury is finishing the step it is on, then it stops.' : 'Mercury stopped.', 'success');
   else showToast((data && data.message) || 'Failed to stop.', 'error');
   btn.disabled = false;
   loadMercuryStatus();
@@ -1292,8 +1296,8 @@ async function loadUsage() {
 let _mailboxes = null;
 
 async function loadOutbox() {
-  const [data, mbox, pauses] = await Promise.all([
-    api('/api/outbox'), api('/api/mailboxes'), api('/api/pauses')]);
+  const [data, mbox, pauses, sending] = await Promise.all([
+    api('/api/outbox'), api('/api/mailboxes'), api('/api/pauses'), api('/api/sending/status')]);
   _mailboxes = mbox && !mbox.error ? mbox : null;
   const pausesEl = document.getElementById('outbox-pauses');
   if (pausesEl) pausesEl.innerHTML = renderPauses(pauses);
@@ -1315,24 +1319,21 @@ async function loadOutbox() {
   navCount('nav-outbox', pending.length);
   navCount('nav-exclusions', (data.blocked || []).length);
 
+  const send = sending && !sending.error && sending.holds ? sending : null;
+  const blocked = send ? send.blocked : !!data.paused;
   actions.innerHTML =
-    (pending.length && !data.paused
+    (pending.length && !blocked
       ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()">Approve all ' +
         pending.length + '</button>' : '') +
-    (data.paused
+    (send && send.paused
       ? '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'resume\')">' +
         'Resume sending</button>'
       : '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'pause\')">' +
         'Pause all sending</button>');
 
-  // The kill switch gets a banner only when it's actually on — a permanent
-  // bar for a thing that isn't happening is just noise.
-  banner.innerHTML = data.paused
-    ? '<div class="card" style="border-color:var(--s-bad-line);margin-bottom:16px">' +
-        '<h2 class="icon-title" style="color:var(--s-bad)">' + icon('pause-circle') + 'Sending is paused</h2>' +
-        '<p style="color:var(--text-2);font-size:13px">' + escHtml(data.paused) +
-        '. Approved mail stays queued until you resume.</p></div>'
-    : '';
+  // A banner only when something holds mail back: a permanent bar for a
+  // thing that isn't happening is just noise.
+  banner.innerHTML = send ? renderSendingHolds(send) : '';
 
   desk.innerHTML = pending.length ? renderDesk(pending, _desk.i) :
     '<div class="card">' + emptyState('tray', 'Nothing to review',
@@ -1618,10 +1619,51 @@ async function outboxApproveAll() {
   loadOutbox();
 }
 
+// Your pause and the health holds are separate: resume lifts only your pause,
+// and a bounce hold is cleared on its own, after the cause is fixed.
+function renderSendingHolds(s) {
+  const rows = [];
+  if (s.paused) rows.push([toneBadge('waiting', 'Paused by you'), s.reason]);
+  for (const h of s.holds) {
+    const label = h.scope === 'global' ? 'Health hold'
+      : h.source === 'operator' ? 'Inbox paused' : 'Inbox on hold';
+    rows.push([toneBadge(h.scope === 'global' ? 'bad' : 'waiting', label),
+      (h.mailbox ? h.mailbox + ': ' : '') + h.reason]);
+  }
+  if (!rows.length) return '';
+  const flight = s.in_flight.filter(i => !i.interrupted).length;
+  if (flight && s.blocked) rows.push([toneBadge('active', 'In flight'),
+    flight + (flight === 1 ? ' email was' : ' emails were') + ' already being sent and will finish.']);
+  const killSwitch = s.holds.some(h => h.kind === 'bounce_kill_switch');
+  const title = !s.blocked ? 'Some inboxes are on hold'
+    : s.holds.some(h => h.scope === 'global') ? 'Sending is on hold' : 'Sending is paused';
+  const lede = !s.blocked ? 'Other inboxes keep sending. Resume an inbox from the Mailboxes tab.'
+    : s.paused && s.holds.some(h => h.scope === 'global')
+      ? 'Resuming lifts your pause only. Approved mail stays queued until every hold is cleared.'
+      : s.paused ? 'Approved mail stays queued until you resume.'
+      : 'Resuming does not lift a health hold. Approved mail stays queued until it is cleared.';
+  return '<section class="panel"><div class="panel-head"><div><h3 class="icon-title">' +
+      icon('pause-circle') + escHtml(title) + '</h3><p>' + escHtml(lede) + '</p></div>' +
+      (killSwitch ? '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'clear-hold\')">' +
+        'Clear bounce hold</button>' : '') +
+    '</div><div class="panel-body"><div class="hold-list">' +
+      rows.map(r => '<div>' + r[0] + '<span>' + escHtml(r[1]) + '</span></div>').join('') +
+    '</div></div></section>';
+}
+
 async function sendingToggle(action) {
+  if (action === 'clear-hold' && !await confirmModal({
+    title: 'Clear the bounce hold?',
+    copy: 'Only clear it once the cause is fixed (list quality, DNS, the inbox Mercury was told about). ' +
+      'The bounce count starts again from zero. Your own pause and paused inboxes stay as they are.',
+    ok: 'Clear hold'})) return;
   const data = await api('/api/sending/' + action, {method: 'POST'});
-  if (data && data.success) showToast(action === 'pause' ? 'Sending paused.' : 'Sending resumed.', 'success');
-  else showToast('Failed.', 'error');
+  if (data && data.success) {
+    const msg = action === 'pause' ? 'Sending paused.'
+      : action === 'clear-hold' ? (data.cleared ? 'Bounce hold cleared.' : 'There was no bounce hold to clear.')
+      : data.blocked ? 'Your pause is lifted. Sending is still on hold.' : 'Sending resumed.';
+    showToast(msg, 'success');
+  } else showToast((data && data.message) || 'Failed.', 'error');
   loadOutbox();
 }
 
