@@ -24,6 +24,7 @@ from mercury.paths import PROJECT_ROOT  # noqa: E402
 from mercury.personas_api import router as personas_router  # noqa: E402
 from mercury.imports_api import router as imports_router  # noqa: E402
 from mercury.demos_api import router as demos_router  # noqa: E402
+from mercury.control.audit import redact_text  # noqa: E402
 from mercury.control.context import OperatorContext  # noqa: E402
 from mercury.control.errors import (  # noqa: E402
     Conflict, ControlError, Forbidden, Invalid, NotFound, Unavailable,
@@ -50,6 +51,15 @@ app.include_router(exclusions_router)
 _env_lock = asyncio.Lock()
 # Everything this server does, it does for the person at this machine.
 DASHBOARD = OperatorContext.local("dashboard")
+REQUEST_KEY_MAX = 200
+
+
+def _ctx(request: Request | None = None) -> OperatorContext:
+    """The local operator. A request that sends an ``Idempotency-Key``
+    header gets it as its request key: a retry with the same key returns
+    the first answer instead of running the command again."""
+    key = (request.headers.get("Idempotency-Key") or "").strip() if request is not None else ""
+    return OperatorContext.local("dashboard", request_id=key[:REQUEST_KEY_MAX]) if key else DASHBOARD
 
 
 # ── Helpers ──
@@ -75,7 +85,7 @@ def _control_error(error: ControlError, key: str = "message",
                    overrides: dict | None = None, detail: bool = False) -> JSONResponse:
     """The error as JSON. ``detail`` adds the stable code and its details;
     routes that predate the services leave it off to keep their old shape."""
-    body = {"success": False, key: str(error)}
+    body = {"success": False, key: redact_text(str(error))}
     if detail:
         body |= {"code": error.code, **error.details}
     return JSONResponse(body, status_code=_control_status(error, overrides))
@@ -379,7 +389,7 @@ async def get_supported_config():
     from mercury.control.settings import ConfigService
 
     try:
-        return await ConfigService(DASHBOARD).get()
+        return await ConfigService(DASHBOARD, _state()).get()
     except ControlError as e:
         return _control_error(e, detail=True)
     except Exception as e:
@@ -390,8 +400,9 @@ async def get_supported_config():
 
 @app.patch("/api/config")
 async def update_supported_config(request: Request):
-    """Change allowlisted settings: {"dotted.path": value, ...}. A secret or
-    an unsupported field is refused before anything is written."""
+    """Change allowlisted settings: {"revision": <from GET>, "changes":
+    {"dotted.path": value, ...}}. A secret or an unsupported field is refused
+    before anything is written; so is a stale revision."""
     from mercury.control.settings import ConfigService
 
     body = await _json_body(request)
@@ -399,7 +410,10 @@ async def update_supported_config(request: Request):
         return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
     async with _env_lock:
         try:
-            result = await ConfigService(DASHBOARD).update(body)
+            state = _state()
+            await state.init_db()
+            result = await ConfigService(_ctx(request), state).update(
+                body.get("changes"), body.get("revision"))
         except ControlError as e:
             return _control_error(e, detail=True)
         except Exception as e:
@@ -618,7 +632,7 @@ def _state():
     return StateManager(db_path=str(DB_PATH))
 
 
-def _outbox(with_pool: bool = False) -> OutboxService:
+def _outbox(with_pool: bool = False, request: Request | None = None) -> OutboxService:
     """The outbox commands, wired the way the sender sees the world. The
     pool is only needed to say which mailbox an email goes out from."""
     pool = None
@@ -627,7 +641,7 @@ def _outbox(with_pool: bool = False) -> OutboxService:
             _cfg, pool = _mail_context()
         except Exception:
             pool = None
-    return OutboxService(DASHBOARD, _state(), _demo_config(), pool)
+    return OutboxService(_ctx(request), _state(), _demo_config(), pool)
 
 
 @app.get("/api/outbox")
@@ -751,38 +765,50 @@ async def test_inbox(email: str):
 
 
 @app.post("/api/outbox/approve-all")
-async def outbox_approve_all():
-    try:
-        result = await (await _outbox().ready()).approve_all()
-        return {"success": True, "approved": result["approved"]}
-    except Exception as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
-
-
-@app.post("/api/outbox/{item_id}/approve")
-async def outbox_approve(item_id: str):
-    try:
-        result = await (await _outbox().ready()).approve(item_id)
-        return {"success": True, "followups_approved": result["followups_approved"]}
-    except (NotFound, Conflict):
-        return {"success": False, "followups_approved": 0}
-    except Exception as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
-
-
-@app.post("/api/outbox/batch")
-async def outbox_batch(request: Request):
-    """Approve or reject an explicit list of ids: {"action", "ids"}."""
+async def outbox_approve_all(request: Request):
+    """Approve the emails the reviewer was shown: {"items": [{"id", "revision"}]}.
+    Anything not listed, or changed since, stays in review."""
     body = await _json_body(request)
     if body is None:
         return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
     try:
-        result = await (await _outbox().ready()).batch(body.get("action"), body.get("ids"))
+        result = await (await _outbox(request=request).ready()).approve_all(body.get("items"))
         return {"success": True, **result}
     except ControlError as e:
         return _control_error(e, detail=True)
     except Exception as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
+
+
+@app.post("/api/outbox/{item_id}/approve")
+async def outbox_approve(item_id: str, request: Request):
+    """Approve one email at the revision on screen: {"revision": n}."""
+    body = await _json_body(request) or {}
+    try:
+        result = await (await _outbox(request=request).ready()).approve(item_id, body.get("revision"))
+        return {"success": True, "followups_approved": result["followups_approved"],
+                "revision": result["revision"]}
+    except ControlError as e:
+        if e.code in ("not_found", "not_pending"):
+            return {"success": False, "followups_approved": 0}
+        return _control_error(e, detail=True)
+    except Exception as e:
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
+
+
+@app.post("/api/outbox/batch")
+async def outbox_batch(request: Request):
+    """Approve or reject a frozen list: {"action", "items": [{"id", "revision"}]}."""
+    body = await _json_body(request)
+    if body is None:
+        return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
+    try:
+        result = await (await _outbox(request=request).ready()).batch(body.get("action"), body.get("items"))
+        return {"success": True, **result}
+    except ControlError as e:
+        return _control_error(e, detail=True)
+    except Exception as e:
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
 
 
 @app.get("/api/outbox/{item_id}")
@@ -795,55 +821,65 @@ async def outbox_item(item_id: str):
 
 
 @app.post("/api/outbox/{item_id}/reject")
-async def outbox_reject(item_id: str):
+async def outbox_reject(item_id: str, request: Request):
+    """Reject one queued email at the revision on screen: {"revision": n}."""
+    body = await _json_body(request) or {}
     try:
-        result = await (await _outbox().ready()).reject(item_id)
+        result = await (await _outbox(request=request).ready()).reject(item_id, body.get("revision"))
         return {"success": True, "rejected": result["rejected"]}
-    except (NotFound, Conflict):
-        return {"success": True, "rejected": 0}
+    except ControlError as e:
+        if e.code in ("not_found", "not_queued"):
+            return {"success": True, "rejected": 0}
+        return _control_error(e, detail=True)
     except Exception as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
 
 
 @app.put("/api/outbox/{item_id}")
 async def outbox_edit(item_id: str, request: Request):
-    """The reviewer edits a draft in place. Approved mail stays approved."""
+    """The reviewer edits a draft in place: {"subject", "body", "revision"}.
+    The edit is a new revision; an approved draft goes back to review."""
     try:
         body = await request.json()
         subject = str(body.get("subject") or "").strip()[:200]
         text = str(body.get("body") or "").strip()[:4000]
-        await (await _outbox().ready()).edit(item_id, subject, text)
-        return {"success": True}
+        result = await (await _outbox(request=request).ready()).edit(
+            item_id, subject, text, body.get("revision"))
+        return {"success": True, "revision": result["revision"], "status": result["status"],
+                "approval_cleared": result["approval_cleared"]}
     except NotFound:
         return JSONResponse({"success": False,
                              "message": "only pending or approved drafts can be edited"},
                             status_code=409)
     except ControlError as e:
-        return _control_error(e)
+        return _control_error(e, detail=True)
     except Exception as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
 
 
 @app.post("/api/outbox/{item_id}/reschedule")
 async def outbox_reschedule(item_id: str, request: Request):
-    """Move a queued email to a new send time (stored as naive UTC)."""
+    """Move a queued email to a new send time (stored as naive UTC):
+    {"send_at", "revision"}. An approved email goes back to review."""
     try:
         body = await request.json()
     except Exception:
         body = {}
-    raw = (body or {}).get("send_at") if isinstance(body, dict) else None
-    when = _parse_send_at(raw)
+    body = body if isinstance(body, dict) else {}
+    when = _parse_send_at(body.get("send_at"))
     if when is None:
         return JSONResponse(
             {"success": False, "error": "send_at must be an ISO datetime"},
             status_code=400)
     try:
-        result = await (await _outbox().ready()).reschedule(item_id, when)
-        return {"success": True, "send_at": result["send_at"]}
+        result = await (await _outbox(request=request).ready()).reschedule(
+            item_id, when, body.get("revision"))
+        return {"success": True, "send_at": result["send_at"], "revision": result["revision"],
+                "status": result["status"], "approval_cleared": result["approval_cleared"]}
     except ControlError as e:
-        return _control_error(e, "error", {"not_editable": 400})
+        return _control_error(e, "error", {"not_editable": 400}, detail=True)
     except Exception as e:
-        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+        return JSONResponse({"success": False, "error": redact_text(e)}, status_code=500)
 
 
 # ── Out-of-office pauses ──
@@ -1248,7 +1284,7 @@ async def get_calendar(start: str | None = None, end: str | None = None):
     except Exception as e:
         logger.debug("calendar init_db failed: %s", e)
     rows = await query_db(
-        f"""SELECT o.id, {_CAL_EVENT_EXPR} AS at, o.kind, o.step, o.status,
+        f"""SELECT o.id, {_CAL_EVENT_EXPR} AS at, o.kind, o.step, o.status, o.revision,
                    o.subject, o.to_email, o.prospect_id, o.campaign_id, o.error,
                    o.body, COALESCE(o.mailbox, '') AS mailbox, p.first_name, p.last_name,
                    COALESCE(NULLIF(c.name, ''), p.company, '') AS company_name
@@ -1283,6 +1319,7 @@ async def get_calendar(start: str | None = None, end: str | None = None):
             "step": int(r.get("step") or 1),
             "label": _outbox_label(kind, r.get("step")),
             "status": r.get("status") or "",
+            "revision": int(r.get("revision") or 1),
             "subject": r.get("subject") or "",
             "to_email": r.get("to_email") or "",
             "prospect_id": r.get("prospect_id") or "",
@@ -1304,8 +1341,10 @@ async def outbox_regenerate(item_id: str, request: Request):
             body = await request.json()
         except Exception:
             body = {}
-        instruction = str((body or {}).get("instruction") or "").strip()[:500]
-        updated = await (await _outbox().ready()).regenerate(item_id, instruction)
+        body = body if isinstance(body, dict) else {}
+        instruction = str(body.get("instruction") or "").strip()[:500]
+        updated = await (await _outbox(request=request).ready()).regenerate(
+            item_id, instruction, body.get("revision"))
         return {"success": True, **updated}
     except NotFound as e:
         if e.code != "not_found":
@@ -1314,9 +1353,9 @@ async def outbox_regenerate(item_id: str, request: Request):
                              "message": "only pending or approved drafts can be regenerated"},
                             status_code=409)
     except ControlError as e:
-        return _control_error(e)
+        return _control_error(e, detail=True)
     except Exception as e:
-        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+        return JSONResponse({"success": False, "message": redact_text(e)}, status_code=500)
 
 
 @app.post("/api/sending/{action}")

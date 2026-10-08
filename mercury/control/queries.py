@@ -130,6 +130,15 @@ class QueryService:
         rows = await self._rows("SELECT * FROM actions ORDER BY created_at DESC LIMIT ?", (int(limit),))
         return _decode(rows, "details_json", "details", {})
 
+    async def audit(self, object_type: str = "", object_id: str = "", limit: int = 100) -> list[dict]:
+        """Operator commands, newest first: who, through which client, on
+        what, revisions before and after, and how each ended."""
+        self.ctx.require("read")
+        if not Path(self.state.db_path).exists():
+            return []
+        await self.state.init_db()
+        return await self.state.get_audit(object_type, object_id, limit)
+
     async def runs(self, limit: int = 25) -> list[dict]:
         """The collector run log: what ran, when, what it produced and cost."""
         self.ctx.require("read")

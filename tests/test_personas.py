@@ -140,12 +140,14 @@ def test_regeneration_keeps_original_version_and_every_prompt(client, monkeypatc
     original = profile(client, persona_id)
     draft = client.post("/api/personas/preview", json={"prospect_id":pid, "version_id":original["version_id"]}).json()
     item_id = queue(client, draft, pid, status="approved")
-    assert client.put(f"/api/outbox/{item_id}", json={"subject":"edited subject", "body":"Edited by a person"}).status_code == 200
+    edited = client.put(f"/api/outbox/{item_id}", json={"subject":"edited subject", "body":"Edited by a person", "revision":1})
+    assert edited.status_code == 200 and edited.json()["approval_cleared"] is True
     assert run(client.state.get_outbox_item(item_id))["manually_edited"] == 1
     client.post(f"/api/personas/{persona_id}/save", json=update_body(original, tone="formal", avatar_seed=AVATAR_SEEDS[7]))
     client.post("/api/personas/workspace/default")
-    regenerated = client.post(f"/api/outbox/{item_id}/regenerate", json={"instruction":"Shorter please"})
+    regenerated = client.post(f"/api/outbox/{item_id}/regenerate", json={"instruction":"Shorter please", "revision":2})
     assert regenerated.status_code == 200, regenerated.text
+    assert regenerated.json()["revision"] == 3
     assert regenerated.json()["writing_persona"]["version_id"] == original["version_id"]
     assert regenerated.json()["status"] == "pending_review" and not regenerated.json()["manually_edited"]
     history = client.get(f"/api/outbox/{item_id}/generation-history").json()["generations"]
@@ -156,7 +158,7 @@ def test_regeneration_keeps_original_version_and_every_prompt(client, monkeypatc
     assert "Shorter please" in history[0]["prompt"]
     assert "Shorter please" not in history[1]["prompt"]
     run(client.state.update_outbox_item(item_id, status="sent", sent_at="2026-10-08T12:00:00"))
-    assert client.post(f"/api/outbox/{item_id}/regenerate", json={}).status_code == 409
+    assert client.post(f"/api/outbox/{item_id}/regenerate", json={"revision":3}).status_code == 409
     sent = client.get("/api/outbox").json()["sent"][0]
     assert sent["writing_persona"]["version_id"] == original["version_id"]
 
@@ -213,7 +215,8 @@ def test_reply_inherits_thread_voice_after_default_changes(client, monkeypatch):
     history = run(PersonaStore(client.state).history(reply["id"]))
     assert history[0]["persona"]["version_id"] == original["version_id"]
     assert history[0]["prompt"] == response_model.await_args.args[0]
-    regeneration = client.post(f"/api/outbox/{reply['id']}/regenerate", json={"instruction":"Make the next step specific"})
+    regeneration = client.post(f"/api/outbox/{reply['id']}/regenerate",
+                               json={"instruction":"Make the next step specific", "revision":reply["revision"]})
     assert regeneration.status_code == 200, regeneration.text
     assert regeneration.json()["subject"] == "Re: your quotes"
     assert regeneration.json()["kind"] == "reply"
