@@ -1158,6 +1158,136 @@ def cmd_demos(args):
         sys.exit(1)
 
 
+def cmd_exclusions(args):
+    """Exclusions: addresses and domains Mercury never emails."""
+    import json
+
+    from mercury.control.exclusions import ExclusionError, ExclusionService
+    from mercury.state import StateManager
+
+    async def _run():
+        service = await ExclusionService(StateManager(), _load_config_quiet()).ready()
+        action = args.exclusions_action
+        if action in ("add", "remove", "check", "import") and not args.target:
+            raise ExclusionError("invalid", f"Missing argument: mercury exclusions {action} ...")
+        if action == "list":
+            rules = await service.list(args.search, removed=args.removed)
+            if args.json:
+                return print(json.dumps(rules, indent=2))
+            if not rules:
+                return print("\n  No exclusions." + ("" if args.removed else
+                             " Add one: mercury exclusions add jane@acme.com --reason ...") + "\n")
+            print(f"\n  {'Id':<13} {'Added':<17} Rule")
+            for r in rules:
+                when = (r["removed_at"] or r["created_at"])[:16]
+                extra = f"  ({r['reason']})" if r["reason"] else ""
+                print(f"  {r['id']:<13} {when:<17} {r['description']}{extra}")
+            print()
+        elif action == "add":
+            kind = args.kind or ("email" if "@" in args.target.strip("@") else "domain")
+            rule = await service.add(kind, args.target, reason=args.reason,
+                                     include_subdomains=args.subdomains, actor="cli")
+            if args.json:
+                return print(json.dumps(rule, indent=2))
+            verb = "Added" if rule["created"] else "Already excluded:"
+            print(f"\n  {verb} {rule['description']}.")
+            if rule.get("blocked"):
+                print(f"  {rule['blocked']} queued email(s) are now blocked.")
+            print()
+        elif action == "remove":
+            result = await service.remove(args.target, note=args.note, actor="cli",
+                                          confirm_opt_out=args.confirm_opt_out)
+            if args.json:
+                return print(json.dumps(result, indent=2))
+            print(f"\n  Lifted: {result['description']}.")
+            for other in result["still_excluded_by"]:
+                print(f"  Still excluded by: {other['description']}.")
+            print("  Blocked emails stay blocked until you send them back to review.\n")
+        elif action == "check":
+            result = await service.check(args.target)
+            if args.json:
+                return print(json.dumps(result, indent=2))
+            if not result["excluded"]:
+                return print(f"\n  {result['email']} is not excluded.\n")
+            print(f"\n  {result['email']} is excluded by:")
+            for r in result["rules"]:
+                print(f"    {r['description']}")
+            print()
+        elif action == "import":
+            data = sys.stdin.buffer.read() if args.target == "-" else Path(args.target).read_bytes()
+            result = await service.import_csv(data, actor="cli", reason=args.reason)
+            if args.json:
+                return print(json.dumps(result, indent=2))
+            print(f"\n  Added {result['added']}; {result['already_excluded']} already excluded; "
+                  f"{result['invalid_count']} invalid.")
+            for bad in result["invalid"][:20]:
+                print(f"    row {bad['row']}: {bad['error']}")
+            print()
+        elif action == "export":
+            text = await service.export_csv(removed=args.removed)
+            if args.target and args.target != "-":
+                Path(args.target).write_text(text)
+                print(f"\n  Wrote {args.target}\n")
+            else:
+                print(text, end="")
+
+    try:
+        asyncio.run(_run())
+    except (ExclusionError, OSError) as error:
+        print(f"\n  {error}\n")
+        sys.exit(1)
+
+
+def cmd_holds(args):
+    """Company holds: cold mail to a company paused after a reply, or by you."""
+    import json
+
+    from mercury.control.exclusions import ExclusionError, ExclusionService
+    from mercury.state import StateManager
+
+    async def _run():
+        service = await ExclusionService(StateManager(), _load_config_quiet()).ready()
+        action = args.holds_action
+        if action != "list" and not args.target:
+            raise ExclusionError("invalid", f"Missing argument: mercury holds {action} ID")
+        if action == "list":
+            holds = await service.holds(released=args.released)
+            if args.json:
+                return print(json.dumps(holds, indent=2))
+            if not holds:
+                return print("\n  No company is on hold.\n")
+            print(f"\n  {'Hold':<13} {'Since':<17} {'Queued':>6}  Company")
+            for h in holds:
+                name = h["company_name"] or h["company_domain"] or h["company_id"]
+                print(f"  {h['id']:<13} {h['created_at'][:16]:<17} {h['queued']:>6}  "
+                      f"{name}: {h['reason_text']}")
+            print("\n  Resume one: mercury holds release HOLD_ID --note ...\n")
+        elif action == "hold":
+            hold = await service.hold(args.target, note=args.note, actor="cli")
+            print(json.dumps(hold, indent=2) if args.json else
+                  f"\n  {'Holding' if hold['created'] else 'Already holding'} cold mail to "
+                  f"company {args.target}.\n")
+        elif action == "release":
+            released = await service.release(args.target, note=args.note, actor="cli")
+            print(json.dumps(released, indent=2) if args.json else
+                  "\n  Resumed. Approved cold mail to that company goes out again; drafts "
+                  "still wait for review.\n")
+
+    try:
+        asyncio.run(_run())
+    except ExclusionError as error:
+        print(f"\n  {error}\n")
+        sys.exit(1)
+
+
+def _load_config_quiet():
+    try:
+        from mercury.config import load_config
+        return load_config()
+    except Exception:
+        return None
+
+
 def cmd_sending(args):
     """Pause/resume the sending kill switch."""
     from mercury.state import StateManager
@@ -1336,6 +1466,35 @@ def main():
     sub.add_argument("--all-rows", action="store_true", help="show: list every row")
     sub.add_argument("--json", action="store_true", help="Machine-readable output")
     sub.set_defaults(func=cmd_imports)
+
+    sub = subparsers.add_parser(
+        "exclusions", help="Addresses and domains Mercury never emails")
+    sub.add_argument("exclusions_action", nargs="?", default="list",
+                     choices=["list", "add", "remove", "check", "import", "export"])
+    sub.add_argument("target", nargs="?", default="",
+                     help="add: email or domain; remove: rule id; check: email; "
+                          "import/export: CSV file (- for stdin/stdout)")
+    sub.add_argument("--kind", choices=["email", "domain"], default="",
+                     help="add: force the rule kind (default: guessed from the value)")
+    sub.add_argument("--subdomains", action="store_true",
+                     help="add: a domain rule also matches its subdomains")
+    sub.add_argument("--reason", default="", help="add/import: why (kept in the audit log)")
+    sub.add_argument("--note", default="", help="remove: why you are lifting it")
+    sub.add_argument("--confirm-opt-out", action="store_true",
+                     help="remove: lift an opt-out (the person asked to hear from you again)")
+    sub.add_argument("--search", default="", help="list: filter by address, domain or reason")
+    sub.add_argument("--removed", action="store_true", help="list/export: include lifted rules")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub.set_defaults(func=cmd_exclusions)
+
+    sub = subparsers.add_parser("holds", help="Company holds: list, hold, release")
+    sub.add_argument("holds_action", nargs="?", default="list",
+                     choices=["list", "hold", "release"])
+    sub.add_argument("target", nargs="?", default="", help="hold: company id; release: hold id")
+    sub.add_argument("--note", default="", help="Why (kept with the hold)")
+    sub.add_argument("--released", action="store_true", help="list: show past holds")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub.set_defaults(func=cmd_holds)
 
     # mercury sending pause|resume|status
     sub = subparsers.add_parser("discover", help="Find businesses matching your ICP")

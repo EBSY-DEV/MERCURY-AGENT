@@ -689,6 +689,9 @@ def main():
         asyncio.run(run_setup())
         return
 
+    from mercury.banner import print_banner
+
+    print_banner()
     try:
         asyncio.run(_run_with_signals())
     except KeyboardInterrupt:
