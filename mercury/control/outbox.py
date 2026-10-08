@@ -205,6 +205,11 @@ class OutboxService:
             "sent": await with_from_mailbox(state, await self._rows(
                 "SELECT * FROM outbox WHERE status = 'sent' "
                 "ORDER BY sent_at DESC LIMIT 25"), legacy),
+            # The rolling day the send caps count (sent_24h on /api/mailboxes).
+            "sent_today": await with_from_mailbox(state, await self._rows(
+                "SELECT * FROM outbox WHERE status = 'sent' AND replace(sent_at, 'T', ' ') >= "
+                "strftime('%Y-%m-%d %H:%M:%S', 'now', '-24 hours') "
+                "ORDER BY sent_at DESC LIMIT 200"), legacy),
             "failed": await self._rows(
                 "SELECT * FROM outbox WHERE status IN ('failed','rejected','cancelled') "
                 "ORDER BY updated_at DESC LIMIT 25"),
@@ -212,11 +217,15 @@ class OutboxService:
         from mercury.offers import annotate_outbox as annotate_offers
         from mercury.pains import annotate_outbox as annotate_pains
 
-        buckets = ("pending", "approved", "blocked", "sending", "sent", "failed")
+        from mercury.outbox_context import annotate_contacts, annotate_review
+
+        buckets = ("pending", "approved", "blocked", "sending", "sent", "sent_today", "failed")
         for bucket in buckets:
             self._with_wire_subject(with_draft_checks(data[bucket]))
             await annotate_offers(state, self.config, data[bucket])
         await annotate_pains(state, [row for bucket in buckets for row in data[bucket]])
+        await annotate_review(state, self.config, data["pending"] + data["approved"])
+        await annotate_contacts(state, [row for bucket in buckets[2:] for row in data[bucket]])
         return data
 
     async def _item(self, item_id: str) -> dict:
@@ -242,6 +251,9 @@ class OutboxService:
         from mercury.pains import annotate_outbox as annotate_pains
 
         await annotate_pains(self.state, rows)
+        from mercury.outbox_context import annotate_review
+
+        await annotate_review(self.state, self.config, rows)
         return self._with_wire_subject(with_draft_checks(rows))[0]
 
     # ── Review ──
