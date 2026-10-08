@@ -7,7 +7,31 @@ minor versions can still change behaviour.
 
 ## [Unreleased]
 
+### Added
+
+- **Exclusions and company limits.** Exact-address and domain exclusions
+  (subdomains only when you ask), with a reason, a source and an append-only
+  history. Opt-outs and bounces are recorded as exclusions on the address, so
+  deleting, re-importing or rediscovering a contact never reactivates it.
+  Exclusions are re-checked in the transaction that claims each email, and
+  queued email they cover is blocked until you send it back to review. New
+  per-company limits (`max_new_contacts_per_company_per_day`,
+  `max_active_contacts_per_company`) and a company hold when someone replies
+  (`pause_company_on_reply`, on by default). Dashboard **Exclusions** tab,
+  reasons in the Outbox, and `mercury exclusions` / `mercury holds` commands.
+  Requeued exclusions require a fresh approval even with automatic follow-ups;
+  blocked sequences can be discarded without lifting their exclusion. Active
+  company limits count each contact once across campaigns.
+
 ### Changed
+
+- **`mercury run` opens with the logo.** The mark is drawn in the terminal with quadrant blocks (rasterised
+  from the symbol's own geometry), with the name, version and folder beside it. Printed only to a terminal,
+  not to a log file or a service journal, and not for `--once`. Narrow terminals get the plain dot and
+  name; terminals that cannot encode it get an ASCII fallback. `NO_COLOR` turns the colour off.
+- **`max_bounce_rate` now defaults to 2%** (was 5%), and the rate check starts
+  after 50 sends (was 10). Configs that set the value keep it. `mercury sending
+  resume` and the dashboard's Resume now clear the per-bucket counters too.
 
 - **Harvey is now Mercury Agent.** The package (`mercury/`), CLI
   (`mercury ...`), config (`mercury.yaml`, `mercury.local.yaml`) and database
@@ -39,6 +63,58 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Bounces are classified by SMTP code** (#54). The Handler reads the enhanced
+  status code (`5.1.1`, `5.7.26`) from each bounce and stores `dsn_code` and a
+  `bucket` on the `bounce` event. A bad address (`LIST`) invalidates the prospect
+  as before; a sender block (`SENDER`, any 5.7.x) pauses that mailbox; a `BURNED`
+  code (5.7.606 to 5.7.614) pauses every mailbox on the domain and flags it
+  `CANCEL_CANDIDATE`; a 4.x.x throttle halves the mailbox's cap for 7 days; and
+  `NOISE` (mailbox full and similar) is ignored by every rate. The global kill
+  switch now also trips when sender plus burned bounces pass 20% of the
+  classified ones (after 30). The Mailboxes drawer shows the breakdown. No schema
+  change.
+
+- **Out-of-office pauses** (#4). A vacation auto-reply no longer lets the
+  follow-ups keep landing while the person is away. On the native Gmail/SMTP
+  path Mercury pauses that contact's remaining cold steps, reads the return date
+  (English and Spanish: "until October 20", "hasta el 20 de octubre", "back
+  Monday", "for two weeks") against the time the message arrived in your
+  `usage.quiet_hours.timezone`, and resumes at the end of quiet hours on that
+  day (Monday if it falls on a weekend), or `channels.email.ooo_resume_buffer_days`
+  business days later if you set one. A missing, ambiguous, impossible or
+  past date pauses the contact into a "return date needs review" state that
+  never resumes by itself. The pause is stored in the new `sequence_pauses`
+  table (migration v14), survives restarts, leaves approvals and drafts alone,
+  and is ended by a human reply, opt-out, bounce or closing the contact.
+  Paused contacts show on the Outbox tab, where you can set a date or resume
+  them. Acknowledgements, ticket replies and read receipts are recorded as
+  `auto_reply` events and change nothing. The Instantly path cannot pause a
+  remote sequence and says so in the activity log.
+
+- **Demo gate** (#62). An offer under `offers:` with `requires_demo: true`
+  holds every sequence email that carries its key until the prospect's demo
+  is marked ready, so an email never claims something was built before it
+  was. A `demos` table tracks each demo (requested, ready, retired) with its
+  link, recording, agent id and builder. `mercury demos` lists who is waiting
+  and marks demos ready or retired; the Outbox shows why an email waits with
+  a Mark ready drawer, and Today counts the contacts waiting. The gate fails
+  closed on an unknown offer or a failed check. Ready demos retire
+  `demos.retire_after_days` after the last email to a contact who never
+  replied. Campaigns and outbox rows gain an `offer_key` for the offer router
+  (#57) to fill.
+
+- **Deliverability health and a placement test** (#53). `mercury health`, a
+  Deliverability card on Today and a verdict per domain on the Mailboxes tab
+  show each sending domain's sends, replies and bounces over 7, 14 and 30 days,
+  its sending age, and a verdict: too young (under 30 days), not enough data
+  (under 200 sends for the reply rate, 50 for bounces), keep (1% replies after
+  200) or cancel candidate (0 replies on 150+, under 1% after 200, or a burned
+  bounce code once bounces are classified). `mercury mail placement` sends the
+  real email 1 from every mailbox, plus a control sender, to seed inboxes you
+  own, reads where each copy landed over IMAP and says whether it is the domain
+  or the copy. It never touches the outbox or a daily cap. Results go in a new
+  `placement_tests` table (created on first use) and show next to the DNS
+  checklist. Configure under `channels.email.placement`.
 - **CSV contact import** (#3). Dashboard (Contacts → Import CSV), `mercury import`
   share one service. It has a read-only preview
   with per-row outcomes (new, needs enrichment, duplicate, invalid), column

@@ -65,7 +65,7 @@ Catch-all domains come back `risky`, not `guess`. Those are sent only with `send
 
 Check in this order:
 
-1. `mercury sending`: is the kill switch on?
+1. `mercury sending`: did you pause sending, or is a hold on (bounces, compliance, an inbox)?
 2. The log or Today: "compliance hold" means `compliance.postal_address` is empty.
 3. `mercury outbox`: are emails waiting for approval?
 4. `mercury mail test`: are the provider credentials and ports working?
@@ -79,7 +79,9 @@ Check in this order:
 mercury sending pause
 ```
 
-Or press **Pause all sending** on the Outbox tab. Nothing leaves the outbox until you resume; drafts keep accumulating for review. `mercury sending resume` (or **Resume sending**) turns it back on and resets the bounce counter. Mercury pauses itself the same way when bounces pass `max_bounce_rate`.
+Or press **Pause all sending** on the Outbox tab. Nothing new leaves the outbox until you resume; an email already being sent finishes, and drafts keep accumulating for review. `mercury sending resume` (or **Resume sending**) lifts your pause and nothing else.
+
+Mercury also puts sending on hold by itself when bounces pass `max_bounce_rate` (default 2%) or when sender and reputation blocks pass 20% of bounces. Resume does not lift that hold and does not reset the bounce counters. Fix the cause, then run `mercury sending clear-hold` (or **Clear bounce hold** on the Outbox tab). See [Pauses and holds](email-and-deliverability.md#pauses-and-holds).
 
 ## How do I resume a paused mailbox?
 

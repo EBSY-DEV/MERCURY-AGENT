@@ -142,14 +142,8 @@ body { display: grid; grid-template-columns: 252px minmax(0, 1fr); background: v
 .sidebar::-webkit-scrollbar { display: none; }
 
 .brand { display: flex; align-items: center; gap: 10px; padding: 2px 6px; }
-.brand .mark {
-  width: 30px; height: 30px; flex: none;
-  display: flex; align-items: center; justify-content: center;
-  background: linear-gradient(140deg, #C7B6FF 0%, #9C84F0 55%, #7A5EDB 100%);
-  color: #fff; border-radius: 9px;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.35), 0 2px 8px rgba(109, 83, 211, 0.25);
-  font-family: var(--display); font-size: 15px; font-weight: 600; line-height: 1; letter-spacing: -0.02em;
-}
+.brand .mark { width: 24px; height: 24px; flex: none; color: var(--accent); }
+.brand .mark svg { display: block; width: 100%; height: 100%; fill: currentColor; } /* small cut of the Transit mark, design/brand/final */
 .brand h1 { font-family: var(--display); font-size: 15.5px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
 .brand .tagline { font-size: 11.5px; font-weight: 500; color: var(--text-3); line-height: 1.2; margin-top: 2px; }
 
@@ -213,10 +207,25 @@ body { display: grid; grid-template-columns: 252px minmax(0, 1fr); background: v
 .agent-title { font-size: 12.5px; font-weight: 600; }
 .agent-sub { font-size: 11.5px; color: var(--text-3); }
 .agent-card .ph { color: var(--text-3); font-size: 14px; }
-.status-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--text-3); }
-.status-dot.running { background: #3FA56B; box-shadow: 0 0 0 3px var(--s-good-bg); }
-.status-dot.stopped { background: var(--text-3); box-shadow: 0 0 0 3px var(--panel-raised); }
-.status-dot.offline { background: var(--s-bad); box-shadow: 0 0 0 3px var(--s-bad-bg); }
+/* The agent's presence is the Transit mark (design/brand/GUIDELINES.md section 6):
+   running = the heartbeat loop, asleep or offline = the closed disc, no dot.
+   It sits beside the agent's name and is not a status pill. */
+.agent-mark { width: 20px; height: 20px; flex: none; color: var(--accent); }
+.agent-mark svg { display: block; width: 100%; height: 100%; fill: currentColor; }
+.agent-mark.stopped, .agent-mark.offline { color: var(--text-3); }
+.agent-mark.stopped .am-dot, .agent-mark.offline .am-dot { display: none; }
+.agent-mark.stopped .am-disc, .agent-mark.offline .am-disc { mask: none; }
+.agent-mark.running .am-mv { transform-box: fill-box; transform-origin: center; animation: 2.4s infinite both; }
+.agent-mark.running .am-dot { animation-name: am-dot; }
+.agent-mark.running .am-bite { animation-name: am-dot; }
+@keyframes am-dot {
+  0%   { transform: translateX(-54.98px) scale(0); animation-timing-function: cubic-bezier(.33,1,.68,1); }
+  12%  { transform: translateX(-54.98px) scale(1); animation-timing-function: cubic-bezier(.16,1,.3,1); }
+  58%  { transform: translateX(0) scale(1); }
+  88%  { transform: translateX(0) scale(1); animation-timing-function: cubic-bezier(.5,0,.75,0); }
+  100% { transform: translateX(9.82px) scale(0); }
+}
+@media (prefers-reduced-motion: reduce) { .agent-mark.running .am-mv { animation: none; } }
 
 .shell {
   margin: 8px 8px 8px 0; min-height: calc(100dvh - 16px);
@@ -619,6 +628,10 @@ td a:hover { text-decoration: underline; }
 .desk-regen .btn { flex: none; }
 .desk-note { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-2); margin-top: 8px; }
 .desk-note .ph { font-size: 14px; color: var(--text-3); }
+/* Demo gate: why this email waits, and the way to release it */
+.desk-note.hold { flex-wrap: wrap; row-gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.desk-note.hold > span:not(.badge) { flex: 1; min-width: 200px; text-wrap: pretty; }
+.desk-note.hold .btn { flex: none; }
 
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .mono-sm { font-family: var(--mono); font-size: 12px; }
@@ -1074,6 +1087,10 @@ details[open] summary::before { content: '– '; }
 .resched-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .resched-row .form-input { width: auto; flex: 1; min-width: 200px; max-width: 260px; padding: 6px 10px; }
 
+/* Paused-for-out-of-office table: a date field and two buttons per contact. */
+.pause-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pause-actions .form-input { width: auto; padding: 5px 9px; font-family: var(--mono); font-size: 12px; }
+
 @media (max-width: 700px) {
   .drawer { top: 0; right: 0; bottom: 0; width: 100vw; border-radius: 0; border: none; }
 }
@@ -1480,6 +1497,12 @@ details[open] summary::before { content: '– '; }
 /* Summary: a stacked bar of stages, quiet issue list in the foot */
 .mb-stack { display: flex; gap: 2px; height: 6px; margin: 0 16px 16px; border-radius: 99px; overflow: hidden; }
 .mb-stack > span { min-width: 4px; }
+.mb-limits:not(:empty) { margin-top: 16px; }
+/* A badge then a sentence, one per row: inbox limits, and the sending holds
+   on the Outbox tab. */
+.mb-limit-list, .hold-list { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--text-2); }
+.mb-limit-list > div, .hold-list > div { display: flex; gap: 12px; align-items: center; }
+.mb-limit-list .badge, .hold-list .badge { white-space: nowrap; }
 .mb-issues { display: flex; flex-direction: column; gap: 3px; }
 .mb-issues .badge { white-space: normal; }
 
@@ -1554,6 +1577,8 @@ details[open] summary::before { content: '– '; }
 .mb-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden; }
 .mb-stats > div { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; }
 .mb-stats > div + div { border-left: 1px solid var(--border); }
+.mb-stats > div:nth-child(3n+1) { border-left: 0; }
+.mb-stats > div:nth-child(n+4) { border-top: 1px solid var(--border); }
 .mb-stats span { font-size: 11.5px; color: var(--text-3); }
 .mb-stats b { font-family: var(--mono); font-size: 15px; font-weight: 500; font-variant-numeric: tabular-nums; }
 .mb-stats b.is-bad { color: var(--s-bad); }
@@ -1696,3 +1721,61 @@ details[open] summary::before { content: '– '; }
 }
 .imp-error .ph { color: var(--s-bad); font-size: 16px; flex-shrink: 0; margin-top: 1px; }
 @media (max-width: 720px) { .imp-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+/* ── Deliverability health: Today card and the Mailboxes domain drawer ── */
+
+.health-table { overflow-x: auto; margin-top: 12px; border-top: 1px solid var(--border); }
+.health-table th:first-child, .health-table td:first-child { padding-left: 18px; }
+.health-table th:last-child, .health-table td:last-child { padding-right: 18px; }
+.health-table tbody tr:hover td { background: none; }
+.health-table th.num { font-family: var(--sans); }
+.health-table td:first-child { white-space: nowrap; }
+.hl-n { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.hl-sub, .hl-reason {
+  display: block; margin-top: 3px; font-family: var(--sans); font-size: 11.5px;
+  color: var(--text-3); white-space: nowrap;
+}
+.hl-age { white-space: nowrap; }
+.hl-verdict { min-width: 260px; }
+.hl-reason { white-space: normal; text-wrap: pretty; max-width: 46ch; }
+.hl-flag { display: flex; gap: 6px; align-items: flex-start; margin-top: 6px; font-size: 11.5px; color: var(--text-2); max-width: 46ch; }
+.hl-flag .ph { font-size: 13px; margin-top: 1px; color: var(--text-3); }
+.hl-flag.t-bad, .hl-flag.t-bad .ph { color: var(--s-bad); }
+.hl-flag.t-waiting .ph { color: var(--s-wait); }
+.health-rules { padding: 10px 18px 14px; border-top: 1px solid var(--border); font-size: 12.5px; color: var(--text-2); }
+.health-rules summary { color: var(--text-2); font-weight: 500; }
+.health-rules ul { margin: 8px 0 0 18px; display: grid; gap: 3px; color: var(--text-3); }
+.health-foot { flex-wrap: wrap; align-items: flex-start; }
+.health-pl { display: inline-flex; align-items: baseline; gap: 8px 10px; flex-wrap: wrap; min-width: 0; flex: 1; }
+
+.mb-verdict { display: inline-flex; }
+.hl-lead { font-size: 13.5px; color: var(--text); line-height: 1.5; margin-bottom: 12px; text-wrap: pretty; }
+.hl-stats small { font-size: 11px; color: var(--text-3); }
+.pl-table table { font-size: 12.5px; }
+.pl-table th, .pl-table td { padding: 9px 14px; vertical-align: middle; }
+.pl-table th { font-weight: 600; }
+.pl-table td b { font-weight: 500; }
+.pl-table tbody tr:hover td { background: none; }
+.pl-table .hl-sub { font-family: var(--mono); max-width: 30ch; overflow: hidden; text-overflow: ellipsis; }
+.pl-table .mb-dns-when { margin: 0; }
+/* Narrow: keep the 30-day figures and the verdict; the short windows live in the Mailboxes drawer. */
+@media (max-width: 900px) { .health-table .hl-short { display: none; } .hl-verdict { min-width: 200px; } }
+.imp-summary:has(.imp-excluded) { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.sig-stat.imp-excluded .n { color: var(--text-3); }
+
+/* ── Exclusions ──────────────────────────────────────────────── */
+
+.form-row .form-group.fit { flex: 0 0 auto; min-width: 0; }
+.ex-check { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); cursor: pointer; user-select: none; }
+.form-row .ex-check { height: 36px; }
+.ex-check input { accent-color: var(--accent); }
+.drawer-section .ex-check { margin-bottom: 4px; }
+.ex-row { cursor: pointer; }
+.ex-act { text-align: right; white-space: nowrap; width: 1%; }
+.ex-note { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; color: var(--text-2); text-wrap: pretty; }
+.ex-note .ph { font-size: 15px; color: var(--text-3); flex: none; margin-top: 2px; }
+/* A queued email's policy verdict: badge, then the plain-sentence reason. */
+.ex-why { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; margin-top: 4px; font-size: 12.5px; color: var(--text-2); white-space: normal; }
+.ex-why .badge { flex: none; }
+.desk-policy { margin: 8px 0 2px; }
+.desk-policy .ex-why { margin-top: 0; }

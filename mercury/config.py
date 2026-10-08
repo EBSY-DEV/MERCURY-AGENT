@@ -107,8 +107,9 @@ class MailboxConfig(BaseModel):
     # Preserve a legacy inbox with separate IMAP credentials when rotation
     # is enabled from the dashboard. Empty uses its SMTP password.
     imap_password_env: str = ""
-    # Steady-state ceiling once warm-up has run its course.
-    daily_cap: int = 30
+    # Steady-state ceiling once warm-up has run its course. 15 is the smtp
+    # provider ceiling (provider_daily_ceilings), so the default never warns.
+    daily_cap: int = 15
     # First day this mailbox sent cold mail. The cap starts at
     # channels.email.warmup_initial_cap and grows weekly from here. Leave
     # empty for a mailbox that is already warm. A date in the future means
@@ -136,6 +137,63 @@ class MailboxConfig(BaseModel):
         return v
 
 
+class PlacementSeedConfig(BaseModel):
+    """A seed inbox you own that the placement test sends to and reads.
+
+    Mercury reads it over IMAP to see which folder each test email landed
+    in. ``provider`` (gmail, outlook, yahoo, other) and ``imap_host`` are
+    guessed from the address when left empty; set ``provider: gmail`` for a
+    Google Workspace seed on its own domain so Primary and Promotions are
+    told apart. The password (an app password) is read from the env var in
+    ``password_env``, which must start with PLACEMENT_ or MAILBOX_. Leave it
+    empty to read the seed yourself and record the folder with
+    ``mercury mail placement mark``.
+    """
+    email: str
+    provider: str = ""
+    password_env: str = ""
+    username: str = ""
+    imap_host: str = ""
+    imap_port: int = 993
+
+    @field_validator("email")
+    @classmethod
+    def _seed_email(cls, v: str) -> str:
+        return _address(v)
+
+
+def _address(v: str) -> str:
+    v = (v or "").strip().lower()
+    if "@" not in v or v.startswith("@") or v.endswith("@"):
+        raise ValueError(f"'{v}' is not an email address")
+    return v
+
+
+class PlacementControlConfig(BaseModel):
+    """A known-good personal mailbox (usually a personal Gmail) that sends
+    the same text as the control. Its SMTP password comes from the env var
+    in ``password_env`` (PLACEMENT_* or MAILBOX_*)."""
+    email: str
+    name: str = ""
+    password_env: str = ""
+    username: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+
+    @field_validator("email")
+    @classmethod
+    def _control_email(cls, v: str) -> str:
+        return _address(v)
+
+
+class PlacementConfig(BaseModel):
+    """The inbox placement test (``mercury mail placement``)."""
+    seeds: list[PlacementSeedConfig] = []
+    control: PlacementControlConfig | None = None
+    # How long to keep looking for the test emails in the seed inboxes.
+    wait_seconds: int = 180
+
+
 class EmailChannelConfig(BaseModel):
     enabled: bool = True
     # "instantly" (legacy), "gmail" (Gmail/Workspace via API — recommended),
@@ -151,8 +209,11 @@ class EmailChannelConfig(BaseModel):
     # Set false for full autopilot once you trust the output.
     require_approval: bool = True
     # Kill switch: pause all sending when bounces exceed this fraction of
-    # sent mail (measured over the trailing sends). 0 disables the switch.
-    max_bounce_rate: float = 0.05
+    # sent mail (checked once 50 emails have gone out; NOISE bounces such as
+    # "mailbox full" do not count). 0 disables this rate check. Sender and
+    # reputation blocks (5.7.x) have their own trigger, see mercury/bounces.py.
+    # 2% is where Gmail reputation damage starts; 5% was already past it.
+    max_bounce_rate: float = 0.02
     # SMTP only: rotate sends across these mailboxes. Empty keeps the single
     # SMTP_USERNAME mailbox from .env. max_daily_sends still caps the total.
     mailboxes: list[MailboxConfig] = []
@@ -160,6 +221,13 @@ class EmailChannelConfig(BaseModel):
     # here and rises by warmup_weekly_increase every 7 days, up to daily_cap.
     warmup_initial_cap: int = 5
     warmup_weekly_increase: int = 5
+    # Inbox lifecycle limits. Breaking one is a warning (CLI, startup log and
+    # the dashboard Mailboxes tab), or a refusal to start under
+    # `mercury run --strict`. Caps are never lowered silently. Set a value to
+    # 0 (or drop a provider) to switch that check off.
+    max_inboxes_per_domain: int = 2
+    # Safe per-inbox daily_cap by provider, overridable per deployment.
+    provider_daily_ceilings: dict[str, int] = {"gmail": 30, "smtp": 15}
     # With require_approval on, approving a first email also approves its
     # follow-ups (steps 2+), so a sequence you signed off on is not stuck
     # waiting for a second and third click. Replies still need approval.
@@ -167,12 +235,40 @@ class EmailChannelConfig(BaseModel):
     # Pace the day's remaining sends evenly over the cycles left before
     # quiet hours, instead of sending up to MAX_SENDS_PER_CYCLE at once.
     spread_sends: bool = False
+    # Out-of-office replies: resume the sequence this many business days
+    # after the return date they gave. 0 resumes the morning they are back.
+    # A date you set by hand on the Outbox tab is used as is.
+    ooo_resume_buffer_days: int = 0
+    # Seed inboxes and a control sender for `mercury mail placement`.
+    placement: PlacementConfig = PlacementConfig()
+    # Company contact policy (native providers). 0 = no limit. A company is
+    # a known company record: a prospect's company_id, or a company whose
+    # domain is the email's domain. Shared providers (gmail.com, ...) never
+    # make one company, and a contact with no known company gets no limit.
+    # New contacts per company: first emails in a rolling 24 hours, the same
+    # window as max_daily_sends, so it does not depend on a timezone.
+    max_new_contacts_per_company_per_day: int = 0
+    # Contacts per company with an unfinished cold sequence (first email
+    # sent, later steps still queued). A paused sequence keeps its slot
+    # until its remaining steps are rejected or cancelled.
+    max_active_contacts_per_company: int = 0
+    # When someone at a company replies (a person, not an auto-responder or
+    # a bounce), hold cold mail to their colleagues until you resume it.
+    pause_company_on_reply: bool = True
 
-    @field_validator("max_daily_sends")
+    @field_validator("max_daily_sends", "max_new_contacts_per_company_per_day",
+                     "max_active_contacts_per_company")
     @classmethod
-    def _sends_non_negative(cls, v: int) -> int:
+    def _sends_non_negative(cls, v: int, info) -> int:
         if v < 0:
-            raise ValueError("max_daily_sends must be >= 0")
+            raise ValueError(f"{info.field_name} must be >= 0")
+        return v
+
+    @field_validator("ooo_resume_buffer_days")
+    @classmethod
+    def _buffer_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("ooo_resume_buffer_days must be >= 0")
         return v
 
     @field_validator("warmup_initial_cap", "warmup_weekly_increase")
@@ -180,6 +276,13 @@ class EmailChannelConfig(BaseModel):
     def _warmup_non_negative(cls, v: int) -> int:
         if v < 0:
             raise ValueError("warm-up values must be >= 0")
+        return v
+
+    @field_validator("max_inboxes_per_domain")
+    @classmethod
+    def _inboxes_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("max_inboxes_per_domain must be >= 0")
         return v
 
     @field_validator("mailboxes")
@@ -266,6 +369,55 @@ class ComplianceConfig(BaseModel):
     opt_out_line_es: str = '¿No es para ti? Responde "baja" y no te escribo más.'
 
 
+DEMO_KINDS = ("voice", "website")
+
+
+class OfferDefinition(BaseModel):
+    """One offer a prospect can be routed to.
+
+    Only what the demo gate needs lives here today: the key that campaigns
+    and outbox rows carry (``offer_key``), and whether the offer promises
+    something already built for that business. Routing rules, offer text and
+    CTAs belong to the offer router (#57) and extend this model.
+    """
+    key: str
+    # true: no sequence email of this offer leaves until a demo for that
+    # prospect is marked ready (`mercury demos ready`).
+    requires_demo: bool = False
+    # What the demo is: voice (an answering line) or website (a draft site).
+    demo_kind: str = ""
+
+    @field_validator("key")
+    @classmethod
+    def _valid_key(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if not v or not all(ch.isalnum() or ch in "_-" for ch in v):
+            raise ValueError("offer key must be letters, digits, '-' or '_' (e.g. 'voice')")
+        return v
+
+    @field_validator("demo_kind")
+    @classmethod
+    def _valid_kind(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if v and v not in DEMO_KINDS:
+            raise ValueError(f"demo_kind must be one of {', '.join(DEMO_KINDS)}")
+        return v
+
+
+class DemosConfig(BaseModel):
+    # A ready demo is retired this many days after the last email to a
+    # prospect who never replied. The break-up email's "stays ready for N
+    # days" must quote this number. 0 keeps demos until retired by hand.
+    retire_after_days: int = 14
+
+    @field_validator("retire_after_days")
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("retire_after_days must be >= 0")
+        return v
+
+
 class MercuryConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
@@ -273,6 +425,18 @@ class MercuryConfig(BaseModel):
     channels: ChannelsConfig = ChannelsConfig()
     usage: UsageConfig = UsageConfig()
     compliance: ComplianceConfig = ComplianceConfig()
+    offers: list[OfferDefinition] = []
+    demos: DemosConfig = DemosConfig()
+
+    @field_validator("offers")
+    @classmethod
+    def _unique_offers(cls, v: list[OfferDefinition]) -> list[OfferDefinition]:
+        seen: set[str] = set()
+        for offer in v:
+            if offer.key in seen:
+                raise ValueError(f"offer {offer.key} is listed twice")
+            seen.add(offer.key)
+        return v
 
 
 class EnvConfig(BaseModel):
@@ -304,6 +468,9 @@ class EnvConfig(BaseModel):
     # Every MAILBOX_* variable, so channels.email.mailboxes[].password_env
     # can name any of them without a field per mailbox.
     mailbox_secrets: dict[str, str] = {}
+    # Every PLACEMENT_* variable: app passwords of the placement test's seed
+    # inboxes and control sender (channels.email.placement).
+    placement_secrets: dict[str, str] = {}
 
     # Env vars a mailbox may take its password from besides MAILBOX_*. An
     # allowlist, so a typo such as password_env: TAVILY_API_KEY cannot hand
@@ -311,10 +478,13 @@ class EnvConfig(BaseModel):
     _MAILBOX_PASSWORD_FIELDS = ("SMTP_PASSWORD", "IMAP_PASSWORD")
 
     def secret(self, name: str) -> str:
-        """A mailbox password: a MAILBOX_* variable, SMTP_PASSWORD or IMAP_PASSWORD."""
+        """A mailbox password: a MAILBOX_* or PLACEMENT_* variable,
+        SMTP_PASSWORD or IMAP_PASSWORD."""
         name = (name or "").strip()
         if name.startswith("MAILBOX_"):
             return self.mailbox_secrets.get(name, "")
+        if name.startswith("PLACEMENT_"):
+            return self.placement_secrets.get(name, "")
         if name in self._MAILBOX_PASSWORD_FIELDS:
             return getattr(self, name.lower(), "") or ""
         return ""
@@ -403,6 +573,9 @@ def load_env(values=None) -> EnvConfig:
         imap_password=getenv("IMAP_PASSWORD", ""),
         mailbox_secrets={
             k: v for k, v in values.items() if k.startswith("MAILBOX_")
+        },
+        placement_secrets={
+            k: v for k, v in values.items() if k.startswith("PLACEMENT_")
         },
     )
     return env

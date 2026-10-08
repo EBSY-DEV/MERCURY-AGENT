@@ -154,9 +154,9 @@ async def decide_next_action(
     # entirely: one unreviewed email freezes the whole agent.
     sending_paused = False
     try:
-        from mercury.agents.sender import KILL_SWITCH_KEY
+        from mercury.holds import blocking
 
-        sending_paused = bool(await state.get_setting(KILL_SWITCH_KEY))
+        sending_paused = bool((await blocking(state))[0])
     except Exception:  # pragma: no cover - never block a cycle on this
         sending_paused = False
 
@@ -233,6 +233,10 @@ async def decide_next_action(
                     "SELECT COUNT(*) FROM outbox o JOIN prospects p "
                     "ON p.email = o.to_email WHERE o.status = 'approved' "
                     "AND o.sent_at IS NULL "
+                    # Mail held by an out-of-office pause is not sendable work.
+                    "AND NOT (o.kind = 'sequence' AND EXISTS ("
+                    "SELECT 1 FROM sequence_pauses sp WHERE sp.prospect_id = o.prospect_id "
+                    "AND sp.state IN ('paused', 'needs_review'))) "
                     f"AND p.email_status IN ({placeholders})",
                     statuses,
                 ) as cursor:
@@ -309,6 +313,14 @@ async def build_runtime() -> Runtime | None:
         logger.error(f"Cannot start \u2014 configuration error:\n{e}")
         return None
 
+    try:
+        from mercury.integrations.mailboxes import inbox_limit_warnings
+
+        for w in inbox_limit_warnings(config):
+            logger.warning(f"Inbox limits: {w['message']}")
+    except Exception as e:  # advisory only: never block startup
+        logger.debug(f"Inbox limit check skipped: {e}")
+
     env = load_env()
     state = StateManager()
     brain = Brain(state)
@@ -360,6 +372,15 @@ async def run_cycle(rt: Runtime) -> str:
             )
     except Exception as e:
         logger.warning(f"Could not recover stale outbox rows: {e}")
+
+    # Retire demos nobody answered (demos.retire_after_days). One query, no
+    # model call.
+    try:
+        from mercury.demos import retire_stale_demos
+
+        await retire_stale_demos(rt.state, config)
+    except Exception as e:
+        logger.warning(f"Could not retire stale demos: {e}")
 
     # 1. Check usage budget (real subscription quota when readable, else
     # Mercury's own call counter)
@@ -503,6 +524,12 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     rt = await build_runtime()
     if rt is None:
         return
+    # A shutdown request reaches the drain too: it claims nothing new and the
+    # email already in flight finishes before the cycle returns.
+    try:
+        rt.sender.stop_event = stop_event
+    except AttributeError:  # pragma: no cover - a stand-in sender in tests
+        pass
 
     interval = rt.config.usage.heartbeat_interval_minutes * 60
     consecutive_errors = 0
@@ -668,6 +695,9 @@ def main():
         asyncio.run(run_setup())
         return
 
+    from mercury.banner import print_banner
+
+    print_banner()
     try:
         asyncio.run(_run_with_signals())
     except KeyboardInterrupt:
