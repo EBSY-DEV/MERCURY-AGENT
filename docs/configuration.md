@@ -345,6 +345,22 @@ offers:
 
 **Greeting.** A contact with a name of their own, or a registry name a person accepted ([Public registry lookup](prospecting.md#public-registry-lookup)), is greeted by first name. A registry name still waiting for review is not used. A shared inbox (`info@`, `office@`, ...) with no known name gets no greeting at all, generic or by business name, and the email's one ask is a short request to pass the message to the offer's `routing_role` (else `writer.routing_role`). If the model writes a generic greeting anyway, it is removed in code for such a reader and flagged for a named one. The Sender drops a `Hi {{first_name}},` line from the template for contacts with no usable name.
 
+### `experiments`
+
+Defaults for new A/B experiments and the checks that come before any result. See [experiments.md](experiments.md).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `classify_outcomes` | `true` | Label replies of prospects in an experiment with the outcome classifier (one Claude call per human reply, only within budget). Off: labels come from the handler's intent. |
+| `confidence_threshold` | `0.7` | A label below this is uncertain and never counted as positive. |
+| `response_window_days` | `14` | Default response window offered for a new experiment. |
+| `min_per_arm` | `50` | Default mature prospects per arm before a result is shown. |
+| `min_duration_days` | `14` | Default shortest run before a decision. |
+| `health_min_mature` | `30` | Mature prospects (both arms) before the health checks apply. |
+| `low_reply_rate` | `0.01` | Below this any-reply rate, check deliverability before reading the copy result. |
+| `high_bounce_rate` | `0.05` | Above this bounce rate, the same. |
+| `max_classifications_per_cycle` | `20` | Outcome classifier calls per heartbeat at most. |
+
 ## Environment variables (`.env`)
 
 Copy `.env.example` to `.env`. Mercury loads the project's `.env` into the process environment (variables already set in the environment win), so a container or a scheduled job can inject the same variables without a file. `.env` is gitignored.

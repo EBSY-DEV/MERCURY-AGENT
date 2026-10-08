@@ -18,6 +18,7 @@ Mercury Agent is a single Python process that wakes up on a timer, decides what 
 | Gate | `mercury/gate.py` | Deterministic pre-send checks. |
 | Warm-up | `mercury/warmup.py` | Health gates, the week-by-week plan, DNS checks. |
 | Metrics | `mercury/metrics.py` | Sent / replies / positive / bounces definitions shared by the trend chart, heatmap and health gates. |
+| Experiments | `mercury/experiments.py`, `experiment_stats.py`, `control/experiments.py` | A/B experiments: stable arm assignment before drafting, exposure stamped on outgoing mail, outcome labels, attributed results with intervals. See [experiments.md](experiments.md). |
 | Email finding | `mercury/integrations/email_finder.py` | Pattern-first address discovery and single-candidate verification. |
 | Dashboard | `mercury/dashboard.py`, `mercury/web/` | FastAPI JSON API plus plain HTML, CSS and JS served from disk. |
 | Trainer | `mercury/trainer.py` | `mercury train`: crawl a site, write `mercury.local.yaml` and product skills. |
@@ -26,7 +27,7 @@ Mercury Agent is a single Python process that wakes up on a timer, decides what 
 ### Agents
 
 - **Scout** finds people. Python does the searching (Serper, Tavily, DuckDuckGo, Bing, Google), the scraping, the inbox sweep over discovered companies, tech detection and email resolution; Claude only scores and personalizes contacts that were already found.
-- **Writer** turns verified `new` prospects into three-step sequences (opener, follow-up, break-up) and stores them as draft campaigns. It can also regenerate a single outbox email on request. With `offers:` configured, it first routes each prospect to one offer (`mercury/offers.py`, deterministic: first matching rule, else the default), groups campaigns by offer, and writes from that offer's brief only.
+- **Writer** turns verified `new` prospects into three-step sequences (opener, follow-up, break-up) and stores them as draft campaigns. It can also regenerate a single outbox email on request. With `offers:` configured, it first routes each prospect to one offer (`mercury/offers.py`, deterministic: first matching rule, else the default), groups campaigns by offer, and writes from that offer's brief only. Prospects in a running experiment are then assigned an arm and written with that arm's persona and instruction, inside the same offer.
 - **Sender** stages draft campaigns into the outbox and drains due, approved rows through the mailbox pool and the gate. On the legacy Instantly path it deploys campaigns through the Instantly API instead.
 - **Handler** polls inboxes, stores every message before handling it (a failure is retried next cycle, not dropped), separates bounces from human replies, classifies intent, advances conversation stages, queues replies, handles bounces and the kill switch.
 - **Analyst** writes `data/analytics.json` with pipeline and campaign stats. No Claude calls.
@@ -94,7 +95,8 @@ Each cycle (`run_cycle` in `mercury/main.py`):
    - polls inboxes and handles replies and bounces (native providers, when within budget),
    - profiles up to 25 unprofiled companies (free),
    - runs the Scout's inbox sweep over discovered companies with no contact yet,
-   - starts the daily background discovery if one is due (it runs as a separate task and never blocks a cycle).
+   - starts the daily background discovery if one is due (it runs as a separate task and never blocks a cycle),
+   - labels the outcome of new replies from prospects in an experiment (one Claude call each, only within budget).
 
    Tasks run concurrently with `asyncio.gather`; one failing agent is logged and never takes down the cycle.
 5. **Log** the action to `actions` and sleep `heartbeat_interval_minutes`. Consecutive failures back off 60 s, 120 s, 240 s, ... up to 15 minutes.
@@ -127,6 +129,7 @@ When the CLI runs as root (typical in hosted runners), the Brain sets `IS_SANDBO
 | `email_patterns` | Learned address patterns per domain. |
 | `settings` | Key/value flags: `operator_pause` (your pause), `sending_paused` (the bounce kill switch, a health hold), `bounce_count`, `discovery_provider`, cached geocodes and DNS results. See `mercury/holds.py`. |
 | `warmup_inboxes` | The warm-up overlay: manual or automatic pause, checklist, notes. |
+| `experiments`, `experiment_revisions`, `experiment_arms`, `experiment_assignments`, `experiment_outcomes` | A/B experiments: definitions, frozen revisions and arms, one permanent assignment per prospect, outcome labels. Outbox rows carry `experiment_id`, `experiment_revision_id` and `experiment_arm_id` ('' for unassigned mail). |
 
 Migrations are a list of SQL scripts in `MIGRATIONS` (`mercury/state.py`). The schema version is `PRAGMA user_version`; `init_db()` takes a write lock, re-reads the version, and applies each pending script and its version bump inside one transaction. Never edit or reorder a released migration; append a new one.
 

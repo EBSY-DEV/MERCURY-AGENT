@@ -121,9 +121,9 @@ When sending starts, the approved text and persona are frozen together; edits
 and regeneration are rejected. If a process stops during a provider call, the
 row remains in **Sending** for reconciliation with the mailbox rather than
 automatically sending a possible duplicate.
-Emails written before history tracking show **Unknown persona**. This release
-collects attribution for future persona reports and A/B tests; it does not yet
-assign experiment variants or calculate persona conversion rates.
+Emails written before history tracking show **Unknown persona**. Persona
+experiments (one persona per arm, compared on positive replies) are run through
+the experiments API; see [experiments.md](experiments.md).
 
 ## Outbox
 
