@@ -467,7 +467,7 @@ main:has(> #pipeline.active), main:has(> #calendar.active) { max-width: none; pa
   display: inline-flex; align-items: center; gap: 7px;
   font-family: var(--sans); font-size: 13px; font-weight: 500;
   padding: 7px 14px; border-radius: var(--r-sm); border: 1px solid transparent;
-  cursor: pointer; white-space: nowrap;
+  cursor: pointer; white-space: nowrap; text-decoration: none;
   transition: background .15s, border-color .15s, color .15s;
 }
 .btn:active:not(:disabled) { transform: translateY(1px) scale(0.99); }

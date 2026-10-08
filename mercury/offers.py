@@ -294,14 +294,17 @@ def _number(value: float) -> str:
 def fact_line(observation: dict) -> str:
     label = observation.get("label") or observation.get("signal_code", "")
     num, text = observation.get("value_num"), (observation.get("value_text") or "").strip()
+    when = str(observation.get("observed_at") or "")[:10]
+    seen = f" (observed {when})" if when else ""
     if observation.get("value_type") == "bool":
-        value = "yes" if is_positive(observation) else "no"
-    elif num is not None:
+        # A true flag reads as the statement itself ("No website at all"),
+        # not "No website at all: yes", in the brief and on the review desk.
+        return f"- {label}{seen}" if is_positive(observation) else f"- {label}: no{seen}"
+    if num is not None:
         value = _number(num) + (f" ({text})" if text else "")
     else:
         value = text or "yes"
-    when = str(observation.get("observed_at") or "")[:10]
-    return f"- {label}: {value}" + (f" (observed {when})" if when else "")
+    return f"- {label}: {value}{seen}"
 
 
 @dataclass

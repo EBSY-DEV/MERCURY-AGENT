@@ -433,3 +433,16 @@ def test_cli_route_explains_the_choice(client, monkeypatch, capsys):
     cli.main()
     listing = capsys.readouterr().out
     assert "offer_a" in listing and "[default]" in listing and "TEST_SIGNAL_X" in listing
+
+
+def test_fact_line_states_true_flags_plainly():
+    from mercury.offers import fact_line
+
+    true_flag = {"label": "No website at all", "value_type": "bool", "value_num": 1,
+                 "observed_at": "2026-10-02T09:00:00"}
+    false_flag = dict(true_flag, value_num=0)
+    number = {"label": "Search rank", "value_num": 14, "value_text": "roof repair",
+              "observed_at": "2026-10-04"}
+    assert fact_line(true_flag) == "- No website at all (observed 2026-10-02)"
+    assert fact_line(false_flag) == "- No website at all: no (observed 2026-10-02)"
+    assert fact_line(number) == "- Search rank: 14 (roof repair) (observed 2026-10-04)"
