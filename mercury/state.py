@@ -587,7 +587,97 @@ MIGRATIONS: list[str] = [
     CREATE INDEX idx_demos_status ON demos(status);
     CREATE INDEX idx_outbox_offer ON outbox(offer_key) WHERE offer_key != '';
     """,
+    # ── v16: review revisions, approval snapshots, idempotent commands, audit ──
+    """
+    -- revision counts changes to what a reviewer reads and decides on: the
+    -- recipient, the sending mailbox, the text, its generation and a send
+    -- time an operator chose. Status changes and the sender's own timing
+    -- (follow-up spacing, retries, out-of-office resumes) leave it alone.
+    ALTER TABLE outbox ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+    -- The approval snapshot. approved_revision is the revision a reviewer
+    -- (or the no-approval policy) approved, approved_hash the content it
+    -- covered (outbox_hash below). NULL = not approved. The send claim
+    -- requires both to match the row, so a changed draft cannot go out on
+    -- an earlier approval.
+    ALTER TABLE outbox ADD COLUMN approved_revision INTEGER;
+    ALTER TABLE outbox ADD COLUMN approved_hash TEXT DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN approved_by TEXT DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN approved_at TIMESTAMP;
+    -- Mail approved (or mid-send) before snapshots existed keeps its
+    -- approval for the content it holds now.
+    UPDATE outbox SET approved_revision = revision,
+        approved_hash = outbox_hash(to_email, subject, body, mailbox, generation_id),
+        approved_by = 'legacy', approved_at = COALESCE(updated_at, CURRENT_TIMESTAMP)
+        WHERE status IN ('approved', 'sending');
+    -- One row per request key a client sent with a command. A replay with
+    -- the same key returns result_json instead of running again. state is
+    -- 'running' while the first attempt is in flight, then 'done'.
+    CREATE TABLE command_requests (
+        client TEXT NOT NULL,
+        operator TEXT NOT NULL,
+        request_key TEXT NOT NULL,
+        action TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'running',
+        outcome TEXT DEFAULT '',
+        result_json TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        finished_at TIMESTAMP,
+        PRIMARY KEY (client, operator, request_key)
+    );
+    CREATE INDEX idx_command_requests_created ON command_requests(created_at);
+    -- Every operator command: who, through which client, on what, the
+    -- revisions before and after, and how it ended (ok, replayed, or the
+    -- error code). Values are redacted before they get here. Append-only.
+    CREATE TABLE audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        client TEXT NOT NULL,
+        operator TEXT NOT NULL,
+        request_key TEXT DEFAULT '',
+        batch_id TEXT DEFAULT '',
+        action TEXT NOT NULL,
+        object_type TEXT DEFAULT '',
+        object_id TEXT DEFAULT '',
+        revision_before TEXT DEFAULT '',
+        revision_after TEXT DEFAULT '',
+        outcome TEXT NOT NULL,
+        message TEXT DEFAULT '',
+        detail_json TEXT DEFAULT '{}'
+    );
+    CREATE INDEX idx_audit_object ON audit_log(object_type, object_id, id);
+    CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log BEGIN
+        SELECT RAISE(ABORT, 'audit_log is append-only');
+    END;
+    CREATE TRIGGER audit_log_no_delete BEFORE DELETE ON audit_log BEGIN
+        SELECT RAISE(ABORT, 'audit_log is append-only');
+    END;
+    """,
 ]
+
+
+def outbox_hash(to_email, subject, body, mailbox, generation_id) -> str:
+    """The content an approval covers: who it goes to, from which mailbox,
+    what it says and which generation wrote it. Registered on every
+    connection as the SQL function ``outbox_hash``."""
+    import hashlib
+
+    payload = json.dumps([str(v or "") for v in (to_email, subject, body, mailbox, generation_id)],
+                         ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def _register_functions(db) -> None:
+    await db.create_function("outbox_hash", 5, outbox_hash, deterministic=True)
+
+
+# SQL fragment: the content hash of the current outbox row.
+_OUTBOX_HASH_SQL = "outbox_hash(to_email, subject, body, mailbox, generation_id)"
+# SQL fragment: clear an approval (a reviewable change sends the row back).
+_CLEAR_APPROVAL_SQL = (
+    "status = CASE WHEN status = 'approved' THEN 'pending_review' ELSE status END, "
+    "approved_revision = NULL, approved_hash = '', approved_by = '', approved_at = NULL"
+)
 
 # Pause states that hold a prospect's cold sequence back.
 PAUSE_ACTIVE_STATES = ("paused", "needs_review")
@@ -634,6 +724,7 @@ class StateManager:
         """
         db = await aiosqlite.connect(self.db_path, timeout=BUSY_TIMEOUT_SECONDS)
         try:
+            await _register_functions(db)
             yield db
         finally:
             await db.close()
@@ -676,10 +767,14 @@ class StateManager:
         async with aiosqlite.connect(
             self.db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
         ) as db:
+            await _register_functions(db)
             await db.execute("BEGIN IMMEDIATE")
             try:
                 async with db.execute("PRAGMA user_version") as cursor:
                     (version,) = await cursor.fetchone()
+                if 9 <= version < len(MIGRATIONS):
+                    # Before later migrations read outbox.mailbox.
+                    await self._repair_pre_merge_v9(db)
                 for target, script in enumerate(MIGRATIONS, start=1):
                     if version < target:
                         for statement in _split_sql(script):
@@ -1076,26 +1171,37 @@ class StateManager:
         mailbox: str = "",
         generation_id: str = "",
         offer_key: str = "",
+        approved_by: str = "policy",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard.
         Without an ``offer_key`` the row takes its campaign's, so every path
         that queues a sequence email carries the offer the demo gate reads."""
         item_id = _new_id()
+        # Queued already approved (approval not required): the snapshot is
+        # this first revision, approved by the policy that skipped review.
+        approved = status == "approved"
         async with self._connect() as db:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO outbox
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
-                    thread_ref, in_reply_to, mailbox, generation_id, offer_key)
+                    thread_ref, in_reply_to, mailbox, generation_id, offer_key,
+                    approved_revision, approved_hash, approved_by, approved_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                            COALESCE(NULLIF(?, ''),
-                                    (SELECT offer_key FROM campaigns WHERE id = ?), ''))""",
+                                    (SELECT offer_key FROM campaigns WHERE id = ?), ''),
+                           ?, ?, ?, ?)""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
                     status, send_at, provider, thread_ref, in_reply_to,
                     _norm(mailbox), generation_id, _norm(offer_key), campaign_id,
+                    1 if approved else None,
+                    outbox_hash(_norm(to_email), subject, body, _norm(mailbox), generation_id)
+                    if approved else "",
+                    approved_by if approved else "",
+                    _utcnow().isoformat() if approved else None,
                 ),
             )
             inserted = cursor.rowcount > 0
@@ -1150,10 +1256,16 @@ class StateManager:
     })
 
     async def update_outbox_item(self, item_id: str, **kwargs):
+        """Bookkeeping by the sender and scripts. A change to the text or
+        the mailbox without a status of its own is a new revision and drops
+        any approval; send_at and status changes here are the sender's own
+        timing and transitions, and keep it."""
         fields = {k: v for k, v in kwargs.items() if k in self._OUTBOX_COLUMNS}
         if not fields:
             return
         sets = ", ".join(f"{k} = ?" for k in fields)
+        if "status" not in fields and fields.keys() & {"subject", "body", "mailbox"}:
+            sets += f", revision = revision + 1, {_CLEAR_APPROVAL_SQL}"
         async with self._connect() as db:
             await db.execute(
                 f"UPDATE outbox SET {sets}, updated_at = ? WHERE id = ?",
@@ -1161,33 +1273,68 @@ class StateManager:
             )
             await db.commit()
 
-    async def edit_outbox_item(self, item_id: str, **kwargs) -> bool:
-        """Apply reviewer changes only while the draft is still editable."""
-        fields = {k: v for k, v in kwargs.items()
-                  if k in {"subject", "body", "send_at", "manually_edited"}}
+    _REVISABLE_COLUMNS = frozenset({"to_email", "subject", "body", "send_at", "mailbox",
+                                    "manually_edited"})
+
+    async def revise_outbox_item(self, item_id: str, expected_revision: int | None = None,
+                                 **kwargs) -> int | None:
+        """An operator's change to a queued draft: text, recipient, sending
+        mailbox or send time. It is a new revision, and an approved draft
+        goes back to review. Applies only while the draft is pending or
+        approved and, when ``expected_revision`` is given, still at that
+        revision. Returns the new revision, or None when nothing changed."""
+        fields = {k: v for k, v in kwargs.items() if k in self._REVISABLE_COLUMNS}
         if not fields:
-            return False
+            return None
+        for column in ("to_email", "mailbox"):
+            if column in fields:
+                fields[column] = _norm(fields[column])
         sets = ", ".join(f"{k} = ?" for k in fields)
         async with self._connect() as db:
             cursor = await db.execute(
-                f"UPDATE outbox SET {sets}, updated_at = ? WHERE id = ? "
-                "AND status IN ('pending_review', 'approved')",
-                (*fields.values(), _utcnow().isoformat(), item_id),
+                f"UPDATE outbox SET {sets}, revision = revision + 1, {_CLEAR_APPROVAL_SQL}, "
+                "updated_at = ? WHERE id = ? AND status IN ('pending_review', 'approved') "
+                "AND (? IS NULL OR revision = ?)",
+                (*fields.values(), _utcnow().isoformat(), item_id,
+                 expected_revision, expected_revision),
             )
+            if not cursor.rowcount:
+                return None
+            async with db.execute("SELECT revision FROM outbox WHERE id = ?", (item_id,)) as c:
+                (revision,) = await c.fetchone()
             await db.commit()
-            return bool(cursor.rowcount)
+            return int(revision)
+
+    async def edit_outbox_item(self, item_id: str, **kwargs) -> bool:
+        """Apply reviewer changes only while the draft is still editable.
+        Any change is a new revision and sends an approved draft back to review."""
+        fields = {k: v for k, v in kwargs.items()
+                  if k in {"subject", "body", "send_at", "manually_edited"}}
+        return await self.revise_outbox_item(item_id, None, **fields) is not None
 
     async def claim_outbox_item(self, item: dict, mailbox: str) -> bool:
-        """Freeze the validated snapshot before sending; reject stale or claimed rows."""
+        """Freeze the validated snapshot before sending; reject stale or claimed rows.
+
+        The row must still hold exactly what the due scan read, and its
+        approval must be for this revision and this content: an approval
+        for an earlier revision, or content changed behind it, never sends.
+        The mailbox the sender resolved for it (a rotation pick, or the
+        legacy inbox) is the sender's routing, not a review change, so the
+        snapshot takes it over and a retry or recovered send still claims."""
         columns = ("subject", "body", "generation_id", "send_at", "mailbox", "manually_edited")
         matches = " AND ".join(f"{column} = ?" for column in columns)
         async with self._connect() as db:
             cursor = await db.execute(
-                "UPDATE outbox SET status = 'sending', mailbox = ?, updated_at = ? "
+                "UPDATE outbox SET status = 'sending', mailbox = ?, "
+                "approved_hash = outbox_hash(to_email, subject, body, ?, generation_id), "
+                "updated_at = ? "
                 f"WHERE id = ? AND status = 'approved' AND {matches} "
+                "AND approved_revision = revision "
+                f"AND approved_hash = {_OUTBOX_HASH_SQL} "
                 # A pause set after the due scan still holds this email back.
                 f"AND NOT {_PAUSED_OUTBOX_SQL}",
-                (mailbox, _utcnow().isoformat(), item["id"], *(item[column] for column in columns)),
+                (mailbox, mailbox, _utcnow().isoformat(), item["id"],
+                 *(item[column] for column in columns)),
             )
             await db.commit()
             return bool(cursor.rowcount)
@@ -1213,21 +1360,20 @@ class StateManager:
             await db.commit()
             return int(cursor.rowcount or 0)
 
-    async def approve_outbox(self, item_id: str | None = None) -> int:
-        """Approve one pending item, or ALL pending when item_id is None."""
+    async def approve_outbox(self, item_id: str, expected_revision: int | None = None,
+                             approved_by: str = "") -> int:
+        """Approve one pending item and record the snapshot it approved: its
+        current revision and content hash. With ``expected_revision`` the
+        item must still be at that revision."""
+        now = _utcnow().isoformat()
         async with self._connect() as db:
-            if item_id:
-                cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
-                    "WHERE id = ? AND status = 'pending_review'",
-                    (_utcnow().isoformat(), item_id),
-                )
-            else:
-                cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
-                    "WHERE status = 'pending_review'",
-                    (_utcnow().isoformat(),),
-                )
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'approved', approved_revision = revision, "
+                f"approved_hash = {_OUTBOX_HASH_SQL}, approved_by = ?, approved_at = ?, "
+                "updated_at = ? WHERE id = ? AND status = 'pending_review' "
+                "AND (? IS NULL OR revision = ?)",
+                (approved_by, now, now, item_id, expected_revision, expected_revision),
+            )
             await db.commit()
             return cursor.rowcount
 
@@ -1238,9 +1384,12 @@ class StateManager:
         so the sequence it belongs to may run. A follow-up of a still-pending
         or rejected opener stays put. One step per pass, so a 3-step chain
         whose opener was approved is fully promoted within two cycles."""
+        now = _utcnow().isoformat()
         async with self._connect() as db:
             cursor = await db.execute(
-                """UPDATE outbox SET status = 'approved', updated_at = ?
+                f"""UPDATE outbox SET status = 'approved', approved_revision = revision,
+                       approved_hash = {_OUTBOX_HASH_SQL}, approved_by = 'auto_followups',
+                       approved_at = ?, updated_at = ?
                    WHERE status = 'pending_review' AND kind = 'sequence'
                      AND step > 1 AND campaign_id != ''
                      AND (
@@ -1251,7 +1400,7 @@ class StateManager:
                        ORDER BY prev.step DESC LIMIT 1
                      ) IN ('approved', 'sent')"""
                 + (" AND campaign_id = ? AND prospect_id = ?" if campaign_id else ""),
-                (_utcnow().isoformat(),) + ((campaign_id, prospect_id or "") if campaign_id else ()),
+                (now, now) + ((campaign_id, prospect_id or "") if campaign_id else ()),
             )
             await db.commit()
             return cursor.rowcount
@@ -1311,11 +1460,12 @@ class StateManager:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
 
-    async def reject_outbox_item(self, item_id: str) -> int:
+    async def reject_outbox_item(self, item_id: str, expected_revision: int | None = None) -> int:
         """Reject one queued item. For a sequence step, every LATER step of
         the same (campaign, prospect) that is still queued is rejected too:
         'closing the loop' on an email that never went out is nonsense.
-        Returns the number of rows rejected."""
+        With ``expected_revision`` the item must still be at that revision,
+        or nothing is rejected. Returns the number of rows rejected."""
         item = await self.get_outbox_item(item_id)
         if not item:
             return 0
@@ -1323,10 +1473,13 @@ class StateManager:
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'rejected', updated_at = ? "
-                "WHERE id = ? AND status IN ('pending_review', 'approved')",
-                (now, item_id),
+                "WHERE id = ? AND status IN ('pending_review', 'approved') "
+                "AND (? IS NULL OR revision = ?)",
+                (now, item_id, expected_revision, expected_revision),
             )
             n = cursor.rowcount
+            if not n and expected_revision is not None:
+                return 0  # changed since it was read: reject nothing
             if item["kind"] == "sequence" and item["campaign_id"]:
                 cursor = await db.execute(
                     "UPDATE outbox SET status = 'rejected', error = ?, updated_at = ? "
@@ -2444,6 +2597,100 @@ class StateManager:
                 (_new_id(), action_type, agent, json.dumps(details or {}), created_at),
             )
             await db.commit()
+
+    # ── Command requests and audit (see mercury/control/audit.py) ──
+
+    # A first attempt still 'running' after this long died mid-command; its
+    # key may be used again. Finished records are kept for a week.
+    COMMAND_STALE_MINUTES = 15
+    COMMAND_KEEP_DAYS = 7
+
+    async def begin_command(self, client: str, operator: str, key: str, action: str,
+                            fingerprint: str) -> dict | None:
+        """Claim a request key. None: claimed, run the command. Otherwise
+        the existing record (running, or done with its result)."""
+        now = _utcnow()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN IMMEDIATE")
+            await db.execute(
+                "DELETE FROM command_requests WHERE created_at < ? OR "
+                "(state = 'running' AND created_at < ?)",
+                ((now - timedelta(days=self.COMMAND_KEEP_DAYS)).isoformat(),
+                 (now - timedelta(minutes=self.COMMAND_STALE_MINUTES)).isoformat()),
+            )
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO command_requests "
+                "(client, operator, request_key, action, fingerprint, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (client, operator, key, action, fingerprint, now.isoformat()),
+            )
+            if cursor.rowcount:
+                await db.commit()
+                return None
+            async with db.execute(
+                "SELECT * FROM command_requests WHERE client = ? AND operator = ? "
+                "AND request_key = ?", (client, operator, key),
+            ) as c:
+                row = await c.fetchone()
+            await db.commit()
+            return dict(row)
+
+    async def finish_command(self, client: str, operator: str, key: str,
+                             outcome: str, result_json: str) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE command_requests SET state = 'done', outcome = ?, result_json = ?, "
+                "finished_at = ? WHERE client = ? AND operator = ? AND request_key = ?",
+                (outcome, result_json, _utcnow().isoformat(), client, operator, key),
+            )
+            await db.commit()
+
+    async def release_command(self, client: str, operator: str, key: str) -> None:
+        """Forget a claim whose command failed unexpectedly, so a retry runs."""
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM command_requests WHERE client = ? AND operator = ? "
+                "AND request_key = ? AND state = 'running'", (client, operator, key),
+            )
+            await db.commit()
+
+    _AUDIT_COLUMNS = ("client", "operator", "request_key", "batch_id", "action", "object_type",
+                      "object_id", "revision_before", "revision_after", "outcome", "message",
+                      "detail_json")
+
+    async def add_audit(self, entries: list[dict]) -> None:
+        if not entries:
+            return
+        now = _utcnow().isoformat()
+        marks = ", ".join("?" for _ in self._AUDIT_COLUMNS)
+        async with self._connect() as db:
+            await db.executemany(
+                f"INSERT INTO audit_log ({', '.join(self._AUDIT_COLUMNS)}, at) VALUES ({marks}, ?)",
+                [(*("" if e.get(c) is None else e.get(c) for c in self._AUDIT_COLUMNS), now)
+                 for e in entries],
+            )
+            await db.commit()
+
+    async def get_audit(self, object_type: str = "", object_id: str = "",
+                        limit: int = 100) -> list[dict]:
+        """Newest first, optionally for one object."""
+        where, params = [], []
+        if object_type:
+            where.append("object_type = ?")
+            params.append(object_type)
+        if object_id:
+            where.append("object_id = ?")
+            params.append(object_id)
+        sql = "SELECT * FROM audit_log" + (" WHERE " + " AND ".join(where) if where else "")
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql + " ORDER BY id DESC LIMIT ?",
+                                  (*params, max(1, min(int(limit), 1000)))) as cursor:
+                rows = [dict(r) for r in await cursor.fetchall()]
+        for row in rows:
+            row["detail"] = json.loads(row.pop("detail_json") or "{}")
+        return rows
 
     # ── Warm-up overlay (see mercury/warmup.py) ──
 
