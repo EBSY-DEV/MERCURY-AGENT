@@ -162,6 +162,8 @@ Abstaining is an answer and is stored like one. The stored row keeps the entitie
 
 Every contact in `/api/prospects` and `/api/companies/{id}/contacts` carries a `registry` object (`status`, `reason`, `provider_label`, `entity_name`, `document_number`, `source_url`, `confidence`, `looked_up_at`, `person`, `shared_inbox`, `has_own_name`, `name_status`, `review`). `mercury registry show COMPANY` prints the same thing; `mercury registry lookup COMPANY` runs it.
 
+The same object also carries what the dashboard's contact drawer shows: `company_location`, `jurisdiction_name`, `covered` (the jurisdictions Mercury reads), `entity_type` and `city` of the filing, `people` (each with `raw_title` and `suggested`, the one person the accept endpoint takes), `candidates` (the entities weighed on an `ambiguous` or `no_match` answer) and `on_filing` (a named contact's own entry on the filing). `GET /api/contacts/{id}/greeting-preview` returns how that contact's first email would open, with a name (`with_name`) and without one (`without_name`, the routing request addressed to the default offer's `routing_role`, else `writer.routing_role`). Both lines are examples of the shape; the Writer words each email itself.
+
 ## Importing a list
 
 Already have a list? Import it from a CSV in the dashboard (Contacts → **Import CSV**) or with `mercury import`. Both run the same checks and give the same row outcomes.

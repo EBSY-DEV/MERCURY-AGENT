@@ -63,6 +63,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from demo_registry import seed_registry  # noqa: E402  (next to this file)
 from mercury.integrations.mailboxes import warmup_cap  # noqa: E402
 from mercury.models.campaign import Campaign, EmailStep  # noqa: E402
 from mercury.models.company import Company  # noqa: E402
@@ -302,6 +303,7 @@ async def seed(db_path: Path) -> dict:
     counts.update(await seed_history(sm))
     counts.update(await seed_warmup(sm))
     counts.update(await seed_placement(sm))
+    counts.update(await seed_registry(sm, NOW))
     counts.update(await seed_pains(sm))
     return counts
 

@@ -67,6 +67,31 @@ async def plan_greeting(state, config, prospect, company=None, brief=None) -> Gr
     return GreetingPlan(NONE, status=found["status"])
 
 
+async def preview_greeting(state, config, prospect, company=None, brief=None) -> dict:
+    """How the first email would open, for the dashboard: the line it opens
+    with when a name is used, and the routing request it makes without one.
+    Both are examples of the shape; the Writer words each email itself.
+
+    ``mode`` is what would happen now (``name``, ``routing`` or ``none``).
+    ``with_name`` is also filled for a registry name still waiting for a
+    person's accept, so the two outcomes can be compared; it is empty when
+    there is no name to greet."""
+    plan = await plan_greeting(state, config, prospect, company, brief)
+    first = plan.first_name
+    if not first:
+        found = await resolve_contact_name(state, prospect, company)
+        first = (found.get("suggestion") or {}).get("first_name", "")
+    role = plan.role or routing_role(config, brief)
+    from_offer = bool(brief is not None and brief.routing_role)
+    return {
+        "mode": plan.mode, "status": plan.status, "shared_inbox": plan.shared_inbox,
+        "first_name": first,
+        "with_name": f"Hi {first}," if first else "",
+        "without_name": f"Could you pass this to {role}?" if plan.shared_inbox else "",
+        "role": role, "role_source": "offer" if from_offer else "writer",
+    }
+
+
 def business_names(prospect, company=None) -> list[str]:
     """Names a greeting must not address: the business itself."""
     return [n for n in (getattr(company, "name", ""), getattr(prospect, "company", "")) if n]

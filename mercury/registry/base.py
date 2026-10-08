@@ -69,6 +69,7 @@ class RegistryProvider(ABC):
     key = ""            # stable id stored with every lookup: "fl_sunbiz"
     jurisdiction = ""   # two-letter US state code this registry covers
     label = ""          # for people: "Florida Division of Corporations"
+    jurisdiction_name = ""   # for people: "Florida" (falls back to the code)
 
     def supports(self, location: str) -> bool:
         """Eligibility comes from the registry's own jurisdiction, never from

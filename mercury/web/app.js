@@ -1643,45 +1643,9 @@ async function submitFeedback(entityType, entityId, promptText) {
   else showToast((data && data.message) || 'Could not save feedback.', 'error');
 }
 
-function fbProspect(i) {
-  const p = _prospects[i];
-  if (p) submitFeedback('contact', p.id, 'Feedback on this contact:');
-}
-
 function fbCampaign(i) {
   const c = _campaigns[i];
   if (c) submitFeedback('campaign', c.id, 'Leave feedback on this campaign:');
-}
-
-async function loadProspects() {
-  const el = document.getElementById('prospects-table');
-  const data = await api('/api/prospects');
-  if (!data) { el.innerHTML = offlineState(); return; }
-  _prospects = data;
-  if (!data.length) {
-    el.innerHTML = emptyState('address-book', 'No contacts yet',
-      'Mercury hasn\'t found any prospects. Once it\'s running, the Scout agent searches the web for people matching your ideal customer profile in <b>mercury.yaml</b>.');
-    return;
-  }
-  let html = '<div class="table-card"><table><thead><tr><th>Name</th><th>Title</th><th>Company</th><th>Email</th><th>Phone</th><th>Status</th><th>Source</th><th>Added</th><th></th></tr></thead><tbody>';
-  data.forEach((p, i) => {
-    const emailV = p.email ? (escHtml(p.email) + emailTag(p)) : '';
-    const phoneV = p.phone ? (escHtml(p.phone) + (p.phone_verified ? ' <span class="verified" title="verified">' + icon('check-circle') + '</span>' : '')) : '';
-    // Imported contacts say where they came from and what they still lack.
-    const needs = p.import_batch_id
-      ? [['first name', p.first_name], ['last name', p.last_name], ['title', p.title]].filter(x => !x[1]).map(x => x[0]) : [];
-    const source = p.import_batch_id
-      ? '<span title="Import batch ' + escHtml(p.import_batch_id) + '">Import ' + escHtml(p.import_batch_id.slice(0, 6)) +
-        ' · row ' + escHtml(String(p.import_row)) + '</span>'
-      : escHtml(p.source);
-    html += '<tr><td>' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) +
-      (needs.length ? '<div class="muted imp-needs">needs ' + escHtml(needs.join(', ')) + '</div>' : '') + '</td>' +
-      '<td>' + escHtml(p.title) + '</td><td>' + escHtml(p.company) + '</td>' +
-      '<td>' + emailV + '</td><td>' + phoneV + '</td><td>' + badge(p.status) + '</td>' +
-      '<td class="muted">' + source + '</td><td class="muted">' + formatDate(p.created_at) + '</td>' +
-      '<td><button class="btn btn-secondary btn-sm" onclick="fbProspect(' + i + ')">Feedback</button></td></tr>';
-  });
-  el.innerHTML = html + '</tbody></table></div>';
 }
 
 // ── Contacts: CSV import ──
@@ -2270,6 +2234,7 @@ function closeDrawer() {
   d.setAttribute('aria-hidden', 'true');
   document.getElementById('drawer-scrim').classList.remove('open');
   _drawerCtx = null;
+  ctDrawerClosed();
   if (_mb.view) { _mb.view = null; document.querySelectorAll('#mb-table .mb-row.sel').forEach(r => r.classList.remove('sel')); }
   if (_drawerPrevFocus && document.contains(_drawerPrevFocus)) _drawerPrevFocus.focus({preventScroll: true});
   _drawerPrevFocus = null;

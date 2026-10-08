@@ -13,6 +13,7 @@
 <link rel="stylesheet" href="/static/app.css">
 <link rel="stylesheet" href="/static/personas.css">
 <link rel="stylesheet" href="/static/outbox.css">
+<link rel="stylesheet" href="/static/contacts.css">
 <link rel="stylesheet" href="/static/pains.css">
 </head>
 <body>
@@ -262,15 +263,23 @@
 
 <!-- Contacts -->
 <div id="prospects" class="section">
-  <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
+  <div class="section-head ct-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
     <div><h2>Contacts</h2><p>People Mercury has found, verified or imported.</p></div>
-    <div style="display:flex;gap:8px;flex-shrink:0">
+    <div class="ct-head-actions" style="display:flex;gap:8px;flex-shrink:0">
       <button class="btn btn-primary btn-sm" id="imp-toggle" onclick="toggleImport()" aria-expanded="false" aria-controls="import-panel"><i data-ph="upload-simple"></i>Import CSV</button>
       <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv" download>Export deliverable CSV</a>
       <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv?all=true" download>Export all</a>
     </div>
   </div>
   <div id="import-panel" class="imp" hidden></div>
+  <div class="toolbar ct-toolbar" id="contacts-bar" hidden>
+    <label class="search-field">
+      <i data-ph="magnifying-glass"></i>
+      <input type="search" id="ct-search" placeholder="Search contacts" aria-label="Search contacts"
+             autocomplete="off" oninput="ctSearch(this.value)">
+    </label>
+    <div class="segmented" id="ct-filters" role="group" aria-label="Show"></div>
+  </div>
   <div id="prospects-table"></div>
 </div>
 
@@ -800,6 +809,7 @@
 <script src="/static/icons.js"></script>
 <script src="/static/app.js"></script>
 <script src="/static/personas.js"></script>
+<script src="/static/contacts.js"></script>
 <script src="/static/exclusions.js"></script>
 <script src="/static/away.js"></script>
 <script src="/static/outbox.js"></script>
