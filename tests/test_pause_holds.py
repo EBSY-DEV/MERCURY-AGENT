@@ -176,13 +176,13 @@ async def test_pause_committed_after_last_check_still_prevents_claim(state, monk
     read. The claim must enforce it in the same transaction as 'sending'."""
     await _two_due(state)
     sender = make_sender(state, FakeProvider(), require_approval=False)
-    original_claim = state.claim_outbox_item
+    original_claim = state.claim_for_send
 
-    async def pause_then_claim(item, mailbox):
+    async def pause_then_claim(item, mailbox, **policy):
         await state.set_setting(hold_key, "paused for QA")
-        return await original_claim(item, mailbox)
+        return await original_claim(item, mailbox, **policy)
 
-    monkeypatch.setattr(state, "claim_outbox_item", pause_then_claim)
+    monkeypatch.setattr(state, "claim_for_send", pause_then_claim)
     await sender._run_native()
     assert sender.provider.sent == []
     assert await state.get_outbox(status="sending") == []
