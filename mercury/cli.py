@@ -780,6 +780,108 @@ def cmd_signals(args):
     asyncio.run(_signals())
 
 
+def cmd_pains(args):
+    """The pain library: Mercury proposes, you confirm.
+
+    Only confirmed pains are ever written from; a rejected pain stays on file
+    so retraining cannot bring it back.
+    """
+    import json
+
+    from mercury.control.context import OperatorContext
+    from mercury.control.errors import ControlError
+    from mercury.control.pains import PainService
+    from mercury.state import StateManager
+
+    mark = {"confirmed": "[on] ", "proposed": "[ ? ]", "rejected": "[off]"}
+
+    def changes():
+        sent = {"label": args.label, "market": args.market, "sector": args.sector,
+                "owner_words": args.words, "scene": args.scene, "cost": args.cost,
+                "offer_key": args.offer, "signal_codes": args.signal, "evidence": args.evidence,
+                "avoid_terms": args.avoid}
+        return {k: v for k, v in sent.items() if v is not None}
+
+    def detail(p):
+        print(f"\n  {p['code']}  {mark.get(p['status'], '')} {p['status']}  (rev {p['revision']})")
+        print("  " + "=" * 60)
+        rows = (("Label", p["label"]), ("Owner's words", p["owner_words"]), ("Scene", p["scene"]),
+                ("Cost", p["cost"]), ("Market", p["market"] or "any"), ("Sector", p["sector"] or "any"),
+                ("Offer", p["offer_key"] or "any"), ("Signals", ", ".join(p["signal_codes"]) or "any"),
+                ("Evidence", "; ".join(p["evidence"])), ("Avoid terms", ", ".join(p["avoid_terms"])),
+                ("Source", p["source"]))
+        for label, value in rows:
+            if value:
+                print(f"  {label:<14}{value}")
+        if p["status_by"]:
+            print(f"  {'Decided':<14}{p['status_by']} at {str(p['status_at'])[:16]}"
+                  + (f" ({p['status_note']})" if p["status_note"] else ""))
+        st = p["stats"]
+        print(f"  {'Results':<14}{st['sends']} sent, {st['replies']} replied, {st['positive']} interested")
+        print()
+
+    async def _run():
+        service = await PainService(StateManager(), OperatorContext.local("cli")).ready()
+        action = args.pain_action or "list"
+        codes = [c.strip() for c in (args.confirm or args.reject or args.reopen or "").split(",")
+                 if c.strip()]
+        if codes:
+            status = "confirmed" if args.confirm else "rejected" if args.reject else "proposed"
+            if [c.upper() for c in codes] == ["ALL"] and status != "proposed":
+                pending = await service.list(status="proposed")
+                codes = [p["code"] for p in pending["pains"]]
+            result = (await service.set_status(codes, status, args.note) if codes else
+                      {"changed": 0, "unknown": []})
+            print(f"\n  {result['changed']} pain(s) {status}.")
+            if result["unknown"]:
+                print(f"  Not found: {', '.join(result['unknown'])}")
+            print()
+            return
+        if action == "show":
+            p = await service.get(args.code)
+            return print(json.dumps(p, indent=2, default=str)) if args.json else detail(p)
+        if action == "add":
+            p = await service.add({"code": args.code or "", **changes()}, confirm=args.confirmed,
+                                  note=args.note)
+            print(f"\n  Added {p['code']} as {p['status']}.\n")
+            return
+        if action == "edit":
+            sent = changes()
+            if not sent:
+                raise ControlError("Nothing to change. Pass --label, --words, --scene, --cost ...",
+                                   "invalid")
+            p = await service.edit(args.code, sent, args.expected_revision)
+            print(f"\n  Saved {p['code']} (rev {p['revision']}), still {p['status']}.\n")
+            return
+        data = await service.list(status=args.status or "", market=args.market)
+        if args.json:
+            return print(json.dumps(data, indent=2, default=str))
+        s = data["summary"]
+        print(f"\n  Pains: {s['confirmed']} confirmed, {s['proposed']} awaiting you, "
+              f"{s['rejected']} rejected")
+        print("  " + "=" * 66)
+        for p in data["pains"]:
+            st = p["stats"]
+            where = " / ".join(x for x in (p["market"], p["sector"], p["offer_key"]) if x)
+            results = f"  [{st['sends']} sent, {st['replies']} replied]" if st["sends"] else ""
+            print(f"    {mark.get(p['status'], '     ')} {p['code']:<34} "
+                  f"{(p['label'] or p['owner_words'])[:44]}{results}")
+            if where:
+                print(f"          {where}")
+        if not data["pains"]:
+            print("    (none)")
+        if s["proposed"]:
+            print("\n  Confirm with: mercury pains --confirm CODE[,CODE...]")
+            print("  Turn one off: mercury pains --reject CODE")
+        print("  Details: mercury pains show CODE\n")
+
+    try:
+        asyncio.run(_run())
+    except ControlError as error:
+        print(f"\n  {error}\n", file=sys.stderr)
+        sys.exit(1)
+
+
 def _persona_text(value, path):
     """A long field from a flag, a file, or stdin when the file is '-'."""
     from mercury.personas import PersonaError
@@ -1765,6 +1867,53 @@ def main():
     sub.add_argument("--reject", metavar="CODES", default="",
                      help="Comma-separated codes to turn off")
     sub.set_defaults(func=cmd_signals)
+
+    sub = subparsers.add_parser(
+        "pains", help="Review/confirm the pains Mercury may write about")
+    sub.add_argument("--confirm", metavar="CODES", default="",
+                     help="Comma-separated codes to confirm ('all' = every proposed pain)")
+    sub.add_argument("--reject", metavar="CODES", default="",
+                     help="Comma-separated codes to reject (never used, never re-proposed)")
+    sub.add_argument("--reopen", metavar="CODES", default="",
+                     help="Comma-separated codes to move back to proposed")
+    sub.add_argument("--note", default="", help="Why, recorded with a decision")
+    sub.add_argument("--status", default="", choices=["", "proposed", "confirmed", "rejected"],
+                     help="List only pains in this state")
+    sub.add_argument("--market", default=None, help="List only this market ('' = no market)")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    pain_sub = sub.add_subparsers(dest="pain_action")
+    sub.set_defaults(func=cmd_pains, pain_action=None, label=None, words=None, scene=None,
+                     cost=None, sector=None, offer=None, signal=None, evidence=None, avoid=None,
+                     confirmed=False, expected_revision=None, code="")
+
+    def pain_fields(p, create):
+        p.add_argument("--label", default=None, help="The pain in one line")
+        p.add_argument("--words", default=None, help="How the owner says it, in their words")
+        p.add_argument("--scene", default=None, help="The moment it shows up (1-2 lines)")
+        p.add_argument("--cost", default=None, help="What it costs them")
+        p.add_argument("--market", default=None, help="icp.markets name (omit = any)")
+        p.add_argument("--sector", default=None, help="Trade or industry (omit = any)")
+        p.add_argument("--offer", default=None, help="Offer key that answers it")
+        p.add_argument("--signal", action="append", default=None, metavar="CODE",
+                       help="Signal code that makes it applicable (repeat; any of them)")
+        p.add_argument("--evidence", action="append", default=None, help="URL or note (repeat)")
+        p.add_argument("--avoid", action="append", default=None,
+                       help="Phrase that marks a draft as raising it (repeat)")
+        p.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    p = pain_sub.add_parser("show", help="One pain in full")
+    p.add_argument("code")
+    p.add_argument("--json", action="store_true", help="Machine-readable output")
+    p = pain_sub.add_parser("add", help="Add a pain by hand (starts proposed)")
+    p.add_argument("--code", default="", help="PAIN_... (derived from the label if omitted)")
+    p.add_argument("--confirmed", action="store_true", help="Also confirm it (you are deciding it)")
+    p.add_argument("--note", default="", help="Why, recorded with the decision")
+    pain_fields(p, create=True)
+    p = pain_sub.add_parser("edit", help="Change a pain's wording or applicability")
+    p.add_argument("code")
+    p.add_argument("--expected-revision", type=int, default=None,
+                   help="Fail if someone saved a newer version first")
+    pain_fields(p, create=False)
 
     sub = subparsers.add_parser("personas", help="List, edit and preview writing personas")
     personas = sub.add_subparsers(dest="persona_action")

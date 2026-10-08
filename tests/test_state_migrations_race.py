@@ -95,7 +95,7 @@ async def test_pre_merge_dev_db_gets_the_mailbox_column(tmp_path):
 def test_migration_order_contact_policy_v14_v15_then_pauses_v16_demos_v17():
     # main shipped v14/v15 (exclusions, manual review) first; the
     # integration/p0 work (out-of-office pauses, demo gate) comes after.
-    assert len(MIGRATIONS) == 21
+    assert len(MIGRATIONS) == 22
     assert "CREATE TABLE suppressions" in MIGRATIONS[13]
     assert "requires_manual_review" in MIGRATIONS[14]
     assert "CREATE TABLE IF NOT EXISTS sequence_pauses" in MIGRATIONS[15]
@@ -103,10 +103,11 @@ def test_migration_order_contact_policy_v14_v15_then_pauses_v16_demos_v17():
     assert "CREATE TABLE audit_log" in MIGRATIONS[17]
     assert "ALTER TABLE outbox ADD COLUMN thread_subject" in MIGRATIONS[18]
     assert "CREATE TABLE IF NOT EXISTS offer_routes" in MIGRATIONS[20]
+    assert "CREATE TABLE pains" in MIGRATIONS[21]
 
 
 _FULL_TABLES = {"suppressions", "company_holds", "sequence_pauses", "demos",
-                "command_requests", "audit_log", "offer_routes"}
+                "command_requests", "audit_log", "offer_routes", "pains"}
 
 
 def _assert_full_schema(db: str) -> None:
@@ -116,7 +117,7 @@ def _assert_full_schema(db: str) -> None:
     assert _FULL_TABLES <= tables
     assert {"company_id", "requires_manual_review", "offer_key", "revision",
             "approved_revision", "approved_hash", "thread_subject",
-            "thread_references"} <= _columns(conn, "outbox")
+            "thread_references", "pain_code"} <= _columns(conn, "outbox")
     assert "offer_key" in _columns(conn, "campaigns")
     conn.close()
 

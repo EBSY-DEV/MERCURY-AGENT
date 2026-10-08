@@ -24,6 +24,7 @@ from mercury.paths import PROJECT_ROOT  # noqa: E402
 from mercury.personas_api import router as personas_router  # noqa: E402
 from mercury.imports_api import router as imports_router  # noqa: E402
 from mercury.demos_api import router as demos_router  # noqa: E402
+from mercury.pains_api import router as pains_router  # noqa: E402
 from mercury.control.audit import redact_text  # noqa: E402
 from mercury.control.context import OperatorContext  # noqa: E402
 from mercury.control.errors import (  # noqa: E402
@@ -47,6 +48,7 @@ app = FastAPI(title="Mercury Dashboard")
 app.include_router(personas_router)
 app.include_router(imports_router)
 app.include_router(demos_router)
+app.include_router(pains_router)
 app.include_router(exclusions_router)
 app.include_router(pauses_router)
 

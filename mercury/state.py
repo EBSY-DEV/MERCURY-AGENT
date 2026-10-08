@@ -780,6 +780,73 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (campaign_id, prospect_id)
     );
     """,
+    # ── v22: governed pain library ──
+    """
+    -- The pains a cold email may raise, governed like signal_codes: the
+    -- trainer and the Writer PROPOSE, a person confirms or rejects, and only
+    -- confirmed pains are ever written from. A rejected pain stays on file
+    -- (it is the never-use list), so retraining cannot bring it back.
+    --   code          stable id, upper snake case (PAIN_...)
+    --   market        icp.markets[].name this pain belongs to, '' = any
+    --   sector        trade or industry, '' = any
+    --   owner_words   how the owner says it, in their own words
+    --   scene         the moment it shows up, one or two lines
+    --   cost          what it costs them
+    --   signal_codes_json  signal codes that make it applicable (any of)
+    --   offer_key     the offer that answers it, '' = any offer
+    --   evidence_json URLs or notes that support it
+    --   avoid_terms_json   extra phrases that mark a draft as using it
+    --   origin_text   the wording first proposed, kept to recognise a
+    --                 reworded duplicate (never edited)
+    CREATE TABLE pains (
+        code TEXT PRIMARY KEY,
+        label TEXT NOT NULL DEFAULT '',
+        market TEXT NOT NULL DEFAULT '',
+        sector TEXT NOT NULL DEFAULT '',
+        owner_words TEXT NOT NULL DEFAULT '',
+        scene TEXT NOT NULL DEFAULT '',
+        cost TEXT NOT NULL DEFAULT '',
+        signal_codes_json TEXT NOT NULL DEFAULT '[]',
+        offer_key TEXT NOT NULL DEFAULT '',
+        evidence_json TEXT NOT NULL DEFAULT '[]',
+        avoid_terms_json TEXT NOT NULL DEFAULT '[]',
+        origin_text TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'manual',
+        status TEXT NOT NULL DEFAULT 'proposed'
+            CHECK (status IN ('proposed', 'confirmed', 'rejected')),
+        status_by TEXT NOT NULL DEFAULT '',
+        status_at TIMESTAMP,
+        status_note TEXT NOT NULL DEFAULT '',
+        revision INTEGER NOT NULL DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX idx_pains_status ON pains(status);
+
+    -- Only a person moves a pain off 'proposed'. The status change must name
+    -- who made it, and that can never be the trainer or the system.
+    CREATE TRIGGER trg_pains_decision_insert
+    BEFORE INSERT ON pains
+    FOR EACH ROW
+    WHEN NEW.status != 'proposed'
+     AND (NEW.status_by = '' OR lower(NEW.status_by) IN ('trainer', 'system', 'mercury'))
+    BEGIN
+        SELECT RAISE(ABORT, 'a pain decision needs the person who made it');
+    END;
+    CREATE TRIGGER trg_pains_decision_update
+    BEFORE UPDATE OF status ON pains
+    FOR EACH ROW
+    WHEN NEW.status != OLD.status
+     AND (NEW.status_by = '' OR lower(NEW.status_by) IN ('trainer', 'system', 'mercury'))
+    BEGIN
+        SELECT RAISE(ABORT, 'a pain decision needs the person who made it');
+    END;
+
+    -- The pain an email was written around, for the learning loop. ''
+    -- = written without one (or before pains existed).
+    ALTER TABLE outbox ADD COLUMN pain_code TEXT NOT NULL DEFAULT '';
+    CREATE INDEX idx_outbox_pain ON outbox(pain_code) WHERE pain_code != '';
+    """,
 ]
 
 
@@ -1640,6 +1707,7 @@ class StateManager:
         offer_key: str = "",
         approved_by: str = "policy",
         company_id: str = "",
+        pain_code: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard.
@@ -1655,11 +1723,11 @@ class StateManager:
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
                     thread_ref, in_reply_to, mailbox, generation_id, company_id, offer_key,
-                    approved_revision, approved_hash, approved_by, approved_at)
+                    approved_revision, approved_hash, approved_by, approved_at, pain_code)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                            COALESCE(NULLIF(?, ''),
                                     (SELECT offer_key FROM campaigns WHERE id = ?), ''),
-                           ?, ?, ?, ?)""",
+                           ?, ?, ?, ?, ?)""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
@@ -1670,6 +1738,7 @@ class StateManager:
                     if approved else "",
                     approved_by if approved else "",
                     _utcnow().isoformat() if approved else None,
+                    (pain_code or "").strip().upper(),
                 ),
             )
             inserted = cursor.rowcount > 0
@@ -2971,6 +3040,200 @@ class StateManager:
 
     async def confirmed_signal_codes(self) -> set[str]:
         return {r["code"] for r in await self.get_signal_codes(status="confirmed")}
+
+    # ── Pains (governed like signals: proposed -> confirmed / rejected) ──
+
+    PAIN_STATUSES = ("proposed", "confirmed", "rejected")
+    # What an edit may change. status is not here: only set_pain_status
+    # moves it, and it records who.
+    _PAIN_EDITABLE = frozenset({
+        "label", "market", "sector", "owner_words", "scene", "cost",
+        "signal_codes", "offer_key", "evidence", "avoid_terms",
+    })
+    _PAIN_LISTS = {"signal_codes": "signal_codes_json", "evidence": "evidence_json",
+                   "avoid_terms": "avoid_terms_json"}
+
+    @classmethod
+    def _decode_pain(cls, row) -> dict:
+        pain = dict(row)
+        for name, column in cls._PAIN_LISTS.items():
+            try:
+                value = json.loads(pain.pop(column, "[]") or "[]")
+            except ValueError:
+                value = []
+            pain[name] = value if isinstance(value, list) else []
+        return pain
+
+    async def add_pain(
+        self,
+        code: str,
+        *,
+        label: str = "",
+        market: str = "",
+        sector: str = "",
+        owner_words: str = "",
+        scene: str = "",
+        cost: str = "",
+        signal_codes: list[str] | None = None,
+        offer_key: str = "",
+        evidence: list[str] | None = None,
+        avoid_terms: list[str] | None = None,
+        origin_text: str = "",
+        source: str = "manual",
+        status: str = "proposed",
+        status_by: str = "",
+        status_note: str = "",
+    ) -> bool:
+        """Insert one pain. False when the code already exists (nothing is
+        overwritten: an existing row keeps its status and its edits). A
+        status other than 'proposed' needs ``status_by``, the person who
+        decided it; the database refuses it otherwise."""
+        if status not in self.PAIN_STATUSES:
+            raise ValueError(f"invalid pain status: {status}")
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                """INSERT OR IGNORE INTO pains
+                       (code, label, market, sector, owner_words, scene, cost,
+                        signal_codes_json, offer_key, evidence_json, avoid_terms_json,
+                        origin_text, source, status, status_by, status_at, status_note)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (code, label, _norm(market), sector, owner_words, scene, cost,
+                 json.dumps(list(signal_codes or [])), _norm(offer_key),
+                 json.dumps(list(evidence or [])), json.dumps(list(avoid_terms or [])),
+                 origin_text or label or owner_words, source, status, status_by,
+                 now if status != "proposed" else None, status_note),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_pain(self, code: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM pains WHERE code = ?",
+                                  ((code or "").strip().upper(),)) as cursor:
+                row = await cursor.fetchone()
+                return self._decode_pain(row) if row else None
+
+    async def list_pains(self, status: str | None = None, market: str | None = None,
+                         offer_key: str | None = None) -> list[dict]:
+        """Pains in a stable order (code). ``market`` and ``offer_key`` match
+        exactly (case-insensitive); '' matches the pains that name none."""
+        where, params = [], []
+        if status:
+            where.append("status = ?")
+            params.append(status)
+        if market is not None:
+            where.append("market = ?")
+            params.append(_norm(market))
+        if offer_key is not None:
+            where.append("offer_key = ?")
+            params.append(_norm(offer_key))
+        sql = "SELECT * FROM pains" + (" WHERE " + " AND ".join(where) if where else "")
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql + " ORDER BY code", params) as cursor:
+                return [self._decode_pain(r) for r in await cursor.fetchall()]
+
+    async def update_pain(self, code: str, fields: dict,
+                          expected_revision: int | None = None) -> int | None:
+        """Edit a pain's content. Returns the new revision, or None when the
+        pain does not exist or ``expected_revision`` is stale. Never touches
+        the status."""
+        fields = {k: v for k, v in fields.items() if k in self._PAIN_EDITABLE}
+        if not fields:
+            raise ValueError("nothing to change")
+        sets, params = [], []
+        for name, value in fields.items():
+            if name in self._PAIN_LISTS:
+                sets.append(f"{self._PAIN_LISTS[name]} = ?")
+                params.append(json.dumps(list(value or [])))
+            else:
+                sets.append(f"{name} = ?")
+                params.append(_norm(value) if name in ("market", "offer_key") else value)
+        sql = ("UPDATE pains SET " + ", ".join(sets) +
+               ", revision = revision + 1, updated_at = ? WHERE code = ?")
+        params += [_utcnow().isoformat(), (code or "").strip().upper()]
+        if expected_revision is not None:
+            sql += " AND revision = ?"
+            params.append(int(expected_revision))
+        async with self._connect() as db:
+            cursor = await db.execute(sql, params)
+            if cursor.rowcount == 0:
+                await db.commit()
+                return None
+            async with db.execute("SELECT revision FROM pains WHERE code = ?",
+                                  ((code or "").strip().upper(),)) as cur:
+                (revision,) = await cur.fetchone()
+            await db.commit()
+            return revision
+
+    async def set_pain_status(self, code: str, status: str, actor: str, note: str = "",
+                              expected_revision: int | None = None) -> bool:
+        """Confirm, reject or reopen a pain. ``actor`` is the person (or the
+        client acting for them), recorded with the time; the database refuses
+        a blank actor and the trainer/system names. False when the pain does
+        not exist or ``expected_revision`` is stale."""
+        if status not in self.PAIN_STATUSES:
+            raise ValueError(f"invalid pain status: {status}")
+        now = _utcnow().isoformat()
+        sql = ("UPDATE pains SET status = ?, status_by = ?, status_at = ?, status_note = ?, "
+               "revision = revision + 1, updated_at = ? WHERE code = ?")
+        params: list = [status, actor, now, note, now, (code or "").strip().upper()]
+        if expected_revision is not None:
+            sql += " AND revision = ?"
+            params.append(int(expected_revision))
+        async with self._connect() as db:
+            cursor = await db.execute(sql, params)
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def pain_stats(self) -> dict[str, dict]:
+        """Sends and replies attributable to each pain, for the learning loop.
+
+        ``sends``: sent sequence emails that carry the pain's code.
+        ``prospects``: distinct people those went to.
+        ``replies``: distinct people among them who answered at or after a
+        send that used the pain (out-of-office notices excluded).
+        ``positive``: those whose reply was classified interested.
+
+        Deliberately simple: a reply counts for every pain the person was
+        sent before it, and it is not weighed by how long after.
+        """
+        from mercury.metrics import _REPLY_EVENTS
+
+        sql = f"""
+            SELECT o.pain_code AS code,
+                   COUNT(DISTINCT o.id) AS sends,
+                   COUNT(DISTINCT o.prospect_id) AS prospects,
+                   COUNT(DISTINCT CASE WHEN r.k IS NOT NULL AND COALESCE(r.intent, '') != 'ooo'
+                                       THEN o.prospect_id END) AS replies,
+                   COUNT(DISTINCT CASE WHEN r.intent = 'interested'
+                                       THEN o.prospect_id END) AS positive
+            FROM outbox o
+            LEFT JOIN ({_REPLY_EVENTS}) r
+                   ON r.k = o.prospect_id AND datetime(r.ts) >= datetime(o.sent_at)
+            WHERE o.pain_code != '' AND o.status = 'sent' AND o.kind = 'sequence'
+            GROUP BY o.pain_code"""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql) as cursor:
+                return {r["code"]: {"sends": r["sends"], "prospects": r["prospects"],
+                                    "replies": r["replies"], "positive": r["positive"]}
+                        for r in await cursor.fetchall()}
+
+    async def company_signal_codes(self, company_id: str, confirmed_only: bool = True) -> set[str]:
+        """The signals a company currently carries (newest observation of
+        each, and true), by default only those a person has confirmed."""
+        if not company_id:
+            return set()
+        sql = self._CURRENT_CTE + "SELECT DISTINCT signal_code FROM positive WHERE company_id = ?"
+        async with self._connect() as db:
+            async with db.execute(sql, (company_id,)) as cursor:
+                codes = {row[0] for row in await cursor.fetchall()}
+        if confirmed_only:
+            codes &= await self.confirmed_signal_codes()
+        return codes
 
     # ── Observations (every fact is a row, never a column) ──
 

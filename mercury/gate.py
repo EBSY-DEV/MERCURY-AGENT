@@ -10,6 +10,9 @@ code.
 
 import re
 from dataclasses import dataclass, field
+from typing import Iterable
+
+from mercury.pains import find_rejected_pain_hits
 
 # Spam-filter and AI-tell phrases that must never appear in outgoing mail.
 # Mirrors prompts/writer.md; enforced here because prompts can be ignored.
@@ -54,12 +57,18 @@ def pre_send_check(
     allow_risky: bool = False,
     kind: str = "sequence",
     blocked_references: list[str] | None = None,
+    rejected_pains: Iterable[dict] | None = None,
+    allowed_pains: Iterable[dict] = (),
 ) -> GateResult:
     """Run every deterministic check. Returns ok=False with reasons on any hit.
 
     ``blocked_references`` are configured case-study names (and aliases)
     outside this email's offer or scope (mercury.offers.blocked_references);
     naming one blocks the send.
+
+    ``rejected_pains`` (rows from ``state.list_pains(status="rejected")``)
+    stops a draft that raises a pain a person rejected, whatever the model
+    was told; ``allowed_pains`` are the pains whose vocabulary it may share.
     """
     reasons: list[str] = []
     subject = (subject or "").strip()
@@ -103,6 +112,12 @@ def pre_send_check(
     hits = [p for p in BANNED_PHRASES if p in lowered]
     if hits:
         reasons.append(f"banned phrases: {hits[:3]}")
+
+    # A pain a person rejected must not reach a prospect, even if the model
+    # ignored the never-use list in its prompt.
+    if rejected_pains:
+        for hit in find_rejected_pain_hits(subject + "\n" + body, rejected_pains, allowed_pains):
+            reasons.append(f"rejected pain {hit.code}: {hit.reason}")
 
     # Link budget: cold email with links goes to spam
     links = URL_RE.findall(body)
