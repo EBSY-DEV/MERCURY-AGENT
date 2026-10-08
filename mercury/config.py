@@ -10,6 +10,7 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
+from mercury.draft_rules import DEFAULT_WORD_LIMITS
 from mercury.paths import PROJECT_ROOT
 
 logger = logging.getLogger("mercury.config")
@@ -63,6 +64,15 @@ class MarketConfig(BaseModel):
     places: list[str]
     terms: list[str]
     lang: str = "en"
+    # What the Writer is told for prospects in this market, kept in private
+    # config instead of in the prompts. All three are optional and add to, or
+    # (language_line) replace, the built-in language line:
+    #   language_line   the whole "Language and register" instruction
+    #   language_rules  extra rules, one sentence each ("Use formal address.")
+    #   terminology     {word to avoid: word to say instead}
+    language_line: str = ""
+    language_rules: list[str] = []
+    terminology: dict[str, str] = {}
 
 
 class ICPConfig(BaseModel):
@@ -419,12 +429,19 @@ class OfferContent(BaseModel):
     summary: str = ""
     # The only things the email may claim about the offer.
     claims: list[str] = []
+    # The offer as ONE plain sentence, in approved words. A step with
+    # state_offer on says it (the summary is used when this is empty).
+    sentence: str = ""
 
 
 class OfferStep(BaseModel):
     """The call to action and angle of one sequence step."""
     cta: str = ""
     angle: str = ""
+    # true: this email states the offer in one plain sentence (content.sentence,
+    # else content.summary). Off by default: an email that does not ask for it
+    # makes an observation and a question, as before.
+    state_offer: bool = False
 
 
 class CaseStudyScope(BaseModel):
@@ -539,8 +556,12 @@ class OfferDefinition(BaseModel):
     # fact (SERP_RANK, ...). Empty = the codes under signals.require.
     facts: list[str] = []
     materials: list[SupportingMaterial] = []
-    # Per step: {1: {cta, angle}, 2: ..., 3: ...}
+    # Per step: {1: {cta, angle, state_offer}, 2: ..., 3: ...}
     steps: dict[int, OfferStep] = {}
+    # Who a message to a shared inbox (info@, office@) with no known contact
+    # name asks to be passed to ("the person who books jobs"). Empty uses
+    # writer.routing_role.
+    routing_role: str = ""
     case_studies: list[CaseStudy] = []
     evidence: AggregateEvidence | None = None
 
@@ -578,6 +599,14 @@ class OfferDefinition(BaseModel):
                 raise ValueError(f"steps are numbered 1 to {MAX_OFFER_STEP}, got {step}")
         return v
 
+    @model_validator(mode="after")
+    def _offer_sentence_exists(self):
+        for number, step in self.steps.items():
+            if step.state_offer and not (self.content.sentence.strip() or self.content.summary.strip()):
+                raise ValueError(f"offer {self.key}: step {number} has state_offer but the offer has "
+                                 "no content.sentence or content.summary to state")
+        return self
+
     @property
     def has_rule(self) -> bool:
         return bool(self.markets or self.segments or self.signals.require or self.signals.exclude)
@@ -592,6 +621,34 @@ class OfferDefinition(BaseModel):
         if self.evidence:
             codes |= set(self.evidence.require) | set(self.evidence.exclude)
         return codes
+
+
+class WriterConfig(BaseModel):
+    """How the Writer's drafts are held to the rules the prompts state."""
+    # Words allowed per sequence step, counted over the whole body with the
+    # greeting and the sign-off (mercury/draft_rules.py has the counting
+    # rule). Every prompt number is rendered from this, and the same numbers
+    # are enforced: a longer draft is rewritten once, and if it is still over
+    # it is staged flagged and needs an explicit "approve anyway".
+    word_limits: dict[int, int] = dict(DEFAULT_WORD_LIMITS)
+    # Who a shared inbox with no known contact name is asked to pass the
+    # message to, when the offer does not set its own routing_role.
+    routing_role: str = "the person who handles this"
+    # Language line and rules for prospects who belong to no icp.markets
+    # entry. Empty keeps the built-in line.
+    default_language_line: str = ""
+    language_rules: list[str] = []
+
+    @field_validator("word_limits")
+    @classmethod
+    def _limits(cls, v: dict[int, int]) -> dict[int, int]:
+        merged = {**DEFAULT_WORD_LIMITS, **v}
+        for step, limit in merged.items():
+            if not 1 <= step <= MAX_OFFER_STEP:
+                raise ValueError(f"word_limits steps are numbered 1 to {MAX_OFFER_STEP}, got {step}")
+            if not 10 <= limit <= 500:
+                raise ValueError(f"word_limits for step {step} must be between 10 and 500, got {limit}")
+        return merged
 
 
 class DemosConfig(BaseModel):
@@ -617,6 +674,7 @@ class MercuryConfig(BaseModel):
     compliance: ComplianceConfig = ComplianceConfig()
     offers: list[OfferDefinition] = []
     demos: DemosConfig = DemosConfig()
+    writer: WriterConfig = WriterConfig()
 
     @field_validator("offers")
     @classmethod

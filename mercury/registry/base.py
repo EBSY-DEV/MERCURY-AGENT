@@ -102,6 +102,39 @@ def _fold(text: str) -> str:
                    if not unicodedata.combining(c))
 
 
+def _strip_name_decorations(name: str, *, strip_location_suffix: bool = True) -> str:
+    """A business name with its branch tail, trailing parentheses and
+    trailing legal suffixes removed, in its original case. The one place
+    that knows what a legal suffix or a location tail is: both the
+    comparison key below and ``short_business_name`` build on it."""
+    text = (name or "").strip()
+    if strip_location_suffix:
+        head = _LOCATION_SPLIT.split(text, maxsplit=1)[0].strip()
+        text = head or text
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip() or text
+    tokens = text.split()
+    while len(tokens) > 1 and re.sub(r"[^a-z0-9]", "", _fold(tokens[-1]).lower()) in LEGAL_SUFFIXES:
+        tokens.pop()
+    return " ".join(tokens).rstrip(" ,;:-").strip() or text
+
+
+def short_business_name(name: str) -> str:
+    """The name to use in a subject and after the first mention: the
+    business name without legal suffixes (LLC, Inc, Corp, Co, Ltd, PLLC, ...)
+    or a location after a dash or pipe, keeping its own capitalisation.
+    "Acme Roofing LLC - Springfield" becomes "Acme Roofing"."""
+    short = _strip_name_decorations(name)
+    # "Smith & Sons Co." leaves "Smith & Sons"; "Smith &" would be wrong.
+    return re.sub(r"\s*(?:&|\+|and)$", "", short, flags=re.IGNORECASE).strip() or short
+
+
+def name_variants(name: str) -> list[str]:
+    """Other spellings of a full business name a draft may use for it: the
+    name without its location tail but with its legal suffix kept."""
+    head = _LOCATION_SPLIT.split((name or "").strip(), maxsplit=1)[0].strip()
+    return [head] if head and head != (name or "").strip() else []
+
+
 def normalize_business_name(name: str, *, strip_location_suffix: bool = True) -> str:
     """The comparison key for a business name.
 
@@ -111,11 +144,7 @@ def normalize_business_name(name: str, *, strip_location_suffix: bool = True) ->
     ("Acme Roofing - Tampa") is cut off. That is for OUR side only: a name
     taken from the registry is already the legal name and is kept whole.
     """
-    text = _fold(name).strip()
-    if strip_location_suffix:
-        head = _LOCATION_SPLIT.split(text, maxsplit=1)[0].strip()
-        text = head or text
-    text = re.sub(r"\([^)]*\)", " ", text)
+    text = _fold(_strip_name_decorations(name, strip_location_suffix=strip_location_suffix))
     text = text.lower().replace("&", " and ")
     text = re.sub(r"[.']", "", text)            # l.l.c. -> llc, o'neil -> oneil
     text = re.sub(r"[^a-z0-9]+", " ", text)
