@@ -1331,10 +1331,17 @@ class StateManager:
                 f"WHERE id = ? AND status = 'approved' AND {matches} "
                 "AND approved_revision = revision "
                 f"AND approved_hash = {_OUTBOX_HASH_SQL} "
-                # A pause set after the due scan still holds this email back.
+                # Recheck database-backed holds under the write lock. A
+                # pause may land after the sender's last pre-claim read.
+                "AND NOT EXISTS (SELECT 1 FROM settings "
+                "WHERE key IN ('operator_pause', 'sending_paused') "
+                "AND COALESCE(value, '') != '') "
+                # Mailbox pauses hold cold mail; replies still go through.
+                "AND (outbox.kind = 'reply' OR NOT EXISTS ("
+                "SELECT 1 FROM warmup_inboxes WHERE email = ? AND status = 'paused')) "
                 f"AND NOT {_PAUSED_OUTBOX_SQL}",
                 (mailbox, mailbox, _utcnow().isoformat(), item["id"],
-                 *(item[column] for column in columns)),
+                 *(item[column] for column in columns), _norm(mailbox)),
             )
             await db.commit()
             return bool(cursor.rowcount)
