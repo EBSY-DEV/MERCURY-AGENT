@@ -142,8 +142,6 @@ To explore the dashboard with sample data first, run `python scripts/seed_demo.p
 
 ## Screenshots
 
-The dashboard has a light and a dark theme. These images follow your GitHub theme.
-
 <table>
   <tr>
     <td width="50%">
