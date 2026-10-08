@@ -618,7 +618,140 @@ MIGRATIONS: list[str] = [
     ALTER TABLE outbox ADD COLUMN requires_manual_review INTEGER NOT NULL DEFAULT 0;
     UPDATE outbox SET requires_manual_review = 1 WHERE status = 'blocked';
     """,
-    # ── v16: follow-ups thread under their opener ──
+    # ── v16: temporary sequence pauses (out-of-office replies) ──
+    """
+    -- One row per prospect: the current or most recent pause of their cold
+    -- sequence. It is separate from prospects.status (the sales stage) and
+    -- from the outbox rows (which keep their approval status while paused).
+    --   state: paused (resume_at set) | needs_review (no usable return date)
+    --          | resumed (ended) | superseded (a reply, opt-out, bounce or
+    --          closure ended it)
+    -- trigger_message_id / trigger_at identify the inbound message the pause
+    -- was read from, so replaying it changes nothing. manual_override marks a
+    -- date an operator set; only a newer message than override_at may replace it.
+    CREATE TABLE IF NOT EXISTS sequence_pauses (
+        id TEXT PRIMARY KEY,
+        prospect_id TEXT NOT NULL UNIQUE,
+        reason TEXT DEFAULT 'ooo',
+        state TEXT NOT NULL,
+        review_reason TEXT DEFAULT '',
+        trigger_message_id TEXT DEFAULT '',
+        trigger_at TIMESTAMP,
+        confidence REAL DEFAULT 0,
+        return_text TEXT DEFAULT '',
+        resume_at TIMESTAMP,
+        manual_override INTEGER DEFAULT 0,
+        override_at TIMESTAMP,
+        ended_at TIMESTAMP,
+        ended_reason TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_sequence_pauses_state
+        ON sequence_pauses(state, resume_at);
+    """,
+    # ── v17: offer attribution and the per-prospect demo gate ──
+    """
+    -- The offer an email was written for (offers[].key in mercury.yaml).
+    -- '' = written before offers existed: no offer, so no demo gate. An
+    -- outbox row inherits its campaign's key when it is queued.
+    ALTER TABLE campaigns ADD COLUMN offer_key TEXT DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN offer_key TEXT DEFAULT '';
+    -- A demo built for one prospect: the answering line or draft site an
+    -- offer's email says already exists. Sequence emails of an offer with
+    -- requires_demo wait until the prospect's demo is 'ready'.
+    --   requested -> ready -> retired
+    CREATE TABLE demos (
+        id TEXT PRIMARY KEY,
+        prospect_id TEXT NOT NULL,
+        offer_key TEXT NOT NULL,
+        kind TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'requested'
+            CHECK (status IN ('requested', 'ready', 'retired')),
+        demo_url TEXT DEFAULT '',
+        recording_path TEXT DEFAULT '',
+        agent_id TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        built_by TEXT DEFAULT '',
+        retire_reason TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ready_at TIMESTAMP,
+        retired_at TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    -- One live demo per prospect and offer; retired ones stay as history.
+    CREATE UNIQUE INDEX uq_demos_live ON demos(prospect_id, offer_key)
+        WHERE status != 'retired';
+    CREATE INDEX idx_demos_status ON demos(status);
+    CREATE INDEX idx_outbox_offer ON outbox(offer_key) WHERE offer_key != '';
+    """,
+    # ── v18: review revisions, approval snapshots, idempotent commands, audit ──
+    """
+    -- revision counts changes to what a reviewer reads and decides on: the
+    -- recipient, the sending mailbox, the text, its generation and a send
+    -- time an operator chose. Status changes and the sender's own timing
+    -- (follow-up spacing, retries, out-of-office resumes) leave it alone.
+    ALTER TABLE outbox ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+    -- The approval snapshot. approved_revision is the revision a reviewer
+    -- (or the no-approval policy) approved, approved_hash the content it
+    -- covered (outbox_hash below). NULL = not approved. The send claim
+    -- requires both to match the row, so a changed draft cannot go out on
+    -- an earlier approval.
+    ALTER TABLE outbox ADD COLUMN approved_revision INTEGER;
+    ALTER TABLE outbox ADD COLUMN approved_hash TEXT DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN approved_by TEXT DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN approved_at TIMESTAMP;
+    -- Mail approved (or mid-send) before snapshots existed keeps its
+    -- approval for the content it holds now.
+    UPDATE outbox SET approved_revision = revision,
+        approved_hash = outbox_hash(to_email, subject, body, mailbox, generation_id),
+        approved_by = 'legacy', approved_at = COALESCE(updated_at, CURRENT_TIMESTAMP)
+        WHERE status IN ('approved', 'sending');
+    -- One row per request key a client sent with a command. A replay with
+    -- the same key returns result_json instead of running again. state is
+    -- 'running' while the first attempt is in flight, then 'done'.
+    CREATE TABLE command_requests (
+        client TEXT NOT NULL,
+        operator TEXT NOT NULL,
+        request_key TEXT NOT NULL,
+        action TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'running',
+        outcome TEXT DEFAULT '',
+        result_json TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        finished_at TIMESTAMP,
+        PRIMARY KEY (client, operator, request_key)
+    );
+    CREATE INDEX idx_command_requests_created ON command_requests(created_at);
+    -- Every operator command: who, through which client, on what, the
+    -- revisions before and after, and how it ended (ok, replayed, or the
+    -- error code). Values are redacted before they get here. Append-only.
+    CREATE TABLE audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        client TEXT NOT NULL,
+        operator TEXT NOT NULL,
+        request_key TEXT DEFAULT '',
+        batch_id TEXT DEFAULT '',
+        action TEXT NOT NULL,
+        object_type TEXT DEFAULT '',
+        object_id TEXT DEFAULT '',
+        revision_before TEXT DEFAULT '',
+        revision_after TEXT DEFAULT '',
+        outcome TEXT NOT NULL,
+        message TEXT DEFAULT '',
+        detail_json TEXT DEFAULT '{}'
+    );
+    CREATE INDEX idx_audit_object ON audit_log(object_type, object_id, id);
+    CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log BEGIN
+        SELECT RAISE(ABORT, 'audit_log is append-only');
+    END;
+    CREATE TRIGGER audit_log_no_delete BEFORE DELETE ON audit_log BEGIN
+        SELECT RAISE(ABORT, 'audit_log is append-only');
+    END;
+    """,
+    # ── v19: follow-ups thread under their opener ──
     """
     -- A follow-up sent as a reply inherits in_reply_to / thread_ref from the
     -- step sent before it. thread_references is the whole chain of
@@ -629,70 +762,54 @@ MIGRATIONS: list[str] = [
     ALTER TABLE outbox ADD COLUMN thread_references TEXT DEFAULT '';
     ALTER TABLE outbox ADD COLUMN thread_subject TEXT DEFAULT '';
     """,
-    # ── v17: out-of-office pauses and the automatic replies behind them ──
-    """
-    -- A temporary stop on one contact's cold sequence while they are away.
-    -- Kept apart from prospects.status (their pipeline place does not move)
-    -- and from company_holds (it is about one person, and it ends by itself
-    -- at resume_at). One active pause per contact; rows are never deleted:
-    -- ending one stamps ended_at with 'resumed' or 'superseded'.
-    --   review_state  'scheduled' (resume_at is set) or 'needs_review' (no
-    --                 usable date: a person sets one or resumes by hand)
-    --   message_key / message_at  the vacation reply that set the date
-    --   manual_override  a person set the date; only a vacation reply sent
-    --                 after override_at may change it again
-    CREATE TABLE sequence_pauses (
-        id TEXT PRIMARY KEY,
-        prospect_id TEXT NOT NULL,
-        reason TEXT NOT NULL DEFAULT 'out_of_office',
-        status TEXT NOT NULL DEFAULT 'active'
-            CHECK (status IN ('active', 'resumed', 'superseded')),
-        review_state TEXT NOT NULL CHECK (review_state IN ('scheduled', 'needs_review')),
-        review_reason TEXT DEFAULT '',
-        message_key TEXT DEFAULT '',
-        message_at TIMESTAMP,
-        confidence REAL DEFAULT 0,
-        return_text TEXT DEFAULT '',
-        resume_at TIMESTAMP,
-        timezone TEXT DEFAULT '',
-        manual_override INTEGER NOT NULL DEFAULT 0,
-        override_at TIMESTAMP,
-        override_by TEXT DEFAULT '',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        ended_at TIMESTAMP,
-        ended_by TEXT DEFAULT '',
-        ended_reason TEXT DEFAULT ''
-    );
-    CREATE UNIQUE INDEX uq_sequence_pauses_active
-        ON sequence_pauses(prospect_id) WHERE ended_at IS NULL;
-    CREATE INDEX idx_sequence_pauses_due
-        ON sequence_pauses(review_state, resume_at) WHERE ended_at IS NULL;
-    CREATE INDEX idx_sequence_pauses_prospect ON sequence_pauses(prospect_id, ended_at);
-
-    -- Every automatic message from a contact (vacation reply, receipt,
-    -- acknowledgement), kept as a record. They never open a conversation and
-    -- never count as replies. The primary key is what makes a re-polled
-    -- message a no-op instead of a second pause update.
-    CREATE TABLE auto_replies (
-        message_key TEXT PRIMARY KEY,
-        prospect_id TEXT DEFAULT '',
-        from_email TEXT DEFAULT '',
-        mailbox TEXT DEFAULT '',
-        kind TEXT NOT NULL,
-        detected_by TEXT DEFAULT '',
-        subject TEXT DEFAULT '',
-        excerpt TEXT DEFAULT '',
-        received_at TIMESTAMP,
-        return_text TEXT DEFAULT '',
-        parsed_resume_at TIMESTAMP,
-        pause_id TEXT DEFAULT '',
-        outcome TEXT DEFAULT '',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX idx_auto_replies_prospect ON auto_replies(prospect_id, received_at);
-    """,
+    # v20: normalize both OOO branch schemas without dropping recorded data.
+    # Applied transactionally by _normalize_ooo_schema below.
+    "",
 ]
+
+def outbox_hash(to_email, subject, body, mailbox, generation_id) -> str:
+    """The content an approval covers: who it goes to, from which mailbox,
+    what it says and which generation wrote it. Registered on every
+    connection as the SQL function ``outbox_hash``."""
+    import hashlib
+
+    payload = json.dumps([str(v or "") for v in (to_email, subject, body, mailbox, generation_id)],
+                         ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def _register_functions(db) -> None:
+    await db.create_function("outbox_hash", 5, outbox_hash, deterministic=True)
+
+
+# SQL fragment: the content hash of the current outbox row.
+_OUTBOX_HASH_SQL = "outbox_hash(to_email, subject, body, mailbox, generation_id)"
+# SQL fragment: clear an approval (a reviewable change sends the row back).
+_CLEAR_APPROVAL_SQL = (
+    "status = CASE WHEN status = 'approved' THEN 'pending_review' ELSE status END, "
+    "approved_revision = NULL, approved_hash = '', approved_by = '', approved_at = NULL"
+)
+
+# Pause states that hold a prospect's cold sequence back.
+PAUSE_ACTIVE_STATES = ("paused", "needs_review")
+# A prospect who reaches one of these has left the cold sequence for good, so
+# a temporary pause on them is superseded rather than waited out.
+PAUSE_ENDING_STATUSES = frozenset({"replied", "opted_out", "lost", "meeting", "closed", "won"})
+_PAUSE_ACTIVE_SQL = ", ".join(f"'{s}'" for s in PAUSE_ACTIVE_STATES)
+# SQL fragment: an outbox row of a prospect whose cold sequence is paused.
+_PAUSED_OUTBOX_SQL = (
+    "(outbox.kind = 'sequence' AND EXISTS (SELECT 1 FROM sequence_pauses sp "
+    f"WHERE sp.prospect_id = outbox.prospect_id AND sp.state IN ({_PAUSE_ACTIVE_SQL})))"
+)
+
+
+def _ts(when: datetime | None = None) -> str:
+    """Naive-UTC ISO timestamp to the second: the form pauses are stored and
+    compared in."""
+    when = when or _utcnow()
+    if when.tzinfo is not None:
+        when = when.astimezone(timezone.utc).replace(tzinfo=None)
+    return when.replace(microsecond=0).isoformat()
 
 # ── Exclusion matching and company capacity (shared SQL) ──
 # One definition of "this rule covers this address", used by the sender's
@@ -904,7 +1021,7 @@ _PAUSE_HELD = ("pending_review", "approved")
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
 _CAMPAIGN_COLUMNS = frozenset({
     "name", "channel", "instantly_campaign_id",
-    "sequence_json", "prospect_ids_json", "status",
+    "sequence_json", "prospect_ids_json", "status", "offer_key",
 })
 _CONVERSATION_COLUMNS = frozenset({
     "prospect_id", "campaign_id", "channel",
@@ -925,6 +1042,7 @@ class StateManager:
         """
         db = await aiosqlite.connect(self.db_path, timeout=BUSY_TIMEOUT_SECONDS)
         try:
+            await _register_functions(db)
             yield db
         finally:
             await db.close()
@@ -967,14 +1085,21 @@ class StateManager:
         async with aiosqlite.connect(
             self.db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
         ) as db:
+            await _register_functions(db)
             await db.execute("BEGIN IMMEDIATE")
             try:
                 async with db.execute("PRAGMA user_version") as cursor:
                     (version,) = await cursor.fetchone()
+                if 9 <= version < len(MIGRATIONS):
+                    await self._repair_pre_merge_v9(db)
+                version, applied = await self._reconcile_integration_p0(db, version)
                 for target, script in enumerate(MIGRATIONS, start=1):
                     if version < target:
-                        for statement in _split_sql(script):
-                            await db.execute(statement)
+                        if target == 20:
+                            await self._normalize_ooo_schema(db)
+                        elif target not in applied:
+                            for statement in _split_sql(script):
+                                await db.execute(statement)
                         await db.execute(f"PRAGMA user_version = {target}")
                 if version < len(MIGRATIONS):
                     await self._repair_pre_merge_v9(db)
@@ -982,6 +1107,135 @@ class StateManager:
             except BaseException:
                 await db.execute("ROLLBACK")
                 raise
+
+    @staticmethod
+    async def _reconcile_integration_p0(db, version: int) -> tuple[int, set[int]]:
+        """Recognize the development branches by their actual schema.
+
+        Integration used pauses/demos in slots 14/15 before main introduced
+        exclusions. The threading branch used slots 16/17 for thread fields
+        and pause history. Keep their data while applying every missing feature.
+        """
+        if version < 14:
+            return version, set()
+        async with db.execute("SELECT name FROM sqlite_master WHERE type = 'table'") as cur:
+            tables = {row[0] for row in await cur.fetchall()}
+        async with db.execute("PRAGMA table_info(outbox)") as cur:
+            columns = {row[1] for row in await cur.fetchall()}
+        applied = {19} if "thread_subject" in columns and "thread_references" in columns else set()
+        if "sequence_pauses" in tables:
+            applied.add(16)
+        if "demos" in tables:
+            applied.add(17)
+        if "audit_log" in tables and "revision" in columns:
+            applied.add(18)
+        if "suppressions" not in tables and "sequence_pauses" in tables:
+            return 13, applied
+        if version >= 16 and ("sequence_pauses" not in tables or "demos" not in tables):
+            return 15, applied
+        return version, applied
+
+    @staticmethod
+    async def _normalize_ooo_schema(db) -> None:
+        """Upgrade either pause implementation without dropping its history."""
+        async with db.execute("PRAGMA table_info(outbox)") as cur:
+            outbox_columns = {row[1] for row in await cur.fetchall()}
+        for column in ("thread_references", "thread_subject"):
+            if column not in outbox_columns:
+                await db.execute(f"ALTER TABLE outbox ADD COLUMN {column} TEXT DEFAULT ''")
+        async with db.execute("PRAGMA table_info(sequence_pauses)") as cur:
+            columns = {row[1] for row in await cur.fetchall()}
+        legacy = bool(columns and "status" not in columns)
+        if legacy:
+            await db.execute("ALTER TABLE sequence_pauses RENAME TO legacy_sequence_pauses")
+        script = """
+        CREATE TABLE IF NOT EXISTS sequence_pauses (
+            id TEXT PRIMARY KEY,
+            prospect_id TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT 'out_of_office',
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'resumed', 'superseded')),
+            review_state TEXT NOT NULL CHECK (review_state IN ('scheduled', 'needs_review')),
+            review_reason TEXT DEFAULT '',
+            message_key TEXT DEFAULT '',
+            message_at TIMESTAMP,
+            confidence REAL DEFAULT 0,
+            return_text TEXT DEFAULT '',
+            return_date TEXT DEFAULT '',
+            resume_at TIMESTAMP,
+            timezone TEXT DEFAULT '',
+            manual_override INTEGER NOT NULL DEFAULT 0,
+            override_at TIMESTAMP,
+            override_by TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ended_at TIMESTAMP,
+            ended_by TEXT DEFAULT '',
+            ended_reason TEXT DEFAULT '',
+            state TEXT GENERATED ALWAYS AS (CASE WHEN status = 'active' THEN
+                CASE WHEN review_state = 'scheduled' THEN 'paused' ELSE 'needs_review' END
+                ELSE status END) VIRTUAL,
+            trigger_message_id TEXT GENERATED ALWAYS AS (message_key) VIRTUAL,
+            trigger_at TEXT GENERATED ALWAYS AS (message_at) VIRTUAL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_sequence_pauses_active
+            ON sequence_pauses(prospect_id) WHERE ended_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_sequence_pauses_due
+            ON sequence_pauses(review_state, resume_at) WHERE ended_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_sequence_pauses_prospect ON sequence_pauses(prospect_id, ended_at);
+
+        -- Every automatic message from a contact (vacation reply, receipt,
+        -- acknowledgement), kept as a record. They never open a conversation and
+        -- never count as replies. The primary key is what makes a re-polled
+        -- message a no-op instead of a second pause update.
+        CREATE TABLE IF NOT EXISTS auto_replies (
+            message_key TEXT PRIMARY KEY,
+            prospect_id TEXT DEFAULT '',
+            from_email TEXT DEFAULT '',
+            mailbox TEXT DEFAULT '',
+            kind TEXT NOT NULL,
+            detected_by TEXT DEFAULT '',
+            subject TEXT DEFAULT '',
+            excerpt TEXT DEFAULT '',
+            received_at TIMESTAMP,
+            return_text TEXT DEFAULT '',
+            parsed_resume_at TIMESTAMP,
+            pause_id TEXT DEFAULT '',
+            outcome TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_auto_replies_prospect ON auto_replies(prospect_id, received_at);
+        """
+        for statement in _split_sql(script):
+            await db.execute(statement)
+        if legacy:
+            await db.execute("""INSERT INTO sequence_pauses
+                (id, prospect_id, reason, status, review_state, review_reason,
+                 message_key, message_at, confidence, return_text, resume_at,
+                 manual_override, override_at, ended_at, ended_reason, created_at, updated_at)
+                SELECT id, prospect_id, reason,
+                  CASE WHEN state IN ('paused', 'needs_review') THEN 'active' ELSE state END,
+                  CASE WHEN state = 'paused' OR resume_at IS NOT NULL THEN 'scheduled'
+                       ELSE 'needs_review' END,
+                  review_reason, trigger_message_id, trigger_at, confidence, return_text,
+                  resume_at, manual_override, override_at, ended_at, ended_reason,
+                  created_at, updated_at FROM legacy_sequence_pauses""")
+            await db.execute("DROP TABLE legacy_sequence_pauses")
+        else:
+            # The history branch already has the canonical columns. Only the
+            # compatibility read aliases are missing from its older databases.
+            async with db.execute("PRAGMA table_xinfo(sequence_pauses)") as cur:
+                all_columns = {row[1] for row in await cur.fetchall()}
+            if "return_date" not in all_columns:
+                await db.execute("ALTER TABLE sequence_pauses ADD COLUMN return_date TEXT DEFAULT ''")
+            for name, expression in {
+                "state": "CASE WHEN status = 'active' THEN CASE WHEN review_state = 'scheduled' "
+                         "THEN 'paused' ELSE 'needs_review' END ELSE status END",
+                "trigger_message_id": "message_key", "trigger_at": "message_at",
+            }.items():
+                if name not in all_columns:
+                    await db.execute(f"ALTER TABLE sequence_pauses ADD COLUMN {name} TEXT "
+                                     f"GENERATED ALWAYS AS ({expression}) VIRTUAL")
 
     @staticmethod
     async def _repair_pre_merge_v9(db) -> None:
@@ -1259,6 +1513,8 @@ class StateManager:
                 (status, _utcnow().isoformat(), prospect_id),
             )
             await db.commit()
+        if status in PAUSE_ENDING_STATUSES:
+            await self.supersede_pause(prospect_id, f"prospect {status}")
 
     async def get_prospect_by_email(self, email: str) -> Prospect | None:
         """Look up a prospect by email address (indexed, case-insensitive)."""
@@ -1364,23 +1620,28 @@ class StateManager:
         in_reply_to: str = "",
         mailbox: str = "",
         generation_id: str = "",
+        offer_key: str = "",
         company_id: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
-        (campaign, prospect, step) slot already exists — the double-send guard."""
+        (campaign, prospect, step) slot already exists — the double-send guard.
+        Without an ``offer_key`` the row takes its campaign's, so every path
+        that queues a sequence email carries the offer the demo gate reads."""
         item_id = _new_id()
         async with self._connect() as db:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO outbox
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
-                    thread_ref, in_reply_to, mailbox, generation_id, company_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    thread_ref, in_reply_to, mailbox, generation_id, company_id, offer_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           COALESCE(NULLIF(?, ''),
+                                    (SELECT offer_key FROM campaigns WHERE id = ?), ''))""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
                     status, send_at, provider, thread_ref, in_reply_to,
-                    _norm(mailbox), generation_id, company_id,
+                    _norm(mailbox), generation_id, company_id, _norm(offer_key), campaign_id,
                 ),
             )
             inserted = cursor.rowcount > 0
@@ -1399,6 +1660,7 @@ class StateManager:
         status: str | None = None,
         due_before: str | None = None,
         limit: int = 200,
+        exclude_paused: bool = False,
     ) -> list[dict]:
         where, params = [], []
         if status:
@@ -1407,6 +1669,8 @@ class StateManager:
         if due_before:
             where.append("(send_at IS NULL OR send_at <= ?)")
             params.append(due_before)
+        if exclude_paused:
+            where.append(f"NOT {_PAUSED_OUTBOX_SQL}")
         sql = "SELECT * FROM outbox"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -1659,6 +1923,121 @@ class StateManager:
             await db.commit()
             return cursor.rowcount
 
+    # Compatibility methods for integrations that address pauses by prospect.
+
+    async def count_active_pauses(self) -> dict[str, int]:
+        async with self._connect() as db:
+            async with db.execute("SELECT state, COUNT(*) FROM sequence_pauses "
+                                  "WHERE ended_at IS NULL GROUP BY state") as cur:
+                return {row[0]: row[1] for row in await cur.fetchall()}
+
+    async def record_ooo_pause(
+        self, prospect_id: str, *, message_id: str, message_at: datetime,
+        state: str, resume_at: datetime | None = None, confidence: float = 0.0,
+        return_text: str = "", review_reason: str = "", reason: str = "ooo",
+    ) -> dict:
+        if state not in PAUSE_ACTIVE_STATES:
+            raise ValueError(f"not an active pause state: {state!r}")
+        if state == "paused" and resume_at is None:
+            raise ValueError("a paused sequence needs a resume time")
+        outcome, pause = await self.record_auto_reply(
+            message_key=f"{prospect_id}:{message_id or _ts(message_at)}",
+            kind="out_of_office", received_at=_ts(message_at), prospect_id=prospect_id,
+            parsed={"source_message_key": message_id,
+                    "resume_at": _ts(resume_at) if state == "paused" else None,
+                    "confidence": confidence, "text": return_text,
+                    "review_reason": review_reason},
+        )
+        if pause is None:
+            pause = await self.get_pause(prospect_id)
+        action = {"paused": "created", "updated": "updated"}.get(outcome, "ignored")
+        why = "" if action != "ignored" else {
+            "duplicate": "duplicate message", "ignored": "older than the end of the last pause",
+            "kept": "keeps the return date already set or predates its latest correction",
+        }.get(outcome, outcome)
+        return {"action": action, "why": why, "pause": pause}
+
+    async def override_pause(self, prospect_id: str, resume_at: datetime,
+                             now: datetime | None = None) -> dict | None:
+        now_s, when = _ts(now), _ts(resume_at)
+        if when <= now_s:
+            return await self.resume_pause(prospect_id, reason="operator", now=now)
+        pause = await self.get_active_pause(prospect_id)
+        if pause is None:
+            return None
+        changed = await self.set_pause_resume_at(pause["id"], when, now=now_s)
+        return changed[1] if changed else None
+
+    async def resume_due_pauses(self, now: datetime | None = None) -> list[dict]:
+        resumed = []
+        for pause in await self.due_pauses(_ts(now)):
+            result = await self.resume_pause(pause["prospect_id"], reason="return date",
+                                             now=now, only_due=True)
+            if result is not None:
+                resumed.append(result)
+        return resumed
+
+    async def supersede_pause(self, prospect_id: str, reason: str,
+                              now: datetime | None = None) -> bool:
+        return bool(await self.end_pause(prospect_id, reason=reason, now=_ts(now)))
+
+    @staticmethod
+    async def _reschedule_after_pause(db, prospect_id: str, resume_at: str, now_s: str) -> int:
+        """Move a resumed prospect's queued sequence steps to start at
+        ``resume_at``. The next step goes out then (never earlier than it was
+        planned), and each later step keeps its own gap after the one before,
+        so overdue steps do not all fire at once. Statuses are not touched."""
+        async with db.execute(
+            "SELECT id, campaign_id, step, send_at FROM outbox "
+            "WHERE prospect_id = ? AND kind = 'sequence' "
+            "AND status IN ('pending_review', 'approved') "
+            "ORDER BY campaign_id, step",
+            (prospect_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        by_campaign: dict[str, list] = {}
+        for row in rows:
+            by_campaign.setdefault(row[1], []).append(row)
+
+        def parse(value):
+            try:
+                return datetime.fromisoformat(str(value).replace(" ", "T"))
+            except (TypeError, ValueError):
+                return None
+
+        anchor = parse(resume_at) or parse(now_s)
+        moved = 0
+        for campaign_id, steps in by_campaign.items():
+            delays: dict[int, int] = {}
+            if campaign_id:
+                async with db.execute(
+                    "SELECT sequence_json FROM campaigns WHERE id = ?", (campaign_id,)
+                ) as cursor:
+                    found = await cursor.fetchone()
+                if found:
+                    for s in Campaign.sequence_from_json(found[0]):
+                        delays[int(s.step)] = max(0, int(s.delay_days))
+            prev_new = prev_old = None
+            for row_id, _cid, step, send_at in steps:
+                old = parse(send_at) or anchor
+                if prev_new is None:
+                    new = max(old, anchor)
+                else:
+                    if int(step) in delays:
+                        gap = timedelta(days=delays[int(step)])
+                    else:
+                        gap = max(timedelta(0), old - prev_old) if prev_old else timedelta(0)
+                    new = max(old, prev_new + gap)
+                if new != old or send_at is None:
+                    await db.execute(
+                        "UPDATE outbox SET send_at = ?, updated_at = ? WHERE id = ? "
+                        "AND status IN ('pending_review', 'approved')",
+                        (new.replace(microsecond=0).isoformat(), now_s, row_id),
+                    )
+                    moved += 1
+                prev_new, prev_old = new, old
+        return moved
+
     async def count_outbox_sent(self) -> int:
         async with self._connect() as db:
             async with db.execute(
@@ -1699,6 +2078,165 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
+
+    # ── Demos: what an offer's email says was already built for them ──
+
+    DEMO_ARTIFACTS = ("demo_url", "recording_path", "agent_id", "notes", "built_by")
+    # The offer a sequence row belongs to: its own key, else its campaign's.
+    _OUTBOX_OFFER_SQL = "COALESCE(NULLIF(o.offer_key, ''), c.offer_key, '')"
+
+    async def request_demo(self, prospect_id: str, offer_key: str,
+                           kind: str = "") -> tuple[str, bool]:
+        """Register a demo as 'requested'. Returns (demo id, created); a live
+        demo for the same prospect and offer is returned as it is."""
+        offer_key = _norm(offer_key)
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO demos (id, prospect_id, offer_key, kind) "
+                "VALUES (?, ?, ?, ?)",
+                (_new_id(), prospect_id, offer_key, _norm(kind)),
+            )
+            await db.commit()
+            created = cursor.rowcount > 0
+        demo = await self.find_live_demo(prospect_id, offer_key)
+        return (demo["id"] if demo else ""), created
+
+    async def get_demo(self, demo_id: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM demos WHERE id = ?", (demo_id,)) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def find_live_demo(self, prospect_id: str, offer_key: str) -> dict | None:
+        """The requested or ready demo for this prospect and offer, if any."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM demos WHERE prospect_id = ? AND offer_key = ? "
+                "AND status != 'retired'",
+                (prospect_id, _norm(offer_key)),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def list_demos(self, status: str | None = None, prospect_id: str = "",
+                         limit: int = 200) -> list[dict]:
+        """Demo records, newest first, with the prospect's name and address."""
+        where, params = [], []
+        if status:
+            where.append("d.status = ?")
+            params.append(status)
+        if prospect_id:
+            where.append("d.prospect_id = ?")
+            params.append(prospect_id)
+        sql = ("SELECT d.*, COALESCE(p.email, '') AS email, COALESCE(p.first_name, '') AS first_name, "
+               "COALESCE(p.last_name, '') AS last_name, COALESCE(p.company, '') AS company "
+               "FROM demos d LEFT JOIN prospects p ON p.id = d.prospect_id")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY d.updated_at DESC, d.created_at DESC LIMIT ?"
+        params.append(int(limit))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def mark_demo_ready(self, demo_id: str, **artifacts) -> bool:
+        """requested -> ready, or update a ready demo's artifacts. Only the
+        artifact fields given (not None) change. A retired demo stays retired."""
+        fields = {k: str(v).strip() for k, v in artifacts.items()
+                  if k in self.DEMO_ARTIFACTS and v is not None}
+        sets = "".join(f", {k} = ?" for k in fields)
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE demos SET status = 'ready', ready_at = COALESCE(ready_at, ?), "
+                f"updated_at = ?{sets} WHERE id = ? AND status IN ('requested', 'ready')",
+                (now, now, *fields.values(), demo_id),
+            )
+            await db.commit()
+            return bool(cursor.rowcount)
+
+    async def retire_demo(self, demo_id: str, reason: str = "") -> bool:
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE demos SET status = 'retired', retired_at = ?, retire_reason = ?, "
+                "updated_at = ? WHERE id = ? AND status != 'retired'",
+                (now, reason, now, demo_id),
+            )
+            await db.commit()
+            return bool(cursor.rowcount)
+
+    async def outbox_offer_key(self, item: dict) -> str:
+        """The offer an outbox row was written for: its own key, else its
+        campaign's (a row queued before the campaign carried one)."""
+        own = _norm(item.get("offer_key"))
+        if own or not item.get("campaign_id"):
+            return own
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COALESCE(offer_key, '') FROM campaigns WHERE id = ?",
+                (item["campaign_id"],),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return _norm(row[0]) if row else ""
+
+    async def queued_offer_outbox(self, ids: list[str] | None = None) -> list[dict]:
+        """Queued sequence rows that carry an offer, each with its resolved
+        ``offer``, its prospect, and the live demo for that prospect and offer
+        (``demo_id`` / ``demo_status``, None when no demo is registered).
+        ``ids`` limits the scan to those outbox rows."""
+        offer = self._OUTBOX_OFFER_SQL
+        sql = (
+            f"SELECT o.*, {offer} AS offer, d.id AS demo_id, d.status AS demo_status, "
+            "d.kind AS demo_kind, COALESCE(p.first_name, '') AS first_name, "
+            "COALESCE(p.last_name, '') AS last_name, COALESCE(p.company, '') AS company "
+            "FROM outbox o "
+            "LEFT JOIN campaigns c ON c.id = o.campaign_id AND o.campaign_id != '' "
+            "LEFT JOIN prospects p ON p.id = o.prospect_id "
+            f"LEFT JOIN demos d ON d.prospect_id = o.prospect_id AND d.offer_key = {offer} "
+            "AND d.status != 'retired' "
+            "WHERE o.kind = 'sequence' AND o.status IN ('pending_review', 'approved') "
+            f"AND {offer} != ''"
+        )
+        params: list = []
+        if ids is not None:
+            ids = [i for i in ids if i]
+            if not ids:
+                return []
+            sql += f" AND o.id IN ({', '.join('?' for _ in ids)})"
+            params.extend(ids)
+        sql += " ORDER BY o.send_at ASC, o.created_at ASC LIMIT 2000"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def demos_due_for_retirement(self, days: int) -> list[dict]:
+        """Ready demos whose prospect never replied, with nothing queued for
+        them, and no email to them (nor the demo itself) newer than ``days``."""
+        cutoff = (_utcnow() - timedelta(days=max(0, int(days)))).strftime("%Y-%m-%d %H:%M:%S")
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT d.* FROM demos d
+                   LEFT JOIN prospects p ON p.id = d.prospect_id
+                   WHERE d.status = 'ready'
+                     AND COALESCE(p.status, '') NOT IN ('replied', 'meeting', 'closed')
+                     AND NOT EXISTS (
+                       SELECT 1 FROM outbox o WHERE o.prospect_id = d.prospect_id
+                         AND o.kind = 'sequence'
+                         AND o.status IN ('pending_review', 'approved', 'sending'))
+                     AND MAX(
+                       REPLACE(COALESCE((SELECT MAX(REPLACE(o.sent_at, 'T', ' ')) FROM outbox o
+                                         WHERE o.prospect_id = d.prospect_id AND o.status = 'sent'),
+                                        ''), 'T', ' '),
+                       REPLACE(COALESCE(d.ready_at, d.created_at), 'T', ' ')) < ?""",
+                (cutoff,),
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
 
     # ── Exclusions (suppressions) ──
 
@@ -1942,7 +2480,8 @@ class StateManager:
           company_hold          cold mail to this company is paused
           company_daily_limit   the company had its new contacts for 24 hours
           company_active_limit  the company has its unfinished sequences
-          stale                 the row changed since the due scan
+          stale                 the row changed since the due scan, or its
+                                sequence was paused (out of office)
 
         A claimed first email is status 'sending' until the provider answers,
         so it already counts against its company: two senders cannot both see
@@ -1971,7 +2510,9 @@ class StateManager:
                 matches = " AND ".join(f"{column} = ?" for column in columns)
                 cursor = await db.execute(
                     "UPDATE outbox SET status = 'sending', mailbox = ?, company_id = ?, "
-                    f"updated_at = ? WHERE id = ? AND status = 'approved' AND {matches}",
+                    f"updated_at = ? WHERE id = ? AND status = 'approved' AND {matches} "
+                    # A pause set after the due scan still holds this email back.
+                    f"AND NOT {_PAUSED_OUTBOX_SQL}",
                     (mailbox, company_id, now, item["id"], *(item[c] for c in columns)))
                 if not cursor.rowcount:
                     await db.execute("ROLLBACK")
@@ -2052,9 +2593,10 @@ class StateManager:
         fields = {
             "review_state": "scheduled" if scheduled else "needs_review",
             "review_reason": "" if scheduled else (parsed.get("review_reason") or "no_date"),
-            "message_key": message_key, "message_at": received_at,
+            "message_key": parsed.get("source_message_key", message_key), "message_at": received_at,
             "confidence": float(parsed.get("confidence") or 0.0),
-            "return_text": parsed.get("text", ""), "resume_at": parsed.get("resume_at"),
+            "return_text": parsed.get("text", ""), "return_date": parsed.get("local_date", ""),
+            "resume_at": parsed.get("resume_at"),
             "timezone": parsed.get("timezone", ""),
         }
         active = await _active_pause(db, prospect_id)
@@ -2094,7 +2636,8 @@ class StateManager:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT * FROM sequence_pauses WHERE id = ?", (pause_id,)
+                "SELECT * FROM sequence_pauses WHERE id = ? OR prospect_id = ? "
+                "ORDER BY ended_at IS NOT NULL, created_at DESC LIMIT 1", (pause_id, pause_id)
             ) as cur:
                 row = await cur.fetchone()
                 return dict(row) if row else None
@@ -2117,13 +2660,17 @@ class StateManager:
             ) as cur:
                 return [dict(r) for r in await cur.fetchall()]
 
-    async def list_pauses(self, ended: bool = False, limit: int = 200) -> list[dict]:
+    async def list_pauses(self, ended: bool = False, limit: int = 200, *,
+                          active_only: bool | None = None) -> list[dict]:
         """Pauses with who they are, and the cold mail each is holding."""
         held = ", ".join(f"'{s}'" for s in _PAUSE_HELD)
+        where = "" if active_only is False else f"WHERE s.ended_at IS {'NOT ' if ended else ''}NULL"
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                f"""SELECT s.*, COALESCE(p.email, '') AS prospect_email,
+                f"""SELECT s.*, p.first_name, p.last_name, p.email, p.title,
+                       COALESCE(NULLIF(c.name, ''), p.company, '') AS company_name,
+                       COALESCE(p.email, '') AS prospect_email,
                        TRIM(COALESCE(p.first_name, '') || ' ' || COALESCE(p.last_name, ''))
                            AS prospect_name,
                        COALESCE(p.company, '') AS company,
@@ -2135,13 +2682,14 @@ class StateManager:
                           AND o.kind = 'sequence' AND o.status IN ({held})) AS next_send_at
                     FROM sequence_pauses s
                     LEFT JOIN prospects p ON p.id = s.prospect_id
-                    WHERE s.ended_at IS {'NOT ' if ended else ''}NULL
+                    LEFT JOIN companies c ON c.id = p.company_id
+                    {where}
                     ORDER BY {'s.ended_at DESC' if ended else
                               "s.review_state = 'scheduled', COALESCE(s.resume_at, s.created_at)"}
                     LIMIT ?""",
                 (int(limit),),
             ) as cur:
-                return [dict(r) for r in await cur.fetchall()]
+                return [{**dict(r), "queued_count": r["queued"]} for r in await cur.fetchall()]
 
     async def auto_replies_for(self, prospect_id: str, limit: int = 20) -> list[dict]:
         async with self._connect() as db:
@@ -2153,7 +2701,8 @@ class StateManager:
                 return [dict(r) for r in await cur.fetchall()]
 
     async def set_pause_resume_at(self, pause_id: str, resume_at: str, *, actor: str = "",
-                                  now: str | None = None) -> tuple[dict, dict] | None:
+                                  now: str | None = None,
+                                  return_date: str | None = None) -> tuple[dict, dict] | None:
         """A person sets (or corrects) the return time. Returns (before, after),
         or None when the pause is not active. Approval status is untouched."""
         now = now or _utcnow().isoformat()
@@ -2163,87 +2712,60 @@ class StateManager:
             if not before or before["ended_at"]:
                 return None
             cursor = await db.execute(
-                "UPDATE sequence_pauses SET resume_at = ?, review_state = 'scheduled', "
+                "UPDATE sequence_pauses SET resume_at = ?, return_date = COALESCE(?, return_date), "
+                "review_state = 'scheduled', "
                 "review_reason = '', manual_override = 1, override_at = ?, override_by = ?, "
                 "updated_at = ? WHERE id = ? AND ended_at IS NULL",
-                (resume_at, now, actor, now, pause_id))
+                (resume_at, return_date, now, actor, now, before["id"]))
             await db.commit()
             if not cursor.rowcount:
                 return None
         return before, await self.get_pause(pause_id)
 
-    async def resume_pause(self, pause_id: str, *, start_at: str, actor: str = "",
-                           reason: str = "", now: str | None = None,
-                           due_at: str | None = None) -> tuple[dict | None, int]:
-        """End a pause and move the held sequence so it restarts at ``start_at``.
+    async def resume_pause(self, pause_id: str, reason: str = "operator",
+                           now: datetime | str | None = None, *, start_at: str | None = None,
+                           actor: str = "", due_at: str | None = None, only_due: bool = False):
+        """Resume by pause ID (tuple result) or prospect ID (legacy dict result).
 
-        Per campaign, the next unsent step moves to ``start_at`` (never
-        earlier than it was already due) and every later step moves by the
-        same amount, so the gaps between steps stay what the sequence said.
-        Only send_at changes: a draft waiting for review still waits.
-        Automatic resumes pass ``due_at`` to recheck the return date under
-        the write lock: a correction after the due scan must still hold mail.
-        Returns (ended pause, rows rescheduled), or (None, 0) when the pause
-        was not active or is no longer due.
+        The current return date is checked after acquiring the write lock, so
+        an operator correction or newer reply wins over a stale due scan.
         """
-        now = now or _utcnow().isoformat()
-        start = _parse_ts(start_at) or _parse_ts(now)
-        marks = ", ".join("?" for _ in _PAUSE_HELD)
-        async with aiosqlite.connect(
-            self.db_path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
-        ) as db:
+        by_pause = start_at is not None
+        now_s = now if isinstance(now, str) else _ts(now)
+        if only_due:
+            due_at = now_s
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             try:
                 async with db.execute(
-                    "SELECT * FROM sequence_pauses WHERE id = ? AND ended_at IS NULL",
-                    (pause_id,),
+                    "SELECT * FROM sequence_pauses WHERE (id = ? OR prospect_id = ?) "
+                    "AND ended_at IS NULL", (pause_id, pause_id),
                 ) as cur:
                     row = await cur.fetchone()
                 if not row:
-                    await db.execute("ROLLBACK")
-                    return None, 0
+                    await db.rollback()
+                    return (None, 0) if by_pause else None
                 pause = dict(row)
-                if due_at is not None:
-                    resume_at = _parse_ts(pause["resume_at"])
-                    due = _parse_ts(due_at)
-                    if (pause["review_state"] != "scheduled" or resume_at is None
-                            or due is None or resume_at > due):
-                        await db.execute("ROLLBACK")
-                        return None, 0
-                async with db.execute(
-                    f"SELECT id, campaign_id, step, send_at FROM outbox "
-                    f"WHERE prospect_id = ? AND kind = 'sequence' AND status IN ({marks}) "
-                    f"ORDER BY campaign_id, step",
-                    (pause["prospect_id"], *_PAUSE_HELD),
-                ) as cur:
-                    rows = [dict(r) for r in await cur.fetchall()]
-                threads: dict[str, list[dict]] = {}
-                for r in rows:
-                    threads.setdefault(r["campaign_id"] or r["id"], []).append(r)
-                moved = 0
-                for thread in threads.values():
-                    base = _parse_ts(thread[0]["send_at"]) or start
-                    shift = start - base
-                    if shift <= timedelta(0):
-                        continue
-                    for r in thread:
-                        new = (_parse_ts(r["send_at"]) or base) + shift
-                        await db.execute(
-                            f"UPDATE outbox SET send_at = ?, updated_at = ? "
-                            f"WHERE id = ? AND status IN ({marks})",
-                            (new.isoformat(), now, r["id"], *_PAUSE_HELD))
-                        moved += 1
+                resume_at = _parse_ts(pause["resume_at"])
+                if due_at is not None and (pause["review_state"] != "scheduled"
+                        or resume_at is None or resume_at > _parse_ts(due_at)):
+                    await db.rollback()
+                    return (None, 0) if by_pause else None
+                anchor = start_at or (pause["resume_at"] if resume_at is not None
+                                      and resume_at <= _parse_ts(now_s) else now_s)
+                moved = await self._reschedule_after_pause(db, pause["prospect_id"], anchor, now_s)
                 await db.execute(
                     "UPDATE sequence_pauses SET status = 'resumed', ended_at = ?, ended_by = ?, "
                     "ended_reason = ?, updated_at = ? WHERE id = ?",
-                    (now, actor, reason, now, pause_id))
-                await db.execute("COMMIT")
+                    (now_s, actor, reason, now_s, pause["id"]))
+                await db.commit()
             except BaseException:
-                await db.execute("ROLLBACK")
+                await db.rollback()
                 raise
-        return {**pause, "status": "resumed", "ended_at": now, "ended_by": actor,
-                "ended_reason": reason}, moved
+        ended = {**pause, "status": "resumed", "state": "resumed", "ended_at": now_s,
+                 "ended_by": actor, "ended_reason": reason, "rescheduled": moved}
+        return (ended, moved) if by_pause else ended
 
     async def end_pause(self, prospect_id: str, *, reason: str, actor: str = "",
                         now: str | None = None) -> dict | None:
@@ -2740,13 +3262,14 @@ class StateManager:
             await db.execute(
                 """INSERT INTO campaigns
                    (id, name, channel, instantly_campaign_id, sequence_json,
-                    prospect_ids_json, status, created_at, mailbox)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    prospect_ids_json, status, created_at, mailbox, offer_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     campaign.id, campaign.name, campaign.channel,
                     campaign.instantly_campaign_id, campaign.sequence_json(),
                     json.dumps(campaign.prospect_ids), campaign.status,
                     campaign.created_at.isoformat(), campaign.mailbox,
+                    _norm(campaign.offer_key),
                 ),
             )
             await db.commit()

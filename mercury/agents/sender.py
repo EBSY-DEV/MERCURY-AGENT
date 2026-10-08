@@ -27,6 +27,9 @@ from datetime import date, datetime, timedelta, timezone
 
 from mercury.brain import Brain
 from mercury.config import MercuryConfig, EnvConfig
+from mercury.demos import check_campaign as demo_check_campaign
+from mercury.demos import check_outbox_item as demo_check_item
+from mercury.demos import register_requests as register_demo_requests
 from mercury.gate import pre_send_check
 from mercury.integrations.instantly import InstantlyClient
 from mercury.integrations.mail_provider import NATIVE_PROVIDERS, SendResult, get_mail_provider
@@ -112,6 +115,26 @@ SENDABLE_STATUSES = {"new", "queued"}
 SENDABLE_EMAIL_STATUSES = {"verified"}
 SENDABLE_EMAIL_STATUSES_WITH_RISKY = {"verified", "risky"}
 
+# Stopword counts decide the footer language; drafts are ES or EN.
+_ES_MARKERS = (" el ", " la ", " de ", " que ", " para ", " los ", " las ",
+               " una ", " con ", " por ", " tu ", " su ", " está ", " cómo ")
+_EN_MARKERS = (" the ", " and ", " you ", " your ", " with ", " for ",
+               " that ", " on ", " is ", " are ", " to ", " of ")
+
+
+def with_legal_footer(config, body: str) -> str:
+    """Append company + postal address + opt-out line (CAN-SPAM) in the
+    language of the email. Kept out of the draft so the writer never
+    rewrites or drops it. The placement test sends the same footer, so it
+    tests the email prospects actually get."""
+    c = config.compliance
+    padded = f" {body.lower()} "
+    es = sum(padded.count(m) for m in _ES_MARKERS)
+    en = sum(padded.count(m) for m in _EN_MARKERS)
+    opt_out = c.opt_out_line_es if es > en else c.opt_out_line_en
+    company = config.persona.company
+    return f"{body.rstrip()}\n\n{company} · {c.postal_address.strip()}\n{opt_out}"
+
 
 class Sender:
     def __init__(
@@ -139,6 +162,8 @@ class Sender:
         # Naive UTC now. Tests replace it to move through a vacation pause.
         self.clock = lambda: datetime.now(timezone.utc).replace(tzinfo=None)
         self._last_drain_at: float | None = None  # monotonic, for spread_sends
+        # Naive-UTC "now" for scheduling decisions; tests substitute their own.
+        self.clock = lambda: datetime.now(timezone.utc).replace(tzinfo=None)
 
     @property
     def is_native(self) -> bool:
@@ -203,6 +228,14 @@ class Sender:
         # 0. Validate before touching the network
         if not self._validate_sequence(campaign):
             await self.state.update_campaign(campaign.id, status="failed")
+            return
+
+        # Instantly runs the whole sequence once deployed, so an offer that
+        # promises a demo keeps the campaign in draft until every contact's
+        # demo is ready.
+        demo = await demo_check_campaign(self.state, self.config, campaign)
+        if demo.held:
+            logger.info(f"Sender: holding campaign '{campaign.name}': {demo.reason}")
             return
 
         # 1. Create campaign in Instantly — or resume one from a previous
@@ -401,6 +434,7 @@ class Sender:
 
     async def _run_native(self):
         """Stage new campaigns into the outbox, then drain what's due."""
+        await self._resume_due_pauses()
         paused = await self.state.get_setting(KILL_SWITCH_KEY)
         if paused:
             logger.warning(
@@ -460,23 +494,8 @@ class Sender:
             text = text.replace("{{ " + key + " }}", value or "")
         return text.strip()
 
-    # Stopword counts decide the footer language; drafts are ES or EN.
-    _ES_MARKERS = (" el ", " la ", " de ", " que ", " para ", " los ", " las ",
-                   " una ", " con ", " por ", " tu ", " su ", " está ", " cómo ")
-    _EN_MARKERS = (" the ", " and ", " you ", " your ", " with ", " for ",
-                   " that ", " on ", " is ", " are ", " to ", " of ")
-
     def _with_legal_footer(self, body: str) -> str:
-        """Append company + postal address + opt-out line (CAN-SPAM) in the
-        language of the email. Kept out of the draft so the writer never
-        rewrites or drops it."""
-        c = self.config.compliance
-        padded = f" {body.lower()} "
-        es = sum(padded.count(m) for m in self._ES_MARKERS)
-        en = sum(padded.count(m) for m in self._EN_MARKERS)
-        opt_out = c.opt_out_line_es if es > en else c.opt_out_line_en
-        company = self.config.persona.company
-        return f"{body.rstrip()}\n\n{company} · {c.postal_address.strip()}\n{opt_out}"
+        return with_legal_footer(self.config, body)
 
     async def _stage_campaign_native(self, campaign):
         """Render + schedule a draft campaign's emails into the outbox."""
@@ -499,6 +518,7 @@ class Sender:
         excluded = 0
         now = self.clock()
         seen_emails: set[str] = set()
+        queued_ids: list[str] = []
 
         for prospect_id in campaign.prospect_ids:
             prospect = await self.state.get_prospect(prospect_id)
@@ -547,6 +567,7 @@ class Sender:
                     provider=self.provider.name,
                     generation_id=step.generation_id,
                     mailbox=campaign.mailbox,
+                    offer_key=campaign.offer_key,
                     company_id=company_id,
                 )
                 if item_id:
@@ -556,6 +577,12 @@ class Sender:
                 # writer stages step 1 itself); they still join its thread.
                 await self.state.thread_followups(campaign.id, prospect.id)
             await self.state.update_prospect_status(prospect.id, "queued")
+            queued_ids.append(prospect.id)
+
+        # An offer that promises a demo: put each contact's demo on the list
+        # to build now, not when the email first comes due.
+        if queued_ids and campaign.offer_key:
+            await register_demo_requests(self.state, self.config, queued_ids, campaign.offer_key)
 
         await self.state.update_campaign(campaign.id, status="active")
         if skipped:
@@ -639,13 +666,15 @@ class Sender:
         now = self.clock().isoformat()
         # Pauses whose return day has come resume before the scan, so their
         # next step is due in this pass; the rest are held below.
-        await self._resume_due_pauses(now)
         paused = await self.state.paused_prospect_ids()
         # The whole due set, not a budget-sized slice: rows pinned to a
         # mailbox at its cap are skipped below, and a slice of the oldest
         # rows could be nothing but those while other mailboxes sat idle.
+        # Prospects on an out-of-office pause are left out of the scan, so a
+        # long pause cannot crowd due mail out of the scan limit.
         due = await self.state.get_outbox(
-            status="approved", due_before=now, limit=DUE_SCAN_LIMIT
+            status="approved", due_before=now, limit=DUE_SCAN_LIMIT,
+            exclude_paused=True,
         )
         if not due:
             return
@@ -731,6 +760,15 @@ class Sender:
                     )
                     continue
 
+            # Demo gate: an offer that says a demo was built for this business
+            # holds its emails until that demo is ready. Fails closed.
+            demo = await demo_check_item(self.state, self.config, item)
+            if demo.held:
+                logger.info(
+                    f"Sender: holding step {item['step']} to {item['to_email']}: {demo.reason}"
+                )
+                continue
+
             mailbox, _verdict = self._mailbox_for(item, prev, pool, remaining,
                                                   sent_this_cycle, today)
             if mailbox is None:
@@ -751,6 +789,18 @@ class Sender:
                 logger.warning(
                     f"Sender: gate blocked email to {item['to_email']}: "
                     f"{gate.reasons}"
+                )
+                continue
+
+            # A vacation notice may have landed since the due scan was read.
+            # Look again right before claiming (the claim itself refuses a
+            # paused prospect too), so a stale scan cannot send into a pause.
+            if item["kind"] == "sequence" and await self.state.get_active_pause(
+                item["prospect_id"]
+            ):
+                logger.info(
+                    f"Sender: holding step {item['step']} to {item['to_email']}: "
+                    "out-of-office pause."
                 )
                 continue
 
@@ -902,11 +952,12 @@ class Sender:
             logger.info(f"Sender: holding first email to {to}: its company has "
                         f"{detail['active']}/{detail['limit']} contacts in a sequence.")
 
-    async def _resume_due_pauses(self, now: str):
+    async def _resume_due_pauses(self, now: str | None = None):
         """End out-of-office pauses. Any whose contact has left the sequence
         since (replied, opted out, bounced, excluded, closed) is superseded
         and never resumes; any whose return time has come resumes now, with
         its next step due and the later steps moved by the same amount."""
+        now = now or self.clock().isoformat()
         for pause in await self.state.list_pauses():
             over = ""
             if pause["prospect_status"] in STOP_STATUSES:
@@ -938,6 +989,10 @@ class Sender:
             email = prospect.email if prospect else pause["prospect_id"]
             logger.info(f"Sender: {email} is back; their sequence resumes with the next "
                         f"step ({moved} email(s) rescheduled, gaps kept).")
+            await self.state.log_action(
+                "sequence_resumed", "sender",
+                {"prospect_id": pause["prospect_id"], "by": "return date",
+                 "resume_at": pause["resume_at"], "rescheduled": moved})
             await self.state.log_action(
                 "ooo_resumed", "sender",
                 {"prospect_id": pause["prospect_id"], "prospect_email": email,

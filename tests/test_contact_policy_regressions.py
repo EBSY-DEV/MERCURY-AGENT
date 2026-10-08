@@ -116,13 +116,16 @@ async def test_v14_blocked_mail_keeps_review_requirement_on_upgrade(tmp_path, mo
     monkeypatch.setattr(state_module, "MIGRATIONS", migrations[:14])
     state = StateManager(path)
     await state.init_db()
-    # Simulate rows created by the original version of the PR.
-    await state.add_outbox_item(
-        prospect_id="p", to_email="a@acme.com", subject="s", body="b",
-        send_at=_utc(), status="sent", campaign_id="c", step=1)
-    item_id = await state.add_outbox_item(
-        prospect_id="p", to_email="a@acme.com", subject="s", body="b",
-        send_at=_utc(), status="blocked", campaign_id="c", step=2)
+    # Simulate rows created by the original version of the PR. Raw SQL, since
+    # add_outbox_item writes columns later migrations add.
+    item_id = "blocked-step-2"
+    async with aiosqlite.connect(path) as db:
+        for row_id, step, status in (("sent-step-1", 1, "sent"), (item_id, 2, "blocked")):
+            await db.execute(
+                "INSERT INTO outbox (id, campaign_id, prospect_id, step, kind, to_email, "
+                "subject, body, status, send_at) VALUES (?, 'c', 'p', ?, 'sequence', "
+                "'a@acme.com', 's', 'b', ?, ?)", (row_id, step, status, _utc()))
+        await db.commit()
     monkeypatch.setattr(state_module, "MIGRATIONS", migrations)
     await state.init_db()
     assert (await state.get_outbox_item(item_id))["requires_manual_review"] == 1

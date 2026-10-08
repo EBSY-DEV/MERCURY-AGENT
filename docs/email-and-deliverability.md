@@ -52,6 +52,17 @@ With `require_approval: false`, rows start as `approved`.
 
 At most 8 emails leave per cycle, with 4 to 15 seconds of random delay between sends. `max_daily_sends` caps all native sends in a rolling 24-hour window. With `spread_sends: true`, the day's remaining cold budget is divided over the cycles left before quiet hours.
 
+**Demo gate.** Some offers promise something already built for that one business: a phone line that answers in its name, a draft homepage with its photos. Sent before the demo exists, that email makes a false claim. Give such an offer `requires_demo: true` under `offers:` in mercury.yaml, and every sequence email that carries its key (`offer_key`, on the outbox row or its campaign) waits until the prospect's demo is marked ready. The row stays approved and shows "Waiting for demo" in the Outbox; nothing is cancelled. The gate fails closed: an offer key missing from `offers:`, a row with no contact, or an error while checking holds the email. Rows with no offer key are not gated.
+
+```bash
+mercury demos                                   # who is waiting, and every demo
+mercury demos ready EMAIL --url https://...     # or --recording PATH, --agent-id ID, --by NAME
+mercury demos request EMAIL --offer voice       # register one to build
+mercury demos retire EMAIL                      # its emails wait for a new demo
+```
+
+The Outbox tab has the same: a **Waiting for a demo** list and a **Mark ready** drawer to attach the link or recording. A demo that is ready is retired `demos.retire_after_days` (default 14) after the last email to a contact who never replied, once nothing is queued for them. A break-up email that says the demo "stays ready" should quote that number. Instantly deploys a whole sequence at once, so there a demo offer's campaign stays in draft until every contact in it has a ready demo. Building the demo itself is not Mercury's job; this is the bookkeeping and the gate.
+
 Temporary failures (timeouts, connection errors, 4xx deferrals, rate limiting) keep the row approved and retry up to 3 times, 30, 60 and 90 minutes later. Permanent errors mark it `failed`.
 
 **Reviewing.** In the dashboard's Outbox tab you can, for each pending draft:
@@ -107,11 +118,11 @@ channels:
     mailboxes:
       - email: "jordan@acme-mail.com"       # already warm
         password_env: "MAILBOX_JORDAN_PASSWORD"
-        daily_cap: 30
+        daily_cap: 15
       - email: "alex@getacme.com"           # warming since Sept 21
         name: "Alex Rivera"
         password_env: "MAILBOX_ALEX_PASSWORD"
-        daily_cap: 30
+        daily_cap: 15
         warmup_start: "2026-09-21"
       - email: "sam@tryacme.com"            # different provider, starts next week
         password_env: "MAILBOX_SAM_PASSWORD"
@@ -193,8 +204,8 @@ On native providers the Handler polls every configured inbox on every cycle (ski
 
 | Intent | What happens |
 |---|---|
-| Out-of-office (vacation reply) | The contact's cold sequence is **paused** until the day they are back. See below. |
-| Read receipt / automatic acknowledgement | Kept as a record. The sequence continues. |
+| Out-of-office / vacation reply | Recorded as an `auto_reply` event, not a reply: no conversation, no reply metrics. The contact's remaining cold steps are **paused** until they are back (see below). |
+| Other automatic mail (ticket acknowledgements, read receipts, list mail) | Recorded as an `auto_reply` event and otherwise ignored. The sequence continues. |
 | `unsubscribe` | Prospect becomes `opted_out`, conversation closed, every queued email cancelled. No reply is sent. |
 | `escalate` (legal threats, harassment complaints) | Conversation flagged `needs_human`. No auto-reply. |
 | `not_interested` | Prospect becomes `lost`, conversation closed. |
@@ -204,7 +215,7 @@ On native providers the Handler polls every configured inbox on every cycle (ski
 
 A vacation reply is recognised from its headers (`Auto-Submitted`, `X-Autoreply`, ...) or subject plus words that say the person is away, without a model call; one the reply classifier labels out-of-office is handled the same way. An `Auto-Submitted` header alone never pauses anything: receipts and "we received your message" acknowledgements carry it too.
 
-Mercury reads the return date deterministically, in English and Spanish ("until October 20", "back next Monday", "hasta el 20 de octubre", "regreso el lunes", "20/10/2026"), against the reply's own timestamp in `usage.quiet_hours.timezone`. The sequence resumes on that day at 09:00 local time. When the date is missing, could be read two ways (05/10), does not exist, is already past or more than a year away, the contact stays paused with **needs a return date** and never resumes on their own.
+Mercury reads the return date deterministically, in English and Spanish ("until October 20", "back next Monday", "hasta el 20 de octubre", "regreso el lunes", "20/10/2026"), against the reply's own timestamp in `usage.quiet_hours.timezone`. The sequence resumes when quiet hours end on a business day. Weekend dates move to Monday; `channels.email.ooo_resume_buffer_days` adds the configured number of business days. This also applies when you set a return date by hand, while Mercury keeps the stated return date separately from the first send time. "Until" names the return day; "through" and date ranges name the final day away. When the date is missing, could be read two ways (05/10), does not exist, is already past or more than a year away, the contact stays paused with **needs a return date** and never resumes on their own.
 
 While paused, every queued follow-up for them waits, approved or not, and the check is repeated in the transaction that claims each email. On the return day the next unsent step becomes due and later steps move with it, so their gaps stay what the sequence says; caps, pacing, quiet hours, exclusions and approvals all still apply. A human reply, an opt-out, a bounce, an exclusion or closing the contact ends the pause for good.
 
@@ -256,6 +267,57 @@ mercury sending resume     # resume and reset the bounce counters
 The Outbox tab has the same Pause/Resume button, and Today shows "Sending is paused" at the top of Needs you. Fix the cause (usually unverified addresses) before resuming.
 
 The kill switch is global. The health gates are per mailbox. Both can be in effect.
+
+## Deliverability health
+
+Zero replies on its own says nothing: it can be the copy, the list, or mail landing in spam, and on a small sample it is not even a signal. `mercury health` (and the **Deliverability** card on Today, plus a verdict per domain on the Mailboxes tab) answers the narrower question Mercury can answer honestly: is there enough evidence to keep a sending domain, or to cancel it?
+
+Per sending domain (every mailbox on it added together) it shows outreach sends, replies and bounces over the last 7, 14 and 30 days, how long the domain has been sending, and a verdict over the last 30 days. The ladder, checked in this order:
+
+| Verdict | When |
+|---|---|
+| Cancel candidate | Bounce composition says the domain is burned (a 5.7.6xx reputation block). Reads the `BURNED` bucket the Handler stores on each bounce (see [bounces and the kill switch](#bounces-and-the-kill-switch)); bounces logged before classification never trigger it. |
+| Too young | Under 30 days of sending, or nothing sent yet. |
+| Keep | 200 or more sends and replies at 1% or above. |
+| Cancel candidate | 0 replies on 150 or more sends, or replies under 1% after 200 sends. |
+| Not enough data | Everything else: the reply rate needs 200 sends and the bounce rate 50. |
+
+A domain is never "keep" without evidence, and a cancel candidate is only a candidate: run a [placement test](#placement-test) before retiring it. Today lists cancel candidates under Needs you.
+
+Definitions match the trends chart: a send is an outreach email (Mercury's own replies don't count), a reply is a human reply (out-of-office excluded, one per prospect per day), and a bounce is attributed to the mailbox that sent the bounced email. Events no send can be traced to are reported as unattributed and charged to no domain. **Sending age** counts from the domain's first outreach send or the earliest `warmup_start` of its mailboxes, whichever is older; it is not the registration date, so a domain warmed elsewhere reads young until Mercury has 30 days of its history.
+
+A high bounce rate is shown as a flag (over `max_bounce_rate`, after 50 sends) but does not change the verdict on its own: a bounce could be a bad address (a list problem) as easily as a blocked sender (a domain problem). Only a `BURNED` bounce makes a domain a cancel candidate. The per-mailbox [health gates](#health-gates) already pause an inbox past 5%.
+
+```bash
+mercury health          # the table, the reasons, the thresholds and the last placement test
+mercury health --json
+```
+
+## Placement test
+
+`mercury mail placement` sends the campaign's real email 1 (the newest step-one email in the outbox, with the legal footer exactly as a prospect gets it) from every configured mailbox to a few seed inboxes you own, plus the same text from a control sender with a known-good reputation, usually a personal Gmail. Then it reads the seeds over IMAP and records where each copy landed: Primary, Promotions or another Gmail tab, Inbox (non-Gmail), Spam, or not found. Configure the seeds and the control under [`channels.email.placement`](configuration.md#channelsemail).
+
+| Result | Reads as |
+|---|---|
+| Your mailboxes mostly in spam, the control in the inbox | Domain or reputation problem. |
+| Both in spam | Copy problem. Rewrite it and test again. |
+| Your mailboxes in spam, no control configured (or not found) | Assume the copy first. |
+| Your mailboxes mostly in the inbox | Placement is fine. Low replies point at the copy or the list. |
+
+"Mostly" means at least half of the copies found; copies not found yet are left out. Each domain is judged on its own against the same control, so one burned domain can't hide behind a healthy one.
+
+The test never touches the prospect outbox: nothing it sends counts toward a daily cap, a warm-up ramp, the trends or the health verdict. Results are stored one row per sender and seed in the `placement_tests` table, with the last run's summary line in `settings`. The last result shows on Today and next to the DNS checklist in each domain's drawer on the Mailboxes tab.
+
+```bash
+mercury mail placement --dry-run            # who would send to whom; sends nothing
+mercury mail placement                      # send, wait up to placement.wait_seconds, read the seeds
+mercury mail placement --mailbox x.com      # only this domain (or address); repeatable
+mercury mail placement show [RUN]           # the last (or a given) result
+mercury mail placement check [RUN]          # read the seeds again for late mail
+mercury mail placement mark RUN --seed you@outlook.com --sender a@x.com --folder spam
+```
+
+Seeds are read with an app password (Gmail and Yahoo need 2-step verification turned on to create one). Outlook.com has moved IMAP to OAuth sign-in and may refuse app passwords; if it does, leave its `password_env` empty, look at the inbox yourself and record the folder with `mark`. Gmail tabs (Primary, Promotions) are read with Gmail's own search; other providers only distinguish inbox from spam.
 
 ## Compliance footer and opt-outs
 

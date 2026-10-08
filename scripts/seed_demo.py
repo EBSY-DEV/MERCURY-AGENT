@@ -4,7 +4,9 @@ Creates ~12 Denver/Boulder roofing + HVAC companies, 30 prospects spread
 across all seven pipeline columns (new, queued, contacted, replied, meeting,
 won, lost), conversations at several stages, and outbox rows: sequence steps
 1-3 with send times spread over the past two weeks and the next three weeks
-(sent / approved / pending_review / cancelled) plus two replies.
+(sent / approved / pending_review / cancelled) plus two replies. Three of
+the queued contacts are on a ``voice`` offer that requires a demo: one demo
+requested, one not registered, one ready, so the Outbox shows the demo gate.
 
 On top of that: ~60 days of outreach history (sends, replies, positive
 replies, bounces) so the Trends chart has 30/90-day shape, spread over three
@@ -15,6 +17,10 @@ sending mailboxes through ``outbox.mailbox``:
 * alex@getnorthwind.com  — warming since 16 days ago (week 3 of a 5 → 30 ramp),
   with part of the checklist ticked and notes.
 * sam@trynorthwind.com   — scheduled: its ramp starts in three days.
+
+Plus one inbox placement test from yesterday (rows in ``placement_tests``,
+nothing sent): the warm inbox and the control land in the inbox, the
+warming one mostly in spam.
 
 Which inboxes exist, their caps and start dates come from the mail config,
 not the database (see mercury/warmup.py). So next to the database the seed
@@ -68,6 +74,7 @@ DEFAULT_DB = ROOT / "data" / "demo.db"
 REAL_DB = ROOT / "data" / "mercury.db"
 
 NOW = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+VOICE_OFFER = "voice"
 
 COMPANIES = [
     ("Summit Peak Roofing", "summitpeakroofing.com", "Roofing", "Denver, CO"),
@@ -140,17 +147,23 @@ async def seed(db_path: Path) -> dict:
     campaign = Campaign(id="", name="Denver trades — page two", sequence=SEQUENCE,
                         status="active", created_at=NOW - timedelta(days=14))
     campaign.id = await sm.add_campaign(campaign)
+    # The voice offer promises a line already built for each business, so
+    # its emails wait in the Outbox until that contact's demo is ready.
+    voice = Campaign(id="", name="Denver trades — after-hours line", sequence=SEQUENCE,
+                     status="active", offer_key=VOICE_OFFER, created_at=NOW - timedelta(days=2))
+    voice.id = await sm.add_campaign(voice)
 
     counts = {"prospects": 0, "conversations": 0, "outbox": 0}
     idx = 0
     thread_box: dict[str, str] = {}
 
-    async def outbox(p, pid, company, step, status, send_at, sent_at=None, error="", mailbox=""):
+    async def outbox(p, pid, company, step, status, send_at, sent_at=None, error="", mailbox="",
+                     camp=None):
         s = SEQUENCE[step - 1]
         item = await sm.add_outbox_item(
             prospect_id=pid, to_email=p.email, subject=render(s.subject, p, company),
             body=render(s.body, p, company), send_at=iso(send_at), status=status,
-            campaign_id=campaign.id, step=step, provider="smtp", mailbox=mailbox,
+            campaign_id=(camp or campaign).id, step=step, provider="smtp", mailbox=mailbox,
         )
         fields = {}
         if sent_at:
@@ -207,10 +220,19 @@ async def seed(db_path: Path) -> dict:
                 continue
             if column == "queued":
                 first_at = NOW + timedelta(days=rnd.randint(0, 6), hours=rnd.randint(2, 9))
+                # Three on the voice offer: a demo requested, none registered
+                # yet, and one ready (so its emails are not held).
+                camp = voice if k < 3 else None
                 for step in (1, 2, 3):
                     at = first_at + timedelta(days=(step - 1) * 4 + (step > 2))
                     await outbox(p, pid, cname, step,
-                                 "pending_review" if k % 2 else "approved", at)
+                                 "pending_review" if k % 2 else "approved", at, camp=camp)
+                if k in (0, 2):
+                    demo_id, _ = await sm.request_demo(pid, VOICE_OFFER, "voice")
+                    if k == 2:
+                        await sm.mark_demo_ready(demo_id, agent_id="agent_demo_summit",
+                                                 recording_path="demos/summit-call.mp3",
+                                                 built_by="Jordan")
                 continue
 
             # Everyone else got step 1, from whichever mailbox rotation picked
@@ -276,7 +298,44 @@ async def seed(db_path: Path) -> dict:
 
     counts.update(await seed_history(sm))
     counts.update(await seed_warmup(sm))
+    counts.update(await seed_placement(sm))
     return counts
+
+
+async def seed_placement(sm: StateManager) -> dict:
+    """One placement test from yesterday, so the Mailboxes domain drawer and
+    the Today card have a result to show: the warm inbox lands in the inbox,
+    the warming one mostly in spam, and the control in Primary, which reads
+    as a domain problem for getnorthwind.com. No email is sent."""
+    from mercury import placement
+
+    await placement.ensure_schema(sm.db_path)
+    run_id = "demo0001"
+    at = iso(NOW - timedelta(days=1))
+    landed = {
+        MB_WARM: ("primary", "inbox", "inbox"),
+        MB_ALEX: ("spam", "inbox", "spam"),
+        "you@gmail.com": ("primary", "inbox", "inbox"),
+    }
+    seeds = (("seed.northwind@gmail.com", "gmail"), ("seed.northwind@outlook.com", "outlook"),
+             ("seed.northwind@yahoo.com", "yahoo"))
+    n = 0
+    for sender, folders in landed.items():
+        for (seed, provider), folder in zip(seeds, folders):
+            n += 1
+            await placement._insert(sm.db_path, {
+                "id": f"demo-pl-{n}", "run_id": run_id, "sender": sender,
+                "role": "control" if sender == "you@gmail.com" else "fleet",
+                "domain": sender.split("@")[1], "seed": seed, "seed_provider": provider,
+                "message_id": f"<demo-pl-{n}@{sender.split('@')[1]}>",
+                "subject": "Summit Peak Roofing on page two", "folder": folder, "sent_at": at,
+            })
+    async with sm._connect() as db:
+        await db.execute("UPDATE placement_tests SET created_at = ?, checked_at = ? WHERE run_id = ?",
+                         (at, at, run_id))
+        await db.commit()
+    await placement.finish(sm, run_id)
+    return {"placement_rows": n}
 
 
 # ── The demo mail config (mailboxes come from config, not the DB) ──
@@ -317,6 +376,7 @@ def demo_config(template: Path) -> dict:
         ],
     })
     cfg["compliance"] = {"postal_address": "1550 Wewatta St, Denver, CO 80202"}
+    cfg["offers"] = [{"key": VOICE_OFFER, "requires_demo": True, "demo_kind": "voice"}]
     cfg.setdefault("usage", {}).setdefault("quiet_hours", {})["timezone"] = "UTC"
     return cfg
 

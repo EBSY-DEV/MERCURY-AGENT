@@ -89,3 +89,66 @@ async def test_pre_merge_dev_db_gets_the_mailbox_column(tmp_path):
     assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
     assert "mailbox" in _columns(conn, "outbox")
     conn.close()
+
+
+def test_migration_order_contact_policy_v14_v15_then_pauses_v16_demos_v17():
+    # main shipped v14/v15 (exclusions, manual review) first; the
+    # integration/p0 work (out-of-office pauses, demo gate) comes after.
+    assert len(MIGRATIONS) == 20
+    assert "CREATE TABLE suppressions" in MIGRATIONS[13]
+    assert "requires_manual_review" in MIGRATIONS[14]
+    assert "CREATE TABLE IF NOT EXISTS sequence_pauses" in MIGRATIONS[15]
+    assert "CREATE TABLE demos" in MIGRATIONS[16]
+
+
+_FULL_TABLES = {"suppressions", "company_holds", "sequence_pauses", "demos"}
+
+
+def _assert_full_schema(db: str) -> None:
+    conn = sqlite3.connect(db)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    assert _FULL_TABLES <= tables
+    assert {"company_id", "requires_manual_review", "offer_key"} <= _columns(conn, "outbox")
+    assert "offer_key" in _columns(conn, "campaigns")
+    conn.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stamped", [13, 14, 15, 16, 17])
+async def test_main_line_db_upgrades_at_every_version(tmp_path, stamped):
+    db = str(tmp_path / "main.db")
+    _apply(db, MIGRATIONS[:stamped])
+    await StateManager(db).init_db()
+    _assert_full_schema(db)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("p0_scripts", [1, 2])
+async def test_integration_p0_db_gets_main_migrations_without_rerunning_its_own(
+        tmp_path, p0_scripts):
+    # Before main was merged in, integration/p0 stamped v14 = sequence pauses
+    # and v15 = demo gate. Such a DB must still get main's exclusions and
+    # manual review, keep its pause and demo rows, and not re-run the
+    # demo gate's ALTER TABLEs ("duplicate column").
+    db = str(tmp_path / "p0.db")
+    _apply(db, MIGRATIONS[:13] + MIGRATIONS[15:15 + p0_scripts])
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO sequence_pauses (id, prospect_id, state) "
+                 "VALUES ('s1', 'p1', 'paused')")
+    if p0_scripts == 2:
+        conn.execute("INSERT INTO demos (id, prospect_id, offer_key, status) "
+                     "VALUES ('d1', 'p1', 'offer_a', 'ready')")
+    conn.commit()
+    conn.close()
+
+    await StateManager(db).init_db()
+    _assert_full_schema(db)
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT state FROM sequence_pauses WHERE id = 's1'").fetchone() == ("paused",)
+    if p0_scripts == 2:
+        assert conn.execute("SELECT status FROM demos WHERE id = 'd1'").fetchone() == ("ready",)
+    conn.close()
+    # And it stays put on the next start.
+    await StateManager(db).init_db()
+    _assert_full_schema(db)

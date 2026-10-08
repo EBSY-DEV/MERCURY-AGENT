@@ -231,7 +231,7 @@ class SmtpImapProvider(MailProvider):
         headers = {
             k: str(msg.get(k, "")).strip()
             for k in ("Auto-Submitted", "Precedence", "X-Autoreply",
-                      "X-Autorespond", "Return-Path")
+                      "X-Autorespond", "Return-Path", "Content-Type")
             if msg.get(k)
         }
         bounce = looks_like_bounce(from_email, subject)

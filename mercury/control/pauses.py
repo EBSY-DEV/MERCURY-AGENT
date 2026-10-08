@@ -57,7 +57,10 @@ class PauseService:
         resume = ooo.parse_stored(row.get("resume_at"))
         return {
             **row,
-            "back_on": ooo.local_day(resume, tz).isoformat() if resume else None,
+            "back_on": row.get("return_date") or (ooo.local_day(resume, tz).isoformat() if resume else None),
+            "resume_at": row.get("resume_at") or "",
+            "resume_local": ooo.local_day(resume, tz).isoformat() if resume else "",
+            "manual_override": bool(row.get("manual_override")),
             "display_timezone": tz,
             "review_text": ooo.REVIEW_REASONS.get(row.get("review_reason") or "", ""),
         }
@@ -81,13 +84,14 @@ class PauseService:
 
     async def set_return_date(self, pause_id: str, day: str, *, note: str = "",
                               actor: str = "") -> dict:
-        """Set the day they are back. The sequence resumes that day at
-        ``ooo.RESUME_HOUR`` in the configured timezone."""
+        """Set their return day and schedule the first send using quiet hours,
+        weekends and the configured business-day buffer."""
         try:
             back = date.fromisoformat((day or "").strip())
         except ValueError:
             raise PauseError("invalid", "Use a date like 2026-10-20.") from None
         pause = await self._active(pause_id)
+        pause_id = pause["id"]
         tz = self.timezone()
         now = self.clock()
         today = ooo.local_day(now, tz)
@@ -96,9 +100,12 @@ class PauseService:
                                      "them now.")
         if (back - today).days > ooo.MAX_AWAY_DAYS:
             raise PauseError("invalid", "Pick a day within the next year.")
-        resume_at = ooo.resume_time(back, tz).isoformat()
+        _tz, quiet_end = ooo.operator_clock(self.config)
+        buffer = getattr(getattr(getattr(self.config, "channels", None), "email", None),
+                         "ooo_resume_buffer_days", 0)
+        resume_at = ooo.resume_time(back, tz, quiet_end, buffer).isoformat()
         changed = await self.state.set_pause_resume_at(pause_id, resume_at, actor=actor,
-                                                       now=now.isoformat())
+                                                       now=now.isoformat(), return_date=back.isoformat())
         if changed is None:
             raise PauseError("not_found", f"No active pause {pause_id!r}.")
         before, after = changed
@@ -110,12 +117,18 @@ class PauseService:
             "back_on": back.isoformat(), "timezone": tz,
             "note": (note or "").strip()[:MAX_NOTE],
         })
-        return self._public(after)
+        await self.state.log_action("pause_date_changed", actor or "dashboard", {
+            "prospect_id": pause["prospect_id"], "by": "operator",
+            "from": before.get("resume_at") or "", "was": before["state"],
+            "to": after.get("resume_at") or "", "now": after["state"],
+        })
+        return {**self._public(after), "success": True}
 
     async def resume(self, pause_id: str, *, note: str = "", actor: str = "") -> dict:
         """Resume now: the next unsent step is due and later steps keep their
         gaps. A contact who has left the sequence since is not resumed."""
         pause = await self._active(pause_id)
+        pause_id = pause["id"]
         prospect = await self.state.get_prospect(pause["prospect_id"])
         over = ""
         if prospect is None:
@@ -144,4 +157,9 @@ class PauseService:
         await self.state.log_action("ooo_resumed", actor or "dashboard", {
             "prospect_id": pause["prospect_id"], "prospect_email": email,
             "pause_id": pause_id, "rescheduled": moved, "by": "hand", "note": note})
-        return {**self._public(ended), "rescheduled": moved}
+        await self.state.log_action("sequence_resumed", actor or "dashboard", {
+            "prospect_id": pause["prospect_id"], "by": "operator",
+            "was": pause["state"], "resume_at": pause.get("resume_at") or "",
+            "rescheduled": moved,
+        })
+        return {**self._public(ended), "rescheduled": moved, "success": True}
