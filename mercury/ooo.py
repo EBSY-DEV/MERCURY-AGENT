@@ -1,507 +1,612 @@
-"""Out-of-office replies: tell a vacation reply from other machine mail, and
-read the return date out of it.
+"""Out-of-office replies: recognise a vacation auto-reply, read when the person
+is back, and work out the first sending time after that.
 
-Everything here is deterministic and offline. No model call is made: a date
-that the rules below cannot read with confidence is never guessed, the pause
-it creates waits for a person to set the date ("needs review").
+Everything here is deterministic and offline: no model call, no network, no
+clock. The caller passes the time the message arrived, which is what relative
+phrases ("back tomorrow", "for two weeks") are measured against. English and
+Spanish are supported because Mercury writes to US and Dominican prospects.
 
-Two questions, two functions:
-
-  * ``classify_automatic`` -- is this inbound message a machine, and if so is
-    it a vacation reply, a read/delivery receipt, or a generic acknowledgement
-    ("we received your message")? Only a vacation reply pauses a sequence.
-    An ``Auto-Submitted`` header alone never does.
-  * ``parse_return_date`` -- the day the person is back, resolved against the
-    message's own timestamp in the configured timezone. English and Spanish:
-    absolute dates ("October 20", "20 de octubre de 2026", "2026-10-20"),
-    numeric dates that read one way only ("10/20", "20/10/2026"), weekdays
-    ("back next Monday", "regreso el lunes"), "tomorrow" / "mañana",
-    "next week" / "la próxima semana", and a bare day ("until the 20th",
-    "hasta el 20").
-
-Mercury resumes on the return day at ``RESUME_HOUR`` local time, never at
-midnight. Quiet hours, caps and pacing still apply after that.
+The extractor never guesses. When the reply has no usable date it says so
+(``none``), and the same goes for a date that could be read two ways
+(``10/11``), one that does not exist (``31/02``, ``Feb 29`` in a common year),
+one that is already behind us (``past``) and one so far out that it is surely
+a typo (``too_far``). The caller turns each of those into a "return date needs
+review" pause rather than inventing a date.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 
-import pytz
+# A date further out than this is treated as a typo, not a vacation.
+MAX_DAYS_AHEAD = 365
+# A month-and-day with no year that is already this far behind us is read as
+# next year ("until January 3" written on December 28). Anything closer is a
+# date that has simply passed.
+ROLL_FORWARD_AFTER_DAYS = 60
 
-# Local hour on the return day at which a paused sequence becomes eligible.
-RESUME_HOUR = 9
-# A return date further out than this is more likely a misread than a
-# sabbatical; it goes to review instead of silently parking the contact.
-MAX_AWAY_DAYS = 370
-# A month and day with no year that fell this recently before the message is
-# a past date (flagged), not next year's.
-RECENT_PAST_DAYS = 180
+# ── Recognising a vacation reply ──
 
-KINDS = ("out_of_office", "receipt", "acknowledgement")
-
-# Pipeline statuses that take a contact out of their sequence for good (the
-# sender's stop-on-reply set). A vacation reply from them pauses nothing, and
-# an active pause on them ends instead of resuming.
-SEQUENCE_OVER = frozenset({"replied", "opted_out", "lost", "meeting", "closed"})
-
-# Plain-language reasons a pause needs a person, shown in the dashboard.
-REVIEW_REASONS = {
-    "no_date": "The reply gives no return date.",
-    "ambiguous": "The date can be read two ways, like 05/10.",
-    "invalid": "The date in the reply does not exist.",
-    "past": "The return date is before the reply was sent.",
-    "unclear": "A date is mentioned, but not as the day they are back.",
-    "conflicting": "The reply gives more than one return date.",
-    "too_far": "The return date is more than a year away.",
-}
-
-
-# ── Telling machines apart ──
-
-# Accent folding that keeps every index in place, so a span found in the
-# folded text is the same span in the original.
-_FOLD = str.maketrans("áéíóúüñàèìòùâêîôû", "aeiouunaeiouaeiou")
-
-
-def fold(text: str) -> str:
-    return (text or "").lower().translate(_FOLD)
-
-
-_AUTO_SUBJECTS = (
-    "out of office", "out-of-office", "automatic reply", "auto-reply", "autoreply",
-    "auto reply", "fuera de la oficina", "respuesta automatica",
-    "read receipt", "delivery receipt", "return receipt",
-    "we have received your", "we've received your", "acuse de recibo",
+# Subject markers: if the sender's own autoresponder titled the message like
+# this, it is a vacation notice and nothing else.
+_SUBJECT_MARKERS = re.compile(
+    r"out[ -]of[ -](the[ -])?office|\booo\b|on vacation|vacation (reply|notice|message)"
+    r"|away from (my |the )?(desk|office)|fuera de (la )?oficina|\bausente\b|vacaciones"
+    r"|de licencia"
 )
-_RECEIPT_PREFIXES = ("read:", "delivered:", "leido:", "entregado:", "not read:", "no leido:")
-_RECEIPT_MARKERS = (
-    "read receipt", "delivery receipt", "return receipt", "acuse de recibo",
-    "your message was read", "was read on", "su mensaje fue leido", "tu mensaje fue leido",
-    "was delivered to", "fue entregado",
+# First-person statements. A support desk saying "we are out of office on
+# weekends" is not one of these.
+_PERSONAL_AWAY = re.compile(
+    r"\b(i am|i'm|im|i will be|i'll be|i have been|i'm currently|i am currently|i am now)\b"
+    r".{0,45}?\b(out of( the)? office|away|on (vacation|holiday|leave|pto|annual leave"
+    r"|maternity leave|paternity leave|sabbatical)|out until|traveling|travelling"
+    r"|out of town|off until)"
+    r"|\bmy (office hours|vacation)\b"
+    r"|\b(estare|estoy|me encuentro|me ausentare|voy a estar|permanecere|estaremos)\b"
+    r".{0,60}?\b(fuera|ausente|de vacaciones|de viaje|de licencia|de permiso|de baja"
+    r"|de descanso|sin acceso)"
+    r"|\bno (me encuentro|estare|estoy) (en la oficina|disponible)"
+)
+_GENERIC_AWAY = re.compile(
+    r"out[ -]of[ -](the[ -])?office|\booo\b|on vacation|on holiday|on annual leave"
+    r"|\baway from (my |the )?(desk|office|email|computer)"
+    r"|(office|we) (is|are|will be) closed|limited (access|connectivity) to (my )?e-?mail"
+    r"|fuera de (la )?oficina|de vacaciones|oficina (estara )?cerrada"
+)
+# Acknowledgements and ticket systems. Without a first-person away statement,
+# these are not vacation notices even when they mention being out of office.
+_ACK_MARKERS = re.compile(
+    r"we have received (your|the)|your (message|request|inquiry|enquiry|email|ticket)"
+    r" (has been|was|is) (received|logged|created|submitted)|ticket (number|#|id)|case (number|#|id)"
+    r"|reference (number|#)|thank you for (contacting|reaching out|your (message|email|inquiry))"
+    r"|thanks for (contacting|reaching out)|gracias por (contactar|escribir|comunicarse)"
+    r"|hemos recibido (su|tu)|su (mensaje|solicitud|consulta) (ha sido|fue) (recibid|registrad)"
+    r"|numero de (ticket|caso|referencia)"
+)
+_RECEIPT_SUBJECT = re.compile(
+    r"^\s*(read|delivered|not read|accepted|declined|tentative)\s*:|(return|read|delivery) receipt"
+    r"|acuse de (recibo|lectura)|confirmacion de (lectura|entrega)"
 )
 
-_VACATION = re.compile("|".join((
-    # English
-    r"\bout of (the )?office\b", r"\booo\b",
-    r"\bon (a )?(vacation|holiday|holidays|leave|annual leave|pto|sabbatical|"
-    r"parental leave|maternity leave|paternity leave|sick leave|business trip|"
-    r"business travel)\b",
-    r"\b(away|out) (from|of) (the|my) (office|desk)\b",
-    r"\bi('m| am| will be| ll be) (currently |now )?(away|out|travell?ing|on leave|off)\b",
-    r"\bcurrently (away|out|travell?ing|on leave|unavailable)\b",
-    r"\blimited (access to (my )?e-?mail|e-?mail access)\b",
-    r"\b(will|i'll|i will) be back\b", r"\bback (in|at) (the|my) (office|desk)\b",
-    r"\bi('m| am) back on\b", r"\b(i|i'll|i will) return on\b",
-    r"\breturning (on|to the office)\b", r"\b(out|away) until\b",
-    r"\bannual leave\b", r"\bvacation\b",
-    # Spanish (folded)
-    r"\bfuera de (la )?oficina\b", r"\bde vacaciones\b", r"\bausente\b",
-    r"\bde (permiso|licencia)\b", r"\bno (estare|estoy) disponible\b",
-    r"\b(estare|estoy) fuera\b", r"\bregreso el\b", r"\bregresare\b", r"\bvolvere\b",
-    r"\bvuelvo el\b", r"\bde vuelta el\b", r"\bacceso limitado\b",
-    r"\bme reincorporo\b", r"\bme reincorporare\b",
-)))
+
+def _fold(text: str) -> str:
+    """Lowercase and strip accents, one output character per input character."""
+    out = []
+    for ch in text or "":
+        base = "".join(c for c in unicodedata.normalize("NFKD", ch) if not unicodedata.combining(c))
+        if len(base) != 1:
+            base = ch
+        if base.isspace():
+            base = " "
+        elif base in "‐‑‒–—−":
+            base = "-"
+        elif base in "’‘ʼ":
+            base = "'"
+        out.append(base.lower())
+    return "".join(out)
 
 
-def _headers(headers: dict | None) -> dict:
-    return {str(k).lower(): str(v or "").lower() for k, v in (headers or {}).items()}
+def is_receipt(subject: str, headers: dict | None = None) -> bool:
+    """A read or delivery receipt (a message disposition notification)."""
+    ctype = " ".join(str(v) for k, v in (headers or {}).items()
+                     if str(k).lower() == "content-type").lower()
+    return "report-type=disposition-notification" in ctype or bool(
+        _RECEIPT_SUBJECT.search(_fold(subject)))
 
 
-def is_automatic(subject: str, headers: dict | None) -> bool:
-    """A machine wrote this: RFC 3834 headers, the common vendor headers, or
-    a responder's tell-tale subject."""
-    h = _headers(headers)
-    if h.get("auto-submitted", "no") not in ("", "no"):
-        return True
-    if h.get("precedence") in ("bulk", "auto_reply", "junk"):
-        return True
-    if "x-autoreply" in h or "x-autorespond" in h:
-        return True
-    s = fold(subject).strip()
-    return any(m in s for m in _AUTO_SUBJECTS) or s.startswith(_RECEIPT_PREFIXES)
+def classify_auto_reply(subject: str, body: str, headers: dict | None = None) -> str:
+    """What kind of automatic message this is: ``ooo``, ``receipt`` or
+    ``acknowledgement``.
 
-
-def is_vacation_text(subject: str, body: str) -> bool:
-    return bool(_VACATION.search(fold(subject)) or _VACATION.search(fold(body)[:3000]))
-
-
-def classify_automatic(subject: str, body: str, headers: dict | None) -> str | None:
-    """'out_of_office', 'receipt', 'acknowledgement', or None for a message
-    no machine marked as automatic (a person, as far as headers can tell).
-
-    A receipt is checked first: "Read: Out of office plans" is a receipt for
-    an email about vacations, not a vacation reply. Anything else automatic
-    pauses only when its words say the person is away.
+    Only ``ooo`` pauses a sequence. ``receipt`` covers read/delivery receipts
+    and ``acknowledgement`` covers everything else an autoresponder says
+    ("we received your message", ticket numbers, list mail). The caller has
+    already decided the message is automatic, from its headers or its subject.
     """
-    if not is_automatic(subject, headers):
-        return None
-    s = fold(subject).strip()
-    lowered = fold(body)[:2000]
-    if s.startswith(_RECEIPT_PREFIXES) or any(m in s or m in lowered for m in _RECEIPT_MARKERS):
+    subj = _fold(subject)
+    text = _fold(body or "")[:3000]
+    if is_receipt(subject, headers):
         return "receipt"
-    if is_vacation_text(subject, body):
-        return "out_of_office"
+    personal = bool(_PERSONAL_AWAY.search(text) or _PERSONAL_AWAY.search(subj))
+    if _SUBJECT_MARKERS.search(subj) or personal:
+        return "ooo"
+    if _GENERIC_AWAY.search(text) and not _ACK_MARKERS.search(text):
+        return "ooo"
     return "acknowledgement"
 
 
-# ── Return dates ──
-
-_MONTHS = {
-    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
-    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
-    "august": 8, "aug": 8, "september": 9, "sept": 9, "sep": 9, "october": 10,
-    "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
-    "enero": 1, "ene": 1, "febrero": 2, "marzo": 3, "abril": 4, "abr": 4,
-    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8, "ago": 8, "septiembre": 9,
-    "setiembre": 9, "set": 9, "octubre": 10, "noviembre": 11, "diciembre": 12, "dic": 12,
-}
-_WEEKDAYS = {
-    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4,
-    "saturday": 5, "sunday": 6,
-    "lunes": 0, "martes": 1, "miercoles": 2, "jueves": 3, "viernes": 4,
-    "sabado": 5, "domingo": 6,
-}
-
-
-def _alt(words) -> str:
-    return "|".join(sorted(words, key=len, reverse=True))
-
-
-_MON = r"(" + _alt(_MONTHS) + r")\b\.?"
-_WD = r"(" + _alt(_WEEKDAYS) + r")"
-_DAY = r"(\d{1,2})(?:st|nd|rd|th|º|°)?"
-_YEAR = r"(\d{4})"
-_OPT_YEAR = r"(?:\s*,?\s*(?:de(?:l)?\s+)?" + _YEAR + r")?"
-_RANGE_SEP = r"\s*(?:-|–|to|through|thru|al|a)\s*"
-
-# (name, regex, base confidence). Longer matches win any overlap; ties go to
-# the earlier entry, so a range beats the plain date inside it.
-_PATTERNS = (
-    ("range_mdd", re.compile(r"\b" + _MON + r"\s+" + _DAY + _RANGE_SEP + _DAY + r"\b" + _OPT_YEAR), 0.85),
-    ("range_ddm", re.compile(r"\b(?:del?\s+)?" + _DAY + _RANGE_SEP + _DAY + r"(?:\s+(?:of|de))?\s+" + _MON + _OPT_YEAR), 0.85),
-    ("iso", re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"), 0.95),
-    ("md", re.compile(r"\b" + _MON + r"\s+" + _DAY + r"\b" + _OPT_YEAR), 0.95),
-    ("dm", re.compile(r"\b" + _DAY + r"(?:\s+(?:of|de))?\s+" + _MON + _OPT_YEAR), 0.95),
-    ("numeric", re.compile(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{4}|\d{2}))?\b"), 0.85),
-    ("numeric_y", re.compile(r"\b(\d{1,2})[.-](\d{1,2})[.-](\d{4})\b"), 0.85),
-    ("next_week", re.compile(r"\b(next week|la (?:proxima|siguiente) semana|"
-                             r"la semana (?:que viene|proxima|siguiente))\b"), 0.7),
-    ("weekday", re.compile(r"\b(?:(?:next|this|coming|el|este|el proximo|proximo)\s+)?" + _WD +
-                           r"(?:\s+(?:que viene|proximo))?\b"), 0.85),
-    ("tomorrow", re.compile(r"\b(tomorrow|manana)\b"), 0.85),
-    ("day_en", re.compile(r"\b(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)\b"), 0.8),
-    ("day_es", re.compile(r"\b(?:el\s+(?:dia\s+)?|dia\s+)(\d{1,2})\b"), 0.8),
-)
-
-# The closest of these before a date says what the date means.
-_ROLE_WORDS = (
-    ("return", re.compile(
-        r"\b(back|return|returns|returning|be in the office|in the office|"
-        r"available again|available from|regreso|regresare|regresa|vuelvo|volvere|vuelve|"
-        r"de vuelta|reincorporo|reincorporare|retorno|disponible de nuevo|"
-        r"nuevamente disponible|disponible a partir del?)\b")),
-    ("until", re.compile(r"\b(until|till|til|untill|hasta)\b")),
-    ("through", re.compile(r"\b(through|thru)\b")),
-    ("start", re.compile(r"\b(from|since|starting|leaving|beginning|desde|a partir del?|del)\b")),
-)
-_RETURN_AFTER = _ROLE_WORDS[0][1]
-_CONNECTOR = re.compile(r"^\s*(-|–|to|through|thru|and|al|a|y)\s*$")
-_ABSOLUTE = ("range_mdd", "range_ddm", "iso", "md", "dm", "numeric", "numeric_y")
-_ADJACENT = re.compile(r"^[\s,(]*$")
-_SENTENCE_BREAK = re.compile(r"[\n;!?]|\.\s")
-
-
-class _Unreadable(ValueError):
-    """A date mention that cannot become one calendar day: 'ambiguous' or 'invalid'."""
-
-
-@dataclass
-class _Mention:
-    kind: str
-    start: int
-    end: int
-    groups: tuple
-    confidence: float
-    day: date | None = None
-    error: str = ""
-    role: str = ""
+# ── Reading the return date ──
 
 
 @dataclass
 class ReturnDate:
-    """The outcome of reading a vacation reply.
+    """What the extractor found.
 
-    ``resume_at`` (naive UTC) is set only when the date is clear. Otherwise
-    ``review_reason`` names why a person has to decide, and ``text`` still
-    carries whatever date phrase was found, for them to read.
+    ``status`` is ``date`` when ``date`` is a usable return date, otherwise one
+    of ``none``, ``ambiguous``, ``invalid``, ``past`` or ``too_far``; ``date``
+    is still set for ``past`` and ``too_far`` so the review screen can show it.
+    ``text`` is the phrase the date was read from, as the sender wrote it.
     """
-    resume_at: datetime | None
-    local_date: date | None
-    text: str
-    confidence: float
-    review_reason: str
-    timezone: str
+
+    status: str
+    date: date | None = None
+    text: str = ""
+    confidence: float = 0.0
+    note: str = ""
 
     @property
-    def review_state(self) -> str:
-        return "scheduled" if self.resume_at else "needs_review"
-
-    def as_dict(self) -> dict:
-        return {
-            "resume_at": self.resume_at.isoformat() if self.resume_at else None,
-            "local_date": self.local_date.isoformat() if self.local_date else None,
-            "text": self.text, "confidence": self.confidence,
-            "review_state": self.review_state, "review_reason": self.review_reason,
-            "timezone": self.timezone,
-        }
+    def ok(self) -> bool:
+        return self.status == "date" and self.date is not None
 
 
-def _tz(name: str):
-    try:
-        return pytz.timezone(name or "UTC")
-    except pytz.UnknownTimeZoneError:
-        return pytz.utc
+_MONTHS = {
+    "jan": 1, "january": 1, "ene": 1, "enero": 1,
+    "feb": 2, "february": 2, "febrero": 2,
+    "mar": 3, "march": 3, "marzo": 3,
+    "apr": 4, "april": 4, "abr": 4, "abril": 4,
+    "may": 5, "mayo": 5,
+    "jun": 6, "june": 6, "junio": 6,
+    "jul": 7, "july": 7, "julio": 7,
+    "aug": 8, "august": 8, "ago": 8, "agosto": 8,
+    "sep": 9, "sept": 9, "september": 9, "septiembre": 9, "setiembre": 9,
+    "oct": 10, "october": 10, "octubre": 10,
+    "nov": 11, "november": 11, "noviembre": 11,
+    "dec": 12, "december": 12, "dic": 12, "diciembre": 12,
+}
+_WEEKDAYS = {
+    "monday": 0, "mon": 0, "lunes": 0,
+    "tuesday": 1, "tues": 1, "tue": 1, "martes": 1,
+    "wednesday": 2, "wed": 2, "miercoles": 2,
+    "thursday": 3, "thurs": 3, "thur": 3, "thu": 3, "jueves": 3,
+    "friday": 4, "fri": 4, "viernes": 4,
+    "saturday": 5, "sat": 5, "sabado": 5,
+    "sunday": 6, "sun": 6, "domingo": 6,
+}
+_NUMBER_WORDS = {
+    "a": 1, "an": 1, "one": 1, "un": 1, "una": 1, "uno": 1,
+    "two": 2, "dos": 2, "three": 3, "tres": 3, "four": 4, "cuatro": 4,
+    "five": 5, "cinco": 5, "six": 6, "seis": 6, "seven": 7, "siete": 7,
+    "eight": 8, "ocho": 8, "nine": 9, "nueve": 9, "ten": 10, "diez": 10,
+    "eleven": 11, "once": 11, "twelve": 12, "doce": 12,
+    "a couple of": 2, "a couple": 2, "couple of": 2,
+}
+_UNITS = {
+    "day": "d", "days": "d", "dia": "d", "dias": "d",
+    "week": "w", "weeks": "w", "semana": "w", "semanas": "w",
+    "month": "m", "months": "m", "mes": "m", "meses": "m",
+}
+
+_MONTH = r"(?:" + "|".join(sorted(_MONTHS, key=len, reverse=True)) + r")\b\.?"
+_WD = r"(?:" + "|".join(sorted(_WEEKDAYS, key=len, reverse=True)) + r")\b"
+_NUM = r"(?:\d{1,3}|" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")"
+_UNIT = r"(?:" + "|".join(sorted(_UNITS, key=len, reverse=True)) + r")\b"
+_ORD = r"(?:st|nd|rd|th)?"
+_OF = r"(?:of\s+|de\s+)?"
+
+# A word that says "this is when I am reachable again" (or, for "through",
+# the last day I am away).
+_CUE = re.compile(
+    r"(?<![a-z])(until|till|til|through|thru|returning|returns|return|back|resum\w*"
+    r"|available again|hasta|regres\w*|volver\w*|vuelv\w*|de vuelta|reincorpor\w*|retom\w*"
+    r"|a partir del|disponible)(?![a-z])"
+)
+_AWAY_CONTEXT = re.compile(
+    r"out of( the)? office|away|vacation|holiday|leave|pto|travel|trip|ausente|fuera"
+    r"|vacaciones|viaje|licencia|limited (access|connectivity)|sin acceso"
+)
+
+_RE_RANGE_MONTH_FIRST = re.compile(
+    rf"(?<![a-z])(?P<m1>{_MONTH})\s*(?P<d1>\d{{1,2}}){_ORD}(?:\s*,?\s*(?P<y1>\d{{4}}))?(?!\d)"
+    rf"\s*(?:-|to|through|thru)\s*(?:(?P<m2>{_MONTH})\s*)?(?P<d2>\d{{1,2}}){_ORD}"
+    rf"(?:\s*,?\s*(?P<y2>\d{{4}}))?(?![\d:])(?!\s*[ap]\.?m\b)"
+)
+_RE_RANGE_DAY_FIRST = re.compile(
+    rf"(?<![\d/.-])(?P<d1>\d{{1,2}}){_ORD}(?:\s+{_OF}(?P<m1>{_MONTH}))?"
+    rf"\s*(?:-|to|through|thru|al)\s*(?:the\s+)?(?P<d2>\d{{1,2}}){_ORD}\s+{_OF}(?P<m2>{_MONTH})"
+    rf"(?:\s*,?\s*(?:de\s+|del\s+)?(?P<y>\d{{4}}))?(?!\d)"
+)
+_NUMERIC = r"\d{1,2}/\d{1,2}(?:/\d{2,4})?"
+_RE_RANGE_NUMERIC = re.compile(
+    rf"(?<![\d/.:-])(?P<a>{_NUMERIC})\s*(?:-|to|through|thru|al)\s*(?P<b>{_NUMERIC})(?![\d/])"
+)
+_RE_MONTH_FIRST = re.compile(
+    rf"(?:(?P<wd>{_WD}),?\s+)?(?<![a-z])(?P<m>{_MONTH})\s*(?P<d>\d{{1,2}}){_ORD}(?!\d)"
+    rf"(?:\s*,?\s*(?P<y>\d{{4}}))?(?!\d)"
+)
+_RE_DAY_FIRST = re.compile(
+    rf"(?:(?P<wd>{_WD}),?\s+(?:the\s+|el\s+)?)?(?<![\d/.-])(?P<d>\d{{1,2}}){_ORD}\s+{_OF}"
+    rf"(?P<m>{_MONTH})(?:\s*,?\s*(?:de\s+|del\s+)?(?P<y>\d{{4}}))?(?!\d)"
+)
+_RE_ISO = re.compile(r"(?<![\d-])(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})(?![\d-])")
+_RE_NUMERIC = re.compile(
+    r"(?<![\d/.:-])(?P<a>\d{1,2})(?P<sep>[/.-])(?P<b>\d{1,2})"
+    r"(?:(?P=sep)(?P<y>\d{4}|\d{2}))?(?![\d])(?![/.-]\d)"
+)
+_RE_MONTH_ONLY = re.compile(
+    rf"(?:until|till|til|through|thru|back|returning|return|hasta|regres\w*|volver\w*)"
+    rf"\s+(?:in\s+|en\s+|early\s+|late\s+|mid\s+|a\s+|principios de\s+|finales de\s+)?(?P<m>{_MONTH})"
+    rf"(?!\s*\d)"
+)
+_RE_WEEKDAY = re.compile(
+    rf"(?<![a-z])(?:(?:next|this|proximo|este|el)\s+)?(?P<wd>{_WD})(?![a-z])"
+)
+_RE_ORDINAL_DAY = re.compile(
+    r"(?<![\d/.-])(?:the\s+(?P<d1>\d{1,2})(?:st|nd|rd|th)(?!\w)"
+    r"|(?:el|el dia)\s+(?P<d2>\d{1,2})(?!\s*(?:de\b|/|-|\d|:)))"
+)
+_RE_REL_IN = re.compile(
+    rf"(?:until|till|til|back|returning|return|regres\w*|volver\w*|vuelv\w*|de vuelta)\s+"
+    rf"(?:in|en|within|dentro de|after|despues de)\s+(?P<n>{_NUM})\s+(?P<u>{_UNIT})"
+)
+_RE_REL_FOR = re.compile(
+    rf"(?:for|por|durante)\s+(?:the\s+next\s+|the\s+|los\s+proximos\s+|las\s+proximas\s+)?"
+    rf"(?P<n>{_NUM})\s+(?P<u>{_UNIT})"
+)
+_RE_TOMORROW = re.compile(
+    r"(?:until|till|til|back|returning|return|regres\w*|volver\w*|vuelv\w*|de vuelta)"
+    r"\s+(?:on\s+)?(?:tomorrow|manana)(?![a-z])"
+)
+_RE_NEXT_WEEK = re.compile(
+    r"(?:until|till|til|back|returning|return|hasta|regres\w*|volver\w*|vuelv\w*|de vuelta)\s+"
+    r"(?:(?:early|late|the|en|a|in)\s+)?(?:next week|la proxima semana|la semana que viene"
+    r"|la semana proxima)"
+)
+_RE_NEXT_MONTH = re.compile(
+    r"(?:until|till|til|back|returning|return|hasta|regres\w*|volver\w*|vuelv\w*|de vuelta)\s+"
+    r"(?:(?:early|late|the|en|a|in)\s+)?(?:next month|el proximo mes|el mes que viene)"
+)
 
 
-def resume_time(day: date, tz_name: str) -> datetime:
-    """``RESUME_HOUR`` local on ``day``, as naive UTC (how the DB stores time)."""
-    local = _tz(tz_name).localize(datetime.combine(day, time(RESUME_HOUR)))
-    return local.astimezone(timezone.utc).replace(tzinfo=None)
+@dataclass
+class _Cand:
+    start: int
+    end: int
+    kind: str                      # "date" | "ambiguous" | "invalid"
+    date: date | None = None
+    confidence: float = 0.0
+    note: str = ""
 
 
-def local_day(moment: datetime, tz_name: str) -> date:
-    """The calendar day ``moment`` falls on in ``tz_name``. Naive = UTC."""
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    return moment.astimezone(_tz(tz_name)).date()
-
-
-def _with_year(month: int, day: int, ref: date) -> date:
-    """A month and day with no year: this year's when it is still ahead (or
-    only just passed, which is then flagged as past), else next year's.
-    February 29 resolves only to a leap year within that window."""
-    try:
-        this = date(ref.year, month, day)
-    except ValueError:
-        this = None
-    if this and (this >= ref or (ref - this).days <= RECENT_PAST_DAYS):
-        return this
-    try:
-        return date(ref.year + 1, month, day)
-    except ValueError:
-        if this:
-            return this
-        raise _Unreadable("invalid") from None
-
-
-def _ymd(year: str | None, month: int, day: int, ref: date) -> date:
-    if not 1 <= month <= 12 or not 1 <= day <= 31:
-        raise _Unreadable("invalid")
-    if year:
-        y = int(year)
-        if y < 100:
-            y += 2000
+def _add_months(d: date, n: int) -> date:
+    month_index = d.month - 1 + n
+    year, month = d.year + month_index // 12, month_index % 12 + 1
+    day = d.day
+    while day > 28:
         try:
-            return date(y, month, day)
+            return date(year, month, day)
         except ValueError:
-            raise _Unreadable("invalid") from None
-    return _with_year(month, day, ref)
+            day -= 1
+    return date(year, month, day)
 
 
-def _numeric(a: str, b: str, year: str | None, ref: date) -> date:
-    """1/2 is January 2 in the US and 1 February almost everywhere else. Only
-    a date that reads one way (one part above 12, or both equal) is used."""
-    x, y = int(a), int(b)
-    readings = []
-    for month, day in ((x, y), (y, x)):
+def _num(token: str) -> int | None:
+    token = (token or "").strip()
+    if token.isdigit():
+        return int(token)
+    return _NUMBER_WORDS.get(token)
+
+
+def _resolve_month_day(day: int, month: int, year: int | None, today: date):
+    """(date | None, kind, confidence_penalty). Without a year, the next
+    occurrence of that month and day, counting only dates that exist
+    (Feb 29 lands on the next leap year)."""
+    if year is not None:
         try:
-            readings.append(_ymd(year, month, day, ref))
-        except _Unreadable:
-            pass
-    readings = sorted(set(readings))
-    if not readings:
-        raise _Unreadable("invalid")
-    if len(readings) > 1:
-        raise _Unreadable("ambiguous")
-    return readings[0]
-
-
-def _day_of_month(day: int, ref: date) -> date:
-    """'the 20th': this month when it is still ahead, else next month."""
-    if not 1 <= day <= 31:
-        raise _Unreadable("invalid")
-    year, month = ref.year, ref.month
-    if day < ref.day:
-        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+            return date(year, month, day), "date", 0.0
+        except ValueError:
+            return None, "invalid", 0.0
+    found_any = False
+    for y in (today.year, today.year + 1):
+        try:
+            cand = date(y, month, day)
+        except ValueError:
+            continue
+        found_any = True
+        if y == today.year and cand < today - timedelta(days=ROLL_FORWARD_AFTER_DAYS):
+            continue
+        return cand, "date", (0.05 if y != today.year else 0.0)
+    if not found_any:
+        return None, "invalid", 0.0
+    # Only reachable when the sole existing candidate was rolled over; keep
+    # the in-year one so the caller reports it as past.
     try:
-        return date(year, month, day)
+        return date(today.year, month, day), "date", 0.0
     except ValueError:
-        raise _Unreadable("invalid") from None
+        return None, "invalid", 0.0
 
 
-def _resolve(m: _Mention, ref: date) -> date:
-    g = m.groups
-    if m.kind == "range_mdd":
-        return _ymd(g[3], _MONTHS[g[0]], int(g[2]), ref)
-    if m.kind == "range_ddm":
-        return _ymd(g[3], _MONTHS[g[2]], int(g[1]), ref)
-    if m.kind == "iso":
-        return _ymd(g[0], int(g[1]), int(g[2]), ref)
-    if m.kind == "md":
-        return _ymd(g[2], _MONTHS[g[0]], int(g[1]), ref)
-    if m.kind == "dm":
-        return _ymd(g[2], _MONTHS[g[1]], int(g[0]), ref)
-    if m.kind in ("numeric", "numeric_y"):
-        return _numeric(g[0], g[1], g[2], ref)
-    if m.kind == "next_week":
-        return ref + timedelta(days=7 - ref.weekday())
-    if m.kind == "weekday":
-        ahead = (_WEEKDAYS[g[0]] - ref.weekday()) % 7
-        return ref + timedelta(days=ahead or 7)
-    if m.kind == "tomorrow":
-        return ref + timedelta(days=1)
-    return _day_of_month(int(g[0]), ref)
+def _numeric_date(a: int, b: int, year_text: str | None, today: date):
+    """Day/month or month/day, but only when the digits settle which."""
+    year = None
+    if year_text:
+        year = int(year_text)
+        if year < 100:
+            year += 2000
+    if a > 12 and b <= 12:
+        day, month = a, b
+    elif b > 12 and a <= 12:
+        month, day = a, b
+    elif a > 12 and b > 12:
+        return None, "invalid", 0.0
+    elif a == b:
+        day = month = a
+    else:
+        return None, "ambiguous", 0.0
+    d, kind, pen = _resolve_month_day(day, month, year, today)
+    return d, kind, pen
 
 
-def _find_mentions(t: str) -> list[_Mention]:
-    found = []
-    for priority, (kind, rx, confidence) in enumerate(_PATTERNS):
-        for match in rx.finditer(t):
-            if kind == "tomorrow" and t[max(0, match.start() - 3):match.start()] == "la ":
-                continue  # "por la mañana" is the morning, not tomorrow
-            if match.group(0) == "24/7":
+def _check_weekday(d: date | None, wd_text: str | None) -> bool:
+    if d is None or not wd_text:
+        return True
+    return d.weekday() == _WEEKDAYS[wd_text]
+
+
+def _cue_before(norm: str, start: int) -> tuple[bool, bool]:
+    """(has a return cue just before ``start``, that cue is "through")."""
+    window = norm[max(0, start - 45):start]
+    for sep in (". ", "; ", "! ", "? "):
+        i = window.rfind(sep)
+        if i != -1:
+            window = window[i + len(sep):]
+    last = None
+    for m in _CUE.finditer(window):
+        last = m
+    if last is None:
+        return False, False
+    return True, last.group(1) in ("through", "thru")
+
+
+def _overlaps(spans: list[tuple[int, int]], start: int, end: int) -> bool:
+    return any(start < e and s < end for s, e in spans)
+
+
+def _collect(norm: str, today: date) -> list[_Cand]:
+    cands: list[_Cand] = []
+    taken: list[tuple[int, int]] = []
+
+    def add(c: _Cand):
+        cands.append(c)
+        taken.append((c.start, c.end))
+
+    def range_end(m, d_name, m_names, y_name_candidates):
+        month_txt = next((m.group(n) for n in m_names if m.group(n)), None)
+        month = _MONTHS[month_txt.rstrip(".")] if month_txt else None
+        year_txt = next((m.group(n) for n in y_name_candidates if m.group(n)), None)
+        return int(m.group(d_name)), month, int(year_txt) if year_txt else None
+
+    # Ranges: "Oct 6-20", "from October 6 to October 20", "del 6 al 20 de octubre".
+    # The end of a range is the last day away, so they are back the day after.
+    for m in _RE_RANGE_MONTH_FIRST.finditer(norm):
+        day, month, year = range_end(m, "d2", ("m2", "m1"), ("y2", "y1"))
+        d, kind, pen = _resolve_month_day(day, month, year, today)
+        if d is not None:
+            d += timedelta(days=1)
+        add(_Cand(m.start(), m.end(), kind, d, 0.9 - pen, "range end"))
+    for m in _RE_RANGE_DAY_FIRST.finditer(norm):
+        if _overlaps(taken, m.start(), m.end()):
+            continue
+        day, month, year = range_end(m, "d2", ("m2",), ("y",))
+        d, kind, pen = _resolve_month_day(day, month, year, today)
+        if d is not None:
+            d += timedelta(days=1)
+        add(_Cand(m.start(), m.end(), kind, d, 0.9 - pen, "range end"))
+    for m in _RE_RANGE_NUMERIC.finditer(norm):
+        if _overlaps(taken, m.start(), m.end()):
+            continue
+        parts = re.match(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", m.group("b")).groups()
+        d, kind, pen = _numeric_date(int(parts[0]), int(parts[1]), parts[2], today)
+        if d is not None:
+            d += timedelta(days=1)
+        add(_Cand(m.start(), m.end(), kind, d, 0.85 - pen, "range end"))
+
+    # Single dates need a cue ("until", "back on", "hasta el") in front of them.
+    def single(m, kind, d, conf, note):
+        if _overlaps(taken, m.start(), m.end()):
+            return
+        cued, through = _cue_before(norm, m.start())
+        if not cued:
+            return
+        if kind == "date" and d is not None and through:
+            d += timedelta(days=1)  # "through Oct 17": the last day away
+        add(_Cand(m.start(), m.end(), kind, d, conf, note))
+
+    for m in _RE_ISO.finditer(norm):
+        d, kind, pen = _resolve_month_day(int(m["d"]), int(m["m"]), int(m["y"]), today)
+        single(m, kind, d, 0.95, "iso")
+    for rx in (_RE_MONTH_FIRST, _RE_DAY_FIRST):
+        for m in rx.finditer(norm):
+            year = int(m["y"]) if m["y"] else None
+            month = _MONTHS[m["m"].rstrip(".")]
+            d, kind, pen = _resolve_month_day(int(m["d"]), month, year, today)
+            if kind == "date" and not _check_weekday(d, m["wd"]):
+                single(m, "ambiguous", None, 0.0, "weekday does not match the date")
                 continue
-            found.append((match.end() - match.start(), -priority,
-                          _Mention(kind, match.start(), match.end(), match.groups(), confidence)))
-    found.sort(key=lambda f: (f[0], f[1]), reverse=True)
-    taken: list[_Mention] = []
-    for _length, _priority, m in found:
-        if all(m.end <= o.start or m.start >= o.end for o in taken):
-            taken.append(m)
-    taken.sort(key=lambda m: m.start)
-    # "Monday, October 20" and "20 de octubre (lunes)" name one day twice;
-    # the weekday is decoration next to a full date, not a second date.
-    keep = []
-    for i, m in enumerate(taken):
-        if m.kind == "weekday":
-            before = taken[i - 1] if i else None
-            after = taken[i + 1] if i + 1 < len(taken) else None
-            if ((after and after.kind in _ABSOLUTE and _ADJACENT.match(t[m.end:after.start]))
-                    or (before and before.kind in _ABSOLUTE
-                        and _ADJACENT.match(t[before.end:m.start]))):
+            single(m, kind, d, 0.95 - pen, "named month")
+    for m in _RE_NUMERIC.finditer(norm):
+        if m["sep"] == "." and not m["y"]:
+            continue  # "1.5 weeks", not a date
+        d, kind, pen = _numeric_date(int(m["a"]), int(m["b"]), m["y"], today)
+        single(m, kind, d, 0.9 - pen - (0.05 if m["y"] and len(m["y"]) == 2 else 0), "numeric")
+    for m in _RE_MONTH_ONLY.finditer(norm):
+        if not _overlaps(taken, m.start(), m.end()):
+            add(_Cand(m.start(), m.end(), "ambiguous", None, 0.0, "month without a day"))
+
+    # Weekdays and bare days of the month.
+    for m in _RE_WEEKDAY.finditer(norm):
+        wd = _WEEKDAYS[m["wd"]]
+        delta = (wd - today.weekday()) % 7 or 7
+        single(m, "date", today + timedelta(days=delta), 0.75, "weekday")
+    for m in _RE_ORDINAL_DAY.finditer(norm):
+        day = int(m["d1"] or m["d2"])
+        if not 1 <= day <= 31:
+            continue
+        span = m.span("d1") if m["d1"] else m.span("d2")
+        if _overlaps(taken, *span):
+            continue
+        d = None
+        for offset in (0, 1, 2):
+            probe = _add_months(today.replace(day=1), offset)
+            try:
+                cand = probe.replace(day=day)
+            except ValueError:
                 continue
-        keep.append(m)
-    return keep
+            if cand > today:
+                d = cand
+                break
+        single(m, "date" if d else "invalid", d, 0.7, "day of month")
+
+    # Relative phrases, measured against when the message arrived.
+    def offset(n: int, unit: str) -> date:
+        kind = _UNITS[unit]
+        if kind == "d":
+            return today + timedelta(days=n)
+        if kind == "w":
+            return today + timedelta(weeks=n)
+        return _add_months(today, n)
+
+    for m in _RE_REL_IN.finditer(norm):
+        n = _num(m["n"])
+        if n is not None and not _overlaps(taken, m.start(), m.end()):
+            add(_Cand(m.start(), m.end(), "date", offset(n, m["u"]), 0.75, "relative"))
+    for m in _RE_REL_FOR.finditer(norm):
+        n = _num(m["n"])
+        if n is None or _overlaps(taken, m.start(), m.end()):
+            continue
+        if not _AWAY_CONTEXT.search(norm[max(0, m.start() - 90):m.start()]):
+            continue
+        add(_Cand(m.start(), m.end(), "date", offset(n, m["u"]), 0.7, "relative"))
+    for m in _RE_TOMORROW.finditer(norm):
+        if not _overlaps(taken, m.start(), m.end()):
+            add(_Cand(m.start(), m.end(), "date", today + timedelta(days=1), 0.85, "relative"))
+    for m in _RE_NEXT_WEEK.finditer(norm):
+        if not _overlaps(taken, m.start(), m.end()):
+            monday = today + timedelta(days=7 - today.weekday())
+            add(_Cand(m.start(), m.end(), "date", monday, 0.65, "next week"))
+    for m in _RE_NEXT_MONTH.finditer(norm):
+        if not _overlaps(taken, m.start(), m.end()):
+            add(_Cand(m.start(), m.end(), "ambiguous", None, 0.0, "next month"))
+
+    cands.sort(key=lambda c: c.start)
+    return cands
 
 
-def _role(t: str, m: _Mention, previous: _Mention | None) -> str:
-    if m.kind.startswith("range"):
-        return "range_end"
-    if previous is not None and _CONNECTOR.match(t[previous.end:m.start]):
-        return "range_end"
-    window = t[max(0, m.start - 60):m.start]
-    breaks = list(_SENTENCE_BREAK.finditer(window))
-    if breaks:
-        window = window[breaks[-1].end():]
-    best, best_at = "", -1
-    for role, rx in _ROLE_WORDS:
-        for hit in rx.finditer(window):
-            if hit.end() > best_at:
-                best, best_at = role, hit.end()
-    if best:
-        return "" if best == "start" else best
-    # "On October 20 I'll be back": the keyword may follow the date, but only
-    # within the same clause ("out next week, back the week after" is not).
-    after = t[m.end:m.end + 30]
-    stop = re.search(r"[,(]|" + _SENTENCE_BREAK.pattern, after)
-    if stop:
-        after = after[:stop.start()]
-    return "return_after" if _RETURN_AFTER.search(after) else ""
+def _local_today(received: datetime, tz_name: str) -> date:
+    import pytz
+
+    try:
+        tz = pytz.timezone(tz_name or "UTC")
+    except Exception:
+        tz = pytz.UTC
+    if received.tzinfo is None:
+        received = received.replace(tzinfo=timezone.utc)
+    return received.astimezone(tz).date()
 
 
-# How sure a role makes us that the date is the day they are back, and the
-# day the sequence may resume relative to it.
-_ROLE_WEIGHT = {"return": (1.0, 0), "until": (1.0, 0), "through": (0.95, 1),
-                "range_end": (0.85, 1), "return_after": (0.9, 0)}
+def extract_return_date(text: str, received: datetime, tz_name: str = "UTC") -> ReturnDate:
+    """Find when the sender is back, measured against ``received``.
 
-
-def parse_return_date(text: str, received_at: datetime, tz_name: str = "UTC") -> ReturnDate:
-    """Read the return date from a vacation reply's own words.
-
-    ``received_at`` is the message's timestamp (aware, or naive UTC). Every
-    relative date resolves against that moment's calendar day in ``tz_name``,
-    so "back tomorrow" written late on a Tuesday evening in New York means
-    Wednesday even though it is already Wednesday in UTC.
+    ``received`` is when the message arrived (naive values are UTC) and
+    ``tz_name`` is the operator's timezone, used because the sender's own is
+    unknown: "back tomorrow" written at 02:00 UTC is still today in New York.
     """
-    ref = local_day(received_at, tz_name)
-    original = (text or "")[:4000]
-    t = fold(original)
+    source = " ".join((text or "")[:4000].split("\n"))
+    norm = _fold(source)
+    today = _local_today(received, tz_name)
+    cands = _collect(norm, today)
+    if not cands:
+        return ReturnDate("none", note="no return date in the message")
 
-    mentions = _find_mentions(t)
-    previous = None
-    for m in mentions:
-        m.role = _role(t, m, previous)
-        try:
-            m.day = _resolve(m, ref)
-        except _Unreadable as e:
-            m.error = str(e)
-        previous = m
+    def snippet(c: _Cand) -> str:
+        return " ".join(source[c.start:c.end].split()).rstrip(" .,;:")
 
-    def outcome(day=None, mention=None, confidence=0.0, reason=""):
-        return ReturnDate(
-            resume_at=resume_time(day, tz_name) if day and not reason else None,
-            local_date=day if not reason else None,
-            text=original[mention.start:mention.end].strip(" .,") if mention else "",
-            confidence=round(confidence, 2) if not reason else 0.0,
-            review_reason=reason, timezone=tz_name)
-
-    meaningful = [m for m in mentions if m.role]
-    if not meaningful:
-        return outcome(mention=mentions[0] if mentions else None,
-                       reason="unclear" if mentions else "no_date")
-    returns = [m for m in meaningful if m.role in ("return", "return_after")]
-    chosen = returns or meaningful
-    broken = next((m for m in chosen if m.error), None)
-    if broken:
-        return outcome(mention=broken, reason=broken.error)
-
-    days = {}
-    for m in chosen:
-        weight, shift = _ROLE_WEIGHT[m.role]
-        days.setdefault(m.day + timedelta(days=shift), (m, m.confidence * weight))
-    if len(days) > 1:
-        return outcome(mention=chosen[0], reason="conflicting")
-    (day, (mention, confidence)), = days.items()
-    if day < ref:
-        return outcome(mention=mention, reason="past")
-    if (day - ref).days > MAX_AWAY_DAYS:
-        return outcome(mention=mention, reason="too_far")
-    return outcome(day, mention, confidence)
+    good = [c for c in cands if c.kind == "date" and c.date is not None]
+    bad = [c for c in cands if c.kind != "date"]
+    if bad and not good:
+        c = bad[0]
+        status = "invalid" if c.kind == "invalid" else "ambiguous"
+        return ReturnDate(status, text=snippet(c), note=c.note or status)
+    if bad:
+        return ReturnDate("ambiguous", text=snippet(bad[0]),
+                          note="the message gives more than one reading of its dates")
+    if len({c.date for c in good}) > 1:
+        return ReturnDate("ambiguous", text=snippet(good[0]),
+                          note="the message gives different return dates")
+    c = good[0]
+    if c.date < today:
+        return ReturnDate("past", date=c.date, text=snippet(c), confidence=c.confidence,
+                          note="that date has already passed")
+    if (c.date - today).days > MAX_DAYS_AHEAD:
+        return ReturnDate("too_far", date=c.date, text=snippet(c), confidence=c.confidence,
+                          note=f"more than {MAX_DAYS_AHEAD} days away")
+    return ReturnDate("date", date=c.date, text=snippet(c),
+                      confidence=round(max(0.0, min(1.0, c.confidence)), 2), note=c.note)
 
 
-def parse_stored(value) -> datetime | None:
-    """A timestamp as the DB stores it (naive UTC, 'T' or space), or None."""
-    if not value:
-        return None
+# ── Turning a return date into a sending time ──
+
+
+def operator_clock(config) -> tuple[str, str]:
+    """(timezone name, quiet-hours end "HH:MM") from the config, tolerating a
+    config without a ``usage`` section."""
+    quiet = getattr(getattr(config, "usage", None), "quiet_hours", None)
+    tz_name = getattr(quiet, "timezone", "") or "UTC"
+    end = getattr(quiet, "end", "") or "07:00"
+    return tz_name, end
+
+
+def resume_time(return_date: date, tz_name: str = "UTC", quiet_end: str = "09:00",
+                buffer_days: int = 0) -> datetime:
+    """First sending time on or after ``return_date``, as naive UTC.
+
+    That is the moment quiet hours end in the operator's timezone, moved to
+    Monday when the date falls on a weekend. ``buffer_days`` pushes it that
+    many business days later, so the first email does not land on a full
+    inbox the morning they are back.
+    """
+    import pytz
+
     try:
-        return datetime.fromisoformat(str(value).replace(" ", "T"))
+        tz = pytz.timezone(tz_name or "UTC")
+    except Exception:
+        tz = pytz.UTC
+    try:
+        at = dtime.fromisoformat(quiet_end)
     except ValueError:
+        at = dtime(7, 0)
+    day = return_date
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    for _ in range(max(0, int(buffer_days or 0))):
+        day += timedelta(days=1)
+        while day.weekday() >= 5:
+            day += timedelta(days=1)
+    local = tz.localize(datetime.combine(day, at.replace(tzinfo=None)))
+    return local.astimezone(pytz.UTC).replace(tzinfo=None)
+
+
+# Backward-compatible date-result API used by the pause history service.
+# Runtime scheduling uses extract_return_date + resume_time above, including
+# configured quiet hours, weekends and the optional business-day buffer.
+from mercury.ooo_legacy import (
+    MAX_AWAY_DAYS, RESUME_HOUR, REVIEW_REASONS, SEQUENCE_OVER,
+    local_day, message_time, parse_return_date, parse_stored,
+    is_automatic as _legacy_is_automatic,
+    classify_automatic as _legacy_classify_automatic,
+)
+
+
+def is_automatic(subject: str, headers: dict | None) -> bool:
+    return _legacy_is_automatic(subject, headers) or is_receipt(subject, headers)
+
+
+def classify_automatic(subject: str, body: str, headers: dict | None) -> str | None:
+    if not is_automatic(subject, headers):
         return None
-
-
-def message_time(raw_date: str, fallback: datetime) -> datetime:
-    """The inbound message's Date header as naive UTC, or ``fallback``."""
-    from email.utils import parsedate_to_datetime
-
-    try:
-        parsed = parsedate_to_datetime(raw_date) if raw_date else None
-    except (TypeError, ValueError, IndexError):
-        parsed = None
-    if parsed is None:
-        return fallback
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-    return parsed
+    kind = classify_auto_reply(subject, body, headers)
+    if kind == "acknowledgement" and not _ACK_MARKERS.search(_fold(body)):
+        return _legacy_classify_automatic(subject, body, headers) or kind
+    return "out_of_office" if kind == "ooo" else kind

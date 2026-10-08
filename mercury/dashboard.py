@@ -26,6 +26,7 @@ logger = logging.getLogger("mercury.dashboard")
 from mercury.paths import PROJECT_ROOT  # noqa: E402
 from mercury.personas_api import router as personas_router  # noqa: E402
 from mercury.imports_api import router as imports_router  # noqa: E402
+from mercury.demos_api import router as demos_router  # noqa: E402
 from mercury.exclusions_api import router as exclusions_router  # noqa: E402
 from mercury.pauses_api import router as pauses_router  # noqa: E402
 # MERCURY_DB_PATH points the dashboard at another database (e.g. the demo
@@ -39,6 +40,7 @@ LOG_FILE = PROJECT_ROOT / "data" / "mercury.log"
 app = FastAPI(title="Mercury Dashboard")
 app.include_router(personas_router)
 app.include_router(imports_router)
+app.include_router(demos_router)
 app.include_router(exclusions_router)
 app.include_router(pauses_router)
 
@@ -673,14 +675,21 @@ async def get_outbox_api():
             threaded = cfg.channels.email.thread_followups
         except Exception:
             legacy, known, threaded = "", None, True
+        from mercury.demos import annotate_outbox, waiting_for_demo
+
+        config = _demo_config()
+        pending = await state.get_outbox(status="pending_review", limit=100)
+        approved = await state.get_outbox(status="approved", limit=50)
+        await annotate_outbox(state, config, pending + approved)
         return _with_wire_subject(threaded, {
             "paused": await state.get_setting("sending_paused"),
-            "pending": await _with_policy(state, await _with_from_mailbox(
-                state, await state.get_outbox(status="pending_review", limit=100), legacy, known)),
-            "approved": await _with_policy(state, await _with_from_mailbox(
-                state, await state.get_outbox(status="approved", limit=50), legacy, known)),
+            "pending": await _with_policy(
+                state, await _with_from_mailbox(state, pending, legacy, known)),
+            "approved": await _with_policy(
+                state, await _with_from_mailbox(state, approved, legacy, known)),
             "blocked": await _with_policy(state, await state.get_outbox(
                 status="blocked", limit=50)),
+            "waiting_demo": await waiting_for_demo(state, config),
             "sending": await _with_from_mailbox(
                 state, await state.get_outbox(status="sending", limit=50), legacy, known),
             "sent": await _with_from_mailbox(state, await query_db(
@@ -704,6 +713,16 @@ def _with_wire_subject(threaded: bool, data: dict) -> dict:
             for r in rows:
                 r["wire_subject"] = wire_subject(r, threaded)
     return data
+def _demo_config():
+    """The config the demo gate reads, or None when it can't be loaded. The
+    gate fails closed on None: every email that carries an offer shows held."""
+    try:
+        from mercury.config import load_config
+
+        return load_config()
+    except Exception as e:
+        logger.warning(f"Demo gate: could not load the config: {e}")
+        return None
 
 
 def _mail_context():
@@ -1026,6 +1045,57 @@ async def outbox_reschedule(item_id: str, request: Request):
         return {"success": True, "send_at": normalized}
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+# ── Out-of-office pauses ──
+#
+# A prospect who sent a vacation notice has their remaining cold sequence held
+# back (see Handler._pause_for_ooo). The Outbox tab lists them, flags the ones
+# whose return date needs a human, and lets an operator correct the date or
+# resume them. Both actions are recorded in the activity log.
+
+
+def _operator_clock():
+    """(timezone name, quiet-hours end) from the config, or UTC defaults."""
+    try:
+        from mercury.config import load_config
+        from mercury.ooo import operator_clock
+
+        return operator_clock(load_config())
+    except Exception:
+        return "UTC", "07:00"
+
+
+def _pause_view(row: dict, tz_name: str) -> dict:
+    """One paused contact as the UI needs it, with the return date as the
+    operator's calendar day (what the date field edits)."""
+    resume_local = ""
+    if row.get("resume_at"):
+        try:
+            import pytz
+
+            when = datetime.fromisoformat(str(row["resume_at"]).replace(" ", "T"))
+            resume_local = pytz.UTC.localize(when).astimezone(pytz.timezone(tz_name)).date().isoformat()
+        except Exception:
+            resume_local = ""
+    name = f"{row.get('first_name') or ''} {row.get('last_name') or ''}".strip()
+    return {
+        "prospect_id": row["prospect_id"],
+        "name": name or row.get("email") or "",
+        "email": row.get("email") or "",
+        "title": row.get("title") or "",
+        "company": row.get("company_name") or "",
+        "state": row["state"],
+        "review_reason": row.get("review_reason") or "",
+        "return_text": row.get("return_text") or "",
+        "resume_at": row.get("resume_at") or "",
+        "resume_local": resume_local,
+        "confidence": row.get("confidence") or 0,
+        "manual_override": bool(row.get("manual_override")),
+        "queued_count": int(row.get("queued_count") or 0),
+        "paused_since": row.get("created_at") or "",
+        "heard_at": row.get("trigger_at") or "",
+    }
 
 
 # ── Pipeline board + calendar ──
@@ -1759,6 +1829,24 @@ async def get_today():
                 "action": "Read their sites", "tab": "discover",
             })
 
+        try:
+            health = await _health_report(state)
+            cancel = [d for d in health.get("domains", [])
+                      if d.get("verdict") == "CANCEL_CANDIDATE"]
+        except Exception as e:
+            logger.debug("today: health report failed: %s", e)
+            cancel = []
+        if cancel:
+            items.append({
+                "key": "deliverability", "tone": "warn",
+                "title": (f"{cancel[0]['domain']} is a candidate to cancel" if len(cancel) == 1
+                          else f"{len(cancel)} sending domains are candidates to cancel"),
+                "detail": ((cancel[0]["reason"] + " " if len(cancel) == 1 else "")
+                           + "Run a placement test (mercury mail placement) to tell the "
+                             "domain apart from the copy before you retire it."),
+                "action": "Open mailboxes", "tab": "mailboxes",
+            })
+
         if pending:
             items.append({
                 "key": "outbox", "tone": "warn",
@@ -1766,6 +1854,21 @@ async def get_today():
                           else f"{len(pending)} emails waiting for approval"),
                 "detail": "Nothing sends until you approve it. Read them one at a time.",
                 "action": "Open the decisions desk", "tab": "outbox",
+            })
+
+        from mercury.demos import waiting_for_demo
+
+        waiting_demo = await waiting_for_demo(state, _demo_config())
+        stats["waiting_demo"] = len(waiting_demo)
+        if waiting_demo:
+            n = len(waiting_demo)
+            items.append({
+                "key": "demos", "tone": "warn",
+                "title": (f"{n} contact waiting for a demo" if n == 1
+                          else f"{n} contacts waiting for a demo"),
+                "detail": ("Their emails say something was already built for them, so "
+                           "they wait until you mark the demo ready."),
+                "action": "See who is waiting", "tab": "outbox",
             })
 
         blocked = await state.get_outbox(status="blocked", limit=200)
@@ -2028,6 +2131,35 @@ async def get_heatmap(weeks: str = "53"):
     except Exception as e:
         logger.debug("heatmap init_db failed: %s", e)
     return await metrics.heatmap(str(DB_PATH), n, datetime.now(timezone.utc).date())
+
+
+async def _health_report(state) -> dict:
+    """Per-domain deliverability verdicts plus the last placement test.
+    Definitions and thresholds live in mercury/deliverability.py."""
+    from mercury import deliverability, placement
+
+    try:
+        config, pool = _mail_context()
+    except Exception as e:
+        logger.debug("health: mail config unreadable: %s", e)
+        from mercury.config import load_config
+        config, pool = load_config(), None
+    report = await deliverability.domain_report(state, config, pool)
+    report["placement"] = await placement.report(state)
+    report["thresholds_text"] = deliverability.thresholds_text(report)
+    return report
+
+
+@app.get("/api/health")
+async def get_health():
+    """The ``mercury health`` numbers for the Today card and the Mailboxes tab."""
+    try:
+        state = _state()
+        await state.init_db()
+        return await _health_report(state)
+    except Exception as e:
+        logger.error(f"/api/health: {e}", exc_info=True)
+        return _err(f"Could not build the health report: {type(e).__name__}", 500)
 
 
 # ── Inbox warm-up ──

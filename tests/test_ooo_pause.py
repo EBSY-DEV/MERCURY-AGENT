@@ -136,7 +136,7 @@ async def test_vacation_reply_defers_the_sequence_and_resumes_on_return(state):
 
     pause = await state.get_active_pause(pid)
     assert pause["review_state"] == "scheduled"
-    assert pause["resume_at"] == "2026-10-20T13:00:00"      # 09:00 in New York
+    assert pause["resume_at"] == "2026-10-20T11:00:00"      # 07:00 quiet-hours end in New York
     assert pause["return_text"] == "October 20"
     prospect = await state.get_prospect(pid)
     assert prospect.status == "contacted"                    # pipeline place untouched
@@ -145,7 +145,7 @@ async def test_vacation_reply_defers_the_sequence_and_resumes_on_return(state):
     assert await actions(state, "ooo_paused") == 1
 
     # Step 2 was due on the 8th. It waits through the vacation.
-    for moment in ((2026, 10, 8, 15, 0), (2026, 10, 12, 15, 0), (2026, 10, 20, 12, 59)):
+    for moment in ((2026, 10, 8, 15, 0), (2026, 10, 12, 15, 0), (2026, 10, 20, 10, 59)):
         clock.at(*moment)
         await sender._run_native()
         assert len(provider.sent) == 1
@@ -187,7 +187,7 @@ async def test_classifier_detected_vacation_reply_pauses_too(state):
     await make_handler_at(state, provider, clock.at(2026, 10, 7, 14, 0), intent="ooo")._run_native()
 
     pause = await state.get_active_pause(pid)
-    assert pause["resume_at"] == "2026-10-12T13:00:00"
+    assert pause["resume_at"] == "2026-10-12T11:00:00"
     (record,) = await state.auto_replies_for(pid)
     assert record["detected_by"] == "classifier"
     assert await state.get_conversations_by_status("open") == []
@@ -330,7 +330,7 @@ async def test_a_pause_survives_a_restart(state):
     fresh = make_sender_at(reopened, provider, clock.at(2026, 10, 12, 15, 0))
     await fresh._run_native()
     assert len(provider.sent) == 1
-    assert (await reopened.get_active_pause(pid))["resume_at"] == "2026-10-20T13:00:00"
+    assert (await reopened.get_active_pause(pid))["resume_at"] == "2026-10-20T11:00:00"
 
 
 @pytest.mark.asyncio
@@ -345,14 +345,14 @@ async def test_newer_reply_updates_but_a_replayed_old_one_never_beats_an_overrid
 
     clock.at(2026, 10, 7, 15, 0)
     await PauseService(state, TzCfg(), clock=clock).set_return_date(pause["id"], "2026-10-22")
-    assert (await state.get_active_pause(pid))["resume_at"] == "2026-10-22T13:00:00"
+    assert (await state.get_active_pause(pid))["resume_at"] == "2026-10-22T11:00:00"
 
     # An older vacation reply turns up late: the operator's date stands.
     provider.inbound = [vacation(key="<ooo-0@example.com>", date="Mon, 05 Oct 2026 18:00:00 -0400",
                                  body="Out of the office until October 15.")]
     await handler._run_native()
     kept = await state.get_active_pause(pid)
-    assert kept["resume_at"] == "2026-10-22T13:00:00" and kept["manual_override"] == 1
+    assert kept["resume_at"] == "2026-10-22T11:00:00" and kept["manual_override"] == 1
 
     # A genuinely newer one (sent after the correction) updates it.
     provider.inbound = [vacation(key="<ooo-2@example.com>", date="Fri, 09 Oct 2026 08:00:00 -0400",
@@ -360,14 +360,14 @@ async def test_newer_reply_updates_but_a_replayed_old_one_never_beats_an_overrid
     clock.at(2026, 10, 9, 15, 0)
     await handler._run_native()
     updated = await state.get_active_pause(pid)
-    assert updated["resume_at"] == "2026-10-26T13:00:00" and updated["manual_override"] == 0
+    assert updated["resume_at"] == "2026-10-26T11:00:00" and updated["manual_override"] == 0
     assert updated["id"] == pause["id"]
 
     # A newer one with no date does not throw the known date away.
     provider.inbound = [vacation(key="<ooo-3@example.com>", date="Sat, 10 Oct 2026 08:00:00 -0400",
                                  body="I am out of the office.")]
     await handler._run_native()
-    assert (await state.get_active_pause(pid))["resume_at"] == "2026-10-26T13:00:00"
+    assert (await state.get_active_pause(pid))["resume_at"] == "2026-10-26T11:00:00"
     outcomes = {r["message_key"]: r["outcome"] for r in await state.auto_replies_for(pid)}
     assert outcomes == {"<ooo-1@example.com>": "paused", "<ooo-0@example.com>": "kept",
                         "<ooo-2@example.com>": "updated", "<ooo-3@example.com>": "kept"}
@@ -490,7 +490,7 @@ async def test_a_stale_pause_scan_respects_a_later_return_date(state, monkeypatc
 
     pause = await state.get_active_pause(pid)
     assert pause is not None
-    assert pause["resume_at"] == "2026-10-26T13:00:00"
+    assert pause["resume_at"] == "2026-10-26T11:00:00"
     assert len(provider.sent) == 1
     assert await actions(state, "ooo_resumed") == 0
 
@@ -513,7 +513,7 @@ async def test_a_stale_due_scan_cannot_claim_a_contact_paused_since(state):
     await state.record_auto_reply(
         message_key="<late@example.com>", kind="out_of_office", prospect_id=pid,
         received_at="2026-10-08T12:00:00",
-        parsed={"resume_at": "2026-10-20T13:00:00", "text": "October 20", "confidence": 0.95})
+        parsed={"resume_at": "2026-10-20T11:00:00", "text": "October 20", "confidence": 0.95})
     claim, detail = await state.claim_for_send(due[0], "mercury@x.co")
     assert claim == "ooo_pause" and detail["pause"]["prospect_id"] == pid
     assert (await state.get_outbox_item(due[0]["id"]))["status"] == "approved"
@@ -526,13 +526,13 @@ async def test_staging_a_paused_contact_schedules_from_the_return_day(state):
     await state.record_auto_reply(
         message_key="<o@example.com>", kind="out_of_office", prospect_id=pid,
         received_at="2026-10-05T12:00:00",
-        parsed={"resume_at": "2026-10-20T13:00:00", "text": "October 20", "confidence": 0.95})
+        parsed={"resume_at": "2026-10-20T11:00:00", "text": "October 20", "confidence": 0.95})
     await three_step_campaign(state, [pid])
     sender = make_sender_at(state, provider, Clock(2026, 10, 6, 14, 0))
     await sender._run_native()
     assert provider.sent == []
     rows = await sequence_rows(state)
-    assert rows[1]["send_at"] == "2026-10-20T13:00:00"
+    assert rows[1]["send_at"] == "2026-10-20T11:00:00"
     assert rows[1]["status"] == "approved"
 
 
