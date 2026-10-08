@@ -281,6 +281,48 @@ async def test_a_stale_due_scan_cannot_send_an_edited_draft(state):
 
 
 @pytest.mark.asyncio
+async def test_a_stale_due_scan_cannot_send_to_a_rerouted_recipient(state):
+    pid = await _prospect(state)
+    item = await _queue(state, pid, status="approved")
+    provider = FakeProvider()
+    sender = make_sender(state, provider)
+    real_get_outbox = state.get_outbox
+
+    async def scan_then_reroute(*args, **kwargs):
+        rows = await real_get_outbox(*args, **kwargs)
+        await _outbox(state).reroute(item, 1, to_email="other@example.com")
+        await _outbox(state).approve(item, 2)
+        return rows
+
+    state.get_outbox = scan_then_reroute
+    await sender._drain_due()
+    state.get_outbox = real_get_outbox
+    assert provider.sent == []
+    assert (await state.get_outbox_item(item))["status"] == "approved"
+
+    # A later scan must re-run the recipient gate against the changed
+    # address; it cannot reuse the earlier recipient's successful check.
+    current = await state.get_outbox_item(item)
+    assert current["to_email"] == "other@example.com"
+    assert await state.claim_outbox_item(current, "one@example.com")
+
+
+@pytest.mark.asyncio
+async def test_send_claim_requires_the_scanned_revision_even_if_content_returns_to_it(state):
+    pid = await _prospect(state)
+    item = await _queue(state, pid, status="approved")
+    stale = await state.get_outbox_item(item)
+    await _outbox(state).reroute(item, 1, to_email="other@example.com")
+    await _outbox(state).reroute(item, 2, to_email=stale["to_email"])
+    await _outbox(state).approve(item, 3)
+
+    assert not await state.claim_outbox_item(stale, "one@example.com")
+    current = await state.get_outbox_item(item)
+    assert current["revision"] == 3 and current["status"] == "approved"
+    assert await state.claim_outbox_item(current, "one@example.com")
+
+
+@pytest.mark.asyncio
 async def test_content_changed_behind_the_approval_never_sends(state, tmp_path):
     pid = await _prospect(state)
     ids = [await _queue(state, pid, status="approved", campaign_id=f"c{i}") for i in range(4)]
