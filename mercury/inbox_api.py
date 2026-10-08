@@ -16,7 +16,7 @@ from mercury.control.inbox import InboxService
 
 router = APIRouter()
 LIST_FILTERS = ("q", "mailbox", "intent", "stage", "prospect_status", "status", "read",
-                "attention", "response", "snoozed", "reminder")
+                "attention", "needs_you", "response", "snoozed", "reminder")
 
 
 async def service(request: Request | None = None) -> InboxService:
@@ -122,6 +122,15 @@ async def snooze(conversation_id: str, request: Request):
 @router.delete("/api/inbox/conversations/{conversation_id}/snooze")
 async def unsnooze(conversation_id: str, request: Request):
     return await _command((await service(request)).unsnooze(conversation_id))
+
+
+@router.post("/api/inbox/conversations/{conversation_id}/stage")
+async def set_stage(conversation_id: str, request: Request):
+    """{"stage": one of the sales stages}. Audited; does not touch mail."""
+    body = await _body(request)
+    if body is None:
+        return _bad_body()
+    return await _command((await service(request)).set_stage(conversation_id, body.get("stage")))
 
 
 @router.post("/api/inbox/contacts/{prospect_id}/notes")

@@ -51,6 +51,10 @@ BULK_MAX = 200
 NOTE_MAX, REMINDER_NOTE_MAX, QUERY_MAX = 2000, 300, 200
 SNIPPET = 160
 BULK_ACTIONS = ("read", "unread", "snooze", "unsnooze", "exclude")
+# Filters that pick one of the inbox's views (Needs you, Unread, Snoozed,
+# All). Segment counts ignore them so every view shows its own count.
+SEGMENT_FILTERS = ("read", "attention", "needs_you", "response", "snoozed", "reminder")
+CLOSED_STAGES = ("closed_won", "closed_lost")
 LOCAL_NOTE = ("Read, snooze, notes and reminders are kept in Mercury only. They do not "
               "change read flags or anything else in your mailbox.")
 
@@ -171,6 +175,8 @@ WITH conv AS (
              AND o.status = 'sent') AS last_sent_at,
          EXISTS (SELECT 1 FROM outbox o WHERE o.conversation_id = c.id AND o.kind = 'reply'
                    AND o.status IN ({", ".join(f"'{s}'" for s in _DRAFTS)})) AS has_draft,
+         EXISTS (SELECT 1 FROM outbox o WHERE o.conversation_id = c.id AND o.kind = 'reply'
+                   AND o.status = 'pending_review') AS review_draft,
          (SELECT MIN(r.due_at) FROM inbox_reminders r
            WHERE r.conversation_id = c.id AND r.done_at IS NULL) AS next_reminder_at,
          CASE WHEN json_valid(c.thread_json)
@@ -182,7 +188,7 @@ WITH conv AS (
   LEFT JOIN companies co ON co.id = p.company_id AND p.company_id != ''
   LEFT JOIN inbox_state s ON s.conversation_id = c.id
 ),
-rows AS (
+flags AS (
   SELECT conv.*,
     COALESCE(NULLIF(inbound_mailbox, ''), NULLIF(sent_mailbox, ''), '') AS mailbox,
     substr(MAX({_t("created_at")}, {_t("last_inbound_at")}, {_t("last_sent_at")}), 1, 19)
@@ -206,6 +212,14 @@ rows AS (
     CASE WHEN next_reminder_at IS NULL THEN 'none'
          WHEN {_t("next_reminder_at")} <= :now THEN 'due' ELSE 'scheduled' END AS reminder
   FROM conv
+),
+rows AS (
+  -- "Needs you": a person must act. Escalated, a draft waiting for review,
+  -- or a reminder whose time has come.
+  SELECT flags.*,
+    CASE WHEN needs_human = 1 OR review_draft = 1 OR reminder = 'due' THEN 1 ELSE 0 END
+      AS needs_you
+  FROM flags
 )
 """
 
@@ -218,6 +232,7 @@ FACETS = {
     "status": "status",
     "read": "CASE WHEN unread THEN 'unread' ELSE 'read' END",
     "attention": "CASE WHEN needs_human THEN 'needs_human' ELSE 'none' END",
+    "needs_you": "CASE WHEN needs_you THEN 'needs_you' ELSE 'none' END",
     "response": "response",
     "snoozed": "CASE WHEN snoozed THEN 'snoozed' ELSE 'active' END",
     "reminder": "reminder",
@@ -279,6 +294,10 @@ class InboxService:
         if attention is not None:
             out["attention"] = (f"needs_human = {1 if attention else 0}", {})
             echo["attention"] = attention
+        needs_you = _flag(raw.get("needs_you"))
+        if needs_you is not None:
+            out["needs_you"] = (f"needs_you = {1 if needs_you else 0}", {})
+            echo["needs_you"] = needs_you
         response = (raw.get("response") or "").strip().lower()
         if response:
             if response not in ("draft", "awaiting", "none"):
@@ -357,11 +376,25 @@ class InboxService:
                 f"{_ROWS_SQL} SELECT {expr} AS value, COUNT(*) AS count FROM rows{f_where} "
                 "GROUP BY 1 ORDER BY 2 DESC, 1", {**f_params, **now})
             facets[name] = [{"value": r["value"] or "", "count": r["count"]} for r in counted]
+        segments = await self._segments(
+            {k: v for k, v in filters.items() if k not in SEGMENT_FILTERS})
         items = await self._list_items(page)
         nxt = offset + len(items)
         return {"items": items, "total": total, "limit": limit, "offset": offset,
                 "next_offset": nxt if nxt < total else None, "filters": echo,
-                "facets": facets, "local_state_note": LOCAL_NOTE}
+                "facets": facets, "segments": segments, "local_state_note": LOCAL_NOTE}
+
+    async def _segments(self, filters: dict[str, tuple[str, dict]]) -> dict:
+        """How many conversations each view holds under these filters.
+        Snoozed ones count only under Snoozed and All."""
+        where, params = self._where(filters)
+        (seg,) = await self._rows(
+            f"{_ROWS_SQL} SELECT COALESCE(SUM(needs_you = 1 AND snoozed = 0), 0) AS needs_you, "
+            "COALESCE(SUM(unread = 1 AND snoozed = 0), 0) AS unread, "
+            "COALESCE(SUM(snoozed = 1), 0) AS snoozed, COUNT(*) AS everything "
+            f"FROM rows{where}", {**params, "now": _ts(self.clock())})
+        return {"needs_you": seg["needs_you"], "unread": seg["unread"],
+                "snoozed": seg["snoozed"], "all": seg["everything"]}
 
     async def _list_items(self, page: list[dict]) -> list[dict]:
         if not page:
@@ -416,6 +449,7 @@ class InboxService:
                 "snoozed": bool(r["snoozed"]),
                 "snoozed_until": r["snoozed_until"] if r["snoozed"] else None,
                 "needs_human": bool(r["needs_human"]), "opted_out": bool(r["opted_out"]),
+                "needs_you": bool(r["needs_you"]),
                 "response": r["response"], "draft": drafts.get(r["id"]),
                 "reminder": r["reminder"], "next_reminder_at": r["next_reminder_at"],
                 "partial_history": not r["last_inbound_at"] and bool(r["legacy_count"]),
@@ -451,6 +485,7 @@ class InboxService:
                                     "WHERE id = :id", {"id": convo.id,
                                                        "now": _ts(self.clock())})
         unread, snoozed = bool(flags["unread"]), bool(flags["snoozed"])
+        events, stage_since = await self._events(convo, prospect, messages, restrictions)
         return {
             "conversation": {
                 "id": convo.id, "prospect_id": convo.prospect_id,
@@ -459,13 +494,15 @@ class InboxService:
                 or convo.intent == "escalate",
                 "created_at": convo.created_at.isoformat(),
                 "updated_at": convo.updated_at.isoformat(),
+                "stage_since": stage_since,
             },
             "prospect": _prospect_view(prospect),
-            "company": ({"id": company.id, "name": company.name, "domain": company.domain,
-                         "website": company.website, "industry": company.industry,
-                         "location": company.location} if company else
-                        {"id": "", "name": getattr(prospect, "company", "") or "",
-                         "domain": "", "website": "", "industry": "", "location": ""}),
+            "company": {**({"id": company.id, "name": company.name, "domain": company.domain,
+                            "website": company.website, "industry": company.industry,
+                            "location": company.location} if company else
+                           {"id": "", "name": getattr(prospect, "company", "") or "",
+                            "domain": "", "website": "", "industry": "", "location": ""}),
+                        **await self._company_facts(company, convo)},
             "mailbox": target["mailbox"],
             "messages": messages,
             "partial_history": partial,
@@ -488,7 +525,72 @@ class InboxService:
                 "require_approval": self._require_approval(),
             },
             "restrictions": restrictions,
+            "events": events,
         }
+
+    async def _company_facts(self, company, convo) -> dict:
+        """The offer this contact is pitched (their campaign's, or the newest
+        email's) and the company's latest value for each signal, briefly."""
+        offer = ""
+        if convo.campaign_id:
+            rows = await self._rows("SELECT offer_key FROM campaigns WHERE id = ?",
+                                    (convo.campaign_id,))
+            offer = rows[0]["offer_key"] if rows else ""
+        if not offer and convo.prospect_id:
+            rows = await self._rows(
+                "SELECT offer_key FROM outbox WHERE prospect_id = ? AND offer_key != '' "
+                "ORDER BY created_at DESC LIMIT 1", (convo.prospect_id,))
+            offer = rows[0]["offer_key"] if rows else ""
+        signals = []
+        if company is not None:
+            for row in await self._rows(
+                    "SELECT signal_code, value_num, value_text FROM observations o "
+                    "WHERE company_id = ? AND observed_at = (SELECT MAX(observed_at) "
+                    "FROM observations x WHERE x.company_id = o.company_id "
+                    "AND x.signal_code = o.signal_code) GROUP BY signal_code "
+                    "ORDER BY signal_code LIMIT 8", (company.id,)):
+                value = row["value_num"]
+                if value is not None and float(value).is_integer():
+                    value = int(value)
+                text = (row["value_text"] or "").strip()
+                signals.append({"code": row["signal_code"],
+                                "value": value if value is not None else
+                                (text if len(text) <= 24 else "")})
+        return {"offer_key": offer or "", "signals": signals}
+
+    async def _events(self, convo, prospect, messages, restrictions) -> tuple[list[dict], dict]:
+        """What happened to the thread that is not a message (an exclusion,
+        a paused sequence, a stage someone set), oldest first, and since when
+        the conversation has been at its stage: the last stage change made
+        here, or else the first reply (or the start, before any reply)."""
+        events: list[dict] = []
+        exclusion = restrictions.get("exclusion")
+        if exclusion and exclusion.get("created_at"):
+            events.append({"kind": "exclusion", "at": exclusion["created_at"],
+                           "source": exclusion["source"], "value": exclusion.get("value", ""),
+                           "description": exclusion["description"],
+                           "by": exclusion.get("created_by", "")})
+        pause = restrictions.get("pause")
+        if pause and pause.get("created_at"):
+            events.append({"kind": "pause", "at": pause["created_at"], "state": pause["state"],
+                           "resume_at": pause.get("resume_at")})
+        changes = [row for row in await self.state.get_audit("conversation", convo.id, limit=200)
+                   if row["action"] == "inbox.stage" and row["outcome"] == "ok"]
+        for row in reversed(changes):
+            events.append({"kind": "stage", "at": row["at"], "from": row["detail"].get("from", ""),
+                           "to": row["detail"].get("to", ""), "by": row["operator"] or "you"})
+        events.sort(key=lambda e: _sort_time(e["at"]))
+        if changes:
+            since = {"at": changes[0]["at"], "reason": "set"}
+        elif convo.stage in CLOSED_STAGES:
+            reason = "opted_out" if (getattr(prospect, "status", "") == "opted_out"
+                                     or convo.intent == "unsubscribe") else "closed"
+            since = {"at": convo.updated_at.isoformat(), "reason": reason}
+        else:
+            first = next((m for m in messages if m["direction"] == "inbound"), None)
+            since = ({"at": first["at"], "reason": "replied"} if first else
+                     {"at": convo.created_at.isoformat(), "reason": "started"})
+        return events, since
 
     async def _messages(self, convo, prospect) -> tuple[list[dict], bool]:
         pid = convo.prospect_id or ""
@@ -691,11 +793,15 @@ class InboxService:
         rule = await policy.exclusion_for(prospect.email or "")
         if rule:
             out["exclusion"] = {"id": rule["id"], "source": rule["source"],
-                                "description": describe_rule(rule)}
+                                "description": describe_rule(rule),
+                                "value": rule.get("value", ""),
+                                "created_at": rule.get("created_at"),
+                                "created_by": rule.get("created_by", "")}
         pause = await self.state.get_active_pause(prospect.id)
         if pause:
             out["pause"] = {"id": pause["id"], "state": pause.get("state"),
                             "resume_at": pause.get("resume_at"),
+                            "created_at": pause.get("created_at"),
                             "note": "Holds their cold sequence only; replies still go."}
         company_id = await policy.company_for(prospect)
         if company_id:
@@ -747,6 +853,31 @@ class InboxService:
             trail.record(conversation_id)
             return {"id": conversation_id, "snoozed": False, "snoozed_until": None}
         return await self._run("unsnooze", "edit", {"id": conversation_id}, work,
+                               conversation_id)
+
+    async def set_stage(self, conversation_id: str, stage) -> dict:
+        """Move a conversation to a sales stage by hand. A closed stage closes
+        it; an open stage reopens a closed one (an escalated conversation
+        stays with a person). Mail is not touched: queued emails stay as
+        they are, and the Pipeline board follows the stage."""
+        from mercury.models.conversation import STAGES
+
+        async def work(trail):
+            convo = await self._conversation(conversation_id)
+            to = str(stage or "").strip()
+            if to not in STAGES:
+                raise Invalid(f"stage must be one of {', '.join(STAGES)}", field="stage")
+            status = convo.status
+            if to in CLOSED_STAGES:
+                status = "closed"
+            elif status == "closed":
+                status = "open"
+            if to != convo.stage or status != convo.status:
+                await self.state.update_conversation(convo.id, stage=to, status=status)
+            trail.record(convo.id, **{"from": convo.stage, "to": to, "status": status})
+            return {"id": convo.id, "stage": to, "status": status,
+                    "changed": to != convo.stage}
+        return await self._run("stage", "edit", {"id": conversation_id, "stage": stage}, work,
                                conversation_id)
 
     @staticmethod
@@ -896,17 +1027,29 @@ class InboxService:
                                 "confirm": confirm}, work)
 
     async def _bulk_one(self, action, cid, when, kind, reason, exclusions) -> dict:
+        """One conversation's outcome. ``changed`` is false when it was
+        already in the state asked for (read, or snoozed until that time)."""
         convo = await self._conversation(cid)
         now = _ts(self.clock())
+        if action in ("read", "unread", "snooze", "unsnooze"):
+            (before,) = await self._rows(f"{_ROWS_SQL} SELECT unread, snoozed, snoozed_until "
+                                         "FROM rows WHERE id = :id", {"id": cid, "now": now})
         if action in ("read", "unread"):
-            await self.state.set_conversations_read([cid], action == "read", now=now)
-            return {"unread": action == "unread"}
+            changed = bool(before["unread"]) != (action == "unread")
+            if changed:
+                await self.state.set_conversations_read([cid], action == "read", now=now)
+            return {"unread": action == "unread", "changed": changed}
         if action == "snooze":
-            await self.state.snooze_conversation(cid, when, now=now)
-            return {"snoozed_until": when}
+            changed = not (before["snoozed"] and _sort_time(before["snoozed_until"])
+                           == _sort_time(when))
+            if changed:
+                await self.state.snooze_conversation(cid, when, now=now)
+            return {"snoozed_until": when, "changed": changed}
         if action == "unsnooze":
-            await self.state.snooze_conversation(cid, None, now=now)
-            return {"snoozed_until": None}
+            changed = bool(before["snoozed"])
+            if changed:
+                await self.state.snooze_conversation(cid, None, now=now)
+            return {"snoozed_until": None, "changed": changed}
         from mercury.control.exclusions import ExclusionError
         from mercury.policy import email_domain, is_shared_provider
 
@@ -1095,9 +1238,11 @@ class InboxService:
         now = _ts(self.clock())
         due = await self.state.list_reminders(due_before=now, limit=500)
         failed = await self._rows(
-            "SELECT id, from_email, mailbox, subject, last_error, attempts, created_at "
-            "FROM inbound_messages WHERE status = 'failed' ORDER BY created_at DESC LIMIT 50")
-        return {"reminders_due": due, "failed_messages": failed}
+            "SELECT id, from_email, mailbox, subject, last_error, attempts, created_at, "
+            "conversation_id FROM inbound_messages WHERE status = 'failed' "
+            "ORDER BY created_at DESC LIMIT 50")
+        return {"reminders_due": due, "failed_messages": failed,
+                "segments": await self._segments({})}
 
 
 def _legacy_thread(raw) -> list[dict]:
@@ -1121,4 +1266,5 @@ def _prospect_view(prospect) -> dict:
             "linkedin_url": prospect.linkedin_url or "", "phone": prospect.phone or ""}
 
 
-__all__ = ["InboxService", "parse_time", "BULK_ACTIONS", "FACETS", "LOCAL_NOTE"]
+__all__ = ["InboxService", "parse_time", "BULK_ACTIONS", "FACETS", "LOCAL_NOTE",
+           "SEGMENT_FILTERS"]

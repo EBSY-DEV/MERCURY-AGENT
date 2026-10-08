@@ -566,3 +566,164 @@ def test_bulk_actions_report_scope_and_each_outcome(client):
 
     bad = client.post("/api/inbox/bulk", json={"action": "delete", "conversation_ids": [a]})
     assert bad.status_code == 400
+
+
+# ── The screen's views: Needs you, segment counts, stage, events ──
+
+
+def test_needs_you_is_escalated_a_draft_to_review_or_a_due_reminder(client):
+    sm = client.sm
+
+    async def seed():
+        calm = await converse(sm, "calm@example.org")
+        draft = await converse(sm, "draft@example.org")
+        await sm.add_outbox_item(prospect_id=draft[0], conversation_id=draft[1], kind="reply",
+                                 to_email="draft@example.org", subject="Re: hello",
+                                 body="Answer.", send_at=iso(now()))
+        approved = await converse(sm, "approved@example.org")
+        await sm.add_outbox_item(prospect_id=approved[0], conversation_id=approved[1],
+                                 kind="reply", to_email="approved@example.org",
+                                 subject="Re: hello", body="Answer.", send_at=iso(now()),
+                                 status="approved")
+        angry = await converse(sm, "angry@example.org", intent="escalate", status="needs_human")
+        due = await converse(sm, "due@example.org")
+        await sm.add_reminder(due[1], iso(now() - timedelta(minutes=5)))
+        later = await converse(sm, "later@example.org")
+        await sm.add_reminder(later[1], iso(now() + timedelta(days=2)))
+        sleepy = await converse(sm, "sleepy@example.org", intent="escalate", status="needs_human")
+        await sm.snooze_conversation(sleepy[1], iso(now() + timedelta(days=1)))
+        await sm.set_conversations_read([calm[1], later[1]], True)
+        return calm[1], draft[1], approved[1], angry[1], due[1], later[1], sleepy[1]
+    calm, draft, approved, angry, due, later, sleepy = run(seed())
+
+    data = listing(client, needs_you="true")
+    assert {i["id"] for i in data["items"]} == {draft, angry, due}
+    assert all(i["needs_you"] for i in data["items"])
+    assert facet(data, "needs_you") == {"needs_you": 3, "none": 3}
+    # Segment counts ignore the view picked, so each tab shows its own count;
+    # snoozed conversations count only under Snoozed and All.
+    expected = {"needs_you": 3, "unread": 4, "snoozed": 1, "all": 7}
+    assert data["segments"] == expected
+    assert listing(client, read="unread")["segments"] == expected
+    assert listing(client, snoozed="only")["segments"] == expected
+    # Other filters do narrow the counts.
+    assert listing(client, q="angry")["segments"] == {"needs_you": 1, "unread": 1,
+                                                      "snoozed": 0, "all": 1}
+    assert client.get("/api/inbox/conversations",
+                      params={"needs_you": "perhaps"}).status_code == 400
+
+
+def test_a_stage_set_by_hand_is_audited_and_closes_or_reopens(client):
+    sm = client.sm
+    pid, cid, _ = run(converse(sm, "jane@example.org", stage="engaged"))
+    thread = client.get(f"/api/inbox/conversations/{cid}").json()
+    assert thread["conversation"]["stage_since"]["reason"] == "replied"
+    assert thread["events"] == []
+
+    moved = client.post(f"/api/inbox/conversations/{cid}/stage", json={"stage": "qualifying"})
+    assert moved.status_code == 200, moved.text
+    assert moved.json() == {"success": True, "id": cid, "stage": "qualifying", "status": "open",
+                            "changed": True}
+    lost = client.post(f"/api/inbox/conversations/{cid}/stage",
+                       json={"stage": "closed_lost"}).json()
+    assert lost["status"] == "closed"
+    convo = run(sm.get_conversation(cid))
+    assert (convo.stage, convo.status) == ("closed_lost", "closed")
+    reopened = client.post(f"/api/inbox/conversations/{cid}/stage",
+                           json={"stage": "negotiating"}).json()
+    assert reopened["status"] == "open"
+
+    thread = client.get(f"/api/inbox/conversations/{cid}").json()
+    assert thread["conversation"]["stage"] == "negotiating"
+    assert thread["conversation"]["stage_since"]["reason"] == "set"
+    assert [(e["kind"], e["from"], e["to"]) for e in thread["events"]] == [
+        ("stage", "engaged", "qualifying"), ("stage", "qualifying", "closed_lost"),
+        ("stage", "closed_lost", "negotiating")]
+    audit = [r for r in run(sm.get_audit("conversation", cid)) if r["action"] == "inbox.stage"]
+    assert len(audit) == 3 and {r["outcome"] for r in audit} == {"ok"}
+
+    bad = client.post(f"/api/inbox/conversations/{cid}/stage", json={"stage": "won"})
+    assert bad.status_code == 400 and bad.json()["code"] == "invalid"
+    assert client.post("/api/inbox/conversations/nope/stage",
+                       json={"stage": "engaged"}).status_code == 404
+    # The Pipeline board follows the stage.
+    escalated = run(converse(sm, "angry@example.org", intent="escalate", status="needs_human"))
+    kept = client.post(f"/api/inbox/conversations/{escalated[1]}/stage",
+                       json={"stage": "qualifying"}).json()
+    assert kept["status"] == "needs_human"
+
+
+def test_an_exclusion_shows_as_an_event_in_the_thread(client):
+    sm = client.sm
+    _pid, cid, _ = run(converse(sm, "stop@example.org", intent="unsubscribe"))
+    client.post("/api/inbox/bulk", json={"action": "exclude", "conversation_ids": [cid],
+                                         "confirm": True})
+    thread = client.get(f"/api/inbox/conversations/{cid}").json()
+    (event,) = thread["events"]
+    assert event["kind"] == "exclusion" and event["value"] == "stop@example.org"
+    assert event["at"] and thread["restrictions"]["exclusion"]["created_at"] == event["at"]
+
+
+def test_bulk_says_which_conversations_were_already_that_way(client):
+    sm = client.sm
+    a = run(converse(sm, "ann@example.org"))[1]
+    b = run(converse(sm, "bo@example.org"))[1]
+    until = iso(now() + timedelta(days=3))
+    client.post(f"/api/inbox/conversations/{b}/snooze", json={"until": until})
+    client.post(f"/api/inbox/conversations/{b}/read")
+
+    snoozed = client.post("/api/inbox/bulk", json={"action": "snooze", "conversation_ids": [a, b],
+                                                   "until": until}).json()
+    assert [(r["id"], r["changed"]) for r in snoozed["results"]] == [(a, True), (b, False)]
+    read = client.post("/api/inbox/bulk", json={"action": "read",
+                                                "conversation_ids": [a, b]}).json()
+    assert [r["changed"] for r in read["results"]] == [True, False]
+    unsnoozed = client.post("/api/inbox/bulk", json={"action": "unsnooze",
+                                                     "conversation_ids": [a, b]}).json()
+    assert [r["changed"] for r in unsnoozed["results"]] == [True, True]
+    again = client.post("/api/inbox/bulk", json={"action": "unsnooze",
+                                                 "conversation_ids": [a]}).json()
+    assert again["results"][0]["changed"] is False
+
+
+def test_today_lists_each_due_reminder_with_its_contact(client):
+    sm = client.sm
+    _pid, cid, _ = run(converse(sm, "tina@example.org", first="Tina", last="Santos",
+                                company="Arapahoe Example"))
+    client.post(f"/api/inbox/conversations/{cid}/reminders",
+                json={"due_at": iso(now() - timedelta(minutes=30)),
+                      "note": "Confirm the call."})
+    today = client.get("/api/today").json()
+    (item,) = [i for i in today["items"] if i["key"] == "reminders"]
+    assert item["tab"] == "inbox" and today["stats"]["inbox_needs_you"] == 1
+    (reminder,) = item["reminders"]
+    assert reminder["conversation_id"] == cid and reminder["name"] == "Tina Santos"
+    assert reminder["company"] == "Arapahoe Example" and reminder["note"] == "Confirm the call."
+
+
+def test_the_thread_names_the_offer_and_the_company_signals(client):
+    sm = client.sm
+
+    async def seed():
+        from mercury.models.campaign import Campaign
+        from mercury.models.company import Company
+        from mercury.signals import seed_signal_catalog
+        await seed_signal_catalog(sm)
+        company_id = await sm.add_company(Company(name="Acme Example", domain="acme.example",
+                                                  location="Denver, CO"))
+        campaign_id = await sm.add_campaign(Campaign(id="", name="c", offer_key="offer_a"))
+        pid, cid, _ = await converse(sm, "jane@acme.example")
+        async with sm._connect() as db:
+            await db.execute("UPDATE prospects SET company_id = ? WHERE id = ?",
+                             (company_id, pid))
+            await db.commit()
+        await sm.update_conversation(cid, campaign_id=campaign_id)
+        await sm.add_observation("SERP_RANK", company_id=company_id, value_num=14,
+                                 observed_at="2026-01-01T00:00:00")
+        await sm.add_observation("SERP_RANK", company_id=company_id, value_num=12,
+                                 observed_at="2026-02-01T00:00:00")
+        return cid
+    cid = run(seed())
+    company = client.get(f"/api/inbox/conversations/{cid}").json()["company"]
+    assert company["location"] == "Denver, CO" and company["offer_key"] == "offer_a"
+    assert company["signals"] == [{"code": "SERP_RANK", "value": 12}]
