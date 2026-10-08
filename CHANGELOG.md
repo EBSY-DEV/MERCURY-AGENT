@@ -9,6 +9,30 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **One word limit per step, enforced before anything is staged.** `writer.word_limits`
+  (defaults 90, 80 and 50) is the only place a length lives: every prompt number is rendered
+  from it, the static markdown no longer states a body length, and the same limits are
+  enforced in code over the whole body, greeting and sign-off included. A draft over its
+  limit is asked for again once ("at most N words including greeting and sign-off"); if it
+  is still over it is staged flagged. Outbox rows carry `word_count`, `word_limit`, `flags`,
+  `flag_details` and `needs_flag_approval` (migration v24); a flagged draft is never
+  auto-approved, and approving one takes `approve_flagged` (API, batch items, `mercury
+  outbox --approve-flagged`). Edits and regenerations are measured again.
+- **Follow-ups use the persona and the brief's step.** Steps 2 and 3 are written in the
+  persona their thread started with (or their mailbox's voice), with the angle and call to
+  action of the offer brief instead of a fixed description, and are shown the earlier emails
+  so they add something new instead of repeating the product or offer sentence.
+- **A configured offer sentence.** `offers[].content.sentence` and `steps.N.state_offer` let a
+  brief have one email state the offer in one plain sentence. `icp.markets[]` gain
+  `language_line`, `language_rules` and `terminology`, and `writer` gains defaults for
+  prospects in no market, so language and terminology rules can live in private config.
+- **Short business names, no review counts, and greetings from the registry resolver.** The
+  Writer is given a short business name (legal suffixes and a location tail removed) and uses
+  the full name at most once. Review counts and ratings stay out of its facts. A named contact
+  (or an accepted registry name) is greeted by first name; a shared inbox with no name gets no
+  generic greeting and a short routing request to the offer's `routing_role`
+  (`writer.routing_role` as fallback). See `docs/configuration.md#writer`.
+
 - **A governed pain library.** Pains are proposed (by the trainer or by hand),
   confirmed or rejected by a person, and only confirmed ones are written from.
   A rejected pain is the never-use list: retraining cannot bring it back, and a
