@@ -8,7 +8,7 @@ mercury dashboard --port 8080
 mercury dashboard --host 100.101.102.103   # a specific interface, e.g. your tailnet IP
 ```
 
-The dashboard reads and writes the same SQLite database as `mercury run`, and the two can run at the same time. It does not run the heartbeat itself. Most views refresh every 15 seconds while visible; the Outbox and Settings tabs do not auto-refresh, so a draft or form you are editing is never re-rendered under you. The theme follows your system until you pick light or dark with the button at the bottom of the sidebar.
+The dashboard reads and writes the same SQLite database as `mercury run`, and the two can run at the same time. It does not run the heartbeat itself. Most views refresh every 15 seconds while visible; the Outbox and Settings tabs do not auto-refresh, so a draft or form you are editing is never re-rendered under you. The Inbox refreshes, but never replaces a reply or note you are typing. The theme follows your system until you pick light or dark with the button at the bottom of the sidebar.
 
 ## Today
 
@@ -20,7 +20,7 @@ The landing page answers "is anything waiting on me?"
 - **Rates**: reply rate, positive reply rate and bounce rate over the trend window selected below, each with the change against the previous window of the same length. Rates are fractions of outreach emails sent. Bounce rate turns red at 5%.
 - **Outreach trend**: emails sent, replies and bounces per day over 7, 30 or 90 days. Click a legend item to hide a series.
 - **Sending activity**: a year-long grid of outreach emails sent per day, with total, active days, the current and longest streak, and the best day.
-- **Needs you**: decisions only you can make, most blocking first: sending paused, setup incomplete, signals awaiting confirmation, no companies yet, companies not profiled, emails waiting for approval, replies Mercury could not process, inbox reminders that are due, live conversations. A reminder only flags its conversation; nothing is sent from Today.
+- **Needs you**: decisions only you can make, most blocking first: sending paused, setup incomplete, signals awaiting confirmation, no companies yet, companies not profiled, emails waiting for approval, replies Mercury could not process, inbox reminders that are due, live conversations. Each due reminder gets its own row (who, which company, your note) with **Open conversation**. A reminder only flags its conversation; nothing is sent from Today.
 - **Pipeline**: a funnel from businesses found to profiled, contacts, drafted emails and live conversations.
 - **Recent activity**, **Quick actions** (confirm signals, find businesses, review the outbox, see the calendar, export prospects), the setup checklist while setup is incomplete, and **Collector runs** (the latest discovery and profiling jobs with what they found and cost).
 
@@ -164,13 +164,30 @@ Click a domain to see its DNS records, each with a plain-language fix, and every
 
 See [Mailbox rotation](email-and-deliverability.md#mailbox-rotation), [Warm-up ramp](email-and-deliverability.md#warm-up-ramp), and [Health gates](email-and-deliverability.md#health-gates).
 
-## Conversations
+## Inbox
 
-Every reply thread, the intent Mercury assigned, its stage, and Mercury's responses.
+Every conversation from every sending mailbox in one place, in three panes: the list, the thread with a reply box, and the contact. The sidebar count is how many conversations need you.
+
+- **The list**: search (people, companies, subjects and message text; <kbd>/</kbd> jumps to it), the views **Needs you** (escalated to you, a draft waiting for review, or a reminder that is due), **Unread**, **Snoozed** and **All**, and filters for intent, mailbox and stage. Each row shows the intent and one flag: a draft to review, a reply scheduled to send, a reminder, a snooze, or an escalation. Pages of 25.
+- **Bulk**: tick rows to mark them read, snooze them, or exclude them. Exclude asks first, because it stops every email to those addresses. The result says what happened to each one, including any that were already that way.
+- **The thread**: what was really sent and what was received, in order, with system events (an exclusion, a paused sequence, a stage you set) between them. Replies that were never sent are listed apart under **Not sent**. The toolbar sets a reminder (bell), snoozes (moon), marks read or unread (envelope), and under **More** opens the contact or company or excludes them. Opening an unread conversation marks it read.
+- **Replying**: Mercury's draft waits for your review. **Approve and send** (<kbd>A</kbd>) approves it to go out on Mercury's next cycle from the mailbox the thread runs through; **Schedule** approves it for a time; **Regenerate** asks what to change and writes a new draft; **Save draft** keeps your edits for later. Editing an approved reply sends it back to review. If the draft changed somewhere else after you opened it, your text stays in the box and you choose **Reload draft** or **Start a new draft from this text**. Escalated and opted-out or excluded conversations show why you cannot reply here; Mercury does not write to escalated threads, so answer those from your own mail client.
+- **The contact**: role, address and whether it is verified or excluded; the company's location, domain, offer and signals; the conversation's stage (change it from the menu; a closed stage closes the conversation, and the Pipeline board follows); a reminder; and notes.
+
+Read state, snoozes, notes and reminders live in Mercury only. They don't change anything in the mailbox.
+
+| Key | Action |
+|---|---|
+| <kbd>J</kbd> / <kbd>K</kbd> | Next / previous conversation |
+| <kbd>/</kbd> | Search (<kbd>Esc</kbd> clears it) |
+| <kbd>A</kbd> | Approve and send the draft (not while typing) |
+| <kbd>Esc</kbd> | Close a menu |
+
+Below 1100 pixels wide the contact folds into **Contact, notes and reminder** above the thread. On a phone the list and the thread are separate screens, with the thread's tools in the top bar.
 
 ### Inbox API
 
-The unified inbox (one place to triage conversations from every mailbox and answer them) has its data layer under `/api/inbox/`; the screen itself is still being designed. What it relies on:
+The Inbox screen runs on `/api/inbox/`. What it relies on:
 
 - **Every inbound message is stored before it is handled** (`inbound_messages`): provider, receiving mailbox, external and RFC ids, In-Reply-To and References, Date, sender, body, and the sent email it answers. Duplicates are recognised per provider, mailbox and id, so two inboxes never collide, and one message delivered to two inboxes is handled once. A failure while handling leaves the message to be retried next cycle; after five attempts it is kept as failed and flagged on Today.
 - **Threads** combine emails that were really sent with stored inbound mail, each once and in order. Queued and failed drafts are listed apart. Conversations from before inbound storage show their saved text as partial history, with no mailbox or ids, and a message of ours found only there is marked recorded, never sent.
@@ -179,13 +196,14 @@ The unified inbox (one place to triage conversations from every mailbox and answ
 
 | Route | Does |
 |---|---|
-| `GET /api/inbox/conversations` | A page of conversations with `total`, `next_offset` and facet counts. Filters: `q`, `mailbox`, `intent`, `stage`, `prospect_status`, `status`, `read`, `attention`, `response`, `snoozed` (`exclude` by default), `reminder`, plus `limit` and `offset`. |
-| `GET /api/inbox/conversations/{id}` | The thread, drafts, unsent mail, notes, reminders, local state, restrictions and what composing would do. |
+| `GET /api/inbox/conversations` | A page of conversations with `total`, `next_offset`, facet counts and `segments` (how many are in Needs you, Unread, Snoozed and All under the other filters). Filters: `q`, `mailbox`, `intent`, `stage`, `prospect_status`, `status`, `read`, `attention`, `needs_you`, `response`, `snoozed` (`exclude` by default), `reminder`, plus `limit` and `offset`. |
+| `GET /api/inbox/conversations/{id}` | The thread, drafts, unsent mail, notes, reminders, local state, restrictions, events (exclusion, paused sequence, stage changes), since when it has been at its stage, the company's offer and signals, and what composing would do. |
 | `POST .../{id}/read`, `.../unread`, `.../snooze`, `DELETE .../snooze` | Local read state and snooze. |
+| `POST .../{id}/stage` | Set the sales stage (`{"stage": ...}`). Audited. A closed stage closes the conversation and an open one reopens it; queued mail is not touched. |
 | `GET/POST /api/inbox/contacts/{prospect_id}/notes`, `PATCH/DELETE /api/inbox/notes/{id}` | Contact notes. |
 | `POST .../{id}/reminders`, `GET /api/inbox/reminders`, `POST /api/inbox/reminders/{id}/done`, `DELETE /api/inbox/reminders/{id}` | Reminders. |
 | `POST .../{id}/drafts`, `PUT .../drafts/{item}`, `POST .../drafts/{item}/regenerate`, `/approve`, `/schedule`, `/discard` | Compose through the outbox. Every change names the `revision` it was made on. |
-| `POST /api/inbox/bulk` | Read, unread, snooze, unsnooze or exclude an explicit list of conversations, with one result per conversation. Exclude needs `"confirm": true`. |
+| `POST /api/inbox/bulk` | Read, unread, snooze, unsnooze or exclude an explicit list of conversations, with one result per conversation (`changed` is false when it was already that way). Exclude needs `"confirm": true`. |
 
 ## Activity
 
@@ -231,4 +249,4 @@ MERCURY_DB_PATH=data/demo.db MERCURY_CONFIG=data/demo.mercury.yaml \
   MAILBOX_DEMO_PASSWORD=demo mercury dashboard
 ```
 
-The seed creates about a dozen companies, 30 prospects across every pipeline column, two months of outreach history, and three demo mailboxes (one warm and on hold, one warming, one scheduled). It refuses to touch `data/mercury.db` and never sends anything. Don't run `mercury run` with that environment.
+The seed creates about a dozen companies, 30 prospects across every pipeline column, two months of outreach history, three demo mailboxes (one warm and on hold, one warming, one scheduled), and an Inbox with drafts to review, an escalated and an opted-out thread, a snooze, a due reminder and notes. It refuses to touch `data/mercury.db` and never sends anything. Don't run `mercury run` with that environment.

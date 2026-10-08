@@ -172,12 +172,14 @@ const TAB_META = {
   campaigns: ['Campaigns', 'megaphone'], outbox: ['Outbox', 'tray'], mailboxes: ['Mailboxes', 'envelope-simple'],
   exclusions: ['Exclusions', 'prohibit'],
   personas: ['Voice & Personas', 'sparkle'],
-  conversations: ['Conversations', 'chat-circle-text'], activity: ['Activity', 'pulse'],
+  inbox: ['Inbox', 'chat-circle-text'], activity: ['Activity', 'pulse'],
   usage: ['Usage', 'gauge'], settings: ['Settings', 'gear-six'], controls: ['Controls', 'power'],
   help: ['Help', 'question'],
 };
 
 function showTab(id, btn) {
+  if (id === 'conversations') id = 'inbox';   // the Inbox replaced Conversations
+  if (currentTab === 'inbox' && id !== 'inbox') inboxLeave();
   currentTab = id;
   if (id === 'companies') companyDrill = false;
   document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
@@ -216,7 +218,7 @@ function loadCurrentTab() {
     case 'personas': loadPersonas(); break;
     case 'outbox': loadOutbox(); break;
     case 'exclusions': loadExclusions(); break;
-    case 'conversations': loadConversations(); break;
+    case 'inbox': loadInbox(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
     case 'settings': loadSettings(); break;
@@ -233,9 +235,10 @@ async function loadToday() {
 
   navCount('nav-today', (data.items || []).filter(i => i.tone !== 'good').length);
   navCount('nav-outbox', (data.stats || {}).outbox_pending || 0);
+  navCount('nav-inbox', (data.stats || {}).inbox_needs_you || 0);
   renderFigures(data.stats || {});
 
-  const items = data.items || [];
+  const items = inboxTodayItems(data.items || []);
   if (!items.length) {
     el.innerHTML = '<div class="queue-clear">' +
       '<div><span class="qstate">' + icon('check-circle') + 'All clear</span>' +
@@ -249,12 +252,12 @@ async function loadToday() {
   el.innerHTML = '<div class="queue">' + items.map(it =>
     '<div class="queue-item ' + escHtml(it.tone || 'warn') + '">' +
       '<div class="qtext">' +
-        '<span class="qstate">' + ({bad: icon('warning') + 'Blocked', good: icon('arrow-right') + 'Next step'}[it.tone] ||
+        '<span class="qstate">' + (it.stateHtml || {bad: icon('warning') + 'Blocked', good: icon('arrow-right') + 'Next step'}[it.tone] ||
           icon('clock') + 'Needs you') + '</span>' +
         '<div class="qtitle">' + escHtml(it.title) + '</div>' +
         '<div class="qdetail">' + escHtml(it.detail) + '</div>' +
       '</div>' +
-      '<button class="btn btn-secondary btn-sm" onclick="goTab(\'' + escHtml(it.tab) + '\')">' +
+      '<button class="btn btn-secondary btn-sm" onclick="' + escHtml(it.onclick || 'goTab(\'' + it.tab + '\')') + '">' +
         escHtml(it.action) + '</button>' +
     '</div>'
   ).join('') + '</div>';
@@ -281,7 +284,7 @@ function renderFigures(stats) {
     kpi('Awaiting approval', stats.outbox_pending,
         sched ? '<b>' + fmt(sched) + '</b> approved and scheduled' : 'Nothing scheduled', 'outbox') +
     kpi('Live conversations', stats.open_conversations,
-        'Replies are classified automatically', 'conversations');
+        'Replies are classified automatically', 'inbox');
   renderFunnel(stats);
 }
 
@@ -2025,35 +2028,6 @@ async function loadCampaigns() {
   el.innerHTML = html;
 }
 
-async function loadConversations() {
-  const el = document.getElementById('conversations-list');
-  const data = await api('/api/conversations');
-  if (!data) { el.innerHTML = offlineState(); return; }
-  if (!data.length) {
-    el.innerHTML = emptyState('chat-circle-text', 'No conversations yet',
-      'No prospects have replied so far. When they do, the Handler agent classifies each reply and responds — every thread shows up here.');
-    return;
-  }
-  let html = '';
-  for (const c of data) {
-    let threadHtml = '';
-    for (const msg of (c.thread || [])) {
-      // 'harvey' = threads recorded before the rename; still our side.
-      const ours = msg.sender === 'mercury' || msg.sender === 'harvey';
-      const cls = ours ? 'sent' : 'received';
-      threadHtml += '<div class="thread-msg ' + cls + '"><div class="sender">' + escHtml(ours ? 'mercury' : msg.sender) +
-        ' &middot; ' + formatDate(msg.timestamp) + '</div>' + escHtml(msg.content) + '</div>';
-    }
-    const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || 'Unknown';
-    html += '<div class="convo-card"><h3>' + escHtml(name) +
-      (c.company ? ' <span style="color:var(--text-3);font-weight:500">&mdash; ' + escHtml(c.company) + '</span>' : '') + '</h3>' +
-      '<div class="meta">' + badge(c.status) + (c.intent ? badge(c.intent) : '') +
-      '<span>' + escHtml(c.prospect_email || '') + '</span><span>' + formatDate(c.updated_at) + '</span></div>' +
-      (threadHtml || '<p style="color:var(--text-3);font-size:13px">No messages in this thread yet.</p>') + '</div>';
-  }
-  el.innerHTML = html;
-}
-
 async function loadActivity() {
   const el = document.getElementById('activity-list');
   const data = await api('/api/activity');
@@ -2690,7 +2664,7 @@ async function openProspectDrawer(id) {
       ? '<div class="drawer-actions">' +
           targets.map(c => '<button class="btn btn-secondary btn-sm" data-move-to="' + escHtml(c.key) + '">' +
             'Move to ' + escHtml(c.label) + '</button>').join('') +
-          (it.conversation_id ? '<button class="btn btn-secondary btn-sm" data-act="convo">' +
+          (it.conversation_id ? '<button class="btn btn-secondary btn-sm" data-act="convo" data-convo="' + escHtml(it.conversation_id) + '">' +
             icon('chat-circle-text') + 'Conversation</button>' : '') +
         '</div>'
       : '') +
@@ -3065,7 +3039,7 @@ document.getElementById('drawer-body').addEventListener('click', e => {
       case 'back': openProspectDrawer(ctx.from); break;
       case 'approve': case 'reject': evAct(ctx.id, t.dataset.act); break;
       case 'resched': evReschedule(ctx.id); break;
-      case 'convo': closeDrawer(); goTab('conversations'); break;
+      case 'convo': closeDrawer(); inboxOpen(t.dataset.convo); break;
     }
   }
 });
@@ -3298,9 +3272,9 @@ function renderRates() {
   const bounceTone = (t.bounce_rate || 0) >= 0.05 ? 'is-bad' : '';
   el.innerHTML =
     card('Reply rate', t.reply_rate, fmtN(t.replies) + ' repl' + (Number(t.replies) === 1 ? 'y' : 'ies') + ' of ' + fmtN(sent) + ' sent',
-      rateDelta(t.reply_rate, p.reply_rate, p.sent, true, days), 'conversations') +
+      rateDelta(t.reply_rate, p.reply_rate, p.sent, true, days), 'inbox') +
     card('Positive replies', t.positive_rate, fmtN(t.positive) + ' interested of ' + fmtN(sent) + ' sent',
-      rateDelta(t.positive_rate, p.positive_rate, p.sent, true, days), 'conversations') +
+      rateDelta(t.positive_rate, p.positive_rate, p.sent, true, days), 'inbox') +
     card('Bounce rate', t.bounce_rate, fmtN(t.bounces) + ' bounce' + (Number(t.bounces) === 1 ? '' : 's') + ' of ' + fmtN(sent) + ' sent',
       rateDelta(t.bounce_rate, p.bounce_rate, p.sent, false, days), 'mailboxes', bounceTone);
   el.hidden = false;
@@ -4551,6 +4525,7 @@ setInterval(async () => {
   if (!data) return;
   navCount('nav-today', (data.items || []).filter(i => i.tone !== 'good').length);
   navCount('nav-outbox', (data.stats || {}).outbox_pending || 0);
+  navCount('nav-inbox', (data.stats || {}).inbox_needs_you || 0);
 }, 20000);
 
 // Data tabs: auto-refresh live views without clobbering anything in progress.
@@ -4566,7 +4541,7 @@ setInterval(() => {
     case 'campaigns': loadCampaigns(); break;
     case 'pipeline': if (!pipeBusy()) loadPipeline(); break;
     case 'calendar': if (!drawerOpen()) loadCalendar(true); break;
-    case 'conversations': loadConversations(); break;
+    case 'inbox': inboxRefresh(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
     case 'controls': loadLogs(); break;
