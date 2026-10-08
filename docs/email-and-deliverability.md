@@ -67,11 +67,15 @@ Temporary failures (timeouts, connection errors, 4xx deferrals, rate limiting) k
 
 **Reviewing.** In the dashboard's Outbox tab you can, for each pending draft:
 
-- **Edit** the subject and body. Pending and approved rows can be edited; an approved row stays approved. Approving saves unsaved edits first.
+- **Edit** the subject and body. Pending and approved rows can be edited; an edited approved row goes back to `pending_review`. Approving saves unsaved edits first.
 - **Regenerate** with an optional instruction ("shorter", "mention their reviews"). The new draft goes back to `pending_review`.
 - **Approve** or **reject**. Rejecting a sequence step also rejects every later step of that sequence for that prospect.
 
-`mercury outbox` does the same from the terminal (see [Getting started](getting-started.md#8-review-the-outbox)). The Calendar tab can reschedule a pending or approved email to a future time.
+`mercury outbox` does the same from the terminal (see [Getting started](getting-started.md#8-review-the-outbox)). The Calendar tab can reschedule a pending or approved email to a future time; a rescheduled approved email needs approval again.
+
+**Revisions.** Every outbox row has a revision. Changing what a reviewer reads (the text, the recipient, the sending mailbox, a send time you pick, a regenerated draft) makes a new revision and sends an approved email back to review. Approve, reject and every edit name the revision they were decided on, and fail with `stale_revision` if the email changed since, so two people reviewing at once can't overwrite each other or approve text they haven't seen. An approval records the revision and a hash of the content it covered; the sender re-checks both when it claims the email, so nothing goes out on an approval for an earlier version. **Approve all** approves exactly the list on screen, at the revisions shown. The sender's own timing (follow-up spacing, retries, out-of-office resumes) does not change the revision.
+
+**Audit.** Every review and config command is recorded in the `audit_log` table: who (operator and client), which email or file, the revisions before and after, the action, and how it ended, failures included. Secrets are redacted from these records and from error messages. A client may send an `Idempotency-Key` header (dashboard) or request id (MCP); repeating a command with the same key returns the first answer without running it again.
 
 **Follow-up auto-approval.** With `auto_approve_followups: true`, a pending follow-up is approved as soon as the step before it is approved or sent. That happens when you approve in the dashboard and again on every cycle, so a sequence you signed off on is not stuck waiting for two more clicks. Replies always need their own approval while `require_approval` is on.
 
