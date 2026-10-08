@@ -360,17 +360,23 @@ def test_get_one_item(client):
 
 def test_pause_and_resume_through_either_interface(client):
     sm = client.sm
-    assert client.post("/api/sending/pause").json() == {"success": True}
-    status = _run(SendingService(CLI, sm).status())
-    assert status == {"paused": True, "reason": "paused from dashboard"}
+    service = SendingService(CLI, sm, dash._demo_config())
+    paused = client.post("/api/sending/pause").json()
+    status = _run(service.status())
+    assert paused == {"success": True, **_plain(status)}
+    assert status["paused"] and status["blocked"] and status["reason"] == "paused from dashboard"
+    assert client.get("/api/sending/status").json() == _plain(status)
     assert client.get("/api/outbox").json()["paused"] == status["reason"]
 
     _run(sm.set_setting("bounce_count", "7"))
-    assert client.post("/api/sending/resume").json() == {"success": True}
-    assert _run(sm.get_setting("bounce_count")) == "0"  # today's resume resets the count
+    resumed = client.post("/api/sending/resume").json()
+    assert resumed["success"] and resumed["paused"] is False
+    # The template has no postal address: that hold outlives the resume.
+    assert [h["kind"] for h in resumed["holds"]] == ["compliance"] and resumed["blocked"]
+    assert _run(sm.get_setting("bounce_count")) == "7"  # resume never touches the count
 
-    assert _run(SendingService(CLI, sm).pause()) == {"paused": True, "reason": "paused manually"}
-    assert _run(SendingService(CLI, sm).resume())["paused"] is False
+    assert _run(service.pause())["reason"] == "paused manually"
+    assert _run(service.resume())["paused"] is False
     assert client.post("/api/sending/explode").status_code == 400
 
 
@@ -471,7 +477,8 @@ def test_runtime_stop_ends_a_real_process(client):
     child = subprocess.Popen(["sleep", "30"])
     threading.Thread(target=child.wait, daemon=True).start()  # reap it, or it stays a zombie
     dash.PID_FILE.write_text(str(child.pid))
-    assert client.post("/api/mercury/stop").json() == {"success": True}
+    stopped = client.post("/api/mercury/stop").json()
+    assert stopped["success"] and stopped["stopped"] and not stopped["forced"]
     assert child.wait(timeout=5) is not None and not dash.PID_FILE.exists()
 
 
