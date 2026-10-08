@@ -104,7 +104,16 @@
   .ct-c-reg { margin-top: 6px; }
   .ct-table td.ct-c-source { display: none; }
   .ct-head { flex-wrap: wrap; }
-  .ct-head .ct-head-actions { flex-wrap: wrap; }
+  .ct-head .ct-head-actions { display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
+  .ct-head-actions .btn { justify-content: center; white-space: normal; text-align: center; }
+  .ct-head-actions #imp-toggle { grid-column: 1 / -1; }
+  .ct-toolbar { min-width: 0; }
+  #ct-filters { max-width: 100%; min-width: 0; }
   .ct-person { flex-wrap: wrap; }
   .ct-pact { flex-basis: 100%; justify-content: flex-start; padding-left: 28px; }
+}
+
+/* Very narrow: tighten the filter strip so all three fit without scrolling. */
+@media (max-width: 420px) {
+  #ct-filters button { padding: 6px 8px; gap: 4px; }
 }
