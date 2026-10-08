@@ -327,6 +327,8 @@ def test_automatic_replies_recorded_before_the_upgrade_are_backfilled():
         conn = sqlite3.connect(db)
         # Roll the file back to the version before the inbox (v24), as an
         # existing install would be.
+        from tests.test_experiments import drop_experiment_schema
+        drop_experiment_schema(conn)
         for table in ("inbound_messages", "inbox_state", "contact_notes", "inbox_reminders"):
             conn.execute(f"DROP TABLE {table}")
         conn.execute("DROP INDEX idx_outbox_conversation")

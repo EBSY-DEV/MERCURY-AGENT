@@ -1038,6 +1038,9 @@ class Sender:
         elif claim == "company_active_limit":
             logger.info(f"Sender: holding first email to {to}: its company has "
                         f"{detail['active']}/{detail['limit']} contacts in a sequence.")
+        elif claim == "experiment_hold":
+            logger.info(f"Sender: holding step {item['step']} to {to}: experiment "
+                        f"'{detail['experiment']}' has its unsent mail on hold.")
 
     async def _resume_due_pauses(self, now: str | None = None):
         """End out-of-office pauses. Any whose contact has left the sequence

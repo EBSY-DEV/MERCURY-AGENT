@@ -237,6 +237,10 @@ async def decide_next_action(
                     "AND NOT (o.kind = 'sequence' AND EXISTS ("
                     "SELECT 1 FROM sequence_pauses sp WHERE sp.prospect_id = o.prospect_id "
                     "AND sp.state IN ('paused', 'needs_review'))) "
+                    # So is mail of an experiment on hold.
+                    "AND NOT (o.kind = 'sequence' AND o.experiment_id != '' AND EXISTS ("
+                    "SELECT 1 FROM experiments e WHERE e.id = o.experiment_id "
+                    "AND e.hold_mail = 1)) "
                     f"AND p.email_status IN ({placeholders})",
                     statuses,
                 ) as cursor:
@@ -443,6 +447,13 @@ async def run_cycle(rt: Runtime) -> str:
     if (rt.handler.is_native and not over_budget
             and not any(n == "handle_replies" for n, _ in tasks)):
         tasks.append(("handle_replies", rt.handler.run()))
+
+    # Experiment replies get their outcome label (one Claude call each, only
+    # for prospects in an experiment), so it waits while over budget.
+    if rt.handler.is_native and not over_budget:
+        from mercury.experiments import classify_pending
+
+        tasks.append(("label_outcomes", classify_pending(rt.state, rt.brain, config)))
 
     # Profiling rides along every cycle. It is three HTTP requests per
     # business with no model call, so it costs nothing against the
