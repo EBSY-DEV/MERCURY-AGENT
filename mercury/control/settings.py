@@ -166,6 +166,14 @@ class ConfigService:
         if not isinstance(expected_revision, str) or not expected_revision.strip():
             raise Invalid("give the config revision you read (revision)", code="revision_required")
 
+        # All command transports share this database. Hold its writer lock
+        # through the file's read/check/replace so independent processes
+        # cannot both accept the same revision and overwrite each other.
+        async with self.state._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            return self._write(changes, expected_revision, trail)
+
+    def _write(self, changes, expected_revision, trail) -> dict:
         from ruamel.yaml import YAML
 
         from mercury.config import MercuryConfig
