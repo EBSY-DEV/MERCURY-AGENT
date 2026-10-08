@@ -18,6 +18,12 @@ sending mailboxes through ``outbox.mailbox``:
   with part of the checklist ticked and notes.
 * sam@trynorthwind.com   — scheduled: its ramp starts in three days.
 
+Two writing personas ("Plain local", the default, and "Numbers first"), with a
+saved generation behind every board email so the Outbox shows which voice
+wrote each draft. Twelve signals confirmed and observed across the companies
+(listing data for all twelve, homepage profiling for ten), so Companies,
+Signals and the cohort builder have real counts.
+
 Plus one inbox placement test from yesterday (rows in ``placement_tests``,
 nothing sent): the warm inbox and the control land in the inbox, the
 warming one mostly in spam.
@@ -109,13 +115,30 @@ PLAN = [("new", 5), ("queued", 4), ("contacted", 7), ("replied", 5),
 
 SEQUENCE = [
     EmailStep(step=1, delay_days=0, subject="{{company}} on page two",
-              body="Hi {{first_name}}, {{company}} shows up on page two for "
-                   "'roof repair Denver'. Worth a quick look at why?"),
+              body="Hi {{first_name}},\n\nI searched \"{{search}}\" this morning. {{company}} "
+                   "came up on page two, under three shops with fewer reviews than yours.\n\n"
+                   "That gap is usually two or three fixes on the site, not your reputation. "
+                   "Want the short list?\n\nJordan"),
     EmailStep(step=2, delay_days=4, subject="Re: {{company}} on page two",
-              body="{{first_name}}, the three shops above you all have online "
-                   "booking. Want the short list of what they do differently?"),
+              body="{{first_name}}, one more detail. The three shops above you all take "
+                   "bookings online, and Google shows that right in the listing.\n\n"
+                   "Want the short list of what they do differently?\n\nJordan"),
     EmailStep(step=3, delay_days=5, subject="Closing the loop",
-              body="Last note, {{first_name}}. Happy to send the audit if timing's better later."),
+              body="Last note, {{first_name}}. If page two isn't a priority this season, no "
+                   "problem. Happy to send the list whenever timing is better.\n\nJordan"),
+]
+
+# What a homeowner types for each trade; the city comes from the company.
+SEARCH_TERM = {"Roofing": "roof repair", "HVAC": "furnace repair"}
+SEARCHES = {name: f"{SEARCH_TERM[industry]} {location.split(',')[0]}"
+            for name, _, industry, location in COMPANIES}
+
+REPLIES = [
+    "We noticed we slipped this spring. What would fixing it look like?",
+    "Who's above us? Send the list.",
+    "How much does something like this run?",
+    "We already have someone on our website, but go ahead and send it.",
+    "Sure, send it over.",
 ]
 
 
@@ -123,8 +146,13 @@ def iso(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat()
 
 
+def fill(text: str, first_name: str, company: str, search: str) -> str:
+    return (text.replace("{{first_name}}", first_name).replace("{{company}}", company)
+            .replace("{{search}}", search))
+
+
 def render(text: str, p: Prospect, company: str) -> str:
-    return text.replace("{{first_name}}", p.first_name).replace("{{company}}", company)
+    return fill(text, p.first_name, company, SEARCHES.get(company, "roof repair Denver"))
 
 
 async def seed(db_path: Path) -> dict:
@@ -264,7 +292,7 @@ async def seed(db_path: Path) -> dict:
             await outbox(p, pid, cname, 3, "cancelled", max(step3, NOW + timedelta(days=6)),
                          error=reason)
 
-            reply = ("prospect", "Yeah we've noticed the drop. What would this look like for us?")
+            reply = ("prospect", REPLIES[idx % len(REPLIES)])
             if column == "replied":
                 stage = ["engaged", "qualifying", "presenting", "engaged", "negotiating"][k]
                 intent = ["question", "interested", "question", "objection", "interested"][k]
@@ -299,7 +327,128 @@ async def seed(db_path: Path) -> dict:
     counts.update(await seed_history(sm))
     counts.update(await seed_warmup(sm))
     counts.update(await seed_placement(sm))
+    counts.update(await seed_personas(sm))
+    counts.update(await seed_signals(sm, companies))
     return counts
+
+
+PERSONAS = [
+    {"name": "Plain local", "avatar_seed": "mercury-persona-03", "sign_name": "Jordan",
+     "description": "Short, neighborly, one concrete observation per email.",
+     "tone": "plain, friendly, specific", "examples": "",
+     "instructions": "Lead with what you saw. One question. No pitch in the first email."},
+    {"name": "Numbers first", "avatar_seed": "mercury-persona-11", "sign_name": "Jordan",
+     "description": "Opens with the data point, then the gap it implies.",
+     "tone": "direct, factual, brief", "examples": "",
+     "instructions": "Open with the number. Say what it costs them. Offer the list."},
+]
+
+
+async def seed_personas(sm: StateManager) -> dict:
+    """Two writing voices, and a saved generation behind every board email, so
+    the Outbox shows which voice wrote each draft (instead of "Unknown
+    persona") and the Personas tab has sends and replies per version. No
+    model is called: each generation records the seeded text as its output."""
+    from types import SimpleNamespace
+
+    from mercury.personas import PersonaStore
+
+    config = SimpleNamespace(
+        product=SimpleNamespace(name="Local search audit", description="A short list of fixes."),
+        persona=SimpleNamespace(name="Jordan Hale", company="Northwind Outreach", email=MB_WARM,
+                                tone="professional, consultative, confident"),
+    )
+    store = PersonaStore(sm)
+    await store.ensure_default(config)  # the imported "Workspace voice", as on a real install
+    ids = [await store.save(dict(p)) for p in PERSONAS]
+    await store.set_default(ids[0])
+    profiles = {p["id"]: p for p in await store.list()}
+    async with sm._connect() as db:
+        async with db.execute(
+            "SELECT id, prospect_id, subject, body, kind FROM outbox "
+            "WHERE prospect_id NOT LIKE 'hist%' ORDER BY prospect_id, step"
+        ) as cur:
+            rows = await cur.fetchall()
+    n, order = 0, {}
+    for item_id, prospect_id, subject, body, kind in rows:
+        # A contact keeps one voice across its sequence; a third get the challenger.
+        persona = ids[1] if order.setdefault(prospect_id, len(order)) % 3 == 2 else ids[0]
+        gen = await store.record(
+            profiles[persona], config, "Seeded by scripts/seed_demo.py; no model call.",
+            {"subject": subject, "body": body}, "reply" if kind == "reply" else "sequence",
+        )
+        async with sm._connect() as db:
+            await db.execute("UPDATE outbox SET generation_id = ? WHERE id = ?", (gen, item_id))
+            await db.execute(
+                "INSERT INTO email_generation_history (outbox_id, generation_id, original_subject, "
+                "original_body) VALUES (?, ?, ?, ?)", (item_id, gen, subject, body),
+            )
+            await db.commit()
+        n += 1
+    return {"generations": n}
+
+
+# Signals the demo workspace has confirmed. The rest stay proposed, so the
+# Signals tab still has something to decide.
+CONFIRMED = ["FOUND_IN_SERP", "REVIEW_COUNT", "REVIEW_RATING", "NO_ONLINE_BOOKING",
+             "RUNNING_GOOGLE_ADS", "RUNNING_META_ADS", "INCUMBENT_AGENCY", "NO_SCHEMA_MARKUP",
+             "BLOG_STALE", "TECH_STACK", "HIRING_ROLE", "EMAIL_STATUS"]
+AGENCIES = ["Peakline Digital", "Front Range Web Co", "Summit Local Marketing"]
+STACKS = ["WordPress, Google Tag Manager", "Wix", "Squarespace, Google Analytics",
+          "WordPress, HubSpot", "Duda"]
+HIRING = {"Roofing": "Estimator", "HVAC": "HVAC Service Technician"}
+
+
+async def seed_signals(sm: StateManager, companies: list) -> dict:
+    """Confirm a working set of signals and record what Mercury would have
+    observed for each company: listing data, then what profiling read off the
+    homepage. Two companies are left unread, so Today still has a nudge."""
+    from mercury.signals import seed_signal_catalog
+
+    rnd = random.Random(23)
+    await seed_signal_catalog(sm)
+    for code in CONFIRMED:
+        await sm.set_signal_status(code, "confirmed")
+    industry = {name: ind for name, _, ind, _ in COMPANIES}
+    rows = []
+
+    def obs(cid, code, collector, num=None, text="", url=""):
+        rows.append({"company_id": cid, "signal_code": code, "collector": collector,
+                     "value_num": num, "value_text": text, "confidence": 0.9,
+                     "evidence_url": url,
+                     "observed_at": iso(NOW - timedelta(days=rnd.randint(2, 18)))})
+
+    for i, (cid, name, domain) in enumerate(companies):
+        site = f"https://{domain}/"
+        obs(cid, "FOUND_IN_SERP", "discover", text=SEARCHES[name])
+        obs(cid, "REVIEW_COUNT", "discover", num=rnd.randint(18, 260))
+        obs(cid, "REVIEW_RATING", "discover", num=round(rnd.uniform(3.7, 4.9), 1))
+        if i >= 10:
+            continue  # never profiled
+        obs(cid, "NO_ONLINE_BOOKING", "profile", num=float(i % 3 != 0), url=site)
+        obs(cid, "RUNNING_GOOGLE_ADS", "profile", num=float(i % 2 == 0), url=site)
+        obs(cid, "RUNNING_META_ADS", "profile", num=float(i % 4 == 1), url=site)
+        obs(cid, "NO_SCHEMA_MARKUP", "profile", num=float(i % 5 != 2), url=site)
+        obs(cid, "TECH_STACK", "profile", text=STACKS[i % len(STACKS)], url=site)
+        if i % 3 == 1:
+            obs(cid, "INCUMBENT_AGENCY", "profile", text=AGENCIES[i % len(AGENCIES)], url=site)
+        if i % 4 == 3:
+            obs(cid, "BLOG_STALE", "profile", num=rnd.randint(220, 700), url=site + "sitemap.xml")
+        if i in (1, 6):
+            obs(cid, "HIRING_ROLE", "profile", text=HIRING[industry[name]], url=site + "careers")
+    await sm.add_observations(rows, run_id="demo-seed")
+
+    async with sm._connect() as db:
+        async with db.execute(
+            "SELECT id, company_id, email_status FROM prospects WHERE email_status != ''"
+        ) as cur:
+            people = await cur.fetchall()
+    await sm.add_observations([
+        {"company_id": company_id, "prospect_id": pid, "signal_code": "EMAIL_STATUS",
+         "collector": "verify", "value_text": status, "confidence": 0.95}
+        for pid, company_id, status in people
+    ], run_id="demo-seed")
+    return {"observations": len(rows) + len(people)}
 
 
 async def seed_placement(sm: StateManager) -> dict:
@@ -364,6 +513,9 @@ def demo_config(template: Path) -> dict:
         "provider": "smtp", "max_daily_sends": 50, "require_approval": True,
         "auto_approve_followups": True,
         "warmup_initial_cap": INITIAL_CAP, "warmup_weekly_increase": WEEKLY_INCREASE,
+        # The demo inboxes stand in for Workspace seats, so they get Gmail's
+        # ceiling rather than the generic SMTP one.
+        "provider_daily_ceilings": {"smtp": DAILY_CAP},
         "mailboxes": [
             {"email": MB_WARM, "name": "Jordan | Northwind", "password_env": DEMO_PASSWORD_ENV,
              "smtp_host": "smtp.invalid", "daily_cap": DAILY_CAP},
@@ -375,6 +527,10 @@ def demo_config(template: Path) -> dict:
              "warmup_start": (TODAY + timedelta(days=SAM_START_IN_DAYS)).isoformat()},
         ],
     })
+    cfg["icp"] = {**cfg.get("icp", {}),
+                  "industries": ["Roofing", "HVAC"], "company_size": "2-50 employees",
+                  "titles": ["Owner", "General Manager", "Office Manager"],
+                  "geography": ["Denver, CO", "Boulder, CO", "Lakewood, CO"]}
     cfg["compliance"] = {"postal_address": "1550 Wewatta St, Denver, CO 80202"}
     cfg["offers"] = [{"key": VOICE_OFFER, "requires_demo": True, "demo_kind": "voice"}]
     cfg.setdefault("usage", {}).setdefault("quiet_hours", {})["timezone"] = "UTC"
@@ -468,8 +624,8 @@ async def seed_history(sm: StateManager) -> dict:
                 s = SEQUENCE[step - 1]
                 outbox_rows.append((
                     pid + "-o", archived.id, pid, step, email,
-                    s.subject.replace("{{company}}", "your shop"),
-                    s.body.replace("{{first_name}}", "there").replace("{{company}}", "your shop"),
+                    fill(s.subject, "there", "your shop", "roof repair Denver"),
+                    fill(s.body, "there", "your shop", "roof repair Denver"),
                     iso(sent_at), iso(sent_at), mailbox,
                 ))
                 recent = NOW - sent_at < timedelta(days=6, hours=20)
