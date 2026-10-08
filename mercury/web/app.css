@@ -1498,9 +1498,11 @@ details[open] summary::before { content: '– '; }
 .mb-stack { display: flex; gap: 2px; height: 6px; margin: 0 16px 16px; border-radius: 99px; overflow: hidden; }
 .mb-stack > span { min-width: 4px; }
 .mb-limits:not(:empty) { margin-top: 16px; }
-.mb-limit-list { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--text-2); }
-.mb-limit-list > div { display: flex; gap: 12px; align-items: center; }
-.mb-limit-list .badge { white-space: nowrap; }
+/* A badge then a sentence, one per row: inbox limits, and the sending holds
+   on the Outbox tab. */
+.mb-limit-list, .hold-list { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--text-2); }
+.mb-limit-list > div, .hold-list > div { display: flex; gap: 12px; align-items: center; }
+.mb-limit-list .badge, .hold-list .badge { white-space: nowrap; }
 .mb-issues { display: flex; flex-direction: column; gap: 3px; }
 .mb-issues .badge { white-space: normal; }
 

@@ -154,9 +154,9 @@ async def decide_next_action(
     # entirely: one unreviewed email freezes the whole agent.
     sending_paused = False
     try:
-        from mercury.agents.sender import KILL_SWITCH_KEY
+        from mercury.holds import blocking
 
-        sending_paused = bool(await state.get_setting(KILL_SWITCH_KEY))
+        sending_paused = bool((await blocking(state))[0])
     except Exception:  # pragma: no cover - never block a cycle on this
         sending_paused = False
 
@@ -524,6 +524,12 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
     rt = await build_runtime()
     if rt is None:
         return
+    # A shutdown request reaches the drain too: it claims nothing new and the
+    # email already in flight finishes before the cycle returns.
+    try:
+        rt.sender.stop_event = stop_event
+    except AttributeError:  # pragma: no cover - a stand-in sender in tests
+        pass
 
     interval = rt.config.usage.heartbeat_interval_minutes * 60
     consecutive_errors = 0
