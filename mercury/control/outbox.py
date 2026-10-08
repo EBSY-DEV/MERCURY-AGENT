@@ -1,29 +1,75 @@
 """Outbox review commands for the dashboard, the CLI and MCP.
 
-Listing, approving, rejecting, editing, rescheduling and regenerating queued
-email. Approval and rejection apply to explicit ids; "approve all" exists for
-the dashboard button and the CLI flag, and a batch is a list of ids decided
-up front, never a filter re-evaluated later. Failures raise ControlError
-subclasses with stable codes: not_found, not_pending, not_queued,
-not_editable, started_sending, prospect_not_found, conversation_not_found,
-provider_failed.
+Listing, approving, rejecting, editing, rescheduling, re-routing and
+regenerating queued email.
+
+Revisions. Every outbox row carries a ``revision``. A change to what a
+reviewer reads (text, recipient, sending mailbox, a send time an operator
+picks, a regenerated draft) is a new revision, and an approved email goes
+back to review: its approval was for the earlier content. Every review
+command names the revision it was decided on (``expected_revision``) and
+fails with ``stale_revision`` when the row has moved on, so one reviewer
+cannot approve or overwrite a change they have not seen. Approval records
+the revision and a hash of the content it covered, and the sender's claim
+checks both (StateManager.claim_outbox_item).
+
+Batches are explicit and frozen: a list of {id, revision} pairs decided up
+front. "Approve all" is the same thing, built from what the caller showed;
+an email that changed after that list was made is left for review.
+
+Every command is audited and may carry a request key for idempotent replay
+(control/audit.py). Failures raise ControlError subclasses with stable
+codes: not_found, not_pending, not_queued, not_editable, started_sending,
+stale_revision, revision_required, invalid_revision, unknown_mailbox,
+prospect_not_found, conversation_not_found, provider_failed.
 """
 
 from __future__ import annotations
 
 import logging
+import re
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 
+from mercury.control.audit import run_command
 from mercury.control.errors import Conflict, Invalid, NotFound, Unavailable
 
 logger = logging.getLogger(__name__)
 
 EDITABLE_STATUSES = ("pending_review", "approved")
+REJECTABLE_STATUSES = (*EDITABLE_STATUSES, "blocked")
 SUBJECT_MAX, BODY_MAX, INSTRUCTION_MAX = 200, 4000, 500
 BATCH_MAX = 200
 BATCH_ACTIONS = ("approve", "reject")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def expected(value) -> int:
+    """The revision a command was decided on: a positive whole number."""
+    if value is None or value == "":
+        raise Invalid("give the revision you reviewed (revision)", code="revision_required")
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise Invalid("revision must be a positive whole number", code="invalid_revision")
+    return value
+
+
+def frozen_items(items) -> list[tuple[str, int]]:
+    """A batch as (id, revision) pairs: [{"id": ..., "revision": ...}, ...]."""
+    if not isinstance(items, list) or not all(
+            isinstance(i, dict) and isinstance(i.get("id"), str) and i["id"] for i in items):
+        raise Invalid('items must be a list of {"id": ..., "revision": ...}')
+    pairs: dict[str, int] = {}
+    for i in items:
+        revision = expected(i.get("revision"))
+        if pairs.setdefault(i["id"], revision) != revision:
+            raise Invalid(f"{i['id']} is listed with two revisions", code="invalid_revision")
+    if not pairs or len(pairs) > BATCH_MAX:
+        raise Invalid(f"give between 1 and {BATCH_MAX} items")
+    return list(pairs.items())
 
 
 def _utc_naive_now() -> datetime:
@@ -158,105 +204,229 @@ class OutboxService:
             total += n
         return total
 
-    async def approve(self, item_id: str) -> dict:
-        """Approve one email awaiting review."""
-        self.ctx.require("approve")
-        if not await self.state.approve_outbox(item_id or ""):
-            item = await self._item(item_id)
+    def _approver(self) -> str:
+        return f"{self.ctx.client}:{self.ctx.operator}"
+
+    async def _run(self, action: str, scope: str, params: dict, work,
+                   object_id: str = "", revision=None):
+        return await run_command(self.state, self.ctx, f"outbox.{action}", scope=scope,
+                                 params=params, work=work, object_type="outbox",
+                                 object_id=object_id, revision_before=revision)
+
+    @staticmethod
+    def _current(item: dict, revision: int) -> None:
+        now = int(item.get("revision") or 1)
+        if now != revision:
+            raise Conflict(f"this email changed since revision {revision} (now {now}); "
+                           "reload it and review again", code="stale_revision", revision=now)
+
+    async def _lost_race(self, item_id: str, revision: int, statuses: tuple, code: str, what: str):
+        """A guarded UPDATE matched nothing: say why, from the row as it is now."""
+        item = await self._item(item_id)
+        if item["status"] not in statuses:
+            raise Conflict(what.format(status=item["status"]), code=code, status=item["status"])
+        self._current(item, revision)
+        raise Conflict("this email changed while the command ran; reload it",
+                       code="stale_revision", revision=int(item.get("revision") or 1))
+
+    async def _approve_one(self, item_id: str, revision: int, trail) -> dict:
+        item = await self._item(item_id)
+        if item["status"] != "pending_review":
             raise Conflict(f"only emails awaiting review can be approved; this one is {item['status']}",
                            code="not_pending", status=item["status"])
-        followups = await self._promote_followups(await self.state.get_outbox_item(item_id))
-        return {"id": item_id, "approved": 1, "followups_approved": followups}
+        self._current(item, revision)
+        if not await self.state.approve_outbox(item_id, revision, approved_by=self._approver()):
+            await self._lost_race(item_id, revision, ("pending_review",), "not_pending",
+                                  "only emails awaiting review can be approved; this one is {status}")
+        followups = await self._promote_followups(item)
+        trail.record(item_id, revision, revision, followups_approved=followups)
+        return {"id": item_id, "approved": 1, "followups_approved": followups, "revision": revision}
 
-    async def approve_all(self) -> dict:
-        """Approve everything awaiting review right now."""
-        self.ctx.require("approve")
-        n = await self.state.approve_outbox()
-        return {"approved": n, "followups_approved": await self._promote_followups()}
-
-    async def reject(self, item_id: str) -> dict:
-        """Reject one queued email, and the later steps of its sequence."""
-        self.ctx.require("approve")
+    async def _reject_one(self, item_id: str, revision: int, trail) -> dict:
         item = await self._item(item_id)
-        n = await self.state.reject_outbox_item(item_id)
-        if not n:
+        if item["status"] not in REJECTABLE_STATUSES:
             raise Conflict(f"only queued emails can be rejected; this one is {item['status']}",
                            code="not_queued", status=item["status"])
-        return {"id": item_id, "rejected": n}
+        self._current(item, revision)
+        n = await self.state.reject_outbox_item(item_id, revision)
+        if not n:
+            await self._lost_race(item_id, revision, REJECTABLE_STATUSES, "not_queued",
+                                  "only queued emails can be rejected; this one is {status}")
+        trail.record(item_id, revision, revision, rejected=n)
+        return {"id": item_id, "rejected": n, "revision": revision}
 
-    async def batch(self, action: str, ids: list[str]) -> dict:
-        """Approve or reject an explicit list of ids. Each id succeeds or
-        fails on its own; the list is fixed when the call is made."""
-        self.ctx.require("approve")
-        if action not in BATCH_ACTIONS:
-            raise Invalid(f"action must be one of {', '.join(BATCH_ACTIONS)}")
-        if not isinstance(ids, list) or not all(isinstance(i, str) and i for i in ids):
-            raise Invalid("ids must be a list of outbox ids")
-        ids = list(dict.fromkeys(ids))
-        if not ids or len(ids) > BATCH_MAX:
-            raise Invalid(f"give between 1 and {BATCH_MAX} ids")
-        command = self.approve if action == "approve" else self.reject
+    async def approve(self, item_id: str, expected_revision=None) -> dict:
+        """Approve one email awaiting review, at the revision the reviewer read."""
+        async def work(trail):
+            await self._item(item_id)
+            return await self._approve_one(item_id, expected(expected_revision), trail)
+        return await self._run("approve", "approve", {"id": item_id, "revision": expected_revision},
+                               work, item_id, expected_revision)
+
+    async def reject(self, item_id: str, expected_revision=None) -> dict:
+        """Reject one queued email, and the later steps of its sequence."""
+        async def work(trail):
+            await self._item(item_id)
+            return await self._reject_one(item_id, expected(expected_revision), trail)
+        return await self._run("reject", "approve", {"id": item_id, "revision": expected_revision},
+                               work, item_id, expected_revision)
+
+    async def _batch(self, action: str, pairs: list[tuple[str, int]], trail) -> dict:
+        trail.batch_id = uuid.uuid4().hex[:12]
+        command = self._approve_one if action == "approve" else self._reject_one
         results, done = [], 0
-        for item_id in ids:
+        for item_id, revision in pairs:
             try:
-                results.append({"id": item_id, "ok": True, **await command(item_id)})
+                results.append({"id": item_id, "ok": True, **await command(item_id, revision, trail)})
                 done += 1
             except (NotFound, Conflict) as error:
-                results.append({"id": item_id, "ok": False, "code": error.code, "message": str(error)})
-        return {"action": action, "succeeded": done, "failed": len(ids) - done, "results": results}
+                trail.record(item_id, revision, None, outcome=error.code, message=str(error))
+                results.append({"id": item_id, "ok": False, "code": error.code, "message": str(error),
+                                **error.details})
+        return {"action": action, "batch_id": trail.batch_id, "succeeded": done,
+                "failed": len(pairs) - done, "results": results}
+
+    async def batch(self, action: str, items) -> dict:
+        """Approve or reject an explicit, frozen list of {id, revision}. Each
+        item succeeds or fails on its own; one that changed since the list
+        was made fails with stale_revision and is left as it is."""
+        async def work(trail):
+            if action not in BATCH_ACTIONS:
+                raise Invalid(f"action must be one of {', '.join(BATCH_ACTIONS)}")
+            return await self._batch(action, frozen_items(items), trail)
+        return await self._run(f"batch_{action}" if action in BATCH_ACTIONS else "batch",
+                               "approve", {"action": action, "items": items}, work)
+
+    async def approve_all(self, items) -> dict:
+        """Approve every email in ``items``: the {id, revision} list of what
+        the reviewer was shown (pending_snapshot builds one). Never "whatever
+        is pending now": anything queued or changed since stays in review."""
+        async def work(trail):
+            result = await self._batch("approve", frozen_items(items), trail)
+            followups = sum(r.get("followups_approved", 0) for r in result["results"] if r["ok"])
+            return {**result, "approved": result["succeeded"], "followups_approved": followups}
+        return await self._run("approve_all", "approve", {"items": items}, work)
+
+    async def pending_snapshot(self, limit: int = BATCH_MAX) -> list[dict]:
+        """What is awaiting review right now, as a frozen batch to approve."""
+        self.ctx.require("read")
+        rows = await self.state.get_outbox(status="pending_review", limit=min(limit, BATCH_MAX))
+        return [{"id": r["id"], "revision": int(r.get("revision") or 1)} for r in rows]
 
     # ── Edits ──
+    #
+    # Each one is a new revision. An approved email goes back to review.
 
-    async def _editable(self, item_id: str, verb: str) -> dict:
+    async def _editable(self, item_id: str, verb: str, revision: int) -> dict:
         item = await self._item(item_id)
         if item.get("status") not in EDITABLE_STATUSES:
             raise Conflict(f"only pending or approved drafts can be {verb}",
                            code="not_editable", status=item.get("status"))
+        self._current(item, revision)
         return item
 
-    async def edit(self, item_id: str, subject: str, body: str) -> dict:
-        """The reviewer edits a draft in place. Approved mail stays approved."""
-        self.ctx.require("edit")
-        subject, body = (subject or "").strip(), (body or "").strip()
-        if not subject or not body:
-            raise Invalid("subject and body are required")
-        if len(subject) > SUBJECT_MAX or len(body) > BODY_MAX:
-            raise Invalid(f"subject is limited to {SUBJECT_MAX} characters and body to {BODY_MAX}")
-        await self._editable(item_id, "edited")
-        if not await self.state.edit_outbox_item(item_id, subject=subject, body=body, manually_edited=1):
-            raise Conflict("this draft has started sending", code="started_sending")
-        return {"id": item_id}
+    async def _revise(self, item: dict, revision: int, trail, **changes) -> dict:
+        new = await self.state.revise_outbox_item(item["id"], revision, **changes)
+        if new is None:
+            await self._lost_race(item["id"], revision, EDITABLE_STATUSES, "started_sending",
+                                  "this draft has started sending")
+        was_approved = item.get("status") == "approved"
+        trail.record(item["id"], revision, new, approval_cleared=was_approved,
+                     fields=sorted(k for k in changes if k != "manually_edited"))
+        return {"id": item["id"], "revision": new, "status": "pending_review",
+                "approval_cleared": was_approved}
 
-    async def reschedule(self, item_id: str, send_at: datetime) -> dict:
-        """Move a queued email to a new send time (naive UTC)."""
-        self.ctx.require("edit")
-        item = await self._item(item_id)
-        if item.get("status") not in EDITABLE_STATUSES:
-            raise Conflict(f"cannot reschedule an email that is {item.get('status')}",
-                           code="not_editable", status=item.get("status"))
-        if send_at < _utc_naive_now() - timedelta(minutes=1):
-            raise Invalid("send_at is in the past")
-        normalized = send_at.isoformat(timespec="seconds")
-        if not await self.state.edit_outbox_item(item_id, send_at=normalized):
-            raise Conflict("this draft has started sending", code="started_sending")
-        try:
-            await self.state.log_action("outbox_reschedule", self.ctx.actor, {
-                "outbox_id": item_id, "from": item.get("send_at"), "to": normalized,
-            })
-        except Exception as e:
-            # The move happened; a missing log line must not undo it.
-            logger.debug("reschedule log_action failed: %s", e)
-        return {"id": item_id, "send_at": normalized}
+    async def edit(self, item_id: str, subject: str, body: str, expected_revision=None) -> dict:
+        """The reviewer edits a draft in place. An approved draft goes back to review."""
+        async def work(trail):
+            await self._item(item_id)
+            revision = expected(expected_revision)
+            text, message = (subject or "").strip(), (body or "").strip()
+            if not text or not message:
+                raise Invalid("subject and body are required")
+            if len(text) > SUBJECT_MAX or len(message) > BODY_MAX:
+                raise Invalid(f"subject is limited to {SUBJECT_MAX} characters and body to {BODY_MAX}")
+            item = await self._editable(item_id, "edited", revision)
+            return await self._revise(item, revision, trail, subject=text, body=message,
+                                      manually_edited=1)
+        return await self._run("edit", "edit", {"id": item_id, "subject": subject, "body": body,
+                                                "revision": expected_revision},
+                               work, item_id, expected_revision)
 
-    async def regenerate(self, item_id: str, instruction: str = "") -> dict:
+    async def reschedule(self, item_id: str, send_at: datetime, expected_revision=None) -> dict:
+        """Move a queued email to a new send time (naive UTC). An approved
+        email goes back to review: it was approved to go out at another time."""
+        async def work(trail):
+            item = await self._item(item_id)
+            revision = expected(expected_revision)
+            if item.get("status") not in EDITABLE_STATUSES:
+                raise Conflict(f"cannot reschedule an email that is {item.get('status')}",
+                               code="not_editable", status=item.get("status"))
+            self._current(item, revision)
+            if send_at < _utc_naive_now() - timedelta(minutes=1):
+                raise Invalid("send_at is in the past")
+            normalized = send_at.isoformat(timespec="seconds")
+            result = await self._revise(item, revision, trail, send_at=normalized)
+            try:
+                await self.state.log_action("outbox_reschedule", self.ctx.actor, {
+                    "outbox_id": item_id, "from": item.get("send_at"), "to": normalized,
+                })
+            except Exception as e:
+                # The move happened; a missing log line must not undo it.
+                logger.debug("reschedule log_action failed: %s", e)
+            return {**result, "send_at": normalized}
+        return await self._run("reschedule", "edit", {"id": item_id, "send_at": send_at,
+                                                      "revision": expected_revision},
+                               work, item_id, expected_revision)
+
+    async def reroute(self, item_id: str, expected_revision=None, to_email: str | None = None,
+                      mailbox: str | None = None) -> dict:
+        """Change who an email goes to, or the mailbox it goes out from
+        ('' lets the sender pick). Either way it goes back to review."""
+        async def work(trail):
+            await self._item(item_id)
+            revision = expected(expected_revision)
+            changes = {}
+            if to_email is not None:
+                address = str(to_email).strip().lower()
+                if not EMAIL_RE.match(address) or len(address) > 254:
+                    raise Invalid("to_email must be an email address", code="invalid_value",
+                                  field="to_email")
+                changes["to_email"] = address
+            if mailbox is not None:
+                sender = str(mailbox).strip().lower()
+                if sender and not EMAIL_RE.match(sender):
+                    raise Invalid("mailbox must be an email address, or empty to rotate",
+                                  code="invalid_value", field="mailbox")
+                known = self._mailboxes()[1]
+                if sender and known is not None and sender not in {m.lower() for m in known}:
+                    raise Invalid(f"{sender} is not a configured mailbox", code="unknown_mailbox")
+                changes["mailbox"] = sender
+            if not changes:
+                raise Invalid("give to_email, mailbox or both")
+            item = await self._editable(item_id, "re-routed", revision)
+            return {**await self._revise(item, revision, trail, **changes), **changes}
+        return await self._run("reroute", "edit", {"id": item_id, "to_email": to_email,
+                                                   "mailbox": mailbox, "revision": expected_revision},
+                               work, item_id, expected_revision)
+
+    async def regenerate(self, item_id: str, instruction: str = "", expected_revision=None) -> dict:
         """Ask the writer for a new draft, optionally with an instruction. One
-        model call. The new draft goes back to review."""
-        self.ctx.require("edit")
+        model call. The new draft is a new revision and goes back to review."""
+        async def work(trail):
+            await self._item(item_id)
+            return await self._regenerate(item_id, instruction, expected(expected_revision), trail)
+        return await self._run("regenerate", "edit", {"id": item_id, "instruction": instruction,
+                                                      "revision": expected_revision},
+                               work, item_id, expected_revision)
+
+    async def _regenerate(self, item_id: str, instruction: str, revision: int, trail) -> dict:
         instruction = (instruction or "").strip()
         if len(instruction) > INSTRUCTION_MAX:
             raise Invalid(f"instruction is limited to {INSTRUCTION_MAX} characters")
         state = self.state
-        item = await self._editable(item_id, "regenerated")
+        # Checked before the model call: a stale request should not spend one.
+        item = await self._editable(item_id, "regenerated", revision)
         prospect = await state.get_prospect(item["prospect_id"])
         if not prospect:
             raise NotFound("prospect not found", code="prospect_not_found")
@@ -287,7 +457,12 @@ class OutboxService:
             raise Unavailable("the writer returned nothing; try again", code="provider_failed")
         # A regenerated draft is unread: back to the review queue.
         try:
-            await PersonaStore(state).replace_draft(item_id, draft)
-        except ValueError as error:
-            raise Conflict(str(error), code="not_editable") from error
-        return (await PersonaStore(state).enrich([await state.get_outbox_item(item_id)]))[0]
+            await PersonaStore(state).replace_draft(item_id, draft, expected_revision=revision)
+        except ValueError:
+            await self._lost_race(item_id, revision, EDITABLE_STATUSES, "not_editable",
+                                  "only pending or approved drafts can be regenerated")
+        updated = await state.get_outbox_item(item_id)
+        trail.record(item_id, revision, updated.get("revision"),
+                     approval_cleared=item.get("status") == "approved",
+                     generation_id=updated.get("generation_id") or "")
+        return (await PersonaStore(state).enrich([updated]))[0]

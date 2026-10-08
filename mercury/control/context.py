@@ -24,8 +24,9 @@ class OperatorContext:
     client: str
     operator: str = "local"
     scopes: frozenset[str] = field(default=SCOPES)
-    # Optional caller-chosen key for the request. Unused until idempotent
-    # replays exist; carried so every interface already passes one through.
+    # Optional caller-chosen key for the request. A command repeated with
+    # the same key (same client and operator) returns its recorded result
+    # instead of running again; see control/audit.py.
     request_id: str = ""
 
     def __post_init__(self):

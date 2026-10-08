@@ -535,22 +535,44 @@ def cmd_outbox(args):
         outbox = OutboxService(ctx, state, config)
 
         if args.approve_all:
-            n = (await outbox.approve_all())["approved"]
-            print(f"\n  Approved {n} email(s). They'll send on schedule.\n")
+            # A frozen batch of what is pending now: anything that changes
+            # before its turn stays in review.
+            snapshot = await outbox.pending_snapshot()
+            if not snapshot:
+                print("\n  Nothing awaiting review.\n")
+                return
+            result = await outbox.approve_all(snapshot)
+            print(f"\n  Approved {result['approved']} email(s). They'll send on schedule.")
+            if result["failed"]:
+                print(f"  {result['failed']} changed while approving and stay in review.")
+            print()
             return
-        if args.approve:
+        for action in ("approve", "reject"):
+            item_id = getattr(args, action)
+            if not item_id:
+                continue
+            revision = getattr(args, "revision", None)
             try:
-                await outbox.approve(args.approve)
-                print("\n  Approved.\n")
-            except (NotFound, Conflict):
-                print("\n  No pending item with that id.\n")
-            return
-        if args.reject:
-            try:
-                n = (await outbox.reject(args.reject))["rejected"]
-                print(f"\n  Rejected {n} email(s), later steps of the same sequence included.\n")
-            except (NotFound, Conflict):
-                print("\n  No queued item with that id.\n")
+                if revision is None:
+                    # No revision given: act on the revision printed here, so
+                    # what was approved is what this command showed.
+                    item = await outbox.get(item_id)
+                    revision = int(item.get("revision") or 1)
+                    print(f"\n  [{item['id']}] rev {revision} → {item['to_email']}")
+                    print(f"  Subject: {item['subject']}")
+                if action == "approve":
+                    await outbox.approve(item_id, revision)
+                    print(f"\n  Approved revision {revision}.\n")
+                else:
+                    n = (await outbox.reject(item_id, revision))["rejected"]
+                    print(f"\n  Rejected {n} email(s), later steps of the same sequence included.\n")
+            except Conflict as e:
+                if e.code == "stale_revision":
+                    print(f"\n  {e}. Run 'mercury outbox' to see the current draft.\n")
+                else:
+                    print(f"\n  No {'pending' if action == 'approve' else 'queued'} item with that id.\n")
+            except NotFound:
+                print(f"\n  No {'pending' if action == 'approve' else 'queued'} item with that id.\n")
             return
 
         paused = (await SendingService(ctx, state).status())["reason"]
@@ -570,7 +592,7 @@ def cmd_outbox(args):
             print(f"  {len(waiting)} contact(s) waiting for a demo: mercury demos")
         print("  " + "=" * 60)
         for item in pending:
-            print(f"\n  [{item['id']}] step {item['step']} ({item['kind']}) "
+            print(f"\n  [{item['id']}] rev {item.get('revision') or 1} step {item['step']} ({item['kind']}) "
                   f"→ {item['to_email']}  (send {item['send_at'][:16]})")
             if item.get("demo") and item["demo"]["held"]:
                 print(f"  Held: {item['demo']['reason']}")
@@ -579,8 +601,8 @@ def cmd_outbox(args):
             for line in body_preview.splitlines():
                 print(f"    {line}")
         if pending:
-            print("\n  Approve: mercury outbox --approve <id>   |   all: mercury outbox --approve-all")
-            print("  Reject:  mercury outbox --reject <id>\n")
+            print("\n  Approve: mercury outbox --approve <id> [--revision <rev>]   |   all: mercury outbox --approve-all")
+            print("  Reject:  mercury outbox --reject <id> [--revision <rev>]\n")
         else:
             print("  Nothing awaiting review.\n")
 
@@ -1432,6 +1454,8 @@ def main():
     sub.add_argument("--approve", metavar="ID", default="", help="Approve one item")
     sub.add_argument("--approve-all", action="store_true", help="Approve all pending")
     sub.add_argument("--reject", metavar="ID", default="", help="Reject one item")
+    sub.add_argument("--revision", type=int, default=None,
+                     help="The revision you reviewed (shown as 'rev N'); fails if it changed since")
     sub.set_defaults(func=cmd_outbox)
 
     # mercury import FILE / mercury imports

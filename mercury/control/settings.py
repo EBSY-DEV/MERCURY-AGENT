@@ -7,17 +7,24 @@ Secrets live in .env and are set from the dashboard's Settings tab or by
 hand; mailboxes have their own validated editor (mercury/inbox_settings.py).
 A change is validated against the whole config before it is written, and
 the write is atomic and keeps the file's comments and key order.
+
+The config's revision is a hash of the file Mercury reads. A change names
+the revision it was decided on and fails with stale_revision when the file
+changed since (another client, or a hand edit). Changes are audited and
+may carry a request key for idempotent replay (control/audit.py).
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 from io import StringIO
 from pathlib import Path
 
 from pydantic import ValidationError
 
-from mercury.control.errors import Invalid, ProhibitedField
+from mercury.control.audit import looks_secret, redact, run_command
+from mercury.control.errors import Conflict, Invalid, ProhibitedField
 
 # Dotted path -> type. bool is checked before int: True is an int in Python.
 EDITABLE: dict[str, type] = {
@@ -33,12 +40,11 @@ EDITABLE: dict[str, type] = {
     "usage.quiet_hours.end": str,
     "usage.quiet_hours.timezone": str,
 }
-SECRET_HINTS = ("password", "secret", "token", "api_key", "apikey", "credential", "private_key", "_env")
 
 
-def looks_secret(path: str) -> bool:
-    key = str(path).lower()
-    return any(hint in key for hint in SECRET_HINTS)
+def config_revision(text: str) -> str:
+    """The revision of a config file: a short hash of its content."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def config_paths() -> tuple[Path, Path | None]:
@@ -96,26 +102,35 @@ def _check_value(path: str, value):
 
 
 class ConfigService:
-    def __init__(self, ctx, source: Path | None = None, target: Path | None = None):
-        # Defaults: the config Mercury reads, written to mercury.local.yaml
-        # when that is the tracked template (see config_paths).
+    def __init__(self, ctx, state, source: Path | None = None, target: Path | None = None):
+        # state: where changes are audited and request keys recorded.
+        # Paths default to the config Mercury reads, written to
+        # mercury.local.yaml when that is the tracked template (see config_paths).
         if source is None:
             source, private = config_paths()
             target = target or private
-        self.ctx, self.source, self.target = ctx, Path(source), Path(target or source)
+        self.ctx, self.state = ctx, state
+        self.source, self.target = Path(source), Path(target or source)
 
-    def _load(self):
+    def _current_source(self) -> Path:
+        # Another service may have created the private override after this
+        # instance was constructed. Always review and revise the active file.
+        return self.target if self.target.exists() else self.source
+
+    def _load(self, text: str):
         from mercury.config import MercuryConfig
 
         import yaml
-        return MercuryConfig(**(yaml.safe_load(self.source.read_text()) or {}))
+        return MercuryConfig(**(yaml.safe_load(text) or {}))
 
     async def get(self) -> dict:
         """Every editable field and its current value."""
         self.ctx.require("read")
-        config = self._load()
+        source = self._current_source()
+        text = source.read_text()
+        config = self._load(text)
         return {"fields": {path: _lookup(config, path) for path in EDITABLE},
-                "config_file": str(self.source)}
+                "config_file": str(source), "revision": config_revision(text)}
 
     def validate(self, changes) -> dict:
         """The changes, type-checked, or the first reason they can't apply.
@@ -134,22 +149,45 @@ class ConfigService:
                 f"{', '.join(EDITABLE)}", refused, code="unknown_field")
         return {path: _check_value(path, value) for path, value in changes.items()}
 
-    async def update(self, changes: dict) -> dict:
-        """Apply allowlisted changes. Everything is checked (permissions, the
-        allowlist, types, then the whole resulting config) before the file
-        is written, so a refused change leaves it untouched."""
-        self.ctx.require("edit")
-        changes = self.validate(changes)
+    async def update(self, changes: dict, expected_revision: str | None = None) -> dict:
+        """Apply allowlisted changes to the revision the caller read.
+        Everything is checked (permissions, the allowlist, types, the
+        revision, then the whole resulting config) before the file is
+        written, so a refused change leaves it untouched."""
+        async def work(trail):
+            return await self._update(changes, expected_revision, trail)
+        return await run_command(
+            self.state, self.ctx, "config.update", scope="edit",
+            params={"changes": changes, "revision": expected_revision}, work=work,
+            object_type="config", object_id=self.target.name, revision_before=expected_revision)
 
+    async def _update(self, changes, expected_revision, trail) -> dict:
+        changes = self.validate(changes)
+        if not isinstance(expected_revision, str) or not expected_revision.strip():
+            raise Invalid("give the config revision you read (revision)", code="revision_required")
+
+        # All command transports share this database. Hold its writer lock
+        # through the file's read/check/replace so independent processes
+        # cannot both accept the same revision and overwrite each other.
+        async with self.state._connect() as db:
+            await db.execute("BEGIN IMMEDIATE")
+            return self._write(changes, expected_revision, trail)
+
+    def _write(self, changes, expected_revision, trail) -> dict:
         from ruamel.yaml import YAML
 
         from mercury.config import MercuryConfig
         from mercury.inbox_settings import _plain, atomic_write
 
+        text = self._current_source().read_text()
+        current = config_revision(text)
+        if expected_revision.strip() != current:
+            raise Conflict("the configuration changed since you read it; reload it and try again",
+                           code="stale_revision", revision=current)
         rt_yaml = YAML(typ="rt")
         rt_yaml.preserve_quotes = True
         rt_yaml.width = 4096
-        raw = rt_yaml.load(self.source.read_text()) or {}
+        raw = rt_yaml.load(text) or {}
         for path, value in changes.items():
             node = raw
             *parents, leaf = path.split(".")
@@ -168,5 +206,7 @@ class ConfigService:
         out = StringIO()
         rt_yaml.dump(raw, out)
         atomic_write(self.target, out.getvalue())
-        return {"changed": changes, "config_file": str(self.target),
+        revision = config_revision(out.getvalue())
+        trail.record(self.target.name, current, revision, changes=redact(changes))
+        return {"changed": changes, "config_file": str(self.target), "revision": revision,
                 "fields": {path: _lookup(validated, path) for path in EDITABLE}}
