@@ -144,8 +144,15 @@ function xpDrawAll() {
 
 function xpHeadHtml(e) {
   const c = e.controls || {}, fx = c.effects || {};
-  const btn = (action, ic, label, cls) => '<button class="btn ' + (cls || 'btn-secondary') + ' btn-sm" data-act="' + action +
-    '" onclick="expAct(\'' + action + '\')">' + icon(ic) + label + '</button>';
+  // Each control carries its full effect as a tooltip and as its accessible description.
+  const effect = { pause: fx.pause, resume: fx.pause, hold: fx.hold, release: fx.hold, complete: fx.complete };
+  const btn = (action, ic, label, cls) => {
+    const tip = effect[action] || '';
+    return '<button class="btn ' + (cls || 'btn-secondary') + ' btn-sm" data-act="' + action + '"' +
+      (tip ? ' title="' + escAttr(tip) + '" aria-describedby="xp-fx-' + action + '"' : '') +
+      ' onclick="expAct(\'' + action + '\')">' + icon(ic) + label + '</button>' +
+      (tip ? '<span class="sr-only" id="xp-fx-' + action + '">' + escHtml(tip) + '</span>' : '');
+  };
   const buttons = [
     c.can_start ? btn('start', 'play', 'Start enrolling', 'btn-primary') : '',
     e.status === 'draft' && c.can_edit ? '<button class="btn btn-secondary btn-sm" onclick="expEdit()">' + icon('sliders-horizontal') + 'Edit</button>' : '',
@@ -155,9 +162,8 @@ function xpHeadHtml(e) {
     c.can_release ? btn('release', 'play', 'Release held mail') : '',
     c.can_complete ? btn('complete', 'check-circle', 'Complete') : '',
   ].join('');
-  const hints = [];
-  if (c.can_pause || c.can_resume) hints.push(fx.pause);
-  if (c.can_hold || c.can_release) hints.push(fx.hold);
+  const hint = (c.can_pause || c.can_resume || c.can_hold || c.can_release)
+    ? 'Pausing stops new prospects. Holding also keeps approved emails from sending.' : '';
   const held = e.hold_mail
     ? '<span class="xp-held">' + toneBadge('waiting', 'Unsent mail held') + '</span>' : '';
   return '<section class="panel xp-head">' +
@@ -169,7 +175,7 @@ function xpHeadHtml(e) {
       (e.hold_mail && e.hold_reason ? '<p class="xp-setup">Held because: ' + escHtml(e.hold_reason) + '</p>' : '') +
     '</div>' +
     (buttons ? '<div class="xp-head-side"><div class="xp-actions">' + buttons + '</div>' +
-      (hints.length ? '<p class="xp-hint">' + escHtml(hints.join(' ')) + '</p>' : '') + '</div>' : '') +
+      (hint ? '<p class="xp-hint">' + hint + '</p>' : '') + '</div>' : '') +
     '</section>';
 }
 
@@ -452,7 +458,7 @@ function xpDrawDiff() {
   const d = _xp.detail;
   if (!wrap || !d) return;
   const W = wrap.clientWidth;
-  if (!W) return;
+  if (W < 120) return;                               // not laid out yet; the observer redraws
   const c = d.results.comparison;
   if (!c.interval || c.difference === null) {
     wrap.innerHTML = '<div class="chart-note">' + icon('info') + '<span>No interval yet. Both arms need at least one mature prospect.</span></div>';
@@ -471,7 +477,7 @@ function xpDrawDiff() {
   for (let v = dmin; v <= dmax + 1e-9; v += step) ticks.push(v);
   const label = v => v === 0 ? '0' : xpSigned(v, 0);
   const chipText = xpSigned(est) + ' (' + xpSigned(lo) + ' to ' + xpSigned(hi) + ')';
-  const cw = chipText.length * 6.3 + 20;
+  const cw = Math.max(0, Math.min(chipText.length * 6.3 + 20, x1 - x0));
   const cx = Math.max(x0, Math.min(x(est) - cw / 2, x1 - cw));
   let svg = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' +
     escAttr('Difference in ' + (c.metric_label || 'rate') + ', B minus A: ' + chipText + ' points, 95% interval') + '">' +
