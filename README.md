@@ -169,6 +169,7 @@ Cold email law (CAN-SPAM, GDPR/PECR) is your responsibility as the sender. Use a
 | `mercury profile [--limit N] [--stale-days N]` | Read discovered companies' websites (free) |
 | `mercury outbox [--approve ID] [--approve-all] [--reject ID]` | Review queued emails |
 | `mercury sending pause\|resume\|status` | Kill switch for all outbound mail |
+| `mercury demos [list\|ready\|request\|retire] [EMAIL_OR_ID]` | Per-prospect demos: emails of a `requires_demo` offer wait until the demo is ready |
 | `mercury gmail auth\|test` | One-time Gmail OAuth, or connection check |
 | `mercury mail test` | Test the configured provider and every mailbox |
 | `mercury export [--out FILE] [--all] [--min-score N]` | Deliverable prospects to CSV |

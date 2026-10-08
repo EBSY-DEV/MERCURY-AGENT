@@ -31,6 +31,10 @@ class Campaign(BaseModel):
     # The mailbox every step goes out from, when the campaign was written in
     # one mailbox's voice. Empty: the sender rotates as usual.
     mailbox: str = ""
+    # The offer this campaign was written for (offers[].key in mercury.yaml).
+    # Its outbox rows inherit it; an offer with requires_demo holds them
+    # until the prospect's demo is ready. Empty: no offer, no demo gate.
+    offer_key: str = ""
 
     def sequence_json(self) -> str:
         return json.dumps([s.model_dump() for s in self.sequence])
