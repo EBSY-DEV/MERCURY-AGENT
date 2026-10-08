@@ -2,7 +2,7 @@
 
 An experiment compares two versions of your outreach, arm A and arm B, on one variable at a time: the opening angle, the subject line, or the writing persona. Each prospect is assigned to one arm before anything is written for them and stays there for their whole sequence. Results count people, not emails, and wait until every counted prospect has had the same time to answer.
 
-The code is in `mercury/experiments.py` (assignment, exposure, outcomes, results), `mercury/experiment_stats.py` (intervals) and `mercury/control/experiments.py` (commands). The dashboard API is `mercury/experiments_api.py`; the CLI is `mercury experiments`. The Experiments tab itself is not built yet: everything it will show is already computed by the API below.
+The code is in `mercury/experiments.py` (assignment, exposure, outcomes, results), `mercury/experiment_stats.py` (intervals) and `mercury/control/experiments.py` (commands). The dashboard API is `mercury/experiments_api.py`; the CLI is `mercury experiments`. The dashboard's Experiments tab (`mercury/web/experiments.js`) only lays out what the API below computes: the table, the controls, the sample progress, the metric strip, the weekly bars, the B minus A interval and the New experiment drawer. `results` also carries `by_week` (per week of first email, each arm's contacted, mature, pending, positive and replied counts, and whether the week is still open) and `series` (cumulative daily counts among prospects whose window had closed) for those charts, and `GET /api/experiments` carries the personas and ready-made eligible groups the form chooses from.
 
 ## Defining an experiment
 

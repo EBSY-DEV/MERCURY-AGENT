@@ -117,6 +117,32 @@ class ExperimentService:
                 "cohort_filters": list(ex.COHORT_LISTS) + ["min_score"],
                 "defaults": self.defaults(), "effects": EFFECTS}
 
+    async def form_options(self) -> dict:
+        """What the New experiment form chooses from: the writing personas an
+        arm can use ('' is the default voice) and ready-made eligible groups
+        (each is a cohort definition the create call accepts as is)."""
+        personas = [{"id": "", "name": "Default voice", "revision": None}]
+        personas += [{"id": p["id"], "name": p["name"], "revision": p["revision"]}
+                     for p in (await self._personas()).values() if not p["archived"]]
+        cohorts = [{"key": "all", "label": ex.describe_cohort({}), "cohort": {}, "count": None}]
+        async with self.state._connect() as db:
+            industries = await ex._rows(
+                db, "SELECT industry, COUNT(*) AS n FROM prospects WHERE status = 'new' "
+                "AND COALESCE(industry, '') != '' GROUP BY industry ORDER BY n DESC, industry")
+            batches = await ex._rows(
+                db, "SELECT b.id, b.filename, COUNT(p.id) AS n FROM import_batches b "
+                "JOIN prospects p ON p.import_batch_id = b.id AND p.status = 'new' "
+                "GROUP BY b.id ORDER BY b.created_at DESC")
+        for row in industries:
+            cohort = {"industries": [row["industry"]]}
+            cohorts.append({"key": f"industry:{row['industry']}", "count": row["n"],
+                            "label": ex.describe_cohort(cohort), "cohort": cohort})
+        for row in batches:
+            cohort = {"import_batch_ids": [row["id"]]}
+            cohorts.append({"key": f"import:{row['id']}", "count": row["n"], "cohort": cohort,
+                            "label": f"Imported from {row['filename'] or row['id']}"})
+        return {"personas": personas, "cohorts": cohorts}
+
     async def _personas(self) -> dict:
         from mercury.personas import PersonaStore
 
@@ -234,11 +260,21 @@ class ExperimentService:
         experiment, revision, arms = loaded["experiment"], loaded["revision"], loaded["arms"]
         personas = await self._personas()
         status = experiment["status"]
+        pinned = [a["persona_version_id"] for a in arms.values() if a.get("persona_version_id")]
+        revisions = {}
+        if pinned:
+            async with self.state._connect() as db:
+                revisions = {r["id"]: r for r in await ex._rows(
+                    db, "SELECT id, persona_id, revision FROM persona_versions WHERE id IN "
+                    f"({','.join('?' for _ in pinned)})", pinned)}
         arm_list = []
         for key in ex.ARM_KEYS:
             arm = dict(arms.get(key) or {})
-            persona = personas.get(arm.get("persona_id") or "")
+            version = revisions.get(arm.get("persona_version_id")) or {}
+            # An arm on the default voice is pinned to what the default was when it started.
+            persona = personas.get(arm.get("persona_id") or version.get("persona_id") or "")
             arm["persona_name"] = persona["name"] if persona else "Default voice"
+            arm["persona_revision"] = version.get("revision")
             arm_list.append(arm)
         return {
             **experiment,
@@ -303,7 +339,7 @@ class ExperimentService:
                 "created_at": public["created_at"], "started_at": public["started_at"],
                 "completed_at": public["completed_at"],
             })
-        return {"experiments": rows, "options": self.options()}
+        return {"experiments": rows, "options": {**self.options(), **await self.form_options()}}
 
     async def get(self, ref: str, revision: int | None = None) -> dict:
         loaded = await self._loaded(ref, revision)

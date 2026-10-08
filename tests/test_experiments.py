@@ -995,6 +995,62 @@ async def test_earliest_decision_date(world):
     assert decision["line"].endswith(f"earliest decision {expected}")
 
 
+@pytest.mark.asyncio
+async def test_daily_series_is_cumulative_and_ends_on_the_arm_totals(world):
+    exp = await seeded(world, {"A": (10, 2), "B": (12, 5)}, min_per_arm=5, days_since=30, window=14)
+    result = await ex.results(world.state, world.config, exp["id"])
+    series = result["series"]
+    assert series[0]["A"]["mature"] == 10 and series[0]["B"]["mature"] == 12  # all sent together
+    assert series[-1]["date"] == ex.parse_ts(result["as_of"]).date().isoformat()
+    for key in ("A", "B"):
+        total, last = arm(result, key), series[-1][key]
+        assert last["mature"] == total["mature"]
+        assert last["positive"] == total["positive"]["count"]
+        assert last["replied"] == total["any_reply"]["count"]
+        assert last["bounced"] == total["bounce"]["count"]
+        assert last["opted_out"] == total["opt_out"]["count"]
+    for earlier, later in zip(series, series[1:]):
+        assert all(later[k][f] >= earlier[k][f] for k in ("A", "B") for f in earlier["A"])
+    assert [r["date"] for r in series] == sorted({r["date"] for r in series})
+
+
+@pytest.mark.asyncio
+async def test_series_and_weeks_are_empty_until_something_is_contacted(world):
+    exp = await started(world)
+    result = await ex.results(world.state, world.config, exp["id"])
+    assert result["series"] == [] and result["by_week"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_week_is_open_and_has_no_series_until_the_window_closes(world):
+    # Contacted five days ago with a 14-day window.
+    exp = await seeded(world, {"A": (3, 1), "B": (3, 1)}, days_since=5, window=14)
+    young = await ex.results(world.state, world.config, exp["id"])
+    assert young["series"] == []
+    (week,) = young["by_week"]
+    assert week["open"] and week["A"]["pending"] == 3 and week["A"]["mature"] == 0
+    assert week["A"]["positive_rate"] is None
+
+
+@pytest.mark.asyncio
+async def test_by_week_counts_each_prospect_once_in_the_week_of_their_first_email(world):
+    exp = await seeded(world, {"A": (8, 3), "B": (6, 1)}, days_since=40, window=14)
+    result = await ex.results(world.state, world.config, exp["id"])
+    weeks = result["by_week"]
+    assert weeks and not any(w["open"] for w in weeks)
+    for key in ("A", "B"):
+        total = arm(result, key)
+        assert sum(w[key]["contacted"] for w in weeks) == total["contacted"]
+        assert sum(w[key]["mature"] for w in weeks) == total["mature"]
+        assert sum(w[key]["positive"] for w in weeks) == total["positive"]["count"]
+    populated = [w for w in weeks if w["A"]["contacted"]]
+    assert len(populated) == 1
+    week = populated[0]
+    assert datetime.fromisoformat(week["week"]).weekday() == 0   # a Monday
+    assert week["A"]["positive_rate"] == pytest.approx(3 / 8)
+    assert week["ends"] == (datetime.fromisoformat(week["week"]) + timedelta(days=6)).date().isoformat()
+
+
 # ── Migration ──
 
 def test_migration_adds_experiments_and_leaves_old_mail_unassigned():

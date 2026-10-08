@@ -189,3 +189,38 @@ def test_cli_create_preview_start_hold_and_complete(monkeypatch, capsys):
         with pytest.raises(SystemExit):
             _cli(monkeypatch, capsys, db, "experiments", "edit", exp_id, "--b-name", "variant B2")
         assert "cannot be edited" in capsys.readouterr().out
+
+
+def test_api_listing_offers_personas_and_eligible_groups_for_the_form(client):
+    asyncio.run(add_prospects(client.sm, 3, industry="segment_a"))
+    asyncio.run(add_prospects(client.sm, 2, prefix="q", industry="segment_b"))
+    options = client.get("/api/experiments").json()["options"]
+    assert options["personas"][0] == {"id": "", "name": "Default voice", "revision": None}
+    assert all(p["id"] and p["name"] for p in options["personas"][1:])
+    cohorts = {c["key"]: c for c in options["cohorts"]}
+    assert cohorts["all"]["cohort"] == {} and cohorts["all"]["label"].startswith("every new prospect")
+    assert cohorts["industry:segment_a"]["count"] == 3
+    assert cohorts["industry:segment_b"]["cohort"] == {"industries": ["segment_b"]}
+    # Each offered group is a definition the create call accepts as is.
+    created = client.post("/api/experiments", json=definition(
+        cohort=cohorts["industry:segment_a"]["cohort"])).json()
+    assert created["success"] and created["experiment"]["cohort"] == {"industries": ["segment_a"]}
+
+
+def test_api_results_carry_the_series_and_weeks_the_charts_draw(client):
+    created = client.post("/api/experiments", json=definition()).json()
+    results = client.get(f"/api/experiments/{created['experiment']['id']}/results").json()
+    assert results["series"] == [] and results["by_week"] == []
+
+
+def test_api_detail_names_each_arms_pinned_persona_and_the_health_limits(client):
+    created = client.post("/api/experiments", json=definition()).json()
+    exp_id = created["experiment"]["id"]
+    assert [a["persona_revision"] for a in created["experiment"]["arms"]] == [None, None]  # not frozen yet
+    client.post(f"/api/experiments/{exp_id}/start")
+    detail = client.get(f"/api/experiments/{exp_id}").json()
+    assert [a["persona_revision"] for a in detail["experiment"]["arms"]] == [1, 1]
+    assert {a["persona_name"] for a in detail["experiment"]["arms"]} == {"Workspace voice"}
+    limits = detail["results"]["health"]["limits"]
+    assert limits["low_reply_rate"] == 0.01 and limits["high_bounce_rate"] == 0.05
+    assert limits["sending_stops_at"] == 0.9    # the test config's channels.email.max_bounce_rate

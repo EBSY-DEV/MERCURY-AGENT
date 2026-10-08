@@ -622,6 +622,71 @@ def _bounce_counts(row: dict) -> bool:
     return bucket != bounce_policy.NOISE
 
 
+def _week_start(when: datetime):
+    """The Monday (a date) of the week a time falls in."""
+    return (when - timedelta(days=when.weekday())).date()
+
+
+def weekly_breakdown(entries: list[tuple[dict, dict]]) -> list[dict]:
+    """Per week of first email: each arm's contacted, mature, pending, positive
+    and replied counts. Each prospect is in exactly one week, the week of their
+    first email, and counts once. A week is open while any of its prospects
+    is still inside the response window."""
+    weeks: dict = {}
+    for person, t in entries:
+        monday = _week_start(person["first"])
+        row = weeks.setdefault(monday, {k: {"contacted": 0, "mature": 0, "pending": 0,
+                                           "positive": 0, "replied": 0} for k in ARM_KEYS})
+        cell = row[person["arm"]]
+        cell["contacted"] += 1
+        if person["mature"]:
+            cell["mature"] += 1
+            cell["positive"] += int(t["positive"])
+            cell["replied"] += int(t["replied"])
+        else:
+            cell["pending"] += 1
+    out = []
+    if weeks:
+        monday, last = min(weeks), max(weeks)
+        while monday <= last:
+            row = weeks.get(monday) or {k: {"contacted": 0, "mature": 0, "pending": 0,
+                                            "positive": 0, "replied": 0} for k in ARM_KEYS}
+            for cell in row.values():
+                cell["positive_rate"] = _rate(cell["positive"], cell["mature"])
+                cell["reply_rate"] = _rate(cell["replied"], cell["mature"])
+            out.append({"week": monday.isoformat(),
+                        "ends": (monday + timedelta(days=6)).isoformat(),
+                        "open": any(row[k]["pending"] for k in ARM_KEYS), **row})
+            monday += timedelta(days=7)
+    return out
+
+
+def daily_series(entries: list[tuple[dict, dict]], window: timedelta, now: datetime,
+                 max_days: int = 120) -> list[dict]:
+    """Cumulative counts per day among prospects whose window had closed by the
+    end of that day, per arm. Rates are counts over ``mature``. It starts the
+    day the first prospect matured and ends today, so the last row equals the
+    arm totals of the results."""
+    matured = sorted(((p["first"] + window, p["arm"], t) for p, t in entries if p["mature"]),
+                     key=lambda m: m[0])
+    if not matured:
+        return []
+    zero = {k: {"mature": 0, "positive": 0, "replied": 0, "bounced": 0, "opted_out": 0}
+            for k in ARM_KEYS}
+    day, last, i, out = matured[0][0].date(), now.date(), 0, []
+    while day <= last:
+        end = min(datetime.combine(day + timedelta(days=1), datetime.min.time()), now)
+        while i < len(matured) and matured[i][0] <= end:
+            _, key, t = matured[i]
+            zero[key]["mature"] += 1
+            for name in ("positive", "replied", "bounced", "opted_out"):
+                zero[key][name] += int(t[name])
+            i += 1
+        out.append({"date": day.isoformat(), **{k: dict(v) for k, v in zero.items()}})
+        day += timedelta(days=1)
+    return out[-max_days:]
+
+
 async def results(state, config, experiment_id: str, revision_number: int | None = None,
                   now: datetime | None = None) -> dict | None:
     """Per-arm counts, rates, the B minus A difference with its interval,
@@ -911,6 +976,7 @@ async def results(state, config, experiment_id: str, revision_number: int | None
 
     for arm in arm_results:
         arm.pop("_firsts")
+    entries = [(p, tally(p)) for p in per.values() if p["first"]]
     return {
         "experiment_id": experiment_id, "revision": revision["number"],
         "revision_id": revision["id"], "as_of": ts(now),
@@ -918,6 +984,8 @@ async def results(state, config, experiment_id: str, revision_number: int | None
         "min_duration_days": min_days, "confidence_threshold": threshold,
         "primary_metric": metric, "primary_metric_label": PRIMARY_METRICS.get(metric, metric),
         "arms": arm_results, "comparison": comparison,
+        "by_week": weekly_breakdown(entries),
+        "series": daily_series(entries, window, now),
         "decision": {"code": code, "label": RESULT_LABELS[code], "line": line,
                      "sufficient": sufficient, "mature_min": mature_min,
                      "mature_needed": min_per_arm, "duration_met": duration_met,
@@ -925,7 +993,12 @@ async def results(state, config, experiment_id: str, revision_number: int | None
                      "earliest_estimated": estimated, "reasons": reasons,
                      "recommends_winner": code in ("a_ahead", "b_ahead"),
                      "automatic_changes": False},
-        "health": {"warnings": warnings},
+        "health": {"warnings": warnings, "limits": {
+            "low_reply_rate": float(setting(config, "low_reply_rate")),
+            "high_bounce_rate": float(setting(config, "high_bounce_rate")),
+            # Mercury stops sending altogether past this bounce rate.
+            "sending_stops_at": getattr(getattr(getattr(config, "channels", None), "email", None),
+                                        "max_bounce_rate", None)}},
         "data_quality": quality,
         "definitions": DEFINITIONS,
     }
