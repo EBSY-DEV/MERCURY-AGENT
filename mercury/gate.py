@@ -53,8 +53,14 @@ def pre_send_check(
     prospect=None,
     allow_risky: bool = False,
     kind: str = "sequence",
+    blocked_references: list[str] | None = None,
 ) -> GateResult:
-    """Run every deterministic check. Returns ok=False with reasons on any hit."""
+    """Run every deterministic check. Returns ok=False with reasons on any hit.
+
+    ``blocked_references`` are configured case-study names (and aliases)
+    outside this email's offer or scope (mercury.offers.blocked_references);
+    naming one blocks the send.
+    """
     reasons: list[str] = []
     subject = (subject or "").strip()
     body = (body or "").strip()
@@ -102,6 +108,14 @@ def pre_send_check(
     links = URL_RE.findall(body)
     if len(links) > MAX_LINKS:
         reasons.append(f"too many links ({len(links)} > {MAX_LINKS})")
+
+    # Case studies the offer config does not allow for this prospect
+    if blocked_references:
+        from mercury.offers import case_study_hits
+
+        named = case_study_hits(subject + "\n" + body, blocked_references)
+        if named:
+            reasons.append(f"names a case study outside its allowed scope: {named[:3]}")
 
     # No HTML — Mercury sends plain text only
     if re.search(r"<\s*(html|body|div|table|img|a)\b", body, re.IGNORECASE):

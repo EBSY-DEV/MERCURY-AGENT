@@ -255,6 +255,7 @@ Every change to the dashboard (`mercury/web/`) or to a design in `design/*.pen` 
 - **Status is a Phosphor icon plus a word.** Use `.badge t-good|t-waiting|t-bad|t-active|t-note|t-idle` (`toneBadge()` in `app.js`). The colour lives only in the glyph; the label stays `--text-2` (only `t-bad` labels go red). Never use tinted pills, coloured dots, or coloured background chips for status.
 - **Agent presence is the Transit mark, not a dot.** Running is the heartbeat loop, asleep or offline is the closed disc (`.agent-mark` in `app.css`). Logo rules (clear space, minimum sizes, don'ts) are in `design/brand/GUIDELINES.md`.
 - **One accent.** Violet (`--accent`) marks what's selected, primary or interactive. Green, amber, red and blue only mean status. Don't use status colours for decoration or emphasis.
+- **Action tints are the one exception.** An icon-only toolbar button may carry the hue of what it does: reminders amber, snooze blue, read state violet, everything else neutral (`.btn-square.tint-amber|tint-blue|tint-violet`, tokens `--tint-*`). Only for those buttons, never for status, primary actions or decoration, and each keeps a tooltip naming the action.
 - **Tokens only.** Colours, fonts and radii come from CSS variables (`--panel`, `--text-2`, `--border`, `--r-sm`, `--r-md`, ...). No raw hex values in new CSS or markup, except the status glyph colours already defined in `.badge`.
 - **Shape scale:** cards and panels 12px, controls 8px, badges and nav pills fully round. Nothing else.
 - **Numbers are monospaced and tabular** (`var(--mono)` / `.num`).

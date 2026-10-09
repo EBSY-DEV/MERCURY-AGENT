@@ -35,6 +35,7 @@ from mercury.demos import check_campaign as demo_check_campaign
 from mercury.demos import check_outbox_item as demo_check_item
 from mercury.demos import register_requests as register_demo_requests
 from mercury.gate import pre_send_check
+from mercury.offers import blocked_references
 from mercury.integrations.instantly import InstantlyClient
 from mercury.integrations.mail_provider import NATIVE_PROVIDERS, SendResult, get_mail_provider
 from mercury.integrations.mailboxes import (
@@ -821,6 +822,7 @@ class Sender:
             gate = pre_send_check(
                 item["to_email"], subject_out, item["body"],
                 prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
+                blocked_references=await blocked_references(self.state, self.config, item, prospect),
             )
             if not gate:
                 await self.state.update_outbox_item(

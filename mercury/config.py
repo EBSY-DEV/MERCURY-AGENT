@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 from mercury.paths import PROJECT_ROOT
 
@@ -375,15 +375,149 @@ class ComplianceConfig(BaseModel):
 
 
 DEMO_KINDS = ("voice", "website")
+# Sequence steps an offer can give a call to action or angle for.
+MAX_OFFER_STEP = 5
+
+
+def _names(values: list[str]) -> list[str]:
+    """Market and segment names compare case-insensitively."""
+    return [v.strip().lower() for v in values or [] if v and v.strip()]
+
+
+def _signal_codes(values: list[str]) -> list[str]:
+    """Signal codes as the vocabulary stores them. Whether a code exists is
+    a database question, checked by `mercury offers` and the Writer."""
+    codes = []
+    for v in values or []:
+        code = (v or "").strip().upper()
+        if not code:
+            continue
+        if not all(ch.isalnum() or ch == "_" for ch in code):
+            raise ValueError(f"'{v}' is not a signal code (letters, digits and '_', e.g. NO_WEBSITE)")
+        codes.append(code)
+    return codes
+
+
+class OfferSignalRule(BaseModel):
+    """Which observed signals qualify a company for an offer: every code in
+    ``require`` and none in ``exclude``, read the way a cohort reads them
+    (the newest observation per signal, and only a positive one counts)."""
+    require: list[str] = []
+    exclude: list[str] = []
+
+    @field_validator("require", "exclude")
+    @classmethod
+    def _codes(cls, v: list[str]) -> list[str]:
+        return _signal_codes(v)
+
+
+class OfferContent(BaseModel):
+    """The approved description of an offer. With a ``summary`` the brief is
+    the only offer description the Writer sees for that prospect."""
+    name: str = ""
+    # What it is, in one or two plain sentences.
+    summary: str = ""
+    # The only things the email may claim about the offer.
+    claims: list[str] = []
+
+
+class OfferStep(BaseModel):
+    """The call to action and angle of one sequence step."""
+    cta: str = ""
+    angle: str = ""
+
+
+class CaseStudyScope(BaseModel):
+    """Where a case study may be named. Empty lists mean anywhere."""
+    markets: list[str] = []
+    segments: list[str] = []
+
+    @field_validator("markets", "segments")
+    @classmethod
+    def _lower(cls, v: list[str]) -> list[str]:
+        return _names(v)
+
+
+class CaseStudy(BaseModel):
+    """A client story an offer may cite, in approved words, within a scope.
+
+    ``name`` and ``aliases`` are what the pre-send gate looks for: a draft
+    that names a case study outside its scope is blocked.
+    """
+    name: str
+    aliases: list[str] = []
+    summary: str = ""
+    scope: CaseStudyScope = CaseStudyScope()
+
+    @field_validator("name")
+    @classmethod
+    def _named(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("a case study needs a name")
+        return v
+
+    def terms(self) -> list[str]:
+        return [t.strip() for t in [self.name, *self.aliases] if t and t.strip()]
+
+
+class SupportingMaterial(BaseModel):
+    """Optional metadata about something that supports an offer (a sample,
+    a one-pager). Informational: nothing is held for lack of one."""
+    name: str
+    kind: str = ""
+    url: str = ""
+    notes: str = ""
+
+
+class AggregateEvidence(BaseModel):
+    """A statistic computed from Mercury's own observations, never typed in.
+
+    Of the companies checked for every ``require`` signal (optionally only
+    those in ``segments``), how many carry them all and none of
+    ``exclude``. The brief quotes it only when at least ``min_sample``
+    companies were checked.
+    """
+    description: str
+    require: list[str]
+    exclude: list[str] = []
+    segments: list[str] = []
+    min_sample: int = 20
+    # Steps whose brief may quote it. Empty = every step.
+    steps: list[int] = []
+
+    @field_validator("require", "exclude")
+    @classmethod
+    def _codes(cls, v: list[str]) -> list[str]:
+        return _signal_codes(v)
+
+    @field_validator("segments")
+    @classmethod
+    def _lower(cls, v: list[str]) -> list[str]:
+        return _names(v)
+
+    @field_validator("min_sample")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("min_sample must be at least 1")
+        return v
+
+    @model_validator(mode="after")
+    def _has_cohort(self):
+        if not self.require:
+            raise ValueError("evidence needs at least one signal under require")
+        return self
 
 
 class OfferDefinition(BaseModel):
-    """One offer a prospect can be routed to.
+    """One offer a prospect can be routed to (see mercury/offers.py).
 
-    Only what the demo gate needs lives here today: the key that campaigns
-    and outbox rows carry (``offer_key``), and whether the offer promises
-    something already built for that business. Routing rules, offer text and
-    CTAs belong to the offer router (#57) and extend this model.
+    The key is what campaigns and outbox rows carry (``offer_key``). Routing
+    takes the first offer, in configured order, whose rule matches the
+    prospect: ``markets``, ``segments`` and ``signals``. An offer with no
+    rule is only ever chosen as the ``default``, so a config written for the
+    demo gate alone (key, requires_demo, demo_kind) routes nothing.
     """
     key: str
     # true: no sequence email of this offer leaves until a demo for that
@@ -391,6 +525,24 @@ class OfferDefinition(BaseModel):
     requires_demo: bool = False
     # What the demo is: voice (an answering line) or website (a draft site).
     demo_kind: str = ""
+    # The fallback when no offer's rule matches. At most one.
+    default: bool = False
+    # Eligibility: icp.markets names, and segments (the prospect's or its
+    # company's industry). Empty = any.
+    markets: list[str] = []
+    segments: list[str] = []
+    signals: OfferSignalRule = OfferSignalRule()
+    content: OfferContent = OfferContent()
+    # Claim restrictions the brief states verbatim.
+    restrictions: list[str] = []
+    # Signal codes whose newest observation the brief gives as a verified
+    # fact (SERP_RANK, ...). Empty = the codes under signals.require.
+    facts: list[str] = []
+    materials: list[SupportingMaterial] = []
+    # Per step: {1: {cta, angle}, 2: ..., 3: ...}
+    steps: dict[int, OfferStep] = {}
+    case_studies: list[CaseStudy] = []
+    evidence: AggregateEvidence | None = None
 
     @field_validator("key")
     @classmethod
@@ -407,6 +559,39 @@ class OfferDefinition(BaseModel):
         if v and v not in DEMO_KINDS:
             raise ValueError(f"demo_kind must be one of {', '.join(DEMO_KINDS)}")
         return v
+
+    @field_validator("markets", "segments")
+    @classmethod
+    def _lower(cls, v: list[str]) -> list[str]:
+        return _names(v)
+
+    @field_validator("facts")
+    @classmethod
+    def _fact_codes(cls, v: list[str]) -> list[str]:
+        return _signal_codes(v)
+
+    @field_validator("steps")
+    @classmethod
+    def _valid_steps(cls, v: dict[int, OfferStep]) -> dict[int, OfferStep]:
+        for step in v:
+            if not 1 <= step <= MAX_OFFER_STEP:
+                raise ValueError(f"steps are numbered 1 to {MAX_OFFER_STEP}, got {step}")
+        return v
+
+    @property
+    def has_rule(self) -> bool:
+        return bool(self.markets or self.segments or self.signals.require or self.signals.exclude)
+
+    @property
+    def label(self) -> str:
+        return self.content.name.strip() or self.key
+
+    def signal_codes(self) -> set[str]:
+        """Every signal code this offer reads."""
+        codes = set(self.signals.require) | set(self.signals.exclude) | set(self.facts)
+        if self.evidence:
+            codes |= set(self.evidence.require) | set(self.evidence.exclude)
+        return codes
 
 
 class DemosConfig(BaseModel):
@@ -441,7 +626,25 @@ class MercuryConfig(BaseModel):
             if offer.key in seen:
                 raise ValueError(f"offer {offer.key} is listed twice")
             seen.add(offer.key)
+        defaults = [o.key for o in v if o.default]
+        if len(defaults) > 1:
+            raise ValueError(f"only one offer can be the default, got {', '.join(defaults)}")
         return v
+
+    @model_validator(mode="after")
+    def _offer_markets_exist(self):
+        """A market name that matches nothing would silently never route,
+        so a typo fails here. Segments and signal codes are open sets."""
+        known = {m.name.strip().lower() for m in self.icp.markets}
+        for offer in self.offers:
+            named = [("markets", m) for m in offer.markets] + [
+                (f"case study {cs.name}", m) for cs in offer.case_studies for m in cs.scope.markets]
+            for where, market in named:
+                if market not in known:
+                    have = ", ".join(sorted(known)) or "none (icp.markets is empty)"
+                    raise ValueError(f"offer {offer.key}: {where} names market '{market}', "
+                                     f"which is not in icp.markets (have: {have})")
+        return self
 
 
 class EnvConfig(BaseModel):
