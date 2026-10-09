@@ -95,7 +95,7 @@ async def test_pre_merge_dev_db_gets_the_mailbox_column(tmp_path):
 def test_migration_order_contact_policy_v14_v15_then_pauses_v16_demos_v17():
     # main shipped v14/v15 (exclusions, manual review) first; the
     # integration/p0 work (out-of-office pauses, demo gate) comes after.
-    assert len(MIGRATIONS) == 22
+    assert len(MIGRATIONS) == 23
     assert "CREATE TABLE suppressions" in MIGRATIONS[13]
     assert "requires_manual_review" in MIGRATIONS[14]
     assert "CREATE TABLE IF NOT EXISTS sequence_pauses" in MIGRATIONS[15]
@@ -104,10 +104,12 @@ def test_migration_order_contact_policy_v14_v15_then_pauses_v16_demos_v17():
     assert "ALTER TABLE outbox ADD COLUMN thread_subject" in MIGRATIONS[18]
     assert "CREATE TABLE IF NOT EXISTS offer_routes" in MIGRATIONS[20]
     assert "CREATE TABLE pains" in MIGRATIONS[21]
+    assert "CREATE TABLE IF NOT EXISTS registry_lookups" in MIGRATIONS[22]
 
 
 _FULL_TABLES = {"suppressions", "company_holds", "sequence_pauses", "demos",
-                "command_requests", "audit_log", "offer_routes", "pains"}
+                "command_requests", "audit_log", "offer_routes", "pains",
+                "registry_lookups", "registry_name_reviews"}
 
 
 def _assert_full_schema(db: str) -> None:
@@ -119,11 +121,12 @@ def _assert_full_schema(db: str) -> None:
             "approved_revision", "approved_hash", "thread_subject",
             "thread_references", "pain_code"} <= _columns(conn, "outbox")
     assert "offer_key" in _columns(conn, "campaigns")
+    assert "detail_json" in _columns(conn, "observations")
     conn.close()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stamped", [13, 14, 15, 16, 17, 18, 19])
+@pytest.mark.parametrize("stamped", [13, 14, 15, 16, 17, 18, 19, 20, 21, 22])
 async def test_main_line_db_upgrades_at_every_version(tmp_path, stamped):
     db = str(tmp_path / "main.db")
     _apply(db, MIGRATIONS[:stamped])

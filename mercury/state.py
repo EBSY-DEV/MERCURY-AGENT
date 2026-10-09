@@ -847,6 +847,46 @@ MIGRATIONS: list[str] = [
     ALTER TABLE outbox ADD COLUMN pain_code TEXT NOT NULL DEFAULT '';
     CREATE INDEX idx_outbox_pain ON outbox(pain_code) WHERE pain_code != '';
     """,
+    # ── v23: public-registry lookups ──
+    """
+    -- One row per company: the cached answer of the registry lookup,
+    -- including "no match" and "ambiguous". A lookup is made once per
+    -- company; this row is what keeps it from being made again. `people_json`
+    -- holds every natural person the entity page lists, and `candidates_json`
+    -- the entities that were considered, so a reviewer can see why Mercury
+    -- matched or abstained.
+    CREATE TABLE IF NOT EXISTS registry_lookups (
+        company_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        reason TEXT DEFAULT '',
+        entity_name TEXT DEFAULT '',
+        document_number TEXT DEFAULT '',
+        source_url TEXT DEFAULT '',
+        confidence REAL DEFAULT 0,
+        searched_name TEXT DEFAULT '',
+        searched_city TEXT DEFAULT '',
+        candidates_json TEXT DEFAULT '[]',
+        people_json TEXT DEFAULT '[]',
+        looked_up_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- A person's decision on the registry name suggested for one contact.
+    -- Keyed by contact, and remembers WHICH name was decided: a refreshed
+    -- lookup that finds someone else starts the review over.
+    CREATE TABLE IF NOT EXISTS registry_name_reviews (
+        prospect_id TEXT PRIMARY KEY,
+        company_id TEXT DEFAULT '',
+        person_name TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        decided_by TEXT DEFAULT '',
+        decided_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Structured provenance that does not fit value/confidence/url: the
+    -- registry document number, the officer's title code, the match rule.
+    ALTER TABLE observations ADD COLUMN detail_json TEXT DEFAULT '';
+    """,
 ]
 
 
@@ -1484,6 +1524,22 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return self._company_from_row(row) if row else None
+
+    async def find_companies(self, query: str, limit: int = 10) -> list[Company]:
+        """Companies matching an id, a domain, or part of a name."""
+        q = (query or "").strip()
+        if not q:
+            return []
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT * FROM companies
+                   WHERE id = ? OR domain = ? OR name LIKE ? ESCAPE '\\'
+                   ORDER BY (id = ?) DESC, (domain = ?) DESC, created_at DESC LIMIT ?""",
+                (q, _norm(q), "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",
+                 q, _norm(q), int(limit)),
+            ) as cursor:
+                return [self._company_from_row(r) for r in await cursor.fetchall()]
 
     async def get_contacts_for_company(self, company_id: str) -> list[Prospect]:
         async with self._connect() as db:
@@ -3250,6 +3306,7 @@ class StateManager:
         evidence_url: str = "",
         run_id: str = "",
         observed_at: str | None = None,
+        detail: dict | None = None,
     ) -> str:
         """Record one fact. Raises if signal_code isn't in the vocabulary —
         a typo must fail loudly rather than create a junk signal."""
@@ -3259,12 +3316,12 @@ class StateManager:
                 """INSERT INTO observations
                        (id, company_id, prospect_id, signal_code, collector,
                         value_num, value_text, confidence, evidence_url,
-                        observed_at, run_id)
+                        observed_at, run_id, detail_json)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           COALESCE(?, CURRENT_TIMESTAMP), ?)""",
+                           COALESCE(?, CURRENT_TIMESTAMP), ?, ?)""",
                 (obs_id, company_id, prospect_id, signal_code, collector,
                  value_num, value_text, float(confidence), evidence_url,
-                 observed_at, run_id),
+                 observed_at, run_id, json.dumps(detail) if detail else ""),
             )
             await db.commit()
         return obs_id
@@ -3281,6 +3338,7 @@ class StateManager:
                 r.get("value_text", ""), float(r.get("confidence", 1.0)),
                 r.get("evidence_url", ""), r.get("observed_at"),
                 r.get("run_id", run_id),
+                json.dumps(r["detail"]) if r.get("detail") else "",
             )
             for r in rows
         ]
@@ -3289,9 +3347,9 @@ class StateManager:
                 """INSERT INTO observations
                        (id, company_id, prospect_id, signal_code, collector,
                         value_num, value_text, confidence, evidence_url,
-                        observed_at, run_id)
+                        observed_at, run_id, detail_json)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           COALESCE(?, CURRENT_TIMESTAMP), ?)""",
+                           COALESCE(?, CURRENT_TIMESTAMP), ?, ?)""",
                 payload,
             )
             await db.commit()
@@ -3524,6 +3582,121 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return row[0] if row else 0
+
+    # ── Public-registry lookups (one cached answer per company) ──
+
+    @staticmethod
+    def _registry_row(row) -> dict:
+        out = dict(row)
+        for column, key in (("candidates_json", "candidates"), ("people_json", "people")):
+            try:
+                out[key] = json.loads(out.pop(column) or "[]")
+            except (json.JSONDecodeError, TypeError):
+                out[key] = []
+        return out
+
+    async def get_registry_lookup(self, company_id: str) -> dict | None:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM registry_lookups WHERE company_id = ?", (company_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return self._registry_row(row) if row else None
+
+    async def get_registry_lookups(self, company_ids: list[str]) -> dict[str, dict]:
+        ids = [c for c in dict.fromkeys(company_ids) if c]
+        if not ids:
+            return {}
+        out: dict[str, dict] = {}
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                marks = ",".join("?" * len(chunk))
+                async with db.execute(
+                    f"SELECT * FROM registry_lookups WHERE company_id IN ({marks})", chunk
+                ) as cursor:
+                    for row in await cursor.fetchall():
+                        out[row["company_id"]] = self._registry_row(row)
+        return out
+
+    async def save_registry_lookup(self, company_id: str, record: dict) -> None:
+        """Replace the company's cached answer. ``record`` carries the same
+        keys ``get_registry_lookup`` returns."""
+        async with self._connect() as db:
+            await db.execute(
+                """INSERT INTO registry_lookups
+                       (company_id, provider, status, reason, entity_name,
+                        document_number, source_url, confidence, searched_name,
+                        searched_city, candidates_json, people_json, looked_up_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                   ON CONFLICT(company_id) DO UPDATE SET
+                       provider = excluded.provider, status = excluded.status,
+                       reason = excluded.reason, entity_name = excluded.entity_name,
+                       document_number = excluded.document_number,
+                       source_url = excluded.source_url,
+                       confidence = excluded.confidence,
+                       searched_name = excluded.searched_name,
+                       searched_city = excluded.searched_city,
+                       candidates_json = excluded.candidates_json,
+                       people_json = excluded.people_json,
+                       looked_up_at = excluded.looked_up_at""",
+                (company_id, record.get("provider", ""), record["status"],
+                 record.get("reason", ""), record.get("entity_name", ""),
+                 record.get("document_number", ""), record.get("source_url", ""),
+                 float(record.get("confidence") or 0), record.get("searched_name", ""),
+                 record.get("searched_city", ""),
+                 json.dumps(record.get("candidates") or []),
+                 json.dumps(record.get("people") or []),
+                 record.get("looked_up_at")),
+            )
+            await db.commit()
+
+    async def get_registry_reviews(self, prospect_ids: list[str]) -> dict[str, dict]:
+        ids = [p for p in dict.fromkeys(prospect_ids) if p]
+        out: dict[str, dict] = {}
+        if not ids:
+            return out
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            for i in range(0, len(ids), 500):
+                chunk = ids[i:i + 500]
+                marks = ",".join("?" * len(chunk))
+                async with db.execute(
+                    f"SELECT * FROM registry_name_reviews WHERE prospect_id IN ({marks})",
+                    chunk,
+                ) as cursor:
+                    for row in await cursor.fetchall():
+                        out[row["prospect_id"]] = dict(row)
+        return out
+
+    async def set_registry_review(self, prospect_id: str, company_id: str,
+                                  person_name: str, decision: str,
+                                  decided_by: str = "") -> None:
+        if decision not in ("accepted", "dismissed"):
+            raise ValueError(f"invalid registry review decision: {decision}")
+        async with self._connect() as db:
+            await db.execute(
+                """INSERT INTO registry_name_reviews
+                       (prospect_id, company_id, person_name, decision, decided_by)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(prospect_id) DO UPDATE SET
+                       company_id = excluded.company_id,
+                       person_name = excluded.person_name,
+                       decision = excluded.decision,
+                       decided_by = excluded.decided_by,
+                       decided_at = CURRENT_TIMESTAMP""",
+                (prospect_id, company_id, person_name, decision, decided_by),
+            )
+            await db.commit()
+
+    async def clear_registry_review(self, prospect_id: str) -> bool:
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "DELETE FROM registry_name_reviews WHERE prospect_id = ?", (prospect_id,))
+            await db.commit()
+            return cursor.rowcount > 0
 
     # ── Run log (what ran, when, what it produced and cost) ──
 

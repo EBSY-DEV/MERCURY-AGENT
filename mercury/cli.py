@@ -1128,6 +1128,96 @@ def cmd_import(args):
         sys.exit(1)
 
 
+def cmd_registry(args):
+    """Look a company up in its public business registry, or show what it found.
+
+    `show` reads the stored result and never touches the network. `lookup`
+    fetches only when there is no stored result (or with --force), and only
+    after the CONTACT_FOUND signal has been confirmed.
+    """
+    import json
+
+    from mercury.registry.contacts import registry_views
+    from mercury.registry.service import RegistryService, default_providers
+    from mercury.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        service = RegistryService(state, default_providers())
+        try:
+            if args.registry_action == "list":
+                import aiosqlite
+                async with aiosqlite.connect(state.db_path) as db:
+                    counts = await (await db.execute(
+                        "SELECT status, COUNT(*) FROM registry_lookups GROUP BY status")).fetchall()
+                if args.json:
+                    return print(json.dumps(dict(counts), indent=2))
+                if not counts:
+                    return print("\n  No registry lookups yet. Try: mercury registry lookup COMPANY\n")
+                print("\n  Registry lookups")
+                for status, n in counts:
+                    print(f"    {n:>5}  {status}")
+                print()
+                return
+
+            if not args.company:
+                raise SystemExit(f"Which company? mercury registry {args.registry_action} COMPANY "
+                                 "(an id, a domain, or part of the name)")
+            found = await state.find_companies(args.company)
+            if not found:
+                raise SystemExit(f"No company matches {args.company!r}.")
+            if len(found) > 1 and found[0].id != args.company and found[0].domain != args.company.lower():
+                lines = "\n".join(f"    {c.id}  {c.name}  ({c.domain})" for c in found)
+                raise SystemExit(f"{len(found)} companies match {args.company!r}; use an id:\n{lines}")
+            company = found[0]
+
+            if args.registry_action == "lookup":
+                result = await service.lookup(company, force=args.force)
+            else:
+                result = await service.cached(company)
+                if result is None:
+                    provider = service.provider_for(company.location)
+                    from mercury.registry.service import RegistryResult
+                    result = RegistryResult("not_looked_up" if provider else "not_eligible",
+                                            provider=provider.key if provider else "")
+            if args.json:
+                return print(json.dumps(result.as_dict(), indent=2))
+
+            print(f"\n  {company.name}  ({company.location or 'no location'})")
+            note = {
+                "matched": "one active entity matches the name and city",
+                "ambiguous": "abstained: " + result.reason.replace("_", " "),
+                "no_match": "no plausible entity: " + result.reason.replace("_", " "),
+                "not_eligible": "no supported registry covers this location",
+                "not_looked_up": "eligible, not looked up yet (mercury registry lookup)",
+                "unavailable": "the registry could not be read: " + result.reason,
+                "skipped": result.reason + " (mercury signals --confirm CONTACT_FOUND)",
+            }.get(result.status, result.reason)
+            print(f"  Registry: {result.status}, {note}" + ("  [stored]" if result.cached else ""))
+            if result.status == "matched":
+                print(f"  Entity:   {result.entity_name}  ({result.document_number})")
+                print(f"  Source:   {result.source_url}")
+                print(f"  Matched:  {result.confidence:.2f} confidence, looked up {result.looked_up_at}")
+                for person in result.people:
+                    print(f"    - {person['name']}  {person['title']}")
+            for cand in result.candidates if result.status in ("ambiguous", "no_match") else []:
+                print(f"    considered: {cand['name']} ({cand['document_number']}, {cand['status']})")
+            contacts = await state.get_contacts_for_company(company.id)
+            if contacts:
+                views = await registry_views(state, [c.model_dump() for c in contacts])
+                print("\n  Contacts")
+                for c in contacts:
+                    v = views[c.id]
+                    suggestion = f", suggests {v['person']['name']}" if v["person"] and v["shared_inbox"] else ""
+                    print(f"    {c.email or '(no email)':<38} name: {v['name_status']}{suggestion}")
+            print()
+        finally:
+            await service.aclose()
+
+    asyncio.run(_run())
+
+
 def cmd_imports(args):
     """List import batches, verify their addresses, release them to outreach."""
     import json
@@ -1769,6 +1859,18 @@ def main():
     sub.add_argument("--all-rows", action="store_true", help="List every row, not just problems")
     sub.add_argument("--json", action="store_true", help="Machine-readable result")
     sub.set_defaults(func=cmd_import)
+
+    sub = subparsers.add_parser(
+        "registry", help="Public business registry: look up who is behind a company")
+    sub.add_argument("registry_action", nargs="?", default="list",
+                     choices=["list", "show", "lookup"],
+                     help="list: counts; show: the stored result; lookup: fetch it")
+    sub.add_argument("company", nargs="?", default="",
+                     help="Company id, domain, or part of the name")
+    sub.add_argument("--force", action="store_true",
+                     help="lookup: ignore the stored result and fetch again")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub.set_defaults(func=cmd_registry)
 
     sub = subparsers.add_parser("imports", help="Import batches: list, show, verify, release")
     sub.add_argument("imports_action", nargs="?", default="list",
