@@ -25,6 +25,26 @@ from datetime import datetime, timezone
 from mercury.brain import AGENT_SKILLS, Brain
 from mercury.config import MercuryConfig
 from mercury.integrations.mail_provider import NATIVE_PROVIDERS
+from mercury.draft_rules import (
+    REVIEW_SIGNAL_CODES,
+    apply_short_name,
+    count_words,
+    draft_flags,
+    strip_generic_greeting,
+    strip_review_claims,
+    word_limit,
+    word_limits,
+)
+from mercury.greeting import (
+    NAMED,
+    ROUTING,
+    GreetingPlan,
+    business_names,
+    plan_greeting,
+    prompt_lines as greeting_lines,
+    sequence_lines,
+)
+from mercury.greeting import fact_line as greeting_fact_line
 from mercury.models.campaign import Campaign, EmailStep
 from mercury.offers import (
     ConfirmedPain,
@@ -48,6 +68,7 @@ from mercury.pains import (
 )
 from mercury.state import StateManager
 from mercury.personas import PersonaStore, voice_instructions
+from mercury.registry.base import name_variants, short_business_name
 from mercury.voices import MailboxVoices
 
 logger = logging.getLogger("mercury.writer")
@@ -79,6 +100,22 @@ class PainPlan:
     @property
     def code(self) -> str:
         return self.pain.code if self.pain is not None else ""
+
+
+@dataclass
+class DraftContext:
+    """What a draft is checked against once the model has answered."""
+    step: int
+    limit: int
+    decision: RouteDecision
+    brief: OfferBrief | None
+    plan: PainPlan
+    greeting: GreetingPlan
+    full_name: str = ""
+    short_name: str = ""
+    variants: list = field(default_factory=list)
+    business_names: list = field(default_factory=list)
+    who: str = ""
 
 
 def _selection(plan: PainPlan) -> PainSelection:
@@ -144,6 +181,7 @@ class Writer:
             persona_company=self.config.persona.company,
             persona_role=self.config.persona.role,
             persona_tone=profile["tone"],
+            **{f"word_limit_{n}": limit for n, limit in word_limits(self.config).items()},
         ) or (
             f"You are {profile.get('signer') or self.config.persona.name}, {self.config.persona.role} "
             f"at {self.config.persona.company}.\nProduct: {product.name}\n"
@@ -398,6 +436,10 @@ class Writer:
                 mailbox=mailbox,
                 offer_key=decision.key,
                 pain_code=draft.get("pain_code", ""),
+                # A draft over its limit is queued flagged, and a flagged draft
+                # waits for a person even when approval is otherwise automatic.
+                word_limit=draft.get("word_limit", 0),
+                flags=draft.get("flags"),
             )
             if item_id:
                 drafted += 1
@@ -408,6 +450,180 @@ class Writer:
                 f"({'awaiting approval' if require_approval else 'approved'})."
             )
 
+    # ── Rules every draft is held to ──
+
+    def _limit(self, step: int) -> int:
+        return word_limit(self.config, step)
+
+    async def _company_of(self, prospect):
+        if not getattr(prospect, "company_id", ""):
+            return None
+        try:
+            return await self.state.get_company(prospect.company_id)
+        except Exception:
+            return None
+
+    async def _greeting(self, prospect, company, brief) -> GreetingPlan:
+        """Who the email greets, from the registry resolver. If it cannot be
+        worked out the reader is treated as unnamed: no greeting is safer
+        than a wrong one."""
+        try:
+            return await plan_greeting(self.state, self.config, prospect, company, brief)
+        except Exception as e:
+            logger.warning(f"Writer: could not resolve a greeting for {getattr(prospect, 'email', '')}: {e}")
+            return GreetingPlan()
+
+    def _business(self, prospect, company) -> tuple[str, str, list[str]]:
+        """(full name, short name, other spellings of the full name)."""
+        full = (getattr(prospect, "company", "") or getattr(company, "name", "") or "").strip()
+        return full, short_business_name(full), name_variants(full)
+
+    def _name_rule(self, full: str, short: str) -> str:
+        if not full or short.strip().lower() == full.strip().lower():
+            return ""
+        return (f"\n- Business name: use \"{full}\" in full at most once in the whole email. After that, and "
+                f"in the subject line, say \"{short}\". Never put a legal suffix or a location after a dash "
+                "in the subject or the call to action.")
+
+    def _facts(self, prospect, company, greeting: GreetingPlan, names: tuple[str, str, list[str]]) -> list[str]:
+        """What the Writer knows about the reader. Review counts and ratings
+        are left out on purpose: they stay in the scoring notes."""
+        full, short, _variants = names
+        facts = [greeting_fact_line(greeting, prospect)]
+        if prospect.title and greeting.mode != ROUTING:
+            facts.append(f"- Title: {prospect.title}")
+        if full and short.strip().lower() != full.strip().lower():
+            facts.append(f"- Company (full legal name, use it at most once): {full}")
+            facts.append(f"- Short business name (use it after the first mention and in subject lines): {short}")
+        else:
+            facts.append(f"- Company: {full}")
+        if prospect.industry:
+            facts.append(f"- Industry: {prospect.industry}")
+        if company:
+            if company.location:
+                facts.append(f"- Location: {company.location}")
+            description = strip_review_claims(company.description)
+            if description:
+                facts.append(f"- What the company says about itself: {description}")
+            if company.tech_stack:
+                facts.append(f"- Tools detected on their website: {', '.join(company.tech_stack[:6])}")
+            for signal in company.signals[:3]:
+                if str(signal.get("type", "")).upper() in REVIEW_SIGNAL_CODES:
+                    continue
+                detail = strip_review_claims(str(signal.get("detail", "")))
+                if detail:
+                    facts.append(f"- Signal ({signal.get('type', 'signal')}): {detail}")
+        notes = strip_review_claims(prospect.personalization_notes)
+        if notes:
+            facts.append(f"- Research notes: {notes}")
+        return facts
+
+    async def _voice_for(self, item: dict, earlier: list[dict]) -> dict:
+        """The persona an existing email is written in: its own generation's,
+        else its opener's, else the voice of the mailbox it goes out from,
+        else the default. A follow-up never drifts to another persona."""
+        for gid in [item.get("generation_id") or "", *(row.get("generation_id") or "" for row in earlier)]:
+            snapshot = await self.personas.snapshot(gid)
+            if snapshot:
+                return snapshot
+        mailbox = (item.get("mailbox") or next((r["mailbox"] for r in earlier if r.get("mailbox")), "")).strip()
+        if mailbox:
+            return await self.voices.profile_for(mailbox)
+        return await self.personas.resolve(self.config)
+
+    async def _earlier_emails(self, item: dict) -> list[dict]:
+        """The emails of this thread before ``item``, oldest first."""
+        step = int(item.get("step") or 1)
+        if step <= 1 or not item.get("campaign_id"):
+            return []
+        try:
+            import aiosqlite
+
+            async with aiosqlite.connect(self.state.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT step, subject, body, generation_id, mailbox FROM outbox "
+                    "WHERE campaign_id = ? AND prospect_id = ? AND kind = 'sequence' AND step < ? "
+                    "ORDER BY step ASC",
+                    (item.get("campaign_id"), item.get("prospect_id"), step),
+                ) as cursor:
+                    return [dict(r) for r in await cursor.fetchall()]
+        except Exception:
+            return []
+
+    # ── Checking and retrying a draft ──
+
+    def _attempt_draft(self, result, ctx: DraftContext, verb: str) -> dict | None:
+        """A model answer, if it is usable: both fields present, no case study
+        outside its scope, no rejected pain. A generic greeting is stripped
+        from a reader with no name, and the business name is held to the
+        full-once rule."""
+        if not isinstance(result, dict):
+            return None
+        subject = str(result.get("subject") or "").strip()
+        body = str(result.get("body") or "").strip()
+        if not subject or not body:
+            return None
+        hits = self._out_of_scope(self._blocked(ctx.decision, ctx.brief, [ctx.decision.context]), subject, body)
+        if hits:
+            logger.warning(f"Writer: discarded {verb} for {ctx.who}: it names a case "
+                           f"study outside its scope ({', '.join(hits)}).")
+            return None
+        rejected = self._raises_rejected_pain(ctx.plan, subject, body)
+        if rejected:
+            logger.warning(f"Writer: discarded {verb} for {ctx.who}: it raises a "
+                           f"rejected pain ({', '.join(rejected)}).")
+            return None
+        if ctx.greeting.mode != NAMED:
+            body, removed = strip_generic_greeting(body, ctx.business_names)
+            if removed:
+                logger.info(f"Writer: removed the generic greeting {removed!r} from {verb} for {ctx.who}.")
+        subject, body = apply_short_name(subject, body, ctx.full_name, ctx.short_name, ctx.variants)
+        return {"subject": subject[:120], "body": body[:2000]}
+
+    def _shorter(self, draft: dict, ctx: DraftContext) -> str:
+        return (
+            f"\n\nYOUR PREVIOUS DRAFT IS TOO LONG: {count_words(draft['body'])} words. This email may have at "
+            f"most {ctx.limit} words, counted over the whole body including the greeting and the sign-off. "
+            f"Write it again, shorter: at most {ctx.limit} words including greeting and sign-off. Keep the "
+            "facts, the one ask and every rule above; cut everything else.\n"
+            f'Previous draft:\n"""\n{draft["body"]}\n"""\n\n'
+            'Return ONLY JSON: {"subject": "...", "body": "..."}'
+        )
+
+    async def _draft(self, prompt: str, ctx: DraftContext, profile, task: str, instruction: str = "",
+                     verb: str = "the draft") -> dict | None:
+        """One email from the model, held to its step's word limit before it
+        can be staged. A draft over the limit is written again once, with an
+        explicit shorter-than-N instruction; if the better of the two is still
+        over, it is returned FLAGGED (``flags``, ``word_limit``) so the Outbox
+        shows it and a person has to choose to approve it."""
+        result = await self.brain.think_json(
+            prompt, session_id="mercury-writer", agent="writer", task=task)
+        draft = self._attempt_draft(result, ctx, verb)
+        if draft is None:
+            return None
+        used = prompt
+        if count_words(draft["body"]) > ctx.limit:
+            retry_prompt = prompt + self._shorter(draft, ctx)
+            again = self._attempt_draft(await self.brain.think_json(
+                retry_prompt, session_id="mercury-writer", agent="writer", task=task), ctx, verb)
+            if again is not None and count_words(again["body"]) < count_words(draft["body"]):
+                draft, used = again, retry_prompt
+        record = dict(draft)
+        draft["generation_id"] = await self.personas.record(profile, self.config, used, record, task, instruction)
+        draft["pain_code"] = ctx.plan.code
+        draft["word_limit"] = ctx.limit
+        draft["flags"] = draft_flags(draft["body"], ctx.limit, check_greeting=True,
+                                     business_names=ctx.business_names)
+        if draft["flags"]:
+            logger.warning(f"Writer: {verb} for {ctx.who} is flagged ({', '.join(draft['flags'])}; "
+                           f"{count_words(draft['body'])} / {ctx.limit} words). It is staged for review, "
+                           "not for automatic approval.")
+        return draft
+
+    # ── Email 1 ──
+
     async def build_personal_prompt(self, prospect, instruction: str = "", profile=None, decision=None):
         """The same assembled inputs for prompt inspection, preview and drafting."""
         sections, profile = await self.personal_prompt_sections(prospect, instruction, profile, decision)
@@ -416,8 +632,7 @@ class Writer:
     async def personal_prompt_sections(self, prospect, instruction: str = "", profile=None, decision=None):
         """The first-email prompt as labelled pieces, in the order the writer receives them.
         ``decision`` None routes the prospect now (prompt inspection, preview)."""
-        sections, profile, _brief, _decision, _plan = await self._personal_inputs(
-            prospect, instruction, profile, decision)
+        sections, profile, _ctx = await self._personal_inputs(prospect, instruction, profile, decision)
         return sections, profile
 
     async def _personal_inputs(self, prospect, instruction: str = "", profile=None,
@@ -430,33 +645,10 @@ class Writer:
         if decision.offer is not None:
             brief = await build_brief(self.state, self.config, decision, [1], [decision.context],
                                       plan.pain)
-        facts = [
-            f"- Name: {prospect.full_name()}",
-            f"- Title: {prospect.title}",
-            f"- Company: {prospect.company}",
-        ]
-        if prospect.industry:
-            facts.append(f"- Industry: {prospect.industry}")
-
-        company = None
-        if prospect.company_id:
-            try:
-                company = await self.state.get_company(prospect.company_id)
-            except Exception:
-                company = None
-        if company:
-            if company.location:
-                facts.append(f"- Location: {company.location}")
-            if company.description:
-                facts.append(f"- What the company says about itself: {company.description}")
-            if company.tech_stack:
-                facts.append(f"- Tools detected on their website: {', '.join(company.tech_stack[:6])}")
-            for signal in company.signals[:3]:
-                facts.append(
-                    f"- Signal ({signal.get('type', 'signal')}): {signal.get('detail', '')}"
-                )
-        if prospect.personalization_notes:
-            facts.append(f"- Research notes: {prospect.personalization_notes}")
+        company = await self._company_of(prospect)
+        greeting = await self._greeting(prospect, company, brief)
+        names = self._business(prospect, company)
+        facts = self._facts(prospect, company, greeting, names)
         lang_line = await self._market_lang([prospect])
         # Half of the first 24 subjects sent were a variant of "quote form":
         # the model converges on the strongest fact. Show it what is already
@@ -488,15 +680,39 @@ class Writer:
             if instruction and instruction.strip() else ""
         )
 
+        limit = self._limit(1)
         cta = brief.step(1) if brief is not None else None
-        shape = (
-            "One specific observation from the FACTS above, then the\n"
-            "  call to action the OFFER BRIEF gives for this email as its one\n"
-            "  question. Say about the offer only what the OFFER BRIEF allows."
-            if cta is not None and cta.cta else
-            "One specific observation from the FACTS above, one\n"
-            "  question. No pitch, no product name."
-        )
+        # What the email's one ask is. A shared inbox with no known name is
+        # asked to route the message, and that request is the ask.
+        routing = greeting.mode == ROUTING
+        ask = ("the routing request from the Greeting requirement below, as its one ask (the OFFER BRIEF's "
+               "call to action is not used in this email)" if routing else
+               "the call to action the OFFER BRIEF gives for this email as its one question")
+        if brief is not None and brief.offer_sentence(1):
+            shape = (
+                "One specific observation from the FACTS above, then the offer in one plain\n"
+                "  sentence, as the OFFER BRIEF gives it for this email (the brief asks this email\n"
+                f"  to state the offer, so that one sentence is allowed), then {ask}.\n"
+                "  Say nothing else about the offer."
+            )
+        elif routing:
+            shape = (
+                "One specific observation from the FACTS above, then\n"
+                f"  {ask}.\n"
+                + ("  Say about the offer only what the OFFER BRIEF allows." if brief is not None
+                   else "  No pitch, no product name.")
+            )
+        elif cta is not None and cta.cta:
+            shape = (
+                "One specific observation from the FACTS above, then the\n"
+                "  call to action the OFFER BRIEF gives for this email as its one\n"
+                "  question. Say about the offer only what the OFFER BRIEF allows."
+            )
+        else:
+            shape = (
+                "One specific observation from the FACTS above, one\n"
+                "  question. No pitch, no product name."
+            )
         task = f"""
 
 Write ONE cold email (the very first touch) to this specific person.
@@ -508,7 +724,8 @@ or anything else:
 {chr(10).join(facts)}
 
 Requirements:
-- 50-90 words. {shape}
+- At most {limit} words in the body, counting the greeting and the sign-off. {shape}
+- {greeting_lines(greeting, 1)}{self._name_rule(names[0], names[1])}
 - Write the actual text (no merge variables — you know their name/company).
 - Subject: lowercase, 2-4 words, reads like an internal note.
 - Language and register: {lang_line}
@@ -518,49 +735,50 @@ Requirements:
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
         sections = self._base_sections(profile, brief, plan) + [("email", "This email", task)]
-        return sections, profile, brief, decision, plan
+        ctx = DraftContext(
+            step=1, limit=limit, decision=decision, brief=brief, plan=plan, greeting=greeting,
+            full_name=names[0], short_name=names[1], variants=names[2],
+            business_names=business_names(prospect, company), who=getattr(prospect, "email", ""))
+        return sections, profile, ctx
 
     async def _write_personal_email(self, prospect, instruction: str = "", profile=None,
                                     decision: RouteDecision | None = None) -> dict | None:
-        sections, profile, brief, decision, plan = await self._personal_inputs(
-            prospect, instruction, profile, decision)
+        sections, profile, ctx = await self._personal_inputs(prospect, instruction, profile, decision)
         prompt = "".join(text for _key, _label, text in sections)
-        result = await self.brain.think_json(
-            prompt, session_id="mercury-writer",
-            agent="writer", task="personal_email",
-        )
-        if not isinstance(result, dict):
-            return None
-        subject = str(result.get("subject") or "").strip()
-        body = str(result.get("body") or "").strip()
-        if not subject or not body:
-            return None
-        hits = self._out_of_scope(self._blocked(decision, brief, [decision.context]), subject, body)
-        if hits:
-            logger.warning(f"Writer: discarded the draft for {prospect.email}: it names a case "
-                           f"study outside its scope ({', '.join(hits)}).")
-            return None
-        rejected = self._raises_rejected_pain(plan, subject, body)
-        if rejected:
-            logger.warning(f"Writer: discarded the draft for {prospect.email}: it raises a "
-                           f"rejected pain ({', '.join(rejected)}).")
-            return None
-        draft = {"subject": subject[:120], "body": body[:2000]}
-        draft["generation_id"] = await self.personas.record(
-            profile, self.config, prompt, draft, "personal_email", instruction,
-        )
-        draft["pain_code"] = plan.code
-        return draft
+        return await self._draft(prompt, ctx, profile, "personal_email", instruction, "the draft")
+
+    # ── Follow-ups ──
+
+    def _step_role(self, step: int, limit: int, brief: OfferBrief | None) -> str:
+        """What this email is for. An offer brief that gives the step an angle
+        or a call to action decides it; the fixed descriptions are the
+        fallback for a config without one."""
+        spec = brief.step(step) if brief is not None else None
+        if spec is not None and (spec.cta or spec.angle or spec.state_offer):
+            return (f"email {step} of the thread, at most {limit} words including greeting and sign-off. "
+                    f"Use the angle and call to action the OFFER BRIEF gives for email {step}")
+        proof = ("the approved claims or a case study in the OFFER BRIEF"
+                 if brief is not None and brief.authoritative else "the product knowledge")
+        if step == 2:
+            return (f"a FOLLOW-UP sent 3 days after the first email: at most {limit} words including "
+                    "greeting and sign-off, at least four sentences, stands on its own, a different "
+                    f"angle with one concrete proof point from {proof}, and an interest-based question")
+        return (f"the BREAK-UP email, the last one: at most {limit} words including greeting and "
+                "sign-off, gives permission to say no, leaves the door open, no guilt")
 
     async def regenerate_email(self, item: dict, prospect, instruction: str = "") -> dict | None:
         """Rewrite one outbox draft from the review desk.
 
         Step 1 is drafted again from the facts; a follow-up is rewritten in
-        the context of the first email of its thread. The reviewer's
-        instruction ("más corto", "menciona la constructora") is binding.
+        the voice of the persona its thread started with, with its step's
+        angle and call to action from the offer brief, and with the earlier
+        emails of the thread in front of it so it adds something new instead
+        of repeating them. The reviewer's instruction ("más corto",
+        "menciona la constructora") is binding.
         """
-        profile = await self.personas.for_generation(self.config, item.get("generation_id", ""))
         step = int(item.get("step") or 1)
+        earlier = await self._earlier_emails(item)
+        profile = await self._voice_for(item, earlier)
         # A rewrite keeps the offer the email was written for; it is never
         # routed again (a row without one stays without one).
         decision = await decision_for_key(self.state, self.config, prospect,
@@ -568,21 +786,6 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         if step == 1:
             return await self._write_personal_email(prospect, instruction=instruction,
                                                     profile=profile, decision=decision)
-
-        first = ""
-        try:
-            import aiosqlite
-
-            async with aiosqlite.connect(self.state.db_path) as db:
-                async with db.execute(
-                    "SELECT body FROM outbox WHERE campaign_id = ? AND prospect_id = ? "
-                    "AND step = 1 ORDER BY created_at DESC LIMIT 1",
-                    (item.get("campaign_id"), item.get("prospect_id")),
-                ) as cursor:
-                    row = await cursor.fetchone()
-                    first = row[0] if row else ""
-        except Exception:
-            first = ""
 
         lang_line = await self._market_lang([prospect])
         instruction_line = (
@@ -594,63 +797,60 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         if decision.offer is not None:
             brief = await build_brief(self.state, self.config, decision, [step], [decision.context],
                                       plan.pain)
-        proof = ("the approved claims or a case study in the OFFER BRIEF"
-                 if brief is not None and brief.authoritative else "the product knowledge")
-        role = (
-            "a FOLLOW-UP sent 3 days after the first email: 60-110 words, at least "
-            "four sentences, stands on its own, a different angle with one concrete "
-            f"proof point from {proof}, and an interest-based question"
-            if step == 2 else
-            "the BREAK-UP email, the last one: 30-50 words, gives permission to say "
-            "no, leaves the door open, no guilt"
-        )
-        if brief is not None and brief.step(step) is not None:
-            role += (f". Use the angle and call to action the OFFER BRIEF gives for email {step}; "
-                     "they take precedence over this description")
+        company = await self._company_of(prospect)
+        greeting = await self._greeting(prospect, company, brief)
+        names = self._business(prospect, company)
+        facts = self._facts(prospect, company, greeting, names)
+        limit = self._limit(step)
+        thread = "\n\n".join(
+            f'Email {row["step"]} (subject: {row["subject"]}):\n"""\n{row["body"]}\n"""' for row in earlier
+        ) or "(not available)"
         prompt = self._base_prompt(profile, brief, plan)
         prompt += f"""
 
-Rewrite ONE email for this person: {prospect.full_name()}, {prospect.title} at {prospect.company}.
-It is {role}.
+Rewrite ONE email for this reader. It is {self._step_role(step, limit, brief)}.
 
-The first email of the thread was:
-\"\"\"
-{first or "(not available)"}
-\"\"\"
+FACTS — everything you know about them. Every claim about the prospect must come from
+these facts; do not invent anything:
+{chr(10).join(facts)}
+
+The earlier emails of this thread, oldest first. The reader has already read them:
+{thread}
+
+This email must add something new. Do not repeat or paraphrase any sentence of the earlier
+emails, and above all do not say again what the product or the offer is: an earlier email
+has already said it, so assume the reader knows and bring one new piece of information.
 
 Requirements:
+- At most {limit} words in the body, counting the greeting and the sign-off.
+- {greeting_lines(greeting, step)}{self._name_rule(names[0], names[1])}
 - Write the actual text (no merge variables).
 - Subject: lowercase, 2-4 words, like an internal note.
+- Write in the WRITING VOICE above, the same voice as email 1.
 - Language and register: {lang_line}
+- {self._sign_off_rule(profile)}
 - Follow every STRICT EMAIL RULE and the EVIDENCE-BACKED RULES above.{instruction_line}
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
-        result = await self.brain.think_json(
-            prompt, session_id="mercury-writer",
-            agent="writer", task="regenerate_email",
-        )
-        if not isinstance(result, dict):
-            return None
-        subject = str(result.get("subject") or "").strip()
-        body = str(result.get("body") or "").strip()
-        if not subject or not body:
-            return None
-        hits = self._out_of_scope(self._blocked(decision, brief, [decision.context]), subject, body)
-        if hits:
-            logger.warning(f"Writer: discarded a rewrite for {prospect.email}: it names a case "
-                           f"study outside its scope ({', '.join(hits)}).")
-            return None
-        rejected = self._raises_rejected_pain(plan, subject, body)
-        if rejected:
-            logger.warning(f"Writer: discarded a rewrite for {prospect.email}: it raises a "
-                           f"rejected pain ({', '.join(rejected)}).")
-            return None
-        draft = {"subject": subject[:120], "body": body[:2000]}
-        draft["generation_id"] = await self.personas.record(
-            profile, self.config, prompt, draft, "regenerate_email", instruction,
-        )
-        draft["pain_code"] = plan.code
-        return draft
+        ctx = DraftContext(
+            step=step, limit=limit, decision=decision, brief=brief, plan=plan, greeting=greeting,
+            full_name=names[0], short_name=names[1], variants=names[2],
+            business_names=business_names(prospect, company), who=getattr(prospect, "email", ""))
+        return await self._draft(prompt, ctx, profile, "regenerate_email", instruction, "a rewrite")
+
+    # ── Language ──
+
+    def _market_of(self, prospect, company):
+        """(the icp.markets entry the company belongs to or None, its language)."""
+        markets = getattr(self.config.icp, "markets", None) or []
+        loc = ((getattr(company, "location", "") or "") + " "
+               + (getattr(company, "domain", "") or "")).lower()
+        for market in markets:
+            if any(place.lower() in loc for place in market.places):
+                return market, market.lang
+        if loc.rstrip().endswith(".do") or ".com.do" in loc or "domin" in loc:
+            return None, "es"
+        return None, ""
 
     async def _market_lang(self, prospects: list) -> str:
         """The language line for a batch, decided from the prospects' market.
@@ -658,36 +858,53 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         Matched against icp.markets by company location (or a .do domain),
         never left to the model: half the Dominican follow-ups came out in
         English when the sequence prompt did not say which language to use.
+
+        A market may carry its own ``language_line`` (replacing the built-in
+        line), ``language_rules`` and ``terminology``; those come from private
+        config and are added to every prompt for prospects in that market.
+
+        Region-specific text still hard-coded, which that config can replace
+        when it is moved out of the repository: the two built-in lines below,
+        the ``.do`` / "domin" detection in ``_market_of``, and in
+        prompts/writer.md the CASE STUDIES AND REGISTER section, the whole
+        DOMINICAN REGISTER section, the Latin America bullet of the
+        EVIDENCE-BACKED RULES, and the Spanish allowances in rule 16 and in
+        the LANGUAGE section.
         """
         votes: dict[str, int] = {}
-        markets = getattr(self.config.icp, "markets", None) or []
+        winners: dict[str, object] = {}
         for prospect in prospects[:8]:
-            company = None
-            if getattr(prospect, "company_id", ""):
-                try:
-                    company = await self.state.get_company(prospect.company_id)
-                except Exception:
-                    company = None
-            loc = ((getattr(company, "location", "") or "") + " "
-                   + (getattr(company, "domain", "") or "")).lower()
-            lang = ""
-            for market in markets:
-                if any(place.lower() in loc for place in market.places):
-                    lang = market.lang
-                    break
-            if not lang and (loc.rstrip().endswith(".do") or ".com.do" in loc
-                             or "domin" in loc):
-                lang = "es"
+            company = await self._company_of(prospect)
+            market, lang = self._market_of(prospect, company)
             if lang:
                 votes[lang] = votes.get(lang, 0) + 1
+                if market is not None:
+                    winners.setdefault(lang, market)
         lang = max(votes, key=votes.get) if votes else "en"
-        if lang == "es":
-            return ("Spanish, for prospects in the Dominican Republic. The whole "
+        market = winners.get(lang)
+        writer_cfg = getattr(self.config, "writer", None)
+        custom = (market.language_line if market is not None
+                  else getattr(writer_cfg, "default_language_line", "")) or ""
+        if custom.strip():
+            line = custom.strip()
+        elif lang == "es":
+            line = ("Spanish, for prospects in the Dominican Republic. The whole "
                     "sequence follows DOMINICAN REGISTER above — emails 2 and 3 "
                     "too. No English anywhere, not even a subject line.")
-        return ("English, for prospects in the United States. Never mention the "
-                "Dominican Republic or a Dominican client; say \"a local business "
-                "like yours\".")
+        else:
+            line = ("English, for prospects in the United States. Never mention the "
+                    "Dominican Republic or a Dominican client; say \"a local business "
+                    "like yours\".")
+        rules = list(market.language_rules if market is not None else getattr(writer_cfg, "language_rules", []))
+        terms = dict(market.terminology) if market is not None else {}
+        if terms:
+            rules.append("Terminology: " + "; ".join(
+                f'say "{wanted}", never "{avoid}"' for avoid, wanted in terms.items()) + ".")
+        if rules:
+            line += "\n  Market language rules (binding):\n" + "\n".join(f"  - {r}" for r in rules)
+        return line
+
+    # ── The shared sequence ──
 
     async def _write_sequence(self, prospects: list, profile=None,
                               decisions: dict | None = None) -> list[EmailStep]:
@@ -708,10 +925,12 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         if decision.offer is not None:
             brief = await build_brief(self.state, self.config, decision, [1, 2, 3], contexts, plan.pain)
         lang_line = await self._market_lang(prospects)
+        greetings = [await self._greeting(p, await self._company_of(p), brief) for p in prospects]
         # Build context about the prospects
         prospect_summary = "\n".join(
             f"- {p.full_name()}, {p.title} at {p.company}"
-            + (f" | Notes: {p.personalization_notes}" if p.personalization_notes else "")
+            + (f" | Notes: {strip_review_claims(p.personalization_notes)}"
+               if strip_review_claims(p.personalization_notes) else "")
             for p in prospects[:5]  # Show sample for context
         )
 
@@ -724,6 +943,14 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             "  they take precedence over the descriptions above."
             if brief is not None and any(brief.step(n) for n in (1, 2, 3)) else ""
         )
+        l1, l2, l3 = (self._limit(n) for n in (1, 2, 3))
+        offer_once = (
+            "\n- The OFFER BRIEF asks for the offer to be stated in one plain sentence in some emails: say "
+            "it only in the email(s) it names, never again in a later one. Each email adds new information "
+            "and never repeats the product or offer sentence of an earlier one."
+            if brief is not None else
+            "\n- Each email adds new information and never repeats the product sentence of an earlier one."
+        )
 
         prompt += f"""
 
@@ -731,22 +958,25 @@ Write a 3-email cold outreach sequence for prospects like these:
 {prospect_summary}
 
 Requirements:
-- Email 1: Personalized cold observation + one question. 50-90 words. No pitch.
+- Every email's word limit counts the whole body, greeting and sign-off included.
+- Email 1: Personalized cold observation + one question. At most {l1} words. No pitch.
 - Email 2: Follow-up 3 days later. It must stand on its own (the reader does
-  not remember email 1): 60-110 words, at least four sentences, a different
+  not remember email 1): at most {l2} words, at least four sentences, a different
   angle, one concrete proof point from {proof}, and an
   interest-based question ("¿le interesa que le cuente cómo…?" / "worth
   hearing how…?"), never "thoughts?".
-- Email 3: Break-up 4 days after that. 30-50 words. Gives permission to say
+- Email 3: Break-up 4 days after that. At most {l3} words. Gives permission to say
   no and leaves the door open; no guilt ("I never heard back" is banned).
 - Use {{{{first_name}}}}, {{{{company}}}}, {{{{title}}}} as merge variables — every email
   must use at least one, and email 1 must reference something specific to
   these prospects' industry or role (use the notes above).
+- {sequence_lines(greetings)}
+- Write all three emails in the WRITING VOICE above.
 - Never be pushy or salesy. Be consultative and value-driven.
 - Subject lines: lowercase, 2-4 words, like an internal note; no salesy words.
 - Language and register: {lang_line}
 - {self._sign_off_rule(profile)}
-- Follow every rule in the STRICT EMAIL RULES above. No exceptions.{brief_line}
+- Follow every rule in the STRICT EMAIL RULES above. No exceptions.{brief_line}{offer_once}
 
 Return ONLY a JSON array (no markdown fences, no commentary):
 [
@@ -760,6 +990,22 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             agent="writer", task="write_sequence",
         )
         steps = self._parse_sequence(result)
+        # Over a step's limit: ask once for a shorter sequence. What is still
+        # over afterwards is flagged when the Sender stages the rendered email.
+        over = [(st.step, count_words(st.body), self._limit(st.step)) for st in steps
+                if count_words(st.body) > self._limit(st.step)]
+        if over:
+            note = ("\n\nYOUR PREVIOUS SEQUENCE HAD EMAILS THAT ARE TOO LONG: "
+                    + "; ".join(f"email {n} is {c} words, the limit is {lim}" for n, c, lim in over)
+                    + ". Write the whole sequence again with every email within its limit, counted "
+                      "including greeting and sign-off. Previous sequence:\n"
+                    + json.dumps([{"step": st.step, "subject": st.subject, "body": st.body} for st in steps],
+                                 ensure_ascii=False))
+            retry = self._parse_sequence(await self.brain.think_json(
+                prompt + note, session_id="mercury-writer", agent="writer", task="write_sequence"))
+            excess = lambda seq: sum(max(0, count_words(st.body) - self._limit(st.step)) for st in seq)  # noqa: E731
+            if len(retry) >= len(steps) and excess(retry) < excess(steps):
+                steps, prompt = retry, prompt + note
         hits = self._out_of_scope(self._blocked(decision, brief, contexts),
                                   *(f"{st.subject}\n{st.body}" for st in steps))
         if hits:

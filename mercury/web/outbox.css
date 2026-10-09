@@ -1,0 +1,287 @@
+/* Outbox (outbox.js). Built from the shared tokens and components in
+   app.css: .panel, .badge, .btn, .btn-square, .table-card, .link-btn.
+   Radii stay on the scale (12 panels, 8 controls, round badges); every
+   figure is mono. */
+
+/* ── Head and views ──────────────────────────────────────────── */
+
+.ob-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.ob-head-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.ob-pause-mobile { display: none; }
+
+.ob-views-row { display: flex; align-items: center; justify-content: space-between; gap: 12px 20px; flex-wrap: wrap; margin-bottom: 16px; }
+.ob-views-row:empty { display: none; }
+
+/* The segmented control as a track: the chosen view is a raised panel. */
+.ob-views {
+  display: inline-flex; gap: 2px; padding: 3px;
+  background: var(--panel-raised); border: 1px solid var(--border); border-radius: var(--r-sm);
+}
+.ob-views button {
+  display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px;
+  border: 1px solid transparent; border-radius: var(--r-sm); background: none; cursor: pointer;
+  font-family: var(--sans); font-size: 13px; font-weight: 500; color: var(--text-2);
+  transition: background .15s, color .15s;
+}
+.ob-views button:hover { color: var(--text); }
+.ob-views button.on { background: var(--panel); color: var(--text); font-weight: 600; border-color: var(--border); box-shadow: var(--shadow-sm); }
+.ob-n { font-family: var(--mono); font-size: 11.5px; font-weight: 400; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.ob-n.bad { color: var(--s-bad); }
+.ob-short { display: none; }
+
+.ob-capacity { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-3); }
+.ob-capacity > .ph { font-size: 15px; }
+.ob-capacity b.num { font-size: 12.5px; font-weight: 500; color: var(--text); }
+.ob-capacity .ob-slash { font-family: var(--mono); color: var(--text-3); }
+.ob-mb-link { color: var(--accent-deep); margin-left: 8px; }
+.ob-mb-link:hover { color: var(--accent); }
+
+.ob-mono { font-family: var(--mono); font-size: 12px; color: var(--text-2); overflow-wrap: anywhere; }
+
+/* ── To review: one panel, three panes ───────────────────────── */
+
+.ob-desk {
+  display: grid; grid-template-columns: 284px minmax(0, 1fr) 284px;
+  height: max(560px, calc(100dvh - 244px)); margin-bottom: 16px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden;
+}
+
+/* Queue */
+.ob-queue { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); }
+.ob-q-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 16px; min-height: 50px; border-bottom: 1px solid var(--border);
+}
+.ob-q-head b { font-size: 13.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ob-q-list { overflow: hidden auto; min-height: 0; flex: 1; }
+.ob-q-group {
+  padding: 12px 16px 8px; font-size: 12px; color: var(--text-3); border-bottom: 1px solid var(--border);
+}
+.ob-q-group .num { font-size: 11.5px; margin-left: 4px; }
+.ob-q-item {
+  display: flex; flex-direction: column; gap: 3px; width: 100%; padding: 12px 16px;
+  background: none; border: none; border-bottom: 1px solid var(--border); cursor: pointer; text-align: left;
+  font-family: var(--sans); color: var(--text); transition: background .15s;
+}
+.ob-q-item:hover { background: var(--panel-raised); }
+.ob-q-item.active { background: var(--accent-soft); }
+.ob-q-item.active .ob-q-top b { color: var(--accent-deep); }
+.ob-q-top, .ob-q-bot { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-width: 0; }
+.ob-q-top b { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ob-q-time, .ob-q-offer { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); white-space: nowrap; flex: none; font-variant-numeric: tabular-nums; }
+.ob-q-mid { font-size: 12.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ob-q-sub { font-size: 12.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ob-q-flag { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--s-bad); min-width: 0; }
+.ob-q-flag .ph { font-size: 13px; }
+
+/* The email */
+.ob-pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.ob-env { padding: 16px 24px 14px; border-bottom: 1px solid var(--border); }
+.ob-env-row { display: flex; align-items: center; gap: 12px; min-height: 27px; }
+.ob-env-k { width: 56px; flex: none; font-size: 13px; color: var(--text-3); }
+.ob-env-v { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.ob-env-v b { font-size: 13.5px; font-weight: 600; }
+.ob-env-row > .badge { flex: none; }
+.ob-persona {
+  display: inline-flex; align-items: center; gap: 5px; flex: none; padding: 0; background: none; border: none; cursor: pointer;
+  font-family: var(--sans); font-size: 12px; font-weight: 500; color: var(--text-2);
+}
+.ob-persona .ph { font-size: 14px; color: var(--text-3); }
+.ob-persona:hover, .ob-persona:hover .ph { color: var(--accent-deep); }
+
+.ob-subject-row { position: relative; }
+.ob-subject {
+  flex: 1; min-width: 0; width: 100%; padding: 3px 26px 3px 6px; margin-left: -7px;
+  font-family: var(--sans); font-size: 14px; font-weight: 600; letter-spacing: -0.01em; color: var(--text);
+  background: none; border: 1px solid transparent; border-radius: var(--r-sm);
+  transition: border-color .15s, background .15s;
+}
+.ob-subject:hover { border-color: var(--border); }
+.ob-subject:focus { outline: none; border-color: var(--accent-line); background: var(--panel); box-shadow: 0 0 0 3px var(--accent-soft); }
+.ob-pencil { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); color: var(--text-3); font-size: 14px; pointer-events: none; display: flex; }
+.ob-subject:focus + .ob-pencil { color: var(--accent); }
+
+.ob-meta { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 6px 0 0 68px; font-size: 12px; color: var(--text-3); }
+.ob-meta span { display: inline-flex; align-items: center; gap: 6px; }
+.ob-meta .ph { font-size: 13px; }
+.ob-meta .ob-why-btn { margin-left: auto; font-size: 12px; }
+.ob-env .desk-note { margin: 10px 0 0 68px; }
+.ob-env .desk-note.hold { border-bottom: none; padding: 0; }
+
+.ob-body-wrap { flex: 1; min-height: 0; overflow: auto; padding: 18px 24px 8px; }
+.ob-body {
+  display: block; width: calc(100% + 18px); max-width: calc(72ch + 18px); resize: none; overflow: hidden;
+  padding: 6px 8px; margin: -7px -9px;
+  font-family: var(--sans); font-size: 14px; line-height: 1.65; color: var(--text);
+  background: none; border: 1px solid transparent; border-radius: var(--r-sm);
+  transition: border-color .15s, background .15s;
+}
+.ob-body:hover { border-color: var(--border); }
+.ob-body:focus { outline: none; border-color: var(--accent-line); background: var(--panel); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+.ob-flag {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 4px 14px;
+  margin-bottom: 18px; padding: 14px 16px;
+  background: var(--panel-raised); border: 1px solid var(--accent-line); border-radius: var(--r-md);
+}
+.ob-flag > .ph { font-size: 18px; color: var(--s-bad); }
+.ob-flag b { display: block; font-size: 13.5px; font-weight: 600; color: var(--s-bad); }
+.ob-flag p { font-size: 12.5px; color: var(--text-2); margin-top: 2px; text-wrap: pretty; }
+
+.ob-countrow {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
+  padding: 8px 24px 10px; font-size: 12px; color: var(--text-3);
+}
+.ob-count { font-family: var(--mono); font-size: 12px; color: var(--text-2); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ob-count.over { color: var(--s-bad); }
+
+.ob-actions {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 12px 24px; border-top: 1px solid var(--border);
+}
+.ob-actions .btn { padding: 7px 13px; }
+.ob-actions .btn-primary kbd {
+  margin-left: 3px; border: none; padding: 1px 5px;
+  background: color-mix(in srgb, var(--accent-contrast) 22%, transparent); color: var(--accent-contrast);
+}
+.ob-actions-end { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.ob-actions-end .btn-square:disabled { opacity: .45; cursor: not-allowed; }
+.ob-why-btn { display: none; }
+#outbox .btn[hidden] { display: none; }
+
+/* Why this email */
+.ob-rail { background: var(--panel-raised); border-left: 1px solid var(--border); overflow: hidden auto; min-height: 0; }
+.ob-rail-sec { padding: 14px 16px 16px; border-bottom: 1px solid var(--border); }
+.ob-rail-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; font-size: 12px; color: var(--text-3); }
+.ob-link { color: var(--accent-deep); padding: 0; }
+.ob-link:hover { color: var(--accent); }
+.ob-why-item { display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 8px; margin-top: 12px; }
+.ob-why-item:first-of-type { margin-top: 0; }
+.ob-why-item > .ph { font-size: 15px; color: var(--text-3); margin-top: 1px; }
+.ob-why-k { display: block; font-size: 12px; color: var(--text-3); margin-bottom: 1px; }
+.ob-why-item p, .ob-why-item li { font-size: 13px; color: var(--text); line-height: 1.45; overflow-wrap: anywhere; text-wrap: pretty; }
+.ob-why-item ul { list-style: none; display: flex; flex-direction: column; gap: 2px; }
+.ob-why-item p.muted { color: var(--text-3); }
+.ob-why-item .ob-mono { font-size: 12px; color: var(--text); }
+.ob-why-item .badge { vertical-align: -2px; }
+
+.ob-seq { display: flex; flex-direction: column; gap: 8px; }
+.ob-seq-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.ob-seq-row .badge { font-size: 12.5px; color: var(--text); font-weight: 400; white-space: normal; }
+.ob-seq-row .badge.t-idle { color: var(--text-3); }
+.ob-seq-when { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); white-space: nowrap; }
+.ob-rail-note { font-size: 12px; color: var(--text-3); margin-top: 12px; text-wrap: pretty; }
+.ob-contact { font-size: 13px; color: var(--text); }
+.ob-contact.muted { font-size: 12.5px; color: var(--text-3); margin-top: 4px; }
+
+/* In the drawer (narrow screens) the rail sheds its own frame. */
+.ob-rail.in-drawer { background: none; border: none; overflow: visible; margin: -4px -2px 0; }
+.ob-rail.in-drawer .ob-rail-sec { padding: 14px 2px 16px; }
+.ob-rail.in-drawer .ob-rail-sec:last-child { border-bottom: none; }
+
+/* ── Tables: Scheduled, Sent today, Didn't send ──────────────── */
+
+.ob-table { margin-bottom: 16px; }
+.ob-table th { font-size: 12px; font-weight: 500; color: var(--text-3); padding: 12px 16px; }
+.ob-table td { vertical-align: middle; padding: 10px 16px; }
+.ob-table td .badge { margin-top: 2px; }
+.ob-table tr.ob-group td { background: var(--panel-raised); padding: 8px 16px; font-size: 13px; }
+.ob-table tr.ob-group:hover td { background: var(--panel-raised); }
+.ob-table tr.ob-group .num { font-size: 11.5px; color: var(--text-3); margin-left: 4px; }
+.ob-table .ob-when { width: 1%; white-space: nowrap; }
+.ob-table .ob-num { width: 1%; }
+.ob-table .ob-menu-cell { width: 1%; text-align: right; white-space: nowrap; }
+.ob-table .ob-mono.muted { color: var(--text-3); font-size: 11.5px; }
+.ob-table .ob-from .mono-sm, .ob-table .ob-from .muted { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); }
+.ob-row-menu { width: 30px; height: 30px; color: var(--text-3); }
+.ob-row-actions { display: inline-flex; gap: 6px; }
+.ob-table-foot { padding: 11px 16px; font-size: 12.5px; color: var(--text-3); background: var(--panel-raised); border-top: 1px solid var(--border); }
+
+/* ── Narrower: the rail moves into a drawer ─────────────────── */
+
+@media (max-width: 1100px) {
+  .ob-desk { grid-template-columns: 240px minmax(0, 1fr); height: max(520px, calc(100dvh - 284px)); }
+  .ob-desk .ob-rail { display: none; }
+  .ob-actions { padding: 12px 18px; gap: 6px; }
+  .ob-actions .btn { padding: 7px 11px; }
+  .ob-actions-end { gap: 6px; }
+  .ob-why-btn { display: inline-flex; }
+}
+@media (max-width: 860px) {
+  .ob-desk { grid-template-columns: 210px minmax(0, 1fr); }
+  .ob-env, .ob-body-wrap, .ob-countrow, .ob-actions { padding-left: 18px; padding-right: 18px; }
+}
+
+/* ── Phone: the queue is the page, one email opens full screen ── */
+
+.ob-mobile[hidden] { display: none; }
+
+@media (max-width: 700px) {
+  #outbox .ob-head { display: none; }
+  .ob-pause-mobile { display: block; position: fixed; top: 10px; right: 16px; z-index: 21; }
+  .ob-views-row { flex-direction: column; align-items: stretch; gap: 10px; margin-bottom: 8px; }
+  .ob-views { display: flex; }
+  .ob-views button { flex: 1 1 auto; justify-content: center; padding: 6px 8px; font-size: 13px; }
+  .ob-long, .ob-n-wide, .ob-mb-link { display: none; }
+  .ob-short { display: inline; }
+  .ob-capacity { font-size: 12.5px; }
+
+  .ob-queue.phone { border: none; margin: 0 -16px; padding-bottom: 84px; }
+  .ob-queue.phone .ob-q-group { padding: 12px 16px 8px; }
+  .ob-queue.phone .ob-q-item { padding: 12px 16px; gap: 4px; }
+  .ob-queue.phone .ob-q-top b { font-size: 14px; }
+  .ob-queue.phone .ob-q-mid, .ob-queue.phone .ob-q-sub, .ob-queue.phone .ob-q-flag { font-size: 13px; }
+  .ob-phone-bar {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 25;
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    background: var(--panel); border-top: 1px solid var(--border);
+  }
+  .ob-phone-bar .btn { width: 100%; justify-content: center; padding: 11px 14px; font-size: 14px; }
+
+  body.ob-mobile-open:has(#outbox.active) { overflow: hidden; }
+  .ob-mobile {
+    position: fixed; inset: 0; z-index: 30; display: flex; flex-direction: column;
+    background: var(--panel);
+  }
+  .ob-m-head {
+    display: flex; align-items: center; gap: 8px; height: 56px; flex: none; padding: 0 12px 0 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .ob-m-back { color: var(--accent-deep); font-size: 14px; gap: 4px; margin-right: auto; }
+  .ob-m-back .ph { font-size: 16px; }
+  .ob-m-pos { font-size: 12px; color: var(--text-3); margin-right: 6px; }
+  .ob-m-head .btn-square:disabled { opacity: .45; cursor: not-allowed; }
+  .ob-m-scroll { flex: 1; min-height: 0; overflow: auto; }
+  .ob-m-who { padding: 14px 16px 12px; border-bottom: 1px solid var(--border); }
+  .ob-m-name { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .ob-m-name b { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+  .ob-m-who p { font-size: 13px; color: var(--text-2); margin-top: 4px; }
+  .ob-m-who p.ob-mono { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+  .ob-m-who .desk-note { margin-top: 10px; }
+  .ob-m-mail { padding: 14px 16px 12px; border-bottom: 1px solid var(--border); }
+  .ob-m-mail .ob-subject-row { display: flex; margin-bottom: 4px; }
+  .ob-m-mail .ob-subject { font-size: 15px; margin-left: -7px; }
+  .ob-m-mail .ob-body { font-size: 15px; line-height: 1.6; max-width: none; margin: 0 -9px; }
+  .ob-m-count { text-align: right; margin-top: 6px; }
+  .ob-m-mail #ob-save { margin-top: 10px; }
+  .ob-m-mail .ob-flag { grid-template-columns: auto minmax(0, 1fr); margin-bottom: 14px; }
+  .ob-m-mail .ob-flag .btn { grid-column: 2; justify-self: start; margin-top: 6px; }
+  .ob-m-why {
+    display: flex; align-items: center; gap: 12px; width: 100%; padding: 14px 16px;
+    background: var(--panel-raised); border: none; border-bottom: 1px solid var(--border); cursor: pointer;
+    font-family: var(--sans); color: var(--text); text-align: left;
+  }
+  .ob-m-why > .ph { font-size: 16px; color: var(--text-3); flex: none; }
+  .ob-m-why span { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .ob-m-why b { font-size: 13.5px; font-weight: 600; }
+  .ob-m-why small { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); }
+  .ob-m-bar {
+    display: flex; gap: 8px; flex: none; padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+    background: var(--panel); border-top: 1px solid var(--border);
+  }
+  .ob-m-bar .btn { padding: 10px 14px; font-size: 14px; }
+  .ob-m-bar .btn-square { width: 44px; height: auto; }
+  .ob-m-bar .btn-primary { flex: 1; justify-content: center; }
+
+  .ob-table td, .ob-table th { padding-left: 12px; padding-right: 12px; }
+}

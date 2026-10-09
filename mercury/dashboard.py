@@ -819,7 +819,8 @@ async def test_inbox(email: str):
 @app.post("/api/outbox/approve-all")
 async def outbox_approve_all(request: Request):
     """Approve the emails the reviewer was shown: {"items": [{"id", "revision"}]}.
-    Anything not listed, or changed since, stays in review."""
+    Anything not listed, or changed since, stays in review, and so does a
+    flagged draft unless its item says "approve_flagged": true."""
     body = await _json_body(request)
     if body is None:
         return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
@@ -834,12 +835,18 @@ async def outbox_approve_all(request: Request):
 
 @app.post("/api/outbox/{item_id}/approve")
 async def outbox_approve(item_id: str, request: Request):
-    """Approve one email at the revision on screen: {"revision": n}."""
+    """Approve one email at the revision on screen: {"revision": n}.
+
+    A draft flagged by the deterministic checks (over its word limit, a generic
+    greeting) is refused with 409 and code "flagged" unless the reviewer
+    chooses to approve it anyway: {"revision": n, "approve_flagged": true}."""
     body = await _json_body(request) or {}
     try:
-        result = await (await _outbox(request=request).ready()).approve(item_id, body.get("revision"))
+        result = await (await _outbox(request=request).ready()).approve(
+            item_id, body.get("revision"), approve_flagged=body.get("approve_flagged") is True)
         return {"success": True, "followups_approved": result["followups_approved"],
-                "revision": result["revision"]}
+                "revision": result["revision"],
+                **({"flags_accepted": result["flags_accepted"]} if result.get("flags_accepted") else {})}
     except ControlError as e:
         if e.code in ("not_found", "not_pending"):
             return {"success": False, "followups_approved": 0}
@@ -850,7 +857,8 @@ async def outbox_approve(item_id: str, request: Request):
 
 @app.post("/api/outbox/batch")
 async def outbox_batch(request: Request):
-    """Approve or reject a frozen list: {"action", "items": [{"id", "revision"}]}."""
+    """Approve or reject a frozen list: {"action", "items": [{"id", "revision"}]}.
+    A flagged draft is only approved when its item also says "approve_flagged": true."""
     body = await _json_body(request)
     if body is None:
         return JSONResponse({"success": False, "message": "Invalid request body."}, status_code=400)
@@ -898,7 +906,10 @@ async def outbox_edit(item_id: str, request: Request):
         result = await (await _outbox(request=request).ready()).edit(
             item_id, subject, text, body.get("revision"))
         return {"success": True, "revision": result["revision"], "status": result["status"],
-                "approval_cleared": result["approval_cleared"]}
+                "approval_cleared": result["approval_cleared"],
+                "word_count": result["word_count"], "word_limit": result["word_limit"],
+                "flags": result["flags"], "flag_details": result["flag_details"],
+                "needs_flag_approval": result["needs_flag_approval"]}
     except NotFound:
         return JSONResponse({"success": False,
                              "message": "only pending or approved drafts can be edited"},

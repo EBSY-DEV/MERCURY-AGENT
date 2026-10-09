@@ -10,6 +10,7 @@ import uuid
 import aiosqlite
 
 from mercury.control.errors import ControlError
+from mercury.draft_rules import count_words, encode_flags
 
 AVATAR_SEEDS = [f"mercury-persona-{i:02d}" for i in range(1, 25)]
 REPLIED_STATUSES = ("replied", "meeting", "closed")
@@ -123,16 +124,19 @@ class PersonaStore:
                 raise PersonaError("not_found", "Persona version not found")
             return profile
 
+    async def snapshot(self, generation_id=""):
+        """The persona profile a generation was written with, or None."""
+        if not generation_id:
+            return None
+        async with self.state._connect() as db:
+            cursor = await db.execute(
+                "SELECT persona_json FROM email_generations WHERE id = ?", (generation_id,),
+            )
+            row = await cursor.fetchone()
+        return json.loads(row[0]) if row else None
+
     async def for_generation(self, config, generation_id=""):
-        if generation_id:
-            async with self.state._connect() as db:
-                cursor = await db.execute(
-                    "SELECT persona_json FROM email_generations WHERE id = ?", (generation_id,),
-                )
-                row = await cursor.fetchone()
-                if row:
-                    return json.loads(row[0])
-        return await self.resolve(config)
+        return await self.snapshot(generation_id) or await self.resolve(config)
 
     async def save(self, data: dict, persona_id=""):
         """Serialize version increments with default/archive changes."""
@@ -254,19 +258,27 @@ class PersonaStore:
     async def replace_draft(self, item_id, draft, expected_revision=None):
         """Attach a regeneration atomically, refusing mail that left the review
         queue (or, given ``expected_revision``, changed since it was read). The
-        new draft is a new revision and goes back to review unapproved."""
+        new draft is a new revision and goes back to review unapproved.
+
+        The draft is measured again: a Writer draft brings its word limit and
+        flags, so a regeneration that is still too long comes back flagged
+        with the earlier acceptance dropped. A reply draft has no limit."""
         async with self.state._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
                 "UPDATE outbox SET subject = ?, body = ?, generation_id = ?, manually_edited = 0, "
                 "status = 'pending_review', revision = revision + 1, approved_revision = NULL, "
                 "approved_hash = '', approved_by = '', approved_at = NULL, "
-                "pain_code = COALESCE(?, pain_code), updated_at = CURRENT_TIMESTAMP "
+                "pain_code = COALESCE(?, pain_code), "
+                "word_count = ?, word_limit = COALESCE(?, word_limit), flags = ?, "
+                "flags_accepted_by = '', updated_at = CURRENT_TIMESTAMP "
                 "WHERE id = ? AND status IN ('pending_review', 'approved') "
                 "AND (? IS NULL OR revision = ?)",
                 (draft["subject"], draft["body"], draft.get("generation_id", ""),
                  # Only a Writer draft knows its pain; a reply draft leaves the column alone.
                  draft["pain_code"].strip().upper() if "pain_code" in draft else None,
+                 count_words(draft["body"]),
+                 draft.get("word_limit"), encode_flags(draft.get("flags")),
                  item_id, expected_revision, expected_revision),
             )
             if not cursor.rowcount:

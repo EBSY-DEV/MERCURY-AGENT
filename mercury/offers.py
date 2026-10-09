@@ -29,6 +29,8 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from mercury.draft_rules import REVIEW_SIGNAL_CODES
+
 logger = logging.getLogger("mercury.offers")
 
 
@@ -327,6 +329,18 @@ class OfferBrief:
     def step(self, n: int):
         return self.offer.steps.get(n)
 
+    def offer_sentence(self, n: int) -> str:
+        """The one plain sentence email ``n`` states the offer with, or ''
+        when the brief does not ask it to (the step's ``state_offer``)."""
+        step = self.step(n)
+        if step is None or not step.state_offer:
+            return ""
+        return (self.offer.content.sentence.strip() or self.offer.content.summary.strip())
+
+    @property
+    def routing_role(self) -> str:
+        return self.offer.routing_role.strip()
+
     def render(self) -> str:
         offer, content = self.offer, self.offer.content
         many = len(self.steps) > 1
@@ -368,11 +382,15 @@ class OfferBrief:
         step_lines = []
         for n in self.steps:
             step = self.step(n)
-            if step is None or not (step.cta or step.angle):
+            if step is None or not (step.cta or step.angle or step.state_offer):
                 continue
             parts = []
             if step.angle:
                 parts.append(f"angle: {step.angle}")
+            if step.state_offer:
+                parts.append("state the offer in one plain sentence, in these words or very close "
+                             f"to them: \"{self.offer_sentence(n)}\". Say nothing else about the "
+                             "offer in this email")
             if step.cta:
                 parts.append(f"call to action: {step.cta}")
             step_lines.append(f"- Email {n}: " + "; ".join(parts))
@@ -392,6 +410,7 @@ class OfferBrief:
             "offer_key": self.offer.key,
             "label": self.offer.label,
             "steps": self.steps,
+            "routing_role": self.routing_role,
             "reason": self.reason,
             "authoritative": self.authoritative,
             "pain": None if self.pain is None else self.pain.__dict__,
@@ -433,7 +452,9 @@ async def build_brief(state, config, decision: RouteDecision, steps: list[int],
     if len(contexts) == 1:
         codes = offer.facts or offer.signals.require
         observations = contexts[0].observations
-        facts = [fact_line(observations[c]) for c in codes if c in observations]
+        # Review counts and ratings are scoring data, never a fact to write from.
+        facts = [fact_line(observations[c]) for c in codes
+                 if c in observations and c not in REVIEW_SIGNAL_CODES]
     return OfferBrief(
         offer=offer, steps=list(steps), reason=decision.reason, pain=pain, facts=facts,
         evidence=await aggregate_evidence(state, offer, contexts, list(steps)),

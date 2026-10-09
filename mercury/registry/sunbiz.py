@@ -101,6 +101,7 @@ def looks_like_entity(name: str) -> bool:
 class SunbizProvider(RegistryProvider):
     key = "fl_sunbiz"
     jurisdiction = "FL"
+    jurisdiction_name = "Florida"
     label = "Florida Division of Corporations"
 
     def __init__(self, fetch: Fetch | None = None, *, min_interval: float = 3.0,

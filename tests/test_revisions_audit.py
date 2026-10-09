@@ -91,7 +91,8 @@ async def test_editing_an_approved_draft_sends_it_back_and_the_old_approval_fail
     assert _approved_snapshot_holds(row)
 
     edited = await outbox.edit(item, "offer_a, revised", "A revised note. Worth a look?", 1)
-    assert edited == {"id": item, "revision": 2, "status": "pending_review", "approval_cleared": True}
+    assert {k: edited[k] for k in ("id", "revision", "status", "approval_cleared")} == {
+        "id": item, "revision": 2, "status": "pending_review", "approval_cleared": True}
     row = await state.get_outbox_item(item)
     assert row["status"] == "pending_review" and row["approved_revision"] is None
     assert row["approved_hash"] == "" and row["approved_by"] == ""
@@ -501,8 +502,9 @@ def test_dashboard_replays_an_idempotency_key(tmp_path, monkeypatch):
 
     first = client.put(f"/api/outbox/{item}", json=body, headers=headers)
     again = client.put(f"/api/outbox/{item}", json=body, headers=headers)
-    assert first.json() == again.json() == {"success": True, "revision": 2, "status": "pending_review",
-                                            "approval_cleared": False}
+    assert first.json() == again.json()
+    assert {k: first.json()[k] for k in ("success", "revision", "status", "approval_cleared")} == {
+        "success": True, "revision": 2, "status": "pending_review", "approval_cleared": False}
     assert asyncio.run(client.sm.get_outbox_item(item))["revision"] == 2
     # Without a key, the same request is a new command, and stale.
     stale = client.put(f"/api/outbox/{item}", json=body)

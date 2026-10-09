@@ -232,3 +232,80 @@ def test_scout_skips_ineligible_and_ungated_companies(env):
     run(env.sm.set_signal_status("CONTACT_FOUND", "confirmed"))
     run(scout._attach_registry_evidence(other))                  # not Florida
     assert env.fake.requests == []
+
+
+# ── What the drawer needs: the filing's people, and how the first email opens ──
+
+def _confirmed_match(client, env):
+    run(env.sm.set_signal_status("CONTACT_FOUND", "confirmed"))
+    assert client.post(f"/api/companies/{env.company}/registry/refresh").status_code == 200
+
+
+def test_registry_view_carries_what_the_drawer_shows(client, env):
+    before = contacts(client, env.company)["info@example-palm.example.com"]["registry"]
+    assert before["covered"] == ["Florida"] and before["jurisdiction_name"] == "Florida"
+    assert before["company_location"] == "Orlando, FL" and before["people"] == []
+
+    _confirmed_match(client, env)
+    reg = contacts(client, env.company)["info@example-palm.example.com"]["registry"]
+    assert reg["entity_type"] == "limited liability company" and reg["city"] == "Orlando"
+    assert reg["people"] == [{"name": "Jane Doe", "title": "Manager", "raw_title": "MGR", "suggested": True}]
+    assert reg["on_filing"] is None
+    # An outside-Florida company is not covered, and still says what is.
+    other = _company(env.sm, "Mountain Example Roofing", "Denver, CO")
+    _prospect(env.sm, other, "info@mountain.example.com", "Mountain Example Roofing", "Team", "public_inbox")
+    out = contacts(client, other)["info@mountain.example.com"]["registry"]
+    assert out["status"] == "not_eligible" and out["covered"] == ["Florida"] and out["jurisdiction_name"] == ""
+
+
+def test_several_leads_suggest_nobody(client, env):
+    env.fake.details["L15000000001"] = fx.detail_page(
+        ROOFING[0], ROOFING[1], people=[("MGR", "DOE, JANE"), ("AMBR", "ROE, RICHARD")])
+    _confirmed_match(client, env)
+    reg = contacts(client, env.company)["info@example-palm.example.com"]["registry"]
+    assert reg["person"] is None and [p["suggested"] for p in reg["people"]] == [False, False]
+
+
+def test_greeting_preview_follows_the_review(client, env, monkeypatch):
+    import types
+    config = types.SimpleNamespace(
+        writer=types.SimpleNamespace(routing_role="the person who handles this"),
+        offers=[types.SimpleNamespace(default=True, key="offer_a", routing_role="the person who books jobs")])
+    monkeypatch.setattr(dash, "_demo_config", lambda: config)
+    url = f"/api/contacts/{env.inbox}/greeting-preview"
+
+    nothing = client.get(url).json()
+    assert nothing["mode"] == "routing" and nothing["with_name"] == ""
+    assert nothing["without_name"] == "Could you pass this to the person who books jobs?"
+    assert nothing["role_source"] == "offer"
+
+    _confirmed_match(client, env)
+    pending = client.get(url).json()
+    assert pending["mode"] == "routing" and pending["status"] == "registry_pending"
+    assert pending["with_name"] == "Hi Jane,"       # shown for comparison, not used yet
+
+    client.post(f"/api/contacts/{env.inbox}/registry-name", json={"decision": "accepted"})
+    accepted = client.get(url).json()
+    assert accepted["mode"] == "name" and accepted["first_name"] == "Jane"
+
+    client.post(f"/api/contacts/{env.inbox}/registry-name", json={"decision": "dismissed"})
+    assert client.get(url).json()["mode"] == "routing"
+
+
+def test_greeting_preview_for_named_and_unknown_contacts(client, env, monkeypatch):
+    monkeypatch.setattr(dash, "_demo_config", lambda: None)
+    named = client.get(f"/api/contacts/{env.person}/greeting-preview").json()
+    assert named["mode"] == "name" and named["with_name"] == "Hi Pat," and named["without_name"] == ""
+    # No config at all: the writer's default role.
+    shared = client.get(f"/api/contacts/{env.inbox}/greeting-preview").json()
+    assert shared["without_name"] == "Could you pass this to the person who handles this?"
+    assert shared["role_source"] == "writer"
+    assert client.get("/api/contacts/nope/greeting-preview").status_code == 404
+
+
+def test_a_named_contact_on_the_filing_says_which_role(client, env):
+    jane = _prospect(env.sm, env.company, "jane@example-palm.example.com", "Jane", "Doe", "company_website")
+    _confirmed_match(client, env)
+    reg = {r["email"]: r for r in client.get("/api/prospects").json()}["jane@example-palm.example.com"]["registry"]
+    assert reg["has_own_name"] is True and reg["on_filing"] == {"name": "Jane Doe", "title": "Manager"}
+    assert jane

@@ -60,7 +60,7 @@ Style rules are negotiable. These are not:
 ## What Makes Good Cold Email
 
 ### It's short.
-Under 75 words for email 1. Under 60 for emails 2 and 3. Count them. If you're over, cut.
+Stay within the word limit for the step you are writing (the task states it, and it counts the greeting and the sign-off). Count them. If you're over, cut.
 
 ### It sounds like a person.
 Read it out loud. Does it sound like something you'd actually type to someone? Or does it sound like marketing copy? If it's the latter, rewrite.
@@ -83,8 +83,9 @@ Reply rates have fallen (median cold reply ~3.4%, true net-new closer to
 difference is almost entirely relevance and deliverability, not clever copy.
 Encode these findings:
 
-- **Length**: replies peak in the **50-125 word** band. Under 75 for email
-  1 is the target. 200+ word emails reply at roughly half the rate.
+- **Length**: shorter emails get more replies, and 200+ word emails reply at
+  roughly half the rate. Stay within the word limit for the step you are
+  writing; the task states it.
 - **Offer CTAs beat meeting asks.** An ask that gives them something whether
   or not they buy — a free audit, a teardown, a relevant data point — lifts
   replies ~28% over "do you have 30 minutes?". Prefer "want the teardown?"
@@ -167,7 +168,7 @@ Worth a look, or is this already handled?
 
 ### Email 3: The Breakup
 
-Short. Respectful. Creates a tiny bit of FOMO without being manipulative. Under 40 words if possible.
+Short. Respectful. Creates a tiny bit of FOMO without being manipulative. Well inside its word limit.
 
 Don't pitch. Don't summarize your product. Don't list what they're missing. Just close the loop like a normal human would.
 
@@ -291,7 +292,7 @@ Before finalizing any email, ask:
 
 1. Could a real person have written this? (not "could AI have written this to sound human")
 2. Is there exactly one idea in this email?
-3. Is it under 75 words?
+3. Is it within the word limit for this step, greeting and sign-off included?
 4. Would I reply to this if I received it?
 5. Does it contain any em dashes?
 6. Does it contain any of the banned patterns listed above?

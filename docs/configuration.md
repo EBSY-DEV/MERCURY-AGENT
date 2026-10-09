@@ -93,6 +93,9 @@ Each entry in `markets`:
 | `places` | required | List of places. |
 | `terms` | required | Search terms used in those places. |
 | `lang` | `en` | Language hint for providers that localise results. |
+| `language_line` | `""` | The whole "Language and register" instruction the Writer gets for prospects in this market. Empty keeps the built-in line. |
+| `language_rules` | `[]` | Extra rules for this market, one sentence each. They are added to every prompt for these prospects (first emails, follow-ups and the shared sequence). |
+| `terminology` | `{}` | `{word to avoid: word to say instead}`. Rendered as "say X, never Y". |
 
 ```yaml
 icp:
@@ -238,6 +241,8 @@ Prospects are grouped so one campaign carries one offer. The campaign and every 
 
 When an offer has a `content.summary`, the brief is authoritative: the product description, benefits and pricing in the prompt point to it, and the `product_knowledge` skill (the trainer's description of everything you sell) is left out. Without a summary, the brief adds its calls to action, case studies and restrictions to the usual product description.
 
+**Stating the offer.** The first email makes an observation and asks one question, and does not pitch. A step whose `state_offer` is `true` is the exception: that one email states the offer in one plain sentence, in the words of `content.sentence` (else `content.summary`), and nothing else about it. Mercury has no wording of its own for this. Later emails never repeat the sentence: each follow-up is shown the emails before it and told to add something new.
+
 **Case studies.** Each entry under `case_studies` has a `name`, optional `aliases`, the approved `summary`, and a `scope` of `markets` and `segments` (empty means anywhere). Only the selected offer's case studies in scope for the prospect reach the prompt. A draft naming any other configured case study is discarded by the Writer, and the [pre-send gate](email-and-deliverability.md#the-pre-send-gate) blocks it if it gets into the outbox another way, such as a manual edit.
 
 **Evidence.** `evidence` describes a statistic computed from observations, never typed in: of the companies checked for every `require` signal (only those in `segments`, when set), how many carry them all and none of `exclude`. The brief quotes it only when at least `min_sample` companies were checked and at least one matched, only for prospects in its `segments`, and only in its `steps` (empty means all).
@@ -252,7 +257,9 @@ When an offer has a `content.summary`, the brief is authoritative: the product d
 | `segments` | `[]` | Industries. |
 | `signals.require` / `signals.exclude` | `[]` | Signal codes. |
 | `content.name` / `content.summary` / `content.claims` | `""` / `""` / `[]` | The approved description. |
-| `steps` | `{}` | `{1: {cta, angle}, 2: ..., 3: ...}`, steps 1 to 5. |
+| `steps` | `{}` | `{1: {cta, angle, state_offer}, 2: ..., 3: ...}`, steps 1 to 5. `state_offer: true` has that email state the offer in one plain sentence (see below). |
+| `content.sentence` | `""` | The offer as one plain sentence, in approved words. A step with `state_offer` uses it, else `content.summary`. One of them is required for such a step. |
+| `routing_role` | `""` | Who a message to a shared inbox with no known contact name asks to be passed to. Empty uses `writer.routing_role`. |
 | `facts` | `[]` | Signal codes given as verified facts. Empty uses `signals.require`. |
 | `case_studies` | `[]` | `name`, `aliases`, `summary`, `scope.markets`, `scope.segments`. |
 | `restrictions` | `[]` | Claim restrictions, stated in the brief as written. |
@@ -298,6 +305,45 @@ offers:
     content:
       summary: "One plain sentence on what offer B is."
 ```
+
+### `writer`
+
+How the Writer's drafts are held to the rules its prompts state. All keys are optional.
+
+| Key | Default | Description |
+|---|---|---|
+| `word_limits` | `{1: 90, 2: 80, 3: 50}` | Words allowed per sequence step (1 to 5), counted over the whole email body with the greeting and the sign-off. Set only the steps you want to change. |
+| `routing_role` | `the person who handles this` | Who a shared inbox with no known contact name is asked to pass the message to, when the offer sets no `routing_role`. |
+| `default_language_line` | `""` | The language instruction for prospects in no `icp.markets` entry. Empty keeps the built-in line. |
+| `language_rules` | `[]` | Extra language rules for prospects in no market. |
+
+```yaml
+writer:
+  word_limits: {1: 90, 2: 80, 3: 50}
+  routing_role: "the person who handles this"
+icp:
+  markets:
+    - name: "market_a"
+      places: ["Exampleville"]
+      terms: ["service_a"]
+      language_rules: ["Address the reader formally."]
+      terminology: {"avoided_term": "preferred_term"}
+offers:
+  - key: "offer_a"
+    routing_role: "the person who schedules service_a"
+    content: {sentence: "One plain sentence stating offer A."}
+    steps: {1: {state_offer: true, cta: "The one question to ask."}}
+```
+
+**One source of truth for length.** The number in every prompt (the template's rule, the first-email task, each follow-up and the shared sequence) is rendered from `word_limits`, and the same numbers are enforced in code. The static markdown in `prompts/` and `skills/` refers to "the word limit for this step" and states no body length of its own. A word is a whitespace-separated token with at least one letter or digit; a merge variable such as `{{first_name}}` is one word; the subject and the legal footer added at send time are not counted (`mercury/draft_rules.py`).
+
+**Over the limit.** A draft over its step's limit is asked for again once, with an explicit "at most N words including greeting and sign-off", and the shorter of the two is kept. If it is still over it is staged *flagged*: the Outbox row carries `word_count`, `word_limit` and `flags`, it is never auto-approved (not by `require_approval: false`, not by `auto_approve_followups`, not by "Approve all"), and approving it takes an explicit choice. An edit or a regeneration is measured again. The sequence's follow-ups are measured on the rendered email when the Sender stages them, so a template that still runs long is flagged per prospect. See [Flagged drafts](email-and-deliverability.md#flagged-drafts).
+
+**Language rules per market.** `language_line`, `language_rules` and `terminology` on an `icp.markets` entry (and the `writer` defaults for everyone else) carry language and register rules in private configuration instead of in the shared prompts. They are added to, or with `language_line` replace, the built-in language line, and apply to first emails, follow-ups and the shared sequence alike.
+
+**Names and facts.** The Writer is given the business's short name (legal suffixes such as LLC, Inc, Corp, Co, Ltd, PLLC and a location after a dash or pipe removed: "Acme Roofing LLC - Springfield" becomes "Acme Roofing") next to its full name, is told to use the full name at most once and the short name after that and in subjects, and a draft that repeats the full name has the repeats shortened in code. Review counts and star ratings never reach the Writer's facts (the `REVIEW_COUNT` and `REVIEW_RATING` observations, and any sentence of a description or note that quotes them); scoring still reads them.
+
+**Greeting.** A contact with a name of their own, or a registry name a person accepted ([Public registry lookup](prospecting.md#public-registry-lookup)), is greeted by first name. A registry name still waiting for review is not used. A shared inbox (`info@`, `office@`, ...) with no known name gets no greeting at all, generic or by business name, and the email's one ask is a short request to pass the message to the offer's `routing_role` (else `writer.routing_role`). If the model writes a generic greeting anyway, it is removed in code for such a reader and flagged for a named one. The Sender drops a `Hi {{first_name}},` line from the template for contacts with no usable name.
 
 ## Environment variables (`.env`)
 

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from mercury.draft_rules import count_words, decode_flags, draft_flags, encode_flags, recheck_flags
 from mercury.models.company import Company
 from mercury.models.prospect import Prospect
 from mercury.models.campaign import Campaign, EmailStep  # noqa: F401 (EmailStep re-exported)
@@ -887,6 +888,21 @@ MIGRATIONS: list[str] = [
     -- registry document number, the officer's title code, the match rule.
     ALTER TABLE observations ADD COLUMN detail_json TEXT DEFAULT '';
     """,
+    # ── v24: word counts and draft flags on the outbox ──
+    """
+    -- What a reviewer needs to see before approving a draft, and what the
+    -- send path checks again: the body's word count (greeting and sign-off
+    -- included, see mercury/draft_rules.py), the limit it was held to
+    -- (0 = none, as for a reply), and the flags it carries as a JSON list
+    -- ('' = none): over_word_limit, generic_greeting. A flagged draft is never
+    -- approved by policy; a person approves it with an explicit "approve
+    -- anyway", and flags_accepted_by records who. Any change to the draft
+    -- clears that acceptance along with the approval.
+    ALTER TABLE outbox ADD COLUMN word_count INTEGER;
+    ALTER TABLE outbox ADD COLUMN word_limit INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE outbox ADD COLUMN flags TEXT NOT NULL DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN flags_accepted_by TEXT NOT NULL DEFAULT '';
+    """,
 ]
 
 
@@ -910,7 +926,8 @@ _OUTBOX_HASH_SQL = "outbox_hash(to_email, subject, body, mailbox, generation_id)
 # SQL fragment: clear an approval (a reviewable change sends the row back).
 _CLEAR_APPROVAL_SQL = (
     "status = CASE WHEN status = 'approved' THEN 'pending_review' ELSE status END, "
-    "approved_revision = NULL, approved_hash = '', approved_by = '', approved_at = NULL"
+    "approved_revision = NULL, approved_hash = '', approved_by = '', approved_at = NULL, "
+    "flags_accepted_by = ''"
 )
 
 # Pause states that hold a prospect's cold sequence back.
@@ -1764,12 +1781,25 @@ class StateManager:
         approved_by: str = "policy",
         company_id: str = "",
         pain_code: str = "",
+        word_limit: int = 0,
+        flags: list[str] | None = None,
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
         (campaign, prospect, step) slot already exists — the double-send guard.
         Without an ``offer_key`` the row takes its campaign's, so every path
-        that queues a sequence email carries the offer the demo gate reads."""
+        that queues a sequence email carries the offer the demo gate reads.
+
+        The row records its word count and the ``word_limit`` it is held to
+        (0 = none). ``flags`` are the draft's flags; left out, they are worked
+        out from the limit. A flagged draft is never queued as approved: the
+        policy that skips review cannot also accept a draft that broke a rule,
+        so it waits in review for a person's explicit choice."""
         item_id = _new_id()
+        word_limit = max(0, int(word_limit or 0))
+        if flags is None:
+            flags = draft_flags(body, word_limit)
+        if flags and status == "approved":
+            status = "pending_review"
         # Queued already approved (approval not required): the snapshot is
         # this first revision, approved by the policy that skipped review.
         approved = status == "approved"
@@ -1779,11 +1809,12 @@ class StateManager:
                    (id, campaign_id, prospect_id, conversation_id, step, kind,
                     to_email, subject, body, status, send_at, provider,
                     thread_ref, in_reply_to, mailbox, generation_id, company_id, offer_key,
-                    approved_revision, approved_hash, approved_by, approved_at, pain_code)
+                    approved_revision, approved_hash, approved_by, approved_at, pain_code,
+                    word_count, word_limit, flags)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                            COALESCE(NULLIF(?, ''),
                                     (SELECT offer_key FROM campaigns WHERE id = ?), ''),
-                           ?, ?, ?, ?, ?)""",
+                           ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item_id, campaign_id, prospect_id, conversation_id,
                     int(step), kind, _norm(to_email), subject, body,
@@ -1795,6 +1826,7 @@ class StateManager:
                     approved_by if approved else "",
                     _utcnow().isoformat() if approved else None,
                     (pain_code or "").strip().upper(),
+                    count_words(body), word_limit, encode_flags(flags),
                 ),
             )
             inserted = cursor.rowcount > 0
@@ -1849,6 +1881,20 @@ class StateManager:
         "company_id", "in_reply_to", "thread_references", "thread_subject",
     })
 
+    @staticmethod
+    async def _with_draft_checks(db, item_id: str, fields: dict, word_limit: int | None = None) -> dict:
+        """``fields`` plus a fresh word count and flags when the body changes.
+        The limit is the one given, else the one the row was held to."""
+        if "body" not in fields:
+            return fields
+        async with db.execute("SELECT word_limit, flags FROM outbox WHERE id = ?", (item_id,)) as c:
+            row = await c.fetchone()
+        if row is None:
+            return fields
+        limit = int(row[0] or 0) if word_limit is None else max(0, int(word_limit))
+        return {**fields, "word_count": count_words(fields["body"]), "word_limit": limit,
+                "flags": encode_flags(recheck_flags(fields["body"], limit, decode_flags(row[1])))}
+
     async def update_outbox_item(self, item_id: str, **kwargs):
         """Bookkeeping by the sender and scripts. A change to the text or
         the mailbox without a status of its own is a new revision and drops
@@ -1857,10 +1903,11 @@ class StateManager:
         fields = {k: v for k, v in kwargs.items() if k in self._OUTBOX_COLUMNS}
         if not fields:
             return
-        sets = ", ".join(f"{k} = ?" for k in fields)
-        if "status" not in fields and fields.keys() & {"subject", "body", "mailbox"}:
-            sets += f", revision = revision + 1, {_CLEAR_APPROVAL_SQL}"
         async with self._connect() as db:
+            fields = await self._with_draft_checks(db, item_id, fields)
+            sets = ", ".join(f"{k} = ?" for k in fields)
+            if "status" not in fields and fields.keys() & {"subject", "body", "mailbox"}:
+                sets += f", revision = revision + 1, {_CLEAR_APPROVAL_SQL}"
             await db.execute(
                 f"UPDATE outbox SET {sets}, updated_at = ? WHERE id = ?",
                 (*fields.values(), _utcnow().isoformat(), item_id),
@@ -1871,20 +1918,25 @@ class StateManager:
                                     "manually_edited"})
 
     async def revise_outbox_item(self, item_id: str, expected_revision: int | None = None,
-                                 **kwargs) -> int | None:
+                                 word_limit: int | None = None, **kwargs) -> int | None:
         """An operator's change to a queued draft: text, recipient, sending
         mailbox or send time. It is a new revision, and an approved draft
         goes back to review. Applies only while the draft is pending or
         approved and, when ``expected_revision`` is given, still at that
-        revision. Returns the new revision, or None when nothing changed."""
+        revision. Returns the new revision, or None when nothing changed.
+
+        A new body is measured again: its word count and flags are replaced
+        (against ``word_limit`` when given, else the limit the row was held
+        to), and any acceptance of the old flags is dropped with the approval."""
         fields = {k: v for k, v in kwargs.items() if k in self._REVISABLE_COLUMNS}
         if not fields:
             return None
         for column in ("to_email", "mailbox"):
             if column in fields:
                 fields[column] = _norm(fields[column])
-        sets = ", ".join(f"{k} = ?" for k in fields)
         async with self._connect() as db:
+            fields = await self._with_draft_checks(db, item_id, fields, word_limit)
+            sets = ", ".join(f"{k} = ?" for k in fields)
             cursor = await db.execute(
                 f"UPDATE outbox SET {sets}, revision = revision + 1, {_CLEAR_APPROVAL_SQL}, "
                 "updated_at = ? WHERE id = ? AND status IN ('pending_review', 'approved') "
@@ -1939,19 +1991,26 @@ class StateManager:
             return int(cursor.rowcount or 0)
 
     async def approve_outbox(self, item_id: str, expected_revision: int | None = None,
-                             approved_by: str = "") -> int:
+                             approved_by: str = "", accept_flags: bool = False) -> int:
         """Approve one pending item and record the snapshot it approved: its
         current revision and content hash. With ``expected_revision`` the
-        item must still be at that revision."""
+        item must still be at that revision.
+
+        A flagged draft (over its word limit, generic greeting) is approved
+        only with ``accept_flags``: the reviewer's explicit choice, recorded
+        in ``flags_accepted_by`` for the revision approved. Without it a
+        flagged draft stays in review and this returns 0."""
         now = _utcnow().isoformat()
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'approved', requires_manual_review = 0, "
                 "approved_revision = revision, "
                 f"approved_hash = {_OUTBOX_HASH_SQL}, approved_by = ?, approved_at = ?, "
+                "flags_accepted_by = CASE WHEN flags != '' THEN ? ELSE '' END, "
                 "updated_at = ? WHERE id = ? AND status = 'pending_review' "
-                "AND (? IS NULL OR revision = ?)",
-                (approved_by, now, now, item_id, expected_revision, expected_revision),
+                "AND (? IS NULL OR revision = ?) AND (flags = '' OR ? = 1)",
+                (approved_by, now, approved_by or "reviewer", now, item_id,
+                 expected_revision, expected_revision, 1 if accept_flags else 0),
             )
             await db.commit()
             return cursor.rowcount
@@ -1971,7 +2030,7 @@ class StateManager:
                        approved_hash = {_OUTBOX_HASH_SQL}, approved_by = 'auto_followups',
                        approved_at = ?, updated_at = ?
                    WHERE status = 'pending_review' AND kind = 'sequence'
-                     AND requires_manual_review = 0
+                     AND requires_manual_review = 0 AND flags = ''
                      AND step > 1 AND campaign_id != ''
                      AND (
                        SELECT prev.status FROM outbox AS prev
@@ -2750,6 +2809,8 @@ class StateManager:
                     f"updated_at = ? WHERE id = ? AND status = 'approved' AND {matches} "
                     "AND approved_revision = revision "
                     f"AND approved_hash = {_OUTBOX_HASH_SQL} "
+                    # A flagged draft sends only once a person accepted its flags.
+                    "AND (flags = '' OR flags_accepted_by != '') "
                     "AND NOT EXISTS (SELECT 1 FROM settings "
                     "WHERE key IN ('operator_pause', 'sending_paused') "
                     "AND COALESCE(value, '') != '') "

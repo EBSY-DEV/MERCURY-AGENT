@@ -1,0 +1,119 @@
+/* Contacts: the table with its registry column, and the contact drawer.
+   Built from the dashboard's tokens and components: .table-card, .segmented,
+   .search-field, .badge, .facts, .btn. Status stays an icon and a word. */
+
+.ct-toolbar[hidden] { display: none; }
+.ct-n { font-family: var(--mono); font-size: 11px; font-weight: 500; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.segmented button.on .ct-n { color: var(--text-2); }
+#ct-filters { max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+#ct-filters button { white-space: nowrap; }
+
+/* Table */
+.ct-table table { min-width: 880px; }
+.ct-row { cursor: pointer; }
+.ct-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.ct-row.sel td { background: var(--accent-soft); }
+.ct-table td { vertical-align: middle; padding-top: 9px; padding-bottom: 9px; }
+.ct-l1 { font-size: 13px; font-weight: 500; color: var(--text); }
+.ct-l1.muted { font-weight: 400; color: var(--text-3); }
+.ct-l2 { font-size: 12px; color: var(--text-3); margin-top: 1px; }
+.ct-l2 .badge { font-size: 12px; font-weight: 400; }
+.ct-l2.imp-needs { margin-top: 1px; }
+.ct-email { font-size: 12.5px; }
+.ct-c-company { color: var(--text-2); }
+.ct-c-source { font-size: 12.5px; }
+.ct-c-reg .badge { font-weight: 500; }
+.ct-foot {
+  padding: 11px 16px; font-size: 12.5px; color: var(--text-2);
+  background: var(--panel-raised); border-top: 1px solid var(--border);
+}
+.ct-none { padding: 28px 16px; text-align: center; font-size: 13px; color: var(--text-3); }
+
+/* Drawer */
+.ct-card { border: 1px solid var(--border); border-radius: var(--r-md); overflow: hidden; background: var(--panel); }
+.ct-card-head { padding: 13px 14px 12px; }
+.ct-ent { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.ct-meta { font-size: 12px; color: var(--text-3); margin-top: 2px; }
+.ct-match { margin-top: 8px; }
+.ct-state { font-size: 13px; color: var(--text-2); margin-top: 6px; text-wrap: pretty; }
+.ct-person {
+  display: flex; align-items: center; gap: 12px; padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+.ct-avatar { color: var(--text-3); font-size: 16px; display: inline-flex; flex: none; }
+.ct-pwho { flex: 1; min-width: 0; }
+.ct-pn { font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+.ct-pr { font-size: 12px; color: var(--text-3); margin-top: 1px; }
+.ct-code { font-size: 11px; margin-left: 2px; }
+.ct-pact { display: flex; align-items: center; gap: 8px; flex: none; flex-wrap: wrap; justify-content: flex-end; }
+.ct-card-head + .ct-cand { border-top: 1px solid var(--border); }
+.ct-cand { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-top: 1px solid var(--border); }
+.ct-cand-link { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 500; color: var(--accent-deep); text-decoration: none; flex: none; }
+.ct-cand-link:hover { text-decoration: underline; }
+.ct-card-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  padding: 9px 14px; font-size: 12.5px; color: var(--text-3);
+  background: var(--panel-raised); border-top: 1px solid var(--border);
+}
+.ct-foot-l a { display: inline-flex; align-items: center; gap: 6px; font-weight: 500; color: var(--accent-deep); text-decoration: none; }
+.ct-foot-l a:hover { text-decoration: underline; }
+.ct-foot-r { display: inline-flex; align-items: center; gap: 10px; }
+.ct-link {
+  border: none; background: none; padding: 0; cursor: pointer;
+  font-family: var(--sans); font-size: 12.5px; font-weight: 500; color: var(--accent-deep);
+}
+.ct-link:hover:not(:disabled) { text-decoration: underline; }
+.ct-link:disabled { color: var(--text-3); cursor: default; }
+.ct-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.ct-note { font-size: 12.5px; color: var(--text-3); margin-top: 10px; text-wrap: pretty; }
+.ct-msg { margin-top: 10px; font-size: 12.5px; color: var(--text-2); }
+.ct-msg .badge { white-space: normal; align-items: flex-start; font-weight: 400; }
+.ct-msg .badge .ph { margin-top: 1px; }
+.ct-msg a { color: var(--accent-deep); }
+
+/* How the first email opens: two outcomes, the one in use outlined. */
+.ct-open {
+  border: 1px solid transparent; border-radius: var(--r-md); background: var(--panel-raised);
+  padding: 10px 14px 11px; margin-bottom: 8px;
+}
+.ct-open.on { background: var(--panel); border-color: var(--accent-line); }
+.ct-open-h { display: flex; align-items: center; gap: 8px; font-size: 12.5px; font-weight: 500; color: var(--text-2); }
+.ct-open-h .ph { font-size: 14px; color: var(--text-3); }
+.ct-open.on .ct-open-h { color: var(--text); }
+.ct-open.on .ct-open-h .ph { color: var(--accent); }
+.ct-open-t { font-size: 13px; color: var(--text); margin-top: 5px; overflow-wrap: anywhere; }
+
+.ct-drawer .facts { border-top: 1px solid var(--border); }
+
+/* Narrow: each contact becomes a card. */
+@media (max-width: 700px) {
+  .ct-toolbar .search-field { width: 100%; }
+  .ct-table table { min-width: 0; }
+  .ct-table table, .ct-table tbody { display: block; }
+  .ct-table thead { display: none; }
+  .ct-table tbody tr {
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 3px 12px;
+    padding: 12px 14px; border-bottom: 1px solid var(--border);
+  }
+  .ct-table tbody tr:hover td { background: none; }
+  .ct-table tbody tr.ct-row.sel { background: var(--accent-soft); }
+  .ct-table td { display: block; padding: 0; border: none; min-width: 0; }
+  .ct-c-name, .ct-c-company, .ct-c-email { grid-column: 1 / -1; }
+  .ct-c-company { font-size: 12.5px; }
+  .ct-c-status { margin-top: 6px; }
+  .ct-c-reg { margin-top: 6px; }
+  .ct-table td.ct-c-source { display: none; }
+  .ct-head { flex-wrap: wrap; }
+  .ct-head .ct-head-actions { display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
+  .ct-head-actions .btn { justify-content: center; white-space: normal; text-align: center; }
+  .ct-head-actions #imp-toggle { grid-column: 1 / -1; }
+  .ct-toolbar { min-width: 0; }
+  #ct-filters { max-width: 100%; min-width: 0; }
+  .ct-person { flex-wrap: wrap; }
+  .ct-pact { flex-basis: 100%; justify-content: flex-start; padding-left: 28px; }
+}
+
+/* Very narrow: tighten the filter strip so all three fit without scrolling. */
+@media (max-width: 420px) {
+  #ct-filters button { padding: 6px 8px; gap: 4px; }
+}

@@ -297,8 +297,11 @@ def test_edit_and_its_refusals_match(client):
     pid = _prospect(client.sm, "pat@example.com")
     a, b = _queue(client.sm, pid, campaign_id="c1"), _queue(client.sm, pid, campaign_id="c2")
 
-    assert client.put(f"/api/outbox/{a}", json={"subject": "New", "body": "Text", "revision": 1}).json() == {
+    edited = client.put(f"/api/outbox/{a}", json={"subject": "New", "body": "Text", "revision": 1}).json()
+    assert {k: edited[k] for k in ("success", "revision", "status", "approval_cleared")} == {
         "success": True, "revision": 2, "status": "pending_review", "approval_cleared": False}
+    # The edit is measured again: its word count and flags come back with it.
+    assert edited["word_count"] == 1 and edited["flags"] == [] and edited["needs_flag_approval"] is False
     assert _run(OutboxService(CLI, client.sm).edit(b, "New", "Text", 1))["revision"] == 2
     for item in (a, b):
         row = _run(client.sm.get_outbox_item(item))

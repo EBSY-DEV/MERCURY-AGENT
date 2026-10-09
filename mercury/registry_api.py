@@ -5,6 +5,8 @@ already carry each contact's ``registry`` object; these endpoints refresh a
 company's lookup and record a person's accept/dismiss of the registry's name.
 """
 
+from types import SimpleNamespace
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict
 
@@ -65,6 +67,26 @@ async def refresh_company_registry(company_id: str):
         raise HTTPException(409, {"code": "signal_not_confirmed", "message": result.reason +
                                   ". Confirm it on the Signals tab first."})
     return _result(result)
+
+
+@router.get("/api/contacts/{prospect_id}/greeting-preview")
+async def contact_greeting_preview(prospect_id: str):
+    """How this contact's first email would open, with and without a name.
+    Reads stored state only; the routing role comes from the default offer,
+    else the writer's setting."""
+    from mercury.dashboard import _demo_config
+    from mercury.greeting import preview_greeting
+    from mercury.offers import default_offer
+
+    state = await _state()
+    prospect = await state.get_prospect(prospect_id)
+    if prospect is None:
+        raise HTTPException(404, {"code": "not_found", "message": "No such contact."})
+    company = await state.get_company(prospect.company_id) if prospect.company_id else None
+    config = _demo_config()
+    offer = default_offer(config) if config is not None else None
+    brief = SimpleNamespace(routing_role=offer.routing_role.strip()) if offer else None
+    return await preview_greeting(state, config, prospect, company, brief)
 
 
 @router.post("/api/contacts/{prospect_id}/registry-name")

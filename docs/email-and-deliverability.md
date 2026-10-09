@@ -61,17 +61,37 @@ mercury demos request EMAIL --offer voice       # register one to build
 mercury demos retire EMAIL                      # its emails wait for a new demo
 ```
 
-The Outbox tab has the same: a **Waiting for a demo** list and a **Mark ready** drawer to attach the link or recording. A demo that is ready is retired `demos.retire_after_days` (default 14) after the last email to a contact who never replied, once nothing is queued for them. A break-up email that says the demo "stays ready" should quote that number. Instantly deploys a whole sequence at once, so there a demo offer's campaign stays in draft until every contact in it has a ready demo. Building the demo itself is not Mercury's job; this is the bookkeeping and the gate.
+The Outbox tab has the same: a held email shows "Held until the demo is ready" under **Scheduled** (or a note on the draft under **To review**), and **Mark demo ready** opens a drawer to attach the link or recording. A demo that is ready is retired `demos.retire_after_days` (default 14) after the last email to a contact who never replied, once nothing is queued for them. A break-up email that says the demo "stays ready" should quote that number. Instantly deploys a whole sequence at once, so there a demo offer's campaign stays in draft until every contact in it has a ready demo. Building the demo itself is not Mercury's job; this is the bookkeeping and the gate.
 
 Temporary failures (timeouts, connection errors, 4xx deferrals, rate limiting) keep the row approved and retry up to 3 times, 30, 60 and 90 minutes later. Permanent errors mark it `failed`.
 
-**Reviewing.** In the dashboard's Outbox tab you can, for each pending draft:
+**Reviewing.** The dashboard's Outbox tab has four views: **To review** (drafts waiting for you), **Scheduled** (approved, grouped by day), **Sent today** (the last 24 hours, the window the daily caps count) and **Didn't send** (failed, stopped or blocked, with the reason). To review shows one draft at a time: the queue on the left (flagged drafts first, under "Needs a look"), the email in the middle, and on the right **Why this email**: the offer and why it was picked, the pain, the facts the Writer was given, what the email asks for and what it was told to keep out, read from the prompt the draft was written from (`brief` on each `/api/outbox` row), plus the rest of its sequence and the contact. Keys: <kbd>J</kbd>/<kbd>K</kbd> move, <kbd>A</kbd> approves, <kbd>R</kbd> rejects. For each pending draft you can:
 
 - **Edit** the subject and body. Pending and approved rows can be edited; an edited approved row goes back to `pending_review`. Approving saves unsaved edits first.
-- **Regenerate** with an optional instruction ("shorter", "mention their reviews"). The new draft goes back to `pending_review`.
+- **Regenerate** with an optional instruction ("shorter", "mention their reviews"), asked for in a dialog. A draft over its word limit also offers **Rewrite shorter**. The new draft goes back to `pending_review`.
 - **Approve** or **reject**. Rejecting a sequence step also rejects every later step of that sequence for that prospect.
 
 `mercury outbox` does the same from the terminal (see [Getting started](getting-started.md#8-review-the-outbox)). The Calendar tab can reschedule a pending or approved email to a future time; a rescheduled approved email needs approval again.
+
+### Flagged drafts
+
+A draft that breaks a deterministic rule is never staged unflagged. Today those rules are the step's word limit (`writer.word_limits`, counted over the whole body with the greeting and the sign-off) and, for a named contact, a generic opening greeting. Each outbox row carries:
+
+| Field | Meaning |
+|---|---|
+| `word_count` | Words in the body as staged (measured on read for rows written before this existed). |
+| `word_limit` | The limit it was held to; `0` for replies, which have none. |
+| `flags` | Codes: `over_word_limit`, `generic_greeting`. Empty when clean. |
+| `flag_details` | `[{"code", "label"}]` for display: "Over the word limit", "Generic greeting". |
+| `needs_flag_approval` | Flagged and not yet accepted by a person. |
+
+A flagged row waits in `pending_review` even with `require_approval: false`; follow-up auto-approval and "Approve all" skip it. Approving one is an explicit choice:
+
+- `POST /api/outbox/{id}/approve` with `{"revision": n, "approve_flagged": true}`. Without it the answer is `409` with `"code": "flagged"`, `flags`, `word_count` and `word_limit`, and nothing changes.
+- `POST /api/outbox/approve-all` and `/api/outbox/batch`: add `"approve_flagged": true` to the item. An item without it fails with `flagged` and the rest of the batch goes on.
+- `mercury outbox --approve ID --approve-flagged`.
+
+The approval records who accepted the flags (`flags_accepted_by`). Saving an edit (`PUT /api/outbox/{id}`, which returns the new `word_count`, `word_limit`, `flags` and `needs_flag_approval`) or regenerating measures the draft again and drops the acceptance with the approval. As a last line, the pre-send gate fails a row whose flags nobody accepted, and the sender's claim refuses it.
 
 **Revisions.** Every outbox row has a revision. Changing what a reviewer reads (the text, the recipient, the sending mailbox, a send time you pick, a regenerated draft) makes a new revision and sends an approved email back to review. Approve, reject and every edit name the revision they were decided on, and fail with `stale_revision` if the email changed since, so two people reviewing at once can't overwrite each other or approve text they haven't seen. An approval records the revision and a hash of the content it covered; the sender re-checks both when it claims the email, so nothing goes out on an approval for an earlier version. **Approve all** approves exactly the list on screen, at the revisions shown. The sender's own timing (follow-up spacing, retries, out-of-office resumes) does not change the revision.
 
@@ -96,6 +116,7 @@ Prompts can be ignored, so the last check before any email leaves is determinist
 | Merge tags | No unrendered `{{...}}` or `{...}` left. |
 | Banned phrases | Spam triggers and AI tells such as "act now", "click here", "i hope this finds you well", "game-changer", "as an ai". |
 | Links | At most 1 URL. |
+| Flagged drafts | A draft flagged as over its word limit or opening with a generic greeting sends only after a person accepted its flags. See [Flagged drafts](#flagged-drafts). |
 | HTML | None. Mercury sends plain text only. |
 | Case studies | No configured case-study name or alias outside the email's offer and the prospect's market and segment (see [`offers`](configuration.md#offers)). If the scope cannot be worked out, every configured case study is blocked. |
 
