@@ -9,6 +9,15 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **A governed pain library.** Pains are proposed (by the trainer or by hand),
+  confirmed or rejected by a person, and only confirmed ones are written from.
+  A rejected pain is the never-use list: retraining cannot bring it back, and a
+  draft that raises it is stopped by the Writer and by the pre-send gate. The
+  Writer gives each email the one confirmed pain that fits its offer, sector,
+  market and signals (or none), lists the rejected pains as never-use in the
+  prompt, and records the pain on the outbox row. `/api/outbox` rows carry
+  `pain_code` and `pain`. `mercury pains` and `/api/pains` manage the library
+  and show sends and replies per pain. See `docs/pains.md`.
 - **Offer routing and a per-prospect offer brief.** `offers:` entries can now
   carry eligibility (`markets`, `segments`, `signals.require` /
   `signals.exclude`), approved content and claims, per-step calls to action

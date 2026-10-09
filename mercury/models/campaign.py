@@ -17,6 +17,10 @@ class EmailStep(BaseModel):
     body: str
     delay_days: int = 0  # days after previous step
     generation_id: str = ""  # exact prompt + persona version that produced this step
+    # The confirmed pain the sequence was written around ('' = none). One per
+    # campaign: a shared template raises a pain only if every prospect in the
+    # group has the same one. The Sender copies it onto the staged outbox rows.
+    pain_code: str = ""
 
 
 class Campaign(BaseModel):

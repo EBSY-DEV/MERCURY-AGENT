@@ -49,6 +49,8 @@ Every signal Mercury knows how to collect, grouped into Discovery, Profile, Peop
 
 The **cohort builder** at the bottom counts, live, the companies that carry all the signals you require and none you exclude, and lists up to 200 of them. See [Prospecting](prospecting.md#signals).
 
+The **Pains** view beside it lists the problems Mercury may write about, in the owner's words: what is waiting on you, what you confirmed (with the emails sent and replies each one earned) and what you rejected. Confirm or reject from the list, or open one to edit the words, the scene, what it costs, the market and trade it applies to, the confirmed signals that make it apply, the offer that answers it and the evidence. **Add a pain** writes one by hand. A reason on a rejection is optional. Editing never changes a status, and a pain changed elsewhere while you edit is flagged instead of overwritten. See [The pain library](pains.md).
+
 ## Discover
 
 Provider cards show what each discovery source does, its cost and free tier, which `.env` keys it needs, and whether it is ready. Pick one, adjust cities (one per line; defaults to your ICP), results per query, search depth and the spend cap, then press **Estimate cost**. The Run button stays disabled until you have an estimate. Runs happen in the background; **Stop** ends a run between queries. When there are unprofiled companies, a button reads their sites for free.

@@ -12,6 +12,7 @@
 <link rel="apple-touch-icon" href="/static/brand/apple-touch-icon.png">
 <link rel="stylesheet" href="/static/app.css">
 <link rel="stylesheet" href="/static/personas.css">
+<link rel="stylesheet" href="/static/pains.css">
 </head>
 <body>
 
@@ -190,20 +191,25 @@
 <div id="signals" class="section">
   <div class="section-head">
     <h2>Signals</h2>
-    <p>Mercury proposes what it knows how to look for. You decide what actually
-       defines a good prospect &mdash; nothing is collected until you confirm it.</p>
+    <p>Mercury proposes what it knows how to look for, and the problems it can
+       write about. You decide what is true.</p>
   </div>
-  <div id="signals-summary"></div>
-  <div id="signals-groups"></div>
+  <div id="signals-views"></div>
 
-  <div class="subhead">Cohort builder</div>
-  <div class="card">
-    <p class="lede">A prospect list is a query, not a file. Pick the signals a
-      good prospect must have &mdash; and any that disqualify them &mdash; and see
-      how many companies match right now.</p>
-    <div id="cohort-builder"></div>
-    <div id="cohort-result"></div>
+  <div id="signals-view-signals">
+    <div id="signals-summary"></div>
+    <div id="signals-groups"></div>
+
+    <div class="subhead">Cohort builder</div>
+    <div class="card">
+      <p class="lede">A prospect list is a query, not a file. Pick the signals a
+        good prospect must have &mdash; and any that disqualify them &mdash; and see
+        how many companies match right now.</p>
+      <div id="cohort-builder"></div>
+      <div id="cohort-result"></div>
+    </div>
   </div>
+  <div id="signals-view-pains" hidden></div>
 </div>
 
 <!-- Discover: the only stage that spends money -->
@@ -795,5 +801,6 @@
 <script src="/static/personas.js"></script>
 <script src="/static/exclusions.js"></script>
 <script src="/static/away.js"></script>
+<script src="/static/pains.js"></script>
 </body>
 </html>

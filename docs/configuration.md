@@ -233,7 +233,7 @@ Prospects are grouped so one campaign carries one offer. The campaign and every 
 - verified facts: the newest observation of each code in `facts` (default: the codes in `signals.require`). An existing `SERP_RANK` observation is given here when you list it; nothing new is collected;
 - aggregate evidence, when `evidence` is set and enough companies were checked (below);
 - the case studies in scope for this prospect (below);
-- a confirmed pain, when one is supplied. Mercury never makes one up; without one the brief says none was supplied;
+- the one confirmed pain from the [pain library](pains.md) that fits the prospect and this offer, with the owner's words, the scene and the cost. Mercury never makes one up; when none fits, the brief says none was supplied (see [Pains in the Writer](pains.md#pains-in-the-writer));
 - the claim restrictions in `restrictions`, plus a standing rule against invented numbers, clients and results.
 
 When an offer has a `content.summary`, the brief is authoritative: the product description, benefits and pricing in the prompt point to it, and the `product_knowledge` skill (the trainer's description of everything you sell) is left out. Without a summary, the brief adds its calls to action, case studies and restrictions to the usual product description.

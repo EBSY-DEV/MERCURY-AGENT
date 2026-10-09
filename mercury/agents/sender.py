@@ -611,6 +611,7 @@ class Sender:
                     mailbox=campaign.mailbox,
                     offer_key=campaign.offer_key,
                     company_id=company_id,
+                    pain_code=step.pain_code,
                 )
                 if item_id:
                     staged += 1
@@ -819,10 +820,13 @@ class Sender:
             thread = self._thread_for(item, prev)
             subject_out = (reply_subject(thread["thread_subject"])
                            if thread.get("thread_subject") else item["subject"])
+            pains = await self.state.list_pains() if item["kind"] == "sequence" else []
             gate = pre_send_check(
                 item["to_email"], subject_out, item["body"],
                 prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
                 blocked_references=await blocked_references(self.state, self.config, item, prospect),
+                rejected_pains=[p for p in pains if p["status"] == "rejected"],
+                allowed_pains=[p for p in pains if p["status"] == "confirmed"],
             )
             if not gate:
                 await self.state.update_outbox_item(

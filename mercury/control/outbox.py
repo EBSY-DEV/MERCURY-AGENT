@@ -177,10 +177,13 @@ class OutboxService:
                 "ORDER BY updated_at DESC LIMIT 25"),
         }
         from mercury.offers import annotate_outbox as annotate_offers
+        from mercury.pains import annotate_outbox as annotate_pains
 
-        for bucket in ("pending", "approved", "blocked", "sending", "sent", "failed"):
+        buckets = ("pending", "approved", "blocked", "sending", "sent", "failed")
+        for bucket in buckets:
             self._with_wire_subject(data[bucket])
             await annotate_offers(state, self.config, data[bucket])
+        await annotate_pains(state, [row for bucket in buckets for row in data[bucket]])
         return data
 
     async def _item(self, item_id: str) -> dict:
@@ -203,6 +206,9 @@ class OutboxService:
         legacy, known = self._mailboxes()
         rows = await with_from_mailbox(self.state, [item], legacy, known)
         await annotate_offers(self.state, self.config, rows)
+        from mercury.pains import annotate_outbox as annotate_pains
+
+        await annotate_pains(self.state, rows)
         return self._with_wire_subject(rows)[0]
 
     # ── Review ──
@@ -485,4 +491,7 @@ class OutboxService:
         trail.record(item_id, revision, updated.get("revision"),
                      approval_cleared=item.get("status") == "approved",
                      generation_id=updated.get("generation_id") or "")
-        return self._with_wire_subject(await PersonaStore(state).enrich([updated]))[0]
+        from mercury.pains import annotate_outbox as annotate_pains
+
+        rows = await annotate_pains(state, await PersonaStore(state).enrich([updated]))
+        return self._with_wire_subject(rows)[0]

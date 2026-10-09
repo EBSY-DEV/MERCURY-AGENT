@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from mercury.brain import Brain
+from mercury.pains import confirmed_pain_lines, propose_pains
 from mercury.state import StateManager
 
 logger = logging.getLogger("mercury.trainer")
@@ -381,6 +382,8 @@ class Trainer:
         icp_info = await self._extract_icp()
         print(f"      Target: {', '.join(icp_info.get('industries', ['Unknown']))}\n")
 
+        await self._propose_pains(icp_info, base_url)
+
         # Step 4: Competitive analysis
         print("[4/6] Analyzing competitive landscape...")
         competitive_intel = await self._extract_competitive_intel(product_info)
@@ -404,7 +407,9 @@ class Trainer:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
         # Generate product knowledge skill
-        await self._generate_product_knowledge(product_info, icp_info, competitive_intel)
+        await self._generate_product_knowledge(
+            product_info, icp_info, competitive_intel,
+            pain_lines=await confirmed_pain_lines(self.state))
 
         # Generate competitive battle cards skill
         if competitive_intel.get("competitors"):
@@ -506,6 +511,19 @@ Be specific — don't guess generically. Base this on what the website actually 
             "geography": ["United States"],
         }
 
+    async def _propose_pains(self, icp_info: dict, base_url: str) -> list[dict]:
+        """Record the pains the analysis found as PROPOSED, nothing more.
+
+        A person confirms them with `mercury pains`; a rejected pain, or a
+        reworded copy of one, is never proposed again."""
+        results = await propose_pains(self.state, icp_info.get("pain_points") or [],
+                                      evidence=f"trainer crawl of {base_url}")
+        if results:
+            new = sum(1 for r in results if r["outcome"] == "proposed")
+            print(f"      Proposed {new} new pain(s) for your review "
+                  f"({len(results) - new} already on file). Confirm with: mercury pains\n")
+        return results
+
     async def _extract_competitive_intel(self, product_info: dict) -> dict:
         """Extract competitive positioning and differentiators."""
         all_content = self._get_all_content(max_chars=40000)
@@ -572,10 +590,18 @@ Return as a JSON object where keys are the objection and values are the response
         return result if isinstance(result, dict) else {}
 
     async def _generate_product_knowledge(
-        self, product_info: dict, icp_info: dict, competitive_intel: dict
+        self, product_info: dict, icp_info: dict, competitive_intel: dict,
+        pain_lines: list[str] | None = None,
     ):
-        """Generate comprehensive product knowledge skill file."""
+        """Generate comprehensive product knowledge skill file.
+
+        ``pain_lines`` are the pains a person has confirmed. The file never
+        lists what the website analysis merely suggested: those are proposals
+        until `mercury pains --confirm`."""
         product_name = product_info.get("product_name", "the product")
+        pain_lines = pain_lines or []
+        pains_text = (chr(10).join("- " + p for p in pain_lines) if pain_lines else
+                      "_None confirmed yet. Review proposals with `mercury pains`._")
 
         knowledge = f"""# Product Knowledge: {product_name}
 
@@ -612,8 +638,8 @@ Return as a JSON object where keys are the objection and values are the response
 ## Social Proof & Case Studies
 {chr(10).join('- ' + s for s in product_info.get('social_proof', []))}
 
-## Prospect Pain Points
-{chr(10).join('- ' + p for p in icp_info.get('pain_points', []))}
+## Prospect Pain Points (confirmed)
+{pains_text}
 
 ## Buying Triggers
 When these events happen, prospects are most likely to buy:

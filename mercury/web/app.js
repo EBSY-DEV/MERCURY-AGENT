@@ -207,7 +207,7 @@ function loadCurrentTab() {
     case 'today': loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); loadTrend(); loadHeatmap(); loadHealth(); break;
     case 'help': break;
     case 'mailboxes': loadMailboxes(); break;
-    case 'signals': loadSignals(); break;
+    case 'signals': loadSignalsPage(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
     case 'prospects': loadProspects(); break;

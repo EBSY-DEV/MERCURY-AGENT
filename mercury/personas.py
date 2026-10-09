@@ -261,11 +261,13 @@ class PersonaStore:
                 "UPDATE outbox SET subject = ?, body = ?, generation_id = ?, manually_edited = 0, "
                 "status = 'pending_review', revision = revision + 1, approved_revision = NULL, "
                 "approved_hash = '', approved_by = '', approved_at = NULL, "
-                "updated_at = CURRENT_TIMESTAMP "
+                "pain_code = COALESCE(?, pain_code), updated_at = CURRENT_TIMESTAMP "
                 "WHERE id = ? AND status IN ('pending_review', 'approved') "
                 "AND (? IS NULL OR revision = ?)",
-                (draft["subject"], draft["body"], draft.get("generation_id", ""), item_id,
-                 expected_revision, expected_revision),
+                (draft["subject"], draft["body"], draft.get("generation_id", ""),
+                 # Only a Writer draft knows its pain; a reply draft leaves the column alone.
+                 draft["pain_code"].strip().upper() if "pain_code" in draft else None,
+                 item_id, expected_revision, expected_revision),
             )
             if not cursor.rowcount:
                 raise ValueError("This email is no longer available for regeneration")

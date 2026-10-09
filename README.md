@@ -229,6 +229,7 @@ Cold email law (CAN-SPAM, GDPR/PECR) is your responsibility as the sender. Use a
 | `mercury dashboard [--host] [--port]` | Web dashboard (default `127.0.0.1:5555`) |
 | `mercury status` | Pipeline summary |
 | `mercury signals [--confirm CODES] [--reject CODES]` | Review signals; `free` and `all` are accepted as codes |
+| `mercury pains [--confirm CODES] [--reject CODES]` | Review the pains Mercury may write about; `show`, `add` and `edit` subcommands ([docs](docs/pains.md)) |
 | `mercury personas [list\|show\|create\|edit\|default\|archive\|restore\|versions\|prompt\|preview\|mailboxes\|assign]` | Manage writing voices. `prompt` shows the exact writer prompt for a contact; `preview` writes one sample that is never queued. `--json` on every read. `assign EMAIL [PERSONA] --sign-name NAME` gives a mailbox its own voice and sign-off |
 | `mercury discover [--providers] [--estimate] [--provider KEY] [--city ...] [--max-spend N]` | Find businesses |
 | `mercury profile [--limit N] [--stale-days N]` | Read discovered companies' websites (free) |
