@@ -58,6 +58,13 @@ def voice_instructions(profile: dict) -> str:
         sections += ["Writing preferences:", profile["instructions"]]
     if profile.get("examples"):
         sections += ["Style examples (match the voice; do not copy claims or facts):", profile["examples"]]
+    # An experiment arm's instruction (mercury/experiments.py). It is part of
+    # the snapshot, so every email of the sequence, and any regeneration,
+    # follows it.
+    variant = (profile.get("experiment") or {}).get("instruction") or ""
+    if variant:
+        sections += ["Variant instruction (binding for this whole sequence; change only what it names):",
+                     variant]
     return "\n".join(sections)
 
 

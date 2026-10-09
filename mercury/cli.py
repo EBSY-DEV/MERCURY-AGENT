@@ -1688,6 +1688,164 @@ def _load_config_quiet():
         return None
 
 
+def _pct(rate) -> str:
+    return "-" if rate is None else f"{rate:.1%}"
+
+
+def _experiment_definition(args) -> dict:
+    """A definition from --file (JSON or YAML) and/or the flags; flags win."""
+    data: dict = {}
+    if args.file:
+        import yaml
+
+        text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text(encoding="utf-8")
+        loaded = yaml.safe_load(text) or {}
+        if not isinstance(loaded, dict):
+            raise ValueError("The file must hold one experiment definition (a mapping)")
+        data.update(loaded)
+    for flag, key in (("name", "name"), ("hypothesis", "hypothesis"), ("variable", "variable"),
+                      ("split", "allocation_a"), ("window", "response_window_days"),
+                      ("min_per_arm", "min_per_arm"), ("min_days", "min_duration_days"),
+                      ("until", "enroll_until"), ("metric", "primary_metric"),
+                      ("max_enrolled", "max_enrolled")):
+        value = getattr(args, flag, None)
+        if value is not None:
+            data[key] = value
+    arms = {a.get("key") or k: dict(a) for k, a in zip("AB", data.get("arms") or [{}, {}])}
+    for key in "AB":
+        arm = arms.setdefault(key, {})
+        arm["key"] = key
+        for field in ("name", "instruction", "persona"):
+            value = getattr(args, f"{key.lower()}_{field}", None)
+            if value is not None:
+                arm["persona_id" if field == "persona" else field] = value
+    if any(len(a) > 1 for a in arms.values()) or "arms" in data:
+        data["arms"] = [arms["A"], arms["B"]]
+    cohort = dict(data.get("cohort") or {})
+    if args.industry:
+        cohort["industries"] = args.industry
+    if args.batch:
+        cohort["import_batch_ids"] = args.batch
+    if cohort:
+        data["cohort"] = cohort
+    return data
+
+
+def _print_experiment(detail: dict) -> None:
+    e, r = detail["experiment"], detail["results"]
+    hold = "  (unsent mail on hold)" if e["hold_mail"] else ""
+    print(f"\n  {e['name']}  [{e['status_label']}]{hold}  revision {e['revision']}  id {e['id']}")
+    if e.get("hypothesis"):
+        print(f"  {e['hypothesis']}")
+    print(f"  {e['setup_line']}")
+    print(f"  Cohort: {e['cohort_description']}")
+    for arm in r["arms"]:
+        persona = next((a["persona_name"] for a in e["arms"] if a["arm_key"] == arm["key"]), "")
+        print(f"\n  {arm['key']}  {arm['name']}  ({persona})")
+        if arm["instruction"]:
+            print(f"     {arm['instruction']}")
+        print(f"     enrolled {arm['enrolled']}, contacted {arm['contacted']}, "
+              f"mature {arm['mature']}, pending {arm['pending']}")
+        p = arm["primary"]
+        interval = (f" (95% {_pct(p['interval']['low'])} to {_pct(p['interval']['high'])})"
+                    if p["interval"] else "")
+        print(f"     {r['primary_metric_label']}: {p['count']}/{arm['mature']} = {_pct(p['rate'])}"
+              f"{interval}")
+        print(f"     any reply {_pct(arm['any_reply']['rate'])}, bounce {_pct(arm['bounce']['rate'])}, "
+              f"opt-out {_pct(arm['opt_out']['rate'])}, uncertain {arm['uncertain']}, "
+              f"late replies {arm['late_replies']}")
+    c = r["comparison"]
+    if c["difference"] is not None:
+        print(f"\n  B minus A: {c['difference']:+.1%} (95% {c['interval']['low']:+.1%} to "
+              f"{c['interval']['high']:+.1%}, {c['method']})")
+    print(f"\n  {r['decision']['label']}. {r['decision']['line']}")
+    for warning in r["health"]["warnings"]:
+        print(f"  Warning: {warning['message']} Try: {warning['action']['cli']}")
+    print()
+
+
+def cmd_experiments(args):
+    """A/B experiments: create, preview, start, pause, hold, complete, results."""
+    from mercury.config import load_config
+    from mercury.control.context import OperatorContext
+    from mercury.control.errors import ControlError
+    from mercury.control.experiments import EFFECTS, ExperimentService
+    from mercury.state import StateManager
+
+    async def _run():
+        service = await ExperimentService(OperatorContext.local("cli"), StateManager(),
+                                          load_config()).ready()
+        action = args.experiments_action
+        needs_target = action not in ("list", "create") and not (action == "preview" and args.file)
+        if needs_target and not args.target:
+            raise ControlError(f"Which experiment? mercury experiments {action} NAME_OR_ID")
+        out = None
+        if action == "list":
+            result = await service.list()
+            if args.json:
+                return print(json.dumps(result, indent=2))
+            if not result["experiments"]:
+                return print("\n  No experiments yet. Try: mercury experiments create --file test.yaml\n")
+            print(f"\n  {'Id':<13} {'Status':<10} {'Variable':<15} {'Enrolled':>9} {'Mature':>9} "
+                  f"{'Rate A':>7} {'Rate B':>7}  Result")
+            for x in result["experiments"]:
+                print(f"  {x['id']:<13} {x['status_label']:<10} {x['variable_label']:<15} "
+                      f"{x['enrolled']['A']:>4}/{x['enrolled']['B']:<4} "
+                      f"{x['mature']['A']:>4}/{x['mature']['B']:<4} {_pct(x['rate']['A']):>7} "
+                      f"{_pct(x['rate']['B']):>7}  {x['result']['label']}  {x['name']}")
+            return print()
+        if action == "show":
+            out = await service.get(args.target, args.revision)
+            return print(json.dumps(out, indent=2)) if args.json else _print_experiment(out)
+        if action == "assignments":
+            out = await service.exposures(args.target, args.revision, args.arm or "", args.limit)
+        elif action == "preview":
+            out = (await service.preview(definition=_experiment_definition(args)) if args.file
+                   else await service.preview(args.target))
+            if not args.json:
+                print(f"\n  {out['eligible']} eligible now ({out['cohort_description']}): "
+                      f"about {out['expected']['A']} to A and {out['expected']['B']} to B.")
+                for arm in out["arms"]:
+                    print(f"\n  {arm['key']}  {arm['name']}  persona {arm['persona']['name']} "
+                          f"v{arm['persona']['revision']}\n     {arm['instruction'] or '(no instruction)'}")
+                for warning in out["warnings"]:
+                    print(f"\n  Warning: {warning['message']}")
+                return print(f"\n  {out['note']}\n")
+        elif action == "create":
+            out = await service.create(_experiment_definition(args))
+        elif action == "edit":
+            changes = _experiment_definition(args)
+            out = await service.update(args.target, changes, args.expected_version)
+            if not args.json and out.get("new_revision"):
+                print(f"\n  Saved as revision {out['experiment']['revision']}: new enrollments use it.")
+        elif action in ("start", "pause", "resume", "release"):
+            out = await getattr(service, action)(args.target)
+        elif action == "hold":
+            out = await service.hold(args.target, args.reason)
+        elif action == "complete":
+            out = await service.complete(args.target, confirm=args.confirm)
+        elif action == "label":
+            out = await service.label(args.target, args.label)
+            return print(json.dumps(out, indent=2) if args.json else
+                         f"\n  Labelled {args.target} as {args.label}.\n")
+        if args.json:
+            return print(json.dumps(out, indent=2))
+        if action == "assignments":
+            for a in out["assignments"]:
+                steps = ", ".join(f"{e['step']}:{e['status']}" for e in a["emails"]) or "nothing yet"
+                print(f"  {a['arm_key']}  {a['email'] or a['prospect_id']}  {steps}")
+            return print(f"\n  {out['total']} assigned in revision {out['revision']}.\n")
+        if action in EFFECTS:
+            print(f"\n  {EFFECTS[action]}")
+        _print_experiment(out)
+
+    try:
+        asyncio.run(_run())
+    except ControlError as error:
+        print(f"\n  {error}\n")
+        sys.exit(1)
+
+
 def cmd_sending(args):
     """Pause/resume sending, or clear a health hold."""
     from mercury.config import load_config
@@ -2100,6 +2258,42 @@ def main():
     sub.add_argument("--all", action="store_true", help="list: include retired demos")
     sub.add_argument("--json", action="store_true", help="Machine-readable output")
     sub.set_defaults(func=cmd_demos)
+
+    sub = subparsers.add_parser(
+        "experiments", help="A/B experiments: create, preview, start, pause, hold, results")
+    sub.add_argument("experiments_action", nargs="?", default="list",
+                     choices=["list", "show", "create", "edit", "preview", "start", "pause",
+                              "resume", "hold", "release", "complete", "assignments", "label"])
+    sub.add_argument("target", nargs="?", default="",
+                     help="Experiment name, id or id prefix (label: the inbound message id)")
+    sub.add_argument("label", nargs="?", default="", help="label: the outcome label")
+    sub.add_argument("--file", default="", help="create/edit/preview: a JSON or YAML definition")
+    sub.add_argument("--name", default=None)
+    sub.add_argument("--hypothesis", default=None)
+    sub.add_argument("--variable", default=None, choices=["opening_angle", "subject_line", "persona"])
+    for key in ("a", "b"):
+        sub.add_argument(f"--{key}-name", default=None, help=f"Arm {key.upper()}'s name")
+        sub.add_argument(f"--{key}-instruction", default=None,
+                         help=f"Arm {key.upper()}'s generation instruction")
+        sub.add_argument(f"--{key}-persona", default=None, help=f"Arm {key.upper()}'s persona id")
+    sub.add_argument("--split", type=int, default=None, help="Percent of prospects for arm A")
+    sub.add_argument("--window", type=int, default=None, help="Response window in days")
+    sub.add_argument("--min-per-arm", type=int, default=None, help="Mature prospects needed per arm")
+    sub.add_argument("--min-days", type=int, default=None, help="Shortest run before a decision")
+    sub.add_argument("--until", default=None, help="Enroll until this date (YYYY-MM-DD)")
+    sub.add_argument("--max-enrolled", type=int, default=None, help="Enroll at most this many")
+    sub.add_argument("--metric", default=None, choices=["positive_reply_rate", "any_reply_rate"])
+    sub.add_argument("--industry", action="append", default=[], help="Cohort: an industry (repeat)")
+    sub.add_argument("--batch", action="append", default=[], help="Cohort: an import batch (repeat)")
+    sub.add_argument("--revision", type=int, default=None, help="show/assignments: a revision")
+    sub.add_argument("--arm", default="", help="assignments: only A or B")
+    sub.add_argument("--limit", type=int, default=100, help="assignments: how many")
+    sub.add_argument("--expected-version", type=int, default=None,
+                     help="edit: fail if someone saved a newer version first")
+    sub.add_argument("--reason", default="", help="hold: why (kept with the hold)")
+    sub.add_argument("--confirm", action="store_true", help="complete: yes, end enrollment")
+    sub.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub.set_defaults(func=cmd_experiments)
 
     sub = subparsers.add_parser(
         "sending", help="Pause/resume sending (your pause only), or clear a bounce hold")

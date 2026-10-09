@@ -171,6 +171,7 @@ const TAB_META = {
   pipeline: ['Pipeline', 'kanban'], calendar: ['Calendar', 'calendar-blank'],
   campaigns: ['Campaigns', 'megaphone'], outbox: ['Outbox', 'tray'], mailboxes: ['Mailboxes', 'envelope-simple'],
   exclusions: ['Exclusions', 'prohibit'],
+  experiments: ['Experiments', 'flask'],
   personas: ['Voice & Personas', 'sparkle'],
   inbox: ['Inbox', 'chat-circle-text'], activity: ['Activity', 'pulse'],
   usage: ['Usage', 'gauge'], settings: ['Settings', 'gear-six'], controls: ['Controls', 'power'],
@@ -218,6 +219,7 @@ function loadCurrentTab() {
     case 'personas': loadPersonas(); break;
     case 'outbox': loadOutbox(); break;
     case 'exclusions': loadExclusions(); break;
+    case 'experiments': loadExperiments(); break;
     case 'inbox': loadInbox(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;

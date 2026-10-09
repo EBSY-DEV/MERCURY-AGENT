@@ -15,6 +15,7 @@
 <link rel="stylesheet" href="/static/outbox.css">
 <link rel="stylesheet" href="/static/contacts.css">
 <link rel="stylesheet" href="/static/pains.css">
+<link rel="stylesheet" href="/static/experiments.css">
 <link rel="stylesheet" href="/static/inbox.css">
 </head>
 <body>
@@ -49,6 +50,7 @@
       <button data-tab="pipeline" onclick="showTab('pipeline', this)"><i data-ph="kanban"></i><span class="lbl">Pipeline</span></button>
       <button data-tab="calendar" onclick="showTab('calendar', this)"><i data-ph="calendar-blank"></i><span class="lbl">Calendar</span></button>
       <button data-tab="campaigns" onclick="showTab('campaigns', this)"><i data-ph="megaphone"></i><span class="lbl">Campaigns</span></button>
+      <button data-tab="experiments" onclick="showTab('experiments', this)"><i data-ph="flask"></i><span class="lbl">Experiments</span></button>
       <button data-tab="personas" onclick="showTab('personas', this)"><i data-ph="sparkle"></i><span class="lbl">Voice &amp; Personas</span></button>
       <button data-tab="outbox" onclick="showTab('outbox', this)"><i data-ph="tray"></i><span class="lbl">Outbox</span><span class="nav-count" id="nav-outbox"></span></button>
       <button data-tab="exclusions" onclick="showTab('exclusions', this)"><i data-ph="prohibit"></i><span class="lbl">Exclusions</span><span class="nav-count" id="nav-exclusions"></span></button>
@@ -384,6 +386,18 @@
 <div id="campaigns" class="section">
   <div class="section-head"><h2>Campaigns</h2><p>Email sequences Mercury has written and deployed.</p></div>
   <div id="campaigns-list"></div>
+</div>
+
+<!-- Experiments: A/B tests on real replies (experiments.js) -->
+<div id="experiments" class="section xp">
+  <div class="section-head split">
+    <div>
+      <h2>Experiments</h2>
+      <p>Compare two versions on real replies. Mercury waits for enough data before it names a winner.</p>
+    </div>
+    <button class="btn btn-primary" onclick="expNew()"><i data-ph="plus"></i>New experiment</button>
+  </div>
+  <div id="xp-body"><div class="loading-note">Loading experiments…</div></div>
 </div>
 
 <!-- Outbox: every email waits for a yes (outbox.js) -->
@@ -810,6 +824,7 @@
 <script src="/static/app.js"></script>
 <script src="/static/personas.js"></script>
 <script src="/static/contacts.js"></script>
+<script src="/static/experiments.js"></script>
 <script src="/static/exclusions.js"></script>
 <script src="/static/away.js"></script>
 <script src="/static/outbox.js"></script>

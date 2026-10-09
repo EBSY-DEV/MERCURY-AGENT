@@ -72,6 +72,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from demo_registry import seed_registry  # noqa: E402  (next to this file)
 from mercury.integrations.mailboxes import warmup_cap  # noqa: E402
@@ -83,6 +84,7 @@ from mercury.state import StateManager  # noqa: E402
 from demo_pains import extend_config as extend_pain_config, seed_pains  # noqa: E402
 
 import demo_outbox  # noqa: E402  (scripts/demo_outbox.py: offers, pains, review drafts)
+from demo_experiments import seed_experiments  # noqa: E402
 from demo_inbox import seed_inbox  # noqa: E402  (next to this file)
 
 DEFAULT_DB = ROOT / "data" / "demo.db"
@@ -339,6 +341,7 @@ async def seed(db_path: Path) -> dict:
     counts.update(await seed_placement(sm))
     counts.update(await seed_registry(sm, NOW))
     counts.update(await seed_pains(sm))
+    counts.update(await seed_experiments(sm, NOW, MB_WARM))
     counts.update(await seed_personas(sm))
     counts.update(await seed_signals(sm, companies))
     return counts
@@ -721,7 +724,7 @@ def main(argv: list[str]) -> int:
           f"{len(COMPANIES)} companies, {counts['conversations']} conversations, "
           f"{counts['outbox']} outbox rows, {counts['history_sends']} historical sends, "
           f"{counts['history_events']} reply/bounce events, "
-          f"{counts['warmup_inboxes']} warm-up overlays, "
+          f"{counts['warmup_inboxes']} warm-up overlays, {counts['experiments']} experiments, "
           f"{counts['pains']} pains ({counts['pain_emails']} emails tagged).")
     print(f"Demo mail config: {config_path}")
     print(f"Run: MERCURY_DB_PATH={target} MERCURY_CONFIG={config_path} "

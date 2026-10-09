@@ -22,6 +22,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from mercury import experiments
 from mercury.brain import AGENT_SKILLS, Brain
 from mercury.config import MercuryConfig
 from mercury.integrations.mail_provider import NATIVE_PROVIDERS
@@ -331,6 +332,10 @@ class Writer:
             for mailbox in dict.fromkeys(picks):
                 group = [p for p, pick in zip(prospects, picks) if pick == mailbox]
                 groups.append((f"{batch_name} · {mailbox}", group, mailbox, await self.voices.profile_for(mailbox)))
+        if self.is_native:
+            # Running experiments assign their prospects now, before any
+            # draft, and each arm's share is written with the arm's profile.
+            groups = await experiments.writer_groups(self.state, self.config, groups)
 
         for batch_name, prospects, mailbox, profile in groups:
             logger.info(

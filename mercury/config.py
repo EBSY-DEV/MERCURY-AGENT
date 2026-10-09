@@ -665,6 +665,44 @@ class DemosConfig(BaseModel):
         return v
 
 
+class ExperimentsConfig(BaseModel):
+    """A/B experiments (mercury/experiments.py): defaults for a new
+    experiment, the outcome labels' confidence threshold and the health
+    checks that come before any copy conclusion."""
+    # Label replies of experiment contacts with the outcome classifier (one
+    # Claude call per human reply, only while within budget). Off: labels
+    # come from the handler's intent alone (see docs/experiments.md).
+    classify_outcomes: bool = True
+    # A label below this confidence is "uncertain": shown, never counted as
+    # a positive, until the classifier or a person settles it.
+    confidence_threshold: float = 0.7
+    # Defaults the dashboard and CLI offer for a new experiment.
+    response_window_days: int = 14
+    min_per_arm: int = 50
+    min_duration_days: int = 14
+    # Health checks over mature contacts of both arms. Below
+    # low_reply_rate (or above high_bounce_rate) the result says to check
+    # deliverability before reading anything into the copy.
+    health_min_mature: int = 30
+    low_reply_rate: float = 0.01
+    high_bounce_rate: float = 0.05
+    max_classifications_per_cycle: int = 20
+
+    @field_validator("confidence_threshold", "low_reply_rate", "high_bounce_rate")
+    @classmethod
+    def _fraction(cls, v: float) -> float:
+        if not 0 <= v <= 1:
+            raise ValueError("must be between 0 and 1")
+        return v
+
+    @field_validator("response_window_days", "min_per_arm")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("must be at least 1")
+        return v
+
+
 class MercuryConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
@@ -675,6 +713,7 @@ class MercuryConfig(BaseModel):
     offers: list[OfferDefinition] = []
     demos: DemosConfig = DemosConfig()
     writer: WriterConfig = WriterConfig()
+    experiments: ExperimentsConfig = ExperimentsConfig()
 
     @field_validator("offers")
     @classmethod

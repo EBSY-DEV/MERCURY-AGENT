@@ -1011,6 +1011,166 @@ MIGRATIONS: list[str] = [
     CREATE INDEX idx_inbox_reminders_open ON inbox_reminders(due_at) WHERE done_at IS NULL;
     CREATE INDEX idx_inbox_reminders_conversation ON inbox_reminders(conversation_id);
     """,
+    # ── v26: A/B experiments: definitions, revisions, assignment, exposure ──
+    """
+    -- An experiment compares two arms (A, B) on one variable. Its state is
+    -- draft -> running <-> paused -> completed. hold_mail is separate from
+    -- the state: it stops every unsent email of the experiment at the send
+    -- claim without touching approvals (mercury/experiments.py).
+    -- version counts edits, for optimistic concurrency.
+    CREATE TABLE experiments (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        hypothesis TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'draft'
+            CHECK (status IN ('draft', 'running', 'paused', 'completed')),
+        hold_mail INTEGER NOT NULL DEFAULT 0,
+        hold_reason TEXT DEFAULT '',
+        held_at TIMESTAMP,
+        enroll_until TIMESTAMP,
+        max_enrolled INTEGER NOT NULL DEFAULT 0,
+        current_revision INTEGER NOT NULL DEFAULT 1,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_by TEXT DEFAULT '',
+        created_at TIMESTAMP NOT NULL,
+        updated_at TIMESTAMP NOT NULL,
+        started_at TIMESTAMP,
+        paused_at TIMESTAMP,
+        completed_at TIMESTAMP
+    );
+    -- What is compared and how it is measured. A revision is frozen when
+    -- enrollment starts (frozen_at): from then on neither it nor its arms
+    -- change, and a substantive edit is a new revision.
+    CREATE TABLE experiment_revisions (
+        id TEXT PRIMARY KEY,
+        experiment_id TEXT NOT NULL REFERENCES experiments(id),
+        number INTEGER NOT NULL,
+        variable TEXT NOT NULL,
+        allocation_a INTEGER NOT NULL DEFAULT 50 CHECK (allocation_a BETWEEN 1 AND 99),
+        cohort_json TEXT NOT NULL DEFAULT '{}',
+        response_window_days INTEGER NOT NULL,
+        min_per_arm INTEGER NOT NULL,
+        min_duration_days INTEGER NOT NULL DEFAULT 0,
+        primary_metric TEXT NOT NULL DEFAULT 'positive_reply_rate',
+        created_at TIMESTAMP NOT NULL,
+        frozen_at TIMESTAMP,
+        UNIQUE (experiment_id, number)
+    );
+    -- An arm: a generation instruction and/or a persona. persona_id '' is
+    -- the default voice; persona_version_id is the exact version, resolved
+    -- when the revision is frozen.
+    CREATE TABLE experiment_arms (
+        id TEXT PRIMARY KEY,
+        revision_id TEXT NOT NULL REFERENCES experiment_revisions(id),
+        arm_key TEXT NOT NULL CHECK (arm_key IN ('A', 'B')),
+        name TEXT NOT NULL,
+        instruction TEXT DEFAULT '',
+        persona_id TEXT DEFAULT '',
+        persona_version_id TEXT DEFAULT '',
+        UNIQUE (revision_id, arm_key)
+    );
+    CREATE TRIGGER experiment_revisions_frozen BEFORE UPDATE ON experiment_revisions
+    WHEN OLD.frozen_at IS NOT NULL BEGIN
+        SELECT RAISE(ABORT, 'experiment revision is frozen');
+    END;
+    CREATE TRIGGER experiment_arms_frozen BEFORE UPDATE ON experiment_arms
+    WHEN (SELECT frozen_at FROM experiment_revisions WHERE id = OLD.revision_id) IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'experiment arm is frozen');
+    END;
+    CREATE TRIGGER experiment_arms_frozen_delete BEFORE DELETE ON experiment_arms
+    WHEN (SELECT frozen_at FROM experiment_revisions WHERE id = OLD.revision_id) IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'experiment arm is frozen');
+    END;
+    -- One arm per prospect per experiment, written before anything is
+    -- generated for them and never changed. bucket is the hash value the
+    -- arm was drawn from, so the draw can be reproduced.
+    CREATE TABLE experiment_assignments (
+        experiment_id TEXT NOT NULL REFERENCES experiments(id),
+        prospect_id TEXT NOT NULL,
+        revision_id TEXT NOT NULL,
+        arm_id TEXT NOT NULL,
+        arm_key TEXT NOT NULL,
+        bucket REAL NOT NULL,
+        assigned_at TIMESTAMP NOT NULL,
+        PRIMARY KEY (experiment_id, prospect_id)
+    );
+    CREATE INDEX idx_experiment_assignments_prospect ON experiment_assignments(prospect_id);
+    CREATE INDEX idx_experiment_assignments_revision ON experiment_assignments(revision_id, arm_key);
+    CREATE TRIGGER experiment_assignments_no_update BEFORE UPDATE ON experiment_assignments
+    BEGIN
+        SELECT RAISE(ABORT, 'experiment assignments are permanent');
+    END;
+    -- An outcome label for one inbound message that replaces the label
+    -- mapped from the handler's intent: the outcome classifier's, or one a
+    -- person set. source: classifier | manual.
+    CREATE TABLE experiment_outcomes (
+        inbound_id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        confidence REAL NOT NULL,
+        source TEXT NOT NULL,
+        detail TEXT DEFAULT '',
+        labeled_by TEXT DEFAULT '',
+        created_at TIMESTAMP NOT NULL,
+        updated_at TIMESTAMP NOT NULL
+    );
+    -- Exposure: the experiment, revision and arm a sequence email was
+    -- written for. '' = not experiment mail (all mail before this version
+    -- stays explicitly unassigned).
+    ALTER TABLE outbox ADD COLUMN experiment_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN experiment_revision_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE outbox ADD COLUMN experiment_arm_id TEXT NOT NULL DEFAULT '';
+    CREATE INDEX idx_outbox_experiment ON outbox(experiment_id, experiment_revision_id)
+        WHERE experiment_id != '';
+    -- The arm marker a generation carries in its persona snapshot.
+    CREATE VIEW experiment_generations AS
+        SELECT id AS generation_id,
+               CASE WHEN json_valid(persona_json)
+                    THEN json_extract(persona_json, '$.experiment.experiment_id') END
+                   AS experiment_id,
+               CASE WHEN json_valid(persona_json)
+                    THEN json_extract(persona_json, '$.experiment.revision_id') END
+                   AS revision_id,
+               CASE WHEN json_valid(persona_json)
+                    THEN json_extract(persona_json, '$.experiment.arm_id') END
+                   AS arm_id
+        FROM email_generations;
+    -- A sequence email written by an arm's generation, for a prospect
+    -- assigned to that experiment, is stamped with the arm when it is
+    -- queued (or when its generation is first attached). A stamp is never
+    -- moved: exposure history is not rewritten.
+    CREATE TRIGGER outbox_experiment_exposure AFTER INSERT ON outbox
+    WHEN NEW.kind = 'sequence' AND NEW.generation_id != '' AND NEW.experiment_arm_id = ''
+    BEGIN
+        UPDATE outbox SET
+            experiment_id = (SELECT g.experiment_id FROM experiment_generations g
+                             WHERE g.generation_id = NEW.generation_id),
+            experiment_revision_id = (SELECT g.revision_id FROM experiment_generations g
+                                      WHERE g.generation_id = NEW.generation_id),
+            experiment_arm_id = (SELECT g.arm_id FROM experiment_generations g
+                                 WHERE g.generation_id = NEW.generation_id)
+        WHERE id = NEW.id AND EXISTS (
+            SELECT 1 FROM experiment_generations g JOIN experiment_assignments a
+                ON a.experiment_id = g.experiment_id AND a.prospect_id = NEW.prospect_id
+            WHERE g.generation_id = NEW.generation_id AND g.arm_id IS NOT NULL);
+    END;
+    CREATE TRIGGER outbox_experiment_exposure_regen AFTER UPDATE OF generation_id ON outbox
+    WHEN NEW.kind = 'sequence' AND NEW.generation_id != '' AND NEW.experiment_arm_id = ''
+    BEGIN
+        UPDATE outbox SET
+            experiment_id = (SELECT g.experiment_id FROM experiment_generations g
+                             WHERE g.generation_id = NEW.generation_id),
+            experiment_revision_id = (SELECT g.revision_id FROM experiment_generations g
+                                      WHERE g.generation_id = NEW.generation_id),
+            experiment_arm_id = (SELECT g.arm_id FROM experiment_generations g
+                                 WHERE g.generation_id = NEW.generation_id)
+        WHERE id = NEW.id AND EXISTS (
+            SELECT 1 FROM experiment_generations g JOIN experiment_assignments a
+                ON a.experiment_id = g.experiment_id AND a.prospect_id = NEW.prospect_id
+            WHERE g.generation_id = NEW.generation_id AND g.arm_id IS NOT NULL);
+    END;
+    """,
 ]
 
 
@@ -1048,6 +1208,12 @@ _PAUSE_ACTIVE_SQL = ", ".join(f"'{s}'" for s in PAUSE_ACTIVE_STATES)
 _PAUSED_OUTBOX_SQL = (
     "(outbox.kind = 'sequence' AND EXISTS (SELECT 1 FROM sequence_pauses sp "
     f"WHERE sp.prospect_id = outbox.prospect_id AND sp.state IN ({_PAUSE_ACTIVE_SQL})))"
+)
+# SQL fragment: a sequence email of an experiment whose unsent mail is on
+# hold (mercury/experiments.py). It stays queued with its approval as is.
+_EXPERIMENT_HELD_SQL = (
+    "(outbox.kind = 'sequence' AND outbox.experiment_id != '' AND EXISTS ("
+    "SELECT 1 FROM experiments e WHERE e.id = outbox.experiment_id AND e.hold_mail = 1))"
 )
 
 
@@ -1221,6 +1387,14 @@ async def _claim_verdict(db, item: dict, company_id: str, max_new: int, max_acti
         pause = await _active_pause(db, item["prospect_id"])
         if pause:
             return "ooo_pause", {"pause": pause}
+    if item.get("kind") == "sequence" and item.get("id"):
+        async with db.execute(
+            "SELECT e.id, e.name FROM outbox JOIN experiments e ON e.id = outbox.experiment_id "
+            "WHERE outbox.id = ? AND e.hold_mail = 1", (item["id"],),
+        ) as cur:
+            held = await cur.fetchone()
+        if held:
+            return "experiment_hold", {"experiment_id": held[0], "experiment": held[1]}
     if item.get("kind") != "sequence" or not company_id:
         return "claimed", {}
     if respect_holds:
@@ -1990,6 +2164,7 @@ class StateManager:
             params.append(due_before)
         if exclude_paused:
             where.append(f"NOT {_PAUSED_OUTBOX_SQL}")
+            where.append(f"NOT {_EXPERIMENT_HELD_SQL}")
         sql = "SELECT * FROM outbox"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -2910,6 +3085,7 @@ class StateManager:
           company_hold          cold mail to this company is paused
           company_daily_limit   the company had its new contacts for 24 hours
           company_active_limit  the company has its unfinished sequences
+          experiment_hold       its experiment's unsent mail is on hold
           stale                 the row changed since the due scan, or its
                                 sequence was paused (out of office)
 
