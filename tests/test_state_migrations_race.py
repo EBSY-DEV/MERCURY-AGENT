@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 
+import aiosqlite
 import pytest
 
 from mercury.state import MIGRATIONS, StateManager, _split_sql, outbox_hash
@@ -95,7 +96,7 @@ async def test_pre_merge_dev_db_gets_the_mailbox_column(tmp_path):
 def test_migration_order_contact_policy_v14_v15_then_pauses_v16_demos_v17():
     # main shipped v14/v15 (exclusions, manual review) first; the
     # integration/p0 work (out-of-office pauses, demo gate) comes after.
-    assert len(MIGRATIONS) == 24
+    assert len(MIGRATIONS) == 25
     assert "CREATE TABLE suppressions" in MIGRATIONS[13]
     assert "requires_manual_review" in MIGRATIONS[14]
     assert "CREATE TABLE IF NOT EXISTS sequence_pauses" in MIGRATIONS[15]
@@ -106,6 +107,7 @@ def test_migration_order_contact_policy_v14_v15_then_pauses_v16_demos_v17():
     assert "CREATE TABLE pains" in MIGRATIONS[21]
     assert "CREATE TABLE IF NOT EXISTS registry_lookups" in MIGRATIONS[22]
     assert "ALTER TABLE outbox ADD COLUMN flags " in MIGRATIONS[23]
+    assert "CREATE TABLE inbound_messages" in MIGRATIONS[24]
 
 
 _FULL_TABLES = {"suppressions", "company_holds", "sequence_pauses", "demos",
@@ -132,6 +134,12 @@ def _assert_full_schema(db: str) -> None:
 async def test_main_line_db_upgrades_at_every_version(tmp_path, stamped):
     db = str(tmp_path / "main.db")
     _apply(db, MIGRATIONS[:stamped])
+    if stamped >= 20:
+        # v20 is applied by normalizing the pause schema; a database stamped
+        # past it already has auto_replies, which the inbox migration reads.
+        async with aiosqlite.connect(db) as conn:
+            await StateManager._normalize_ooo_schema(conn)
+            await conn.commit()
     await StateManager(db).init_db()
     _assert_full_schema(db)
 

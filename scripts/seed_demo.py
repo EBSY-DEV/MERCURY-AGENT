@@ -18,6 +18,10 @@ sending mailboxes through ``outbox.mailbox``:
   with part of the checklist ticked and notes.
 * sam@trynorthwind.com   — scheduled: its ramp starts in three days.
 
+The Inbox gets stored mail for every conversation (scripts/demo_inbox.py):
+replies across all three mailboxes, drafts waiting for review, a reply
+scheduled for later, an escalated thread, an opted-out contact, a snooze, a
+due reminder, notes, and one reply Mercury could not process.
 Two writing personas ("Plain local", the default, and "Numbers first"), with a
 saved generation behind every board email so the Outbox shows which voice
 wrote each draft. Twelve signals confirmed and observed across the companies
@@ -79,6 +83,7 @@ from mercury.state import StateManager  # noqa: E402
 from demo_pains import extend_config as extend_pain_config, seed_pains  # noqa: E402
 
 import demo_outbox  # noqa: E402  (scripts/demo_outbox.py: offers, pains, review drafts)
+from demo_inbox import seed_inbox  # noqa: E402  (next to this file)
 
 DEFAULT_DB = ROOT / "data" / "demo.db"
 REAL_DB = ROOT / "data" / "mercury.db"
@@ -328,6 +333,7 @@ async def seed(db_path: Path) -> dict:
             await sm.update_outbox_item(item_id, sent_at=iso(NOW - timedelta(days=1) + timedelta(minutes=4)))
         counts["outbox"] += 1
 
+    counts.update(await seed_inbox(sm, NOW))
     counts.update(await seed_history(sm))
     counts.update(await seed_warmup(sm))
     counts.update(await seed_placement(sm))

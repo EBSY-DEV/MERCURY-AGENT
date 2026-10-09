@@ -253,7 +253,7 @@ Opt-outs are matched by keyword before any model call: English phrases such as "
 
 **Stop-on-reply.** Any human reply (anything other than an auto-responder) moves the prospect to `replied` and cancels every queued email for them. A prospect you already moved to Meeting or Won is not pulled back to `replied`.
 
-Conversations move through stages `initial_outreach`, `engaged`, `qualifying`, `presenting`, `negotiating`, `closing`, and end at `closed_won` or `closed_lost`. Mercury advances them from reply intent; you move deals on the Pipeline tab.
+Conversations move through stages `initial_outreach`, `engaged`, `qualifying`, `presenting`, `negotiating`, `closing`, and end at `closed_won` or `closed_lost`. Mercury advances them from reply intent; you move deals on the Pipeline tab, or set a conversation's stage in the Inbox.
 
 ## Bounces and the kill switch
 

@@ -15,6 +15,7 @@
 <link rel="stylesheet" href="/static/outbox.css">
 <link rel="stylesheet" href="/static/contacts.css">
 <link rel="stylesheet" href="/static/pains.css">
+<link rel="stylesheet" href="/static/inbox.css">
 </head>
 <body>
 
@@ -52,7 +53,7 @@
       <button data-tab="outbox" onclick="showTab('outbox', this)"><i data-ph="tray"></i><span class="lbl">Outbox</span><span class="nav-count" id="nav-outbox"></span></button>
       <button data-tab="exclusions" onclick="showTab('exclusions', this)"><i data-ph="prohibit"></i><span class="lbl">Exclusions</span><span class="nav-count" id="nav-exclusions"></span></button>
       <button data-tab="mailboxes" onclick="showTab('mailboxes', this)"><i data-ph="envelope-simple"></i><span class="lbl">Mailboxes</span><span class="nav-flag" id="nav-mailboxes" hidden></span></button>
-      <button data-tab="conversations" onclick="showTab('conversations', this)"><i data-ph="chat-circle-text"></i><span class="lbl">Conversations</span></button>
+      <button data-tab="inbox" onclick="showTab('inbox', this)"><i data-ph="chat-circle-text"></i><span class="lbl">Inbox</span><span class="nav-count" id="nav-inbox" title="Conversations that need you"></span></button>
     </div>
     <div class="nav-group">
       <div class="nav-label">Workspace</div>
@@ -471,10 +472,9 @@
   <div id="mb-body"><div class="loading-note">Loading mailboxes…</div></div>
 </div>
 
-<!-- Conversations -->
-<div id="conversations" class="section">
-  <div class="section-head"><h2>Conversations</h2><p>Every reply, and how Mercury handled it.</p></div>
-  <div id="conversations-list"></div>
+<!-- Inbox: every conversation from every mailbox (inbox.js) -->
+<div id="inbox" class="section">
+  <div class="ibx" id="ibx"></div>
 </div>
 
 <!-- Activity -->
@@ -814,5 +814,6 @@
 <script src="/static/away.js"></script>
 <script src="/static/outbox.js"></script>
 <script src="/static/pains.js"></script>
+<script src="/static/inbox.js"></script>
 </body>
 </html>

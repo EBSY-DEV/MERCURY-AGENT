@@ -35,6 +35,7 @@ from mercury.control.queries import (  # noqa: E402
     SIGNAL_CATEGORIES, SIGNAL_CATEGORY_ORDER, QueryService,
 )
 from mercury.exclusions_api import router as exclusions_router  # noqa: E402
+from mercury.inbox_api import router as inbox_router  # noqa: E402
 from mercury.pauses_api import router as pauses_router  # noqa: E402
 from mercury.registry_api import router as registry_router  # noqa: E402
 # MERCURY_DB_PATH points the dashboard at another database (e.g. the demo
@@ -53,6 +54,7 @@ app.include_router(pains_router)
 app.include_router(exclusions_router)
 app.include_router(pauses_router)
 app.include_router(registry_router)
+app.include_router(inbox_router)
 
 _env_lock = asyncio.Lock()
 # Everything this server does, it does for the person at this machine.
@@ -1692,13 +1694,53 @@ async def get_today():
                 "action": "Review", "tab": "outbox",
             })
 
+        # The inbox: reminders whose time has come and replies that could
+        # not be handled. Flags only; nothing is sent or queued from here.
+        from mercury.control.inbox import InboxService
+
+        inbox = await InboxService(DASHBOARD, state).today()
+        due = inbox["reminders_due"]
+        stats["reminders_due"] = len(due)
+        stats["inbound_failed"] = len(inbox["failed_messages"])
+        stats["inbox_needs_you"] = inbox["segments"]["needs_you"]
+        if inbox["failed_messages"]:
+            n = len(inbox["failed_messages"])
+            items.append({
+                "key": "inbound-failed", "tone": "bad",
+                "title": (f"{n} reply could not be processed" if n == 1
+                          else f"{n} replies could not be processed"),
+                "detail": ("Mercury kept them but stopped retrying. Read them in the inbox "
+                           "and answer by hand if they need it."),
+                "action": "Open the inbox", "tab": "inbox",
+                "messages": [{k: m.get(k) for k in ("id", "from_email", "mailbox", "subject",
+                                                    "created_at", "conversation_id")}
+                             for m in inbox["failed_messages"][:5]],
+            })
+        if due:
+            # The dashboard shows each due reminder on its own (the first few).
+            items.append({
+                "key": "reminders", "tone": "warn",
+                "title": (f"{len(due)} reminder is due" if len(due) == 1
+                          else f"{len(due)} reminders are due"),
+                "detail": ("Conversations you asked to come back to. Nothing is sent "
+                           "until you write and approve a reply."),
+                "action": "Open the inbox", "tab": "inbox",
+                "conversation_ids": list(dict.fromkeys(r["conversation_id"] for r in due)),
+                "reminders": [{
+                    "id": r["id"], "conversation_id": r["conversation_id"],
+                    "due_at": r["due_at"], "note": r.get("note") or "",
+                    "name": f"{r.get('first_name') or ''} {r.get('last_name') or ''}".strip(),
+                    "email": r.get("prospect_email") or "", "company": r.get("company") or "",
+                } for r in due[:5]],
+            })
+
         if open_convos:
             items.append({
                 "key": "replies", "tone": "good",
                 "title": (f"{open_convos} live conversation" if open_convos == 1
                           else f"{open_convos} live conversations"),
                 "detail": "People replied. Check how Mercury is handling them.",
-                "action": "Read conversations", "tab": "conversations",
+                "action": "Open the inbox", "tab": "inbox",
             })
 
         return {"items": items, "stats": stats}

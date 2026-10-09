@@ -911,6 +911,8 @@ class Sender:
                 # Replies thread through their conversation, as before.
                 refs = {"thread_ref": item.get("thread_ref", ""),
                         "in_reply_to": item.get("in_reply_to", "")}
+                if item.get("in_reply_to") and item.get("thread_references"):
+                    refs["references"] = item["thread_references"]
             else:
                 refs = {"thread_ref": thread.get("thread_ref", ""),
                         "in_reply_to": thread.get("in_reply_to", "")}

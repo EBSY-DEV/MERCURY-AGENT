@@ -540,7 +540,11 @@ class OutboxService:
                 raise NotFound("conversation not found", code="conversation_not_found")
             handler = Handler(Brain(state), state, config, env)
             profile = await PersonaStore(state).for_generation(config, item.get("generation_id", ""))
-            latest = next((m.content for m in reversed(convo.thread) if not m.is_ours), "")
+            # The message this reply answers, when it names one; else the
+            # newest thing they said.
+            answered = await state.get_inbound(item.get("answers_inbound_id") or "")
+            latest = (answered or {}).get("body", "").strip() or next(
+                (m.content for m in reversed(convo.thread) if not m.is_ours), "")
             response = await handler._generate_response(
                 convo.intent, latest, prospect, convo, instruction=instruction, profile=profile,
             )

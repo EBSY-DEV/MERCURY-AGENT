@@ -244,6 +244,7 @@ class SmtpImapProvider(MailProvider):
             body=(body or "")[:5000],
             message_id=message_id,
             in_reply_to=str(msg.get("In-Reply-To", "")).strip(),
+            references=" ".join(str(msg.get("References", "")).split()),
             thread_ref=str(msg.get("In-Reply-To", "")).strip(),
             date=str(msg.get("Date", "")),
             is_bounce=bounce,

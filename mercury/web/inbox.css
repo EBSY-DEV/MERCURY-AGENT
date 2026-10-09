@@ -1,0 +1,384 @@
+/* Inbox. Three full-height panes inside the content sheet: the list, the
+   thread with its composer, and the contact's context. Built from the
+   dashboard's tokens and components (.segmented, .badge, .btn, .btn-square
+   with action tints, .menu, .form-input, .empty); see app.css rules 1 to 5. */
+
+main:has(> #inbox.active) { padding: 0; max-width: none; }
+
+.ibx {
+  display: grid; grid-template-columns: minmax(260px, 340px) minmax(320px, 1fr) minmax(240px, 300px);
+  height: calc(100dvh - 74px); min-height: 480px;   /* the sheet minus its margin and top bar */
+  border-radius: 0 0 13px 13px; overflow: hidden;    /* the sheet's own corners, inside its border */
+}
+.ibx .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.ibx-pad { padding: 18px; }
+.ibx-link { color: var(--accent-deep); font-weight: 500; padding: 0; }
+.ibx-link:hover { color: var(--accent); }
+.ibx-icon-btn {
+  display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; flex: none;
+  border: none; background: none; border-radius: var(--r-sm); color: var(--text-3); cursor: pointer;
+}
+.ibx-icon-btn:hover { background: var(--panel-raised); color: var(--text); }
+.ibx-icon-btn .ph { font-size: 14px; }
+
+/* ── List pane ── */
+
+.ibx-list { position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--panel); }
+.ibx-list-head { flex: none; padding: 16px 16px 12px; border-bottom: 1px solid var(--border); }
+.ibx-title-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.ibx-title-row h2 { font-size: 20px; font-weight: 600; letter-spacing: -0.025em; line-height: 1.2; }
+.ibx-title-row .num { font-size: 11.5px; color: var(--text-3); }
+.ibx-search { width: 100%; margin-top: 12px; }
+.ibx-search input { padding-right: 34px; }
+.ibx-search input::-webkit-search-cancel-button { display: none; }
+.ibx-search kbd { position: absolute; right: 9px; pointer-events: none; }
+
+/* The view switch: the dashboard's segmented control as a tray. */
+.segmented.ibx-seg {
+  display: flex; margin-top: 10px; padding: 3px; gap: 2px;
+  background: var(--panel-raised); border-color: var(--border);
+}
+.segmented.ibx-seg button {
+  flex: 1 1 auto; justify-content: center; padding: 5px 6px; border-radius: var(--r-sm); font-size: 12.5px;
+  white-space: nowrap; gap: 5px;
+}
+.segmented.ibx-seg button + button { border-left: none; }
+.segmented.ibx-seg button.on { background: var(--panel); box-shadow: var(--shadow-sm), 0 0 0 1px var(--border); }
+.segmented.ibx-seg .num { font-size: 11.5px; color: var(--text-3); font-weight: 500; }
+.segmented.ibx-seg .num.hot { color: var(--s-bad); }
+
+.ibx-filters { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+.ibx-filter {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 4px 6px 4px 8px; white-space: nowrap;
+  border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--panel);
+  font-family: var(--sans); font-size: 12px; color: var(--text-3); cursor: pointer;
+}
+.ibx-filter b { font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 150px; }
+.ibx-filter b.mono { font-size: 11.5px; font-weight: 500; }
+.ibx-filter .ph { font-size: 11px; flex: none; }
+.ibx-filter:hover, .ibx-filter[aria-expanded='true'] { border-color: var(--accent-line); }
+.ibx-filter.set { border-color: var(--accent-line); background: var(--accent-soft); }
+
+.ibx-bulk { flex: none; padding: 10px 16px; background: var(--accent-soft); border-bottom: 1px solid var(--accent-line); }
+.ibx-bulk[hidden] { display: none; }
+.ibx-bulk-row { display: flex; align-items: center; gap: 6px; }
+.ibx-bulk-row + .ibx-bulk-row { margin-top: 8px; }
+.ibx-bulk-count { display: inline-flex; align-items: center; gap: 8px; flex: 1; font-size: 13px; font-weight: 600; color: var(--accent-deep); cursor: pointer; }
+.ibx-bulk-count input, .ibx-cb { width: 15px; height: 15px; accent-color: var(--accent); margin: 0; flex: none; cursor: pointer; }
+.ibx-bulk .btn-sm .ph { font-size: 14px; }
+
+.ibx-items { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: thin; }
+.ibx-items > .empty { border: none; padding: 40px 20px; }
+.ibx-empty-act { text-align: center; margin-top: -24px; }
+.ibx-items .loading-note { padding: 18px 16px; }
+
+.ibx-item {
+  display: flex; gap: 10px; padding: 13px 16px 14px; border-bottom: 1px solid var(--border);
+  cursor: pointer; transition: background .12s;
+}
+.ibx-item:hover { background: color-mix(in srgb, var(--panel-raised) 60%, var(--panel)); }
+.ibx-item.sel { background: var(--accent-soft); }
+.ibx-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 0; }
+.ibx-cb { margin-top: 2px; }
+.ibx-item-main { flex: 1; min-width: 0; }
+.ibx-item-top { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+.ibx-name { font-size: 13.5px; font-weight: 500; white-space: nowrap; color: var(--text); }
+.ibx-item.unread .ibx-name { font-weight: 600; }
+.ibx-co { flex: 1; min-width: 0; font-size: 12.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ibx-time { flex: none; font-size: 11.5px; color: var(--text-3); }
+.ibx-item.unread .ibx-time { color: var(--text); font-weight: 600; }
+.ibx-subj { font-size: 13px; color: var(--text); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ibx-item.unread .ibx-subj { font-weight: 500; }
+.ibx-snip {
+  font-size: 12.5px; color: var(--text-3); line-height: 1.45; margin-top: 3px;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.ibx-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; margin-top: 7px; }
+.ibx-meta .badge { font-size: 12px; }
+.ibx-flag { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-3); white-space: nowrap; }
+.ibx-flag .ph { font-size: 13px; }
+.ibx-flag.bad { color: var(--s-bad); }
+.ibx-flag.due .ph { color: var(--tint-amber-fg); }
+
+.ibx-foot {
+  flex: none; display: flex; align-items: center; gap: 6px; padding: 9px 12px 9px 16px;
+  background: var(--panel-raised); border-top: 1px solid var(--border);
+}
+.ibx-foot > .num { flex: 1; font-size: 11.5px; color: var(--text-3); text-align: left; }
+.ibx-keys { display: inline-flex; align-items: center; gap: 3px; font-size: 11.5px; color: var(--text-3); margin-right: 6px; }
+.ibx-keys kbd + kbd { margin-left: 1px; }
+.btn-square.ibx-sm { width: 28px; height: 28px; }
+.btn-square.ibx-sm:disabled { opacity: .45; cursor: default; color: var(--text-3); border-color: var(--border); }
+
+/* Bulk results and other two-line notes. */
+.ibx-toast {
+  position: absolute; left: 14px; right: 14px; bottom: 56px; z-index: 30;
+  display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px;
+  background: var(--panel); border: 1px solid var(--border-strong); border-radius: var(--r-md);
+  box-shadow: var(--shadow); animation: toast-in .25s cubic-bezier(.16,1,.3,1);
+}
+body > .ibx-toast { position: fixed; left: 12px; right: 12px; bottom: 16px; z-index: 60; }
+.ibx-toast .badge .ph { font-size: 16px; margin-top: 1px; }
+.ibx-toast b { font-size: 13.5px; font-weight: 600; }
+.ibx-toast p { font-size: 12.5px; color: var(--text-2); margin-top: 2px; text-wrap: pretty; }
+
+/* ── Thread pane ── */
+
+.ibx-thread {
+  display: flex; flex-direction: column; min-width: 0; min-height: 0; border-left: 1px solid var(--border);
+  background: var(--panel); container-type: inline-size;
+}
+/* A narrow thread keeps one row of actions: Schedule and Regenerate become
+   icon buttons (each keeps its tooltip and label for assistive tech). */
+@container (max-width: 470px) {
+  .ibx-act { width: 34px; height: 34px; padding: 0; justify-content: center; }
+  .ibx-act span { display: none; }
+  .ibx-comp-actions { flex-wrap: nowrap; }
+}
+.ibx-thread > .empty { border: none; margin: auto; background: none; }
+.ibx-head { flex: none; padding: 14px 18px 12px; border-bottom: 1px solid var(--border); }
+.ibx-head-row { display: flex; align-items: flex-start; gap: 12px; }
+.ibx-who { flex: 1; min-width: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 10px; }
+.ibx-who h3 { font-size: 16px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.35; }
+.ibx-who-co { font-size: 13px; color: var(--text-2); }
+.ibx-tools { display: flex; gap: 8px; flex: none; }
+.ibx-tools .btn-square, .ibx-top .btn-square { width: 32px; height: 32px; }
+.ibx-head-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; }
+.ibx-to { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-3); min-width: 0; }
+.ibx-to .ph { font-size: 13px; }
+.ibx-to .mono { font-size: 11.5px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; }
+.ibx-head-note { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; font-size: 12.5px; color: var(--text-2); }
+.ibx-head-note > .ph { color: var(--tint-blue-fg); font-size: 14px; }
+
+.ibx-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 18px 18px; scrollbar-width: thin; }
+.ibx-msgs { display: flex; flex-direction: column; gap: 10px; }
+.ibx-msg {
+  padding: 10px 13px 12px; border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--panel); min-width: 0;
+}
+.ibx-msg.out { background: var(--panel-raised); }
+.ibx-msg.unsent { background: none; border-style: dashed; border-color: var(--border-strong); }
+.ibx-msg.unsent .ibx-text { color: var(--text-2); }
+.ibx-msg-head { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.ibx-msg-head > .ph { font-size: 14px; color: var(--text-3); }
+.ibx-msg-head b { font-size: 13px; font-weight: 600; white-space: nowrap; }
+.ibx-msg-when { font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.ibx-msg-badge { margin-left: auto; flex: none; }
+.ibx-msg-from { font-size: 11.5px; color: var(--text-3); margin-top: 2px; }
+.ibx-msg-from .mono { font-size: 11.5px; }
+.ibx-text { font-size: 13.5px; line-height: 1.6; color: var(--text); margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ibx-quoted { margin-top: 6px; }
+.ibx-quoted summary { font-size: 12px; color: var(--text-3); cursor: pointer; }
+.ibx-quoted summary::before { content: none; }
+.ibx-quoted .ibx-text { color: var(--text-3); font-size: 12.5px; border-left: 2px solid var(--border-strong); padding-left: 10px; }
+.ibx-msg-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--text-3); }
+.ibx-msg-foot.bad { color: var(--s-bad); }
+.ibx-msg-foot .mono { font-size: 11.5px; }
+.ibx-sys { display: flex; align-items: flex-start; gap: 8px; padding: 4px 6px; font-size: 12.5px; color: var(--text-3); line-height: 1.5; }
+.ibx-sys > .ph { font-size: 14px; margin-top: 2px; }
+.ibx-sys-when { color: var(--text-2); margin-right: 3px; }
+.ibx-sys .mono { font-size: 12px; color: var(--text-2); }
+.ibx-unsent-head { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; font-weight: 500; color: var(--text-3); }
+.ibx-unsent-head .ph { font-size: 13px; }
+.ibx-earlier { color: var(--accent-deep); padding: 0 2px 8px; font-size: 13px; }
+.ibx-earlier .ph { font-size: 15px; }
+
+/* Composer: the draft under review, with its actions. */
+.ibx-composer { flex: none; padding: 12px 18px 16px; border-top: 1px solid var(--border); background: var(--panel); }
+.ibx-composer:empty { display: none; }
+.ibx-comp-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; min-width: 0; }
+.ibx-comp-head .badge { font-size: 12.5px; }
+.ibx-from { font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.ibx-from .mono { font-size: 11.5px; color: var(--text-2); }
+.ibx-editor {
+  position: relative; border: 1px solid var(--accent-line); border-radius: var(--r-md); background: var(--panel);
+  transition: border-color .15s, box-shadow .15s;
+}
+.ibx-editor:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.ibx-editor textarea {
+  display: block; width: 100%; min-height: 150px; max-height: 38vh; resize: none;
+  padding: 11px 12px 6px; border: none; outline: none; background: none; color: var(--text);
+  font-family: var(--sans); font-size: 13.5px; line-height: 1.55;
+}
+.ibx-editor textarea::placeholder { color: var(--text-3); }
+.ibx-editor-foot {
+  display: flex; justify-content: space-between; gap: 12px; margin: 0 12px; padding: 7px 0 8px;
+  border-top: 1px solid var(--border); font-size: 12px; color: var(--text-3);
+}
+.ibx-editor-foot > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ibx-editor-foot .num { flex: none; font-size: 11.5px; }
+.ibx-editor.busy textarea { opacity: .45; }
+.ibx-busy {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px;
+  font-size: 13px; font-weight: 500; color: var(--accent-deep);
+}
+.ibx-busy .ph { animation: ibx-pulse 1.2s ease-in-out infinite; }
+@keyframes ibx-pulse { 50% { opacity: .35; } }
+.ibx-comp-actions { display: flex; align-items: center; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+.ibx-comp-actions .btn { padding: 7px 11px; }
+.ibx-spacer { flex: 1; }
+.btn-primary kbd {
+  background: color-mix(in srgb, var(--accent-contrast) 22%, transparent); border-color: transparent;
+  color: var(--accent-contrast); margin-left: 3px;
+}
+.ibx-act .ph { font-size: 14px; }
+.ibx-comp-note { display: flex; align-items: flex-start; gap: 7px; margin-top: 8px; font-size: 12.5px; color: var(--text-2); }
+.ibx-comp-note .ph { font-size: 14px; margin-top: 2px; color: var(--text-3); }
+.ibx-comp-note.bad .ph { color: var(--s-bad); }
+.ibx-notice {
+  display: flex; align-items: flex-start; gap: 9px; margin-bottom: 8px; padding: 10px 12px;
+  border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--panel-raised);
+  font-size: 12.5px; color: var(--text-2);
+}
+.ibx-notice > .ph { font-size: 15px; color: var(--s-bad); margin-top: 1px; }
+.ibx-notice-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+
+.ibx-composer.blocked { background: var(--panel-raised); padding-top: 16px; }
+.ibx-blocked { display: flex; align-items: center; gap: 12px; }
+.ibx-blocked > .ph { font-size: 18px; color: var(--s-bad); flex: none; align-self: flex-start; margin-top: 1px; }
+.ibx-blocked > div { flex: 1; min-width: 0; }
+.ibx-blocked b { font-size: 13.5px; font-weight: 600; }
+.ibx-blocked p { font-size: 13px; color: var(--text-2); margin-top: 2px; text-wrap: pretty; }
+.ibx-blocked .btn { flex: none; }
+
+/* ── Context pane ── */
+
+.ibx-ctx { min-width: 0; min-height: 0; overflow-y: auto; background: var(--panel-raised); border-left: 1px solid var(--border); scrollbar-width: thin; }
+.ibx-ctx-sec { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.ibx-id h3 { font-size: 16px; font-weight: 600; letter-spacing: -0.015em; }
+.ibx-id p { font-size: 13px; color: var(--text-2); margin-top: 2px; }
+.ibx-email { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-top: 6px; }
+.ibx-email .mono { font-size: 12px; overflow-wrap: anywhere; min-width: 0; }
+.ibx-ctx-label { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-3); margin-bottom: 7px; }
+.ibx-ctx-label .link-btn { font-size: 12.5px; }
+.ibx-fact { display: flex; align-items: center; gap: 9px; padding: 3px 0; font-size: 13px; color: var(--text); min-width: 0; }
+.ibx-fact > .ph { font-size: 15px; color: var(--text-3); }
+.ibx-fact .mono { font-size: 12px; overflow-wrap: anywhere; min-width: 0; }
+.ibx-fact.muted { color: var(--text-2); }
+.ibx-stage {
+  display: flex; align-items: center; gap: 9px; width: 100%; padding: 8px 11px;
+  border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--panel);
+  font-family: var(--sans); font-size: 13.5px; font-weight: 500; color: var(--text); cursor: pointer; text-align: left;
+}
+.ibx-stage > .ph:first-child { font-size: 16px; color: var(--text-2); }
+.ibx-stage span { flex: 1; }
+.ibx-stage > .ph:last-child { font-size: 13px; color: var(--text-3); transition: transform .15s; }
+.ibx-stage:hover { border-color: var(--accent-line); }
+.ibx-stage[aria-expanded='true'] { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.ibx-stage[aria-expanded='true'] > .ph:last-child { transform: rotate(180deg); }
+.ibx-since { font-size: 12px; color: var(--text-3); margin-top: 8px; }
+.ibx-reminder { display: flex; align-items: flex-start; gap: 9px; padding: 4px 0; font-size: 13px; }
+.ibx-reminder + .ibx-reminder { border-top: 1px solid var(--border); padding-top: 8px; margin-top: 4px; }
+.ibx-reminder > .ph { font-size: 15px; color: var(--text-3); margin-top: 2px; }
+.ibx-reminder.due > .ph { color: var(--tint-amber-fg); }
+.ibx-reminder > div { flex: 1; min-width: 0; }
+.ibx-reminder b { font-weight: 500; }
+.ibx-reminder p { font-size: 12.5px; color: var(--text-2); margin-top: 2px; overflow-wrap: anywhere; }
+.ibx-reminder .btn-sm { padding: 3px 9px; }
+.ibx-note { padding: 10px 12px; margin-bottom: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-md); }
+.ibx-note p { font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ibx-note-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; font-size: 11.5px; color: var(--text-3); min-height: 22px; }
+.ibx-note-foot > span:first-child { font-family: var(--mono); font-size: 11px; }
+.ibx-note-acts { display: inline-flex; gap: 2px; opacity: 0; transition: opacity .12s; }
+.ibx-note:hover .ibx-note-acts, .ibx-note:focus-within .ibx-note-acts { opacity: 1; }
+@media (hover: none) { .ibx-note-acts { opacity: 1; } }
+.ibx-note-form { margin-bottom: 8px; }
+.ibx-note-form textarea { resize: vertical; min-height: 72px; font-size: 13px; line-height: 1.5; }
+.ibx-note-form-acts { display: flex; justify-content: flex-end; gap: 6px; margin-top: 6px; }
+.ibx-add-note {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 11px;
+  border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--panel);
+  font-family: var(--sans); font-size: 13px; color: var(--text-2); cursor: pointer;
+}
+.ibx-add-note:hover { border-color: var(--accent-line); color: var(--accent-deep); }
+.ibx-add-note .ph { font-size: 14px; }
+.ibx-local { padding: 14px 16px 20px; font-size: 12px; color: var(--text-3); line-height: 1.5; text-wrap: pretty; }
+
+/* The context folded into the thread on narrower screens. */
+.ibx-ctx-fold { display: none; }
+.ibx-fold-btn {
+  display: flex; align-items: center; gap: 9px; width: 100%; padding: 10px 18px;
+  border: none; border-bottom: 1px solid var(--border); background: var(--panel-raised);
+  font-family: var(--sans); font-size: 13px; font-weight: 500; color: var(--text-2); cursor: pointer; text-align: left;
+}
+.ibx-fold-btn span:not(.num) { flex: 1; }
+.ibx-fold-btn .ph { font-size: 16px; color: var(--text-3); }
+.ibx-fold-btn .num { font-size: 11.5px; color: var(--text-3); }
+.ibx-fold-btn .ph:last-child { font-size: 13px; }
+.ibx-fold-body { max-height: 55dvh; overflow-y: auto; background: var(--panel-raised); border-bottom: 1px solid var(--border); }
+.ibx-fold-body .ibx-ctx-sec:last-of-type { border-bottom: none; }
+
+/* ── Menus (presets, filters, stages) ── */
+
+.ibx-menu { max-width: min(320px, calc(100vw - 16px)); max-height: min(420px, calc(100dvh - 16px)); overflow-y: auto; }
+.ibx-menu button { gap: 16px; }
+.ibx-menu button[disabled] { opacity: .45; cursor: default; }
+.ibx-menu button.on { background: var(--accent-soft); font-weight: 500; }
+.ibx-menu button.danger, .ibx-menu button.danger .ph { color: var(--s-bad); }
+.ibx-mi { display: inline-flex; align-items: center; gap: 9px; min-width: 0; }
+.ibx-mi > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ibx-mi .ph { font-size: 15px; color: var(--text-3); }
+.ibx-mi .mono { font-size: 12px; }
+.ibx-menu small.num { font-family: var(--mono); font-size: 11px; margin-left: auto; }
+.ibx-menu .ibx-check { color: var(--accent); font-size: 14px; }
+.ibx-menu-div { height: 1px; background: var(--border); margin: 4px 6px; }
+.ibx-stage-menu { padding: 4px; }
+.ibx-pick { padding: 8px; display: flex; flex-direction: column; gap: 8px; width: 260px; max-width: 100%; }
+.ibx-pick .form-label { margin: 0; }
+.ibx-pick .form-input { font-family: var(--mono); font-size: 12.5px; padding: 7px 10px; }
+.ibx-pick-acts { display: flex; justify-content: flex-end; gap: 6px; }
+/* Real buttons inside a menu: undo the menu-item look. */
+.ibx-pick .btn { width: auto; padding: 5px 11px; border-radius: var(--r-sm); font-size: 12px; justify-content: center; }
+.ibx-pick .btn-secondary { background: var(--panel); border: 1px solid var(--border-strong); color: var(--text); }
+.ibx-pick .btn-secondary:hover { background: var(--accent-soft); border-color: var(--accent-line); color: var(--accent-deep); }
+.ibx-pick .btn-primary { background: var(--accent); color: var(--accent-contrast); }
+.ibx-pick .btn-primary:hover { background: var(--accent-deep); }
+
+/* Phone top bar: a back button and the thread's tools. */
+.ibx-top { display: none; }
+.ibx-back {
+  display: inline-flex; align-items: center; gap: 4px; padding: 4px 4px 4px 0; border: none; background: none;
+  font-family: var(--sans); font-size: 14px; font-weight: 500; color: var(--accent-deep); cursor: pointer;
+}
+.ibx-back .ph { font-size: 15px; color: var(--accent-deep); }
+
+/* ── Narrower screens: the context folds into the thread ── */
+
+@media (max-width: 1100px) {
+  .ibx { grid-template-columns: minmax(260px, 320px) minmax(0, 1fr); }
+  .ibx-ctx { display: none; }
+  .ibx-ctx-fold { display: block; flex: none; }
+}
+@media (max-width: 960px) {
+  .ibx { height: calc(100dvh - 56px); border-radius: 0; }
+}
+
+/* ── Phone: the list, then one thread at a time ── */
+
+@media (max-width: 700px) {
+  .ibx { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+  .ibx-thread { display: none; border-left: none; }
+  body.ibx-phone-thread .ibx-list { display: none; }
+  body.ibx-phone-thread .ibx-thread { display: flex; }
+  body.ibx-phone-thread .ibx-top { display: flex; gap: 8px; margin-left: auto; }
+  .ibx-head .ibx-tools { display: none; }
+  .ibx-head { padding: 14px 14px 10px; }
+  .ibx-who { flex-direction: column; gap: 2px; }
+  .ibx-who h3 { font-size: 18px; }
+  .ibx-head-meta .ibx-to { display: none; }
+  .ibx-scroll { padding: 12px 14px 14px; }
+  .ibx-fold-btn { padding: 10px 14px; }
+  .ibx-composer { padding: 10px 14px calc(12px + env(safe-area-inset-bottom)); }
+  .ibx-comp-head .ibx-from, .ibx-editor-foot { display: none; }
+  .ibx-editor textarea { min-height: 120px; max-height: 30vh; font-size: 15px; }
+  .ibx-comp-actions { flex-wrap: nowrap; }
+  .ibx-approve { flex: 1; justify-content: center; padding: 9px 14px; }
+  .ibx-act { width: 36px; height: 36px; padding: 0; justify-content: center; }
+  .ibx-act span, .ibx-save, .ibx-spacer { display: none; }
+  .ibx-blocked { flex-wrap: wrap; }
+  .ibx-blocked > div { flex-basis: calc(100% - 32px); }
+  .ibx-blocked .btn { margin-left: 30px; }
+  .ibx-list-head { padding: 14px 14px 10px; }
+  .ibx-item { padding: 12px 14px; }
+  .ibx-keys { display: none; }
+}
