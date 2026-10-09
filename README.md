@@ -11,7 +11,10 @@ An outreach agent that runs on your Claude Code subscription.
 
 Mercury Agent finds businesses that match your ideal customer, collects specific facts about each one, writes short cold emails that reference those facts, sends them from your own mailboxes, and handles the replies. It runs locally on a 15-minute heartbeat and keeps everything in a SQLite file. Its model calls go through the `claude` CLI in headless mode, so they count against the Claude Pro or Max plan you already have rather than a per-token API bill. By default, nothing is sent until you approve it.
 
-![The Mercury Agent dashboard's Today view: KPIs, reply and bounce rates, outreach trend, and items waiting on a decision](docs/images/today.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/tour-dark.gif">
+  <img src="docs/media/tour.gif" alt="A tour of the Mercury Agent dashboard: the Today view with reply and bounce rates and the outreach trend, then the pipeline board, the send calendar and the mailboxes with their warm-up ramps">
+</picture>
 
 ## What it does
 
@@ -25,6 +28,29 @@ Mercury Agent finds businesses that match your ideal customer, collects specific
 - **Shows its work.** A local dashboard covers today's queue, the pipeline, a calendar of scheduled sends, the approval outbox, warm-up status, signals, discovery and Claude quota usage.
 - **Exports lists.** `mercury export` writes a sequencer-ready CSV, so you can use Mercury as a list builder even if it never sends anything.
 - **Imports lists.** Bring your own CSV from the dashboard or `mercury import`. It previews every row (new, needs enrichment, duplicate, invalid) before anything changes. Imported contacts stay held until you verify and release them.
+
+## See it work
+
+**Review every email before it goes out.** Each draft waits in the Outbox. Move through the queue with `J` and `K`, fix a word in place, and approve with `A`. With `auto_approve_followups` on, approving a first email approves its follow-ups too.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/outbox-dark.gif">
+  <img src="docs/media/outbox.gif" alt="The Outbox: moving between drafts with J and K, changing one word in a draft, then approving it along with its two follow-ups">
+</picture>
+
+**Turn signals into a target list.** A cohort is a query over the signals you confirmed. Here, twelve companies narrow to the five running Google Ads, then the three of those with no online booking, then the two without an agency.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/cohort-dark.gif">
+  <img src="docs/media/cohort.gif" alt="The cohort builder: ticking Running Google Ads, No online booking, and excluding Has a marketing agency narrows the match count from 5 to 3 to 2 and lists the matching companies">
+</picture>
+
+**See the price before discovery spends anything.** Pick a source, name the cities, and Mercury lists the queries it would run and what they cost. The Run button stays disabled until there is an estimate, and it shows the amount.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/discover-dark.gif">
+  <img src="docs/media/discover.gif" alt="The Discover tab: choosing DataForSEO Business Listings, typing three Colorado cities and estimating six queries at $0.29 against a $1.00 spend cap">
+</picture>
 
 ## How it works
 
@@ -116,19 +142,58 @@ To explore the dashboard with sample data first, run `python scripts/seed_demo.p
 
 ## Screenshots
 
-| | |
-|---|---|
-| ![Pipeline kanban](docs/images/pipeline.png) **Pipeline**: prospects by conversation stage. | ![Calendar](docs/images/calendar.png) **Calendar**: scheduled first emails and follow-ups. |
-| ![Outbox](docs/images/outbox.png) **Outbox**: review, edit, regenerate, approve. | ![Mailboxes](docs/images/mailboxes.png) **Mailboxes**: every inbox by domain, with its ramp, health and DNS checks. |
-
-<details>
-<summary>Dark mode and the sending heatmap</summary>
-
-![Today in dark mode](docs/images/today-dark.png)
-
-![Sending heatmap](docs/images/heatmap.png)
-
-</details>
+<table>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/today-dark.png">
+        <img src="docs/images/today.png" alt="Today: companies, contacts, emails awaiting approval, reply and bounce rates, and the outreach trend">
+      </picture>
+      <b>Today</b>: what needs a decision, then the numbers.
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/pipeline-dark.png">
+        <img src="docs/images/pipeline.png" alt="Pipeline kanban with contacts in New, Queued, Contacted, Replied and Meeting columns">
+      </picture>
+      <b>Pipeline</b>: every contact by how far they've got.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/outbox-dark.png">
+        <img src="docs/images/outbox.png" alt="Outbox review desk with a queue of drafts and the selected email open for editing">
+      </picture>
+      <b>Outbox</b>: review, edit, regenerate, approve.
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/calendar-dark.png">
+        <img src="docs/images/calendar.png" alt="Month calendar of sent, scheduled and pending emails">
+      </picture>
+      <b>Calendar</b>: first emails and follow-ups, sent and scheduled.
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/mailboxes-dark.png">
+        <img src="docs/images/mailboxes.png" alt="Mailboxes grouped by domain, each with its warm-up stage, ramp, daily sends, bounce and reply rates">
+      </picture>
+      <b>Mailboxes</b>: every inbox by domain, with its warm-up ramp, health and DNS checks.
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/heatmap-dark.png">
+        <img src="docs/images/heatmap.png" alt="A year-long heatmap of emails sent per day">
+      </picture>
+      <b>Sending activity</b>: a year of sends, one square per day.
+    </td>
+  </tr>
+</table>
 
 ## Costs
 
@@ -202,6 +267,7 @@ pytest
 
 - The dashboard is plain HTML, CSS and JavaScript in `mercury/web/`, served by FastAPI (`mercury/dashboard.py`). There is no build step: edit and reload.
 - `python scripts/seed_demo.py` creates a populated demo database for UI work.
+- `python scripts/readme_media.py` retakes every screenshot and clip in this README from that demo, in light and dark (needs `ffmpeg`). Run it after a visible UI change.
 - Skills (`skills/`) and prompts (`prompts/`) are Markdown. Improvements to email quality often need no code changes.
 - Never commit prospect data, `.env`, or `mercury.local.yaml`.
 

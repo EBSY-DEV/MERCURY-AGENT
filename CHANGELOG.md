@@ -33,6 +33,16 @@ minor versions can still change behaviour.
   flags unknown or unconfirmed signal codes; `mercury offers route EMAIL`
   explains one prospect's offer. Configs without offers, or with offers that
   only set the demo gate, write exactly as before.
+- **README clips and a script that retakes them.** The README opens with a
+  short dashboard tour and shows three flows (reviewing the Outbox, building a
+  cohort, pricing a discovery run) as looping clips. Every screenshot and clip
+  now has a dark version that follows the reader's GitHub theme.
+  `scripts/readme_media.py` seeds the demo, drives the dashboard with
+  Playwright and rewrites `docs/images/` and `docs/media/` in one run. The demo
+  seed now has two writing personas, a draft history behind every email, and
+  confirmed signals with observations, so the Outbox, Signals and cohort
+  builder show real content.
+
 - **Follow-ups thread under the first email.** With `channels.email.thread_followups`
   (on by default, also a switch on the Settings tab), steps 2 and 3 go out as
   replies to the email before them: `In-Reply-To`, a `References` header with
