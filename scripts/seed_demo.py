@@ -368,7 +368,8 @@ async def seed_personas(sm: StateManager) -> dict:
     async with sm._connect() as db:
         async with db.execute(
             "SELECT id, prospect_id, subject, body, kind FROM outbox "
-            "WHERE prospect_id NOT LIKE 'hist%' ORDER BY prospect_id, step"
+            "WHERE prospect_id NOT LIKE 'hist%' AND COALESCE(generation_id, '') = '' "
+            "ORDER BY prospect_id, step"
         ) as cur:
             rows = await cur.fetchall()
     n, order = 0, {}
